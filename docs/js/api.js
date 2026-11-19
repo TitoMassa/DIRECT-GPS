@@ -80,16 +80,67 @@ export const api = {
     apiGetWithFallback(`/api/recorridos?codLinea=${encodeURIComponent(codLinea)}`, () =>
       staticRecorridos(codLinea)
     ),
-  arribos: (idParada, codLinea = '0', simulate = false) => {
+  arribos: (idParada, codLinea = '000', simulate = false) => {
+    const code = !codLinea || codLinea === '0' ? '000' : String(codLinea);
     if (simulate) {
-      return Promise.resolve(staticArribos(idParada, codLinea));
+      return Promise.resolve(staticArribos(idParada, code));
     }
     return apiGetWithFallback(
-      `/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(codLinea)}`,
-      () => staticArribos(idParada, codLinea)
+      `/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(code)}`,
+      () => staticArribos(idParada, code)
     );
   }
 };
+
+export function parseDesvioHorario(raw = '') {
+  const clean = String(raw || '').trim();
+  if (!clean) {
+    return { raw: '', status: 'none', label: 'Sin desvío', shortLabel: '—', sign: '' };
+  }
+  const normalized = clean.replace(/\s+/g, '');
+  if (normalized === '00:00' || normalized === '+00:00' || normalized === '-00:00' || normalized === '0') {
+    return { raw: clean, status: 'ontime', label: 'En horario (00:00)', shortLabel: 'En horario', sign: '=' };
+  }
+  if (normalized.startsWith('+')) {
+    return {
+      raw: clean,
+      status: 'ahead',
+      label: `Adelantado ${normalized}`,
+      shortLabel: `▲ ${normalized}`,
+      sign: '+'
+    };
+  }
+  if (normalized.startsWith('-')) {
+    return {
+      raw: clean,
+      status: 'late',
+      label: `Atrasado ${normalized}`,
+      shortLabel: `▼ ${normalized}`,
+      sign: '-'
+    };
+  }
+  return { raw: clean, status: 'ontime', label: clean, shortLabel: clean, sign: '' };
+}
+
+export function parseChoferInfo(raw = '', existingNombre = '', existingLegajo = '') {
+  if (existingNombre || existingLegajo) {
+    return { nombre: existingNombre, legajo: existingLegajo, raw: raw || `${existingNombre} (${existingLegajo})` };
+  }
+  const clean = String(raw || '').trim();
+  if (!clean) return { nombre: '', legajo: '', raw: '' };
+  const m = clean.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+  if (m) {
+    return { nombre: m[1].trim(), legajo: m[2].trim(), raw: clean };
+  }
+  return { nombre: clean, legajo: '', raw: clean };
+}
+
+export function formatGpsTimeOnly(rawStamp = '') {
+  const clean = String(rawStamp || '').trim();
+  if (!clean) return '';
+  const parts = clean.split(' ');
+  return parts.length > 1 ? parts[1] : clean;
+}
 
 // Haversine distance in meters
 export function distanceMeters(lat1, lng1, lat2, lng2) {

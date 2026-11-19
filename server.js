@@ -134,9 +134,15 @@ async function handleApi(req, res, urlObj) {
       return sendJson(res, 200, result);
     }
 
+    if (pathname === '/api/banderas') {
+      const idParada = searchParams.get('idParada') || PILOT_STOP.id;
+      const result = await smartmove.getBanderasParada(idParada);
+      return sendJson(res, 200, result);
+    }
+
     if (pathname === '/api/arribos') {
       const idParada = searchParams.get('idParada') || PILOT_STOP.id;
-      const codLinea = searchParams.get('codLinea') || '0';
+      const codLinea = searchParams.get('codLinea') || '000';
       const simulate = searchParams.get('simulate') === '1';
       const result = await smartmove.getArribos(idParada, codLinea, simulate);
       return sendJson(res, 200, result);

@@ -6,7 +6,10 @@ import {
   formatBlocks,
   formatWalkMin,
   parseEtaMinutes,
-  computeProximityPercent
+  computeProximityPercent,
+  parseDesvioHorario,
+  parseChoferInfo,
+  formatGpsTimeOnly
 } from './api.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
@@ -17,12 +20,12 @@ const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
 const state = {
   // Active stop & arrivals
   activeStop: { ...PILOT_STOP_DEFAULT },
-  codLineaQuery: '0', // 0 = all lines passing the stop
+  codLineaQuery: '000', // 000 = all lines passing the stop (richer SOAP results)
   filterLine: 'ALL',
   arribos: [],
   selectedBusKey: null,
   simulateMode: false,
-  dataSource: 'smartmovepro',
+  dataSource: 'smartmovepro-soap',
   lastSyncAt: null,
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
@@ -103,11 +106,16 @@ const el = {
   busInspector: document.getElementById('bus-inspector'),
   inspLineBadge: document.getElementById('insp-line-badge'),
   inspBandera: document.getElementById('insp-bandera'),
-  inspSub: document.getElementById('insp-sub'),
+  inspCochePill: document.getElementById('insp-coche-pill'),
+  inspDesvioPill: document.getElementById('insp-desvio-pill'),
+  inspChofer: document.getElementById('insp-chofer'),
+  inspLegajo: document.getElementById('insp-legajo'),
+  inspCoche: document.getElementById('insp-coche'),
   inspEta: document.getElementById('insp-eta'),
   inspDist: document.getElementById('insp-dist'),
   inspBlocks: document.getElementById('insp-blocks'),
   inspAccess: document.getElementById('insp-access'),
+  inspCartel: document.getElementById('insp-cartel'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
   btnInspRoute: document.getElementById('btn-insp-route'),
@@ -125,7 +133,7 @@ const el = {
 // Map Instance
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => selectBus(busKey, true),
-  onStopPick: (stop) => openStopRadar(stop, '0')
+  onStopPick: (stop) => openStopRadar(stop, '000')
 });
 
 // ============================================================================
@@ -265,7 +273,7 @@ function renderFavorites() {
   el.favoritasList.querySelectorAll('.btn-open-fav').forEach((btn) => {
     btn.addEventListener('click', () => {
       const fav = state.favorites.find((x) => x.id === btn.dataset.id);
-      if (fav) openStopRadar(fav, '0');
+      if (fav) openStopRadar(fav, '000');
     });
   });
 
@@ -356,14 +364,14 @@ function updateSignalPill() {
 
 function updateStopHeaderUI() {
   const s = state.activeStop;
+  const isAll = !state.codLineaQuery || state.codLineaQuery === '0' || state.codLineaQuery === '000';
   el.stopCodeBadge.textContent = s.id;
   el.stopTitle.textContent = s.nombre || `Parada ${s.id}`;
-  el.stopPilotTag.textContent =
-    state.codLineaQuery === '0'
-      ? s.id === PILOT_STOP_DEFAULT.id
-        ? 'PILOTO · TODAS LAS LÍNEAS (0)'
-        : 'TODAS LAS LÍNEAS (0)'
-      : `LÍNEA CÓD. ${state.codLineaQuery}`;
+  el.stopPilotTag.textContent = isAll
+    ? s.id === PILOT_STOP_DEFAULT.id
+      ? 'PILOTO · TODAS LAS LÍNEAS (000)'
+      : 'TODAS LAS LÍNEAS (000)'
+    : `LÍNEA CÓD. ${state.codLineaQuery}`;
 
   if (typeof s.lat === 'number' && typeof s.lng === 'number') {
     el.stopCoordsLabel.textContent = `${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}`;
@@ -372,7 +380,7 @@ function updateStopHeaderUI() {
   }
 
   el.btnOriginalLink.href = `https://cuandollega.smartmovepro.net/corrientes/arribos/?codLinea=${encodeURIComponent(
-    state.codLineaQuery
+    isAll ? '0' : state.codLineaQuery
   )}&idParada=${encodeURIComponent(s.id)}`;
 
   updateFavStarButton();
@@ -380,18 +388,19 @@ function updateStopHeaderUI() {
   // Sync URL cleanly for sharing
   const url = new URL(window.location.href);
   url.searchParams.set('idParada', s.id);
-  url.searchParams.set('codLinea', state.codLineaQuery);
+  url.searchParams.set('codLinea', isAll ? '000' : state.codLineaQuery);
   window.history.replaceState({}, '', url.toString());
 }
 
-async function openStopRadar(stopInfo, codLinea = '0') {
+async function openStopRadar(stopInfo, codLinea = '000') {
+  const rawCode = String(codLinea ?? '000').trim();
   state.activeStop = {
     id: String(stopInfo.id || stopInfo.identificador || PILOT_STOP_DEFAULT.id).toUpperCase(),
     nombre: stopInfo.nombre || stopInfo.descripcion || `Parada ${stopInfo.id}`,
     lat: typeof stopInfo.lat === 'number' ? stopInfo.lat : parseFloat(stopInfo.latitud) || null,
     lng: typeof stopInfo.lng === 'number' ? stopInfo.lng : parseFloat(stopInfo.longitud) || null
   };
-  state.codLineaQuery = String(codLinea ?? '0');
+  state.codLineaQuery = !rawCode || rawCode === '0' ? '000' : rawCode;
   state.filterLine = 'ALL';
   state.selectedBusKey = null;
   state.routesVisible = false;
@@ -414,8 +423,10 @@ function normalizeArrivals(rawList, stopCoords) {
   const seenCounts = new Map();
   return (rawList || []).map((a) => {
     const lineName = (a.descripcionLinea || '').trim() || `L${a.codigoLinea}`;
-    const occ = (seenCounts.get(lineName) || 0) + 1;
-    seenCounts.set(lineName, occ);
+    const coche = String(a.identificadorCoche || '').trim();
+    const baseId = coche ? `${a.codigoLinea}-c${coche}` : `${a.codigoLinea}-${lineName}`;
+    const occ = (seenCounts.get(baseId) || 0) + 1;
+    seenCounts.set(baseId, occ);
 
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
@@ -424,12 +435,16 @@ function normalizeArrivals(rawList, stopCoords) {
     const eta = parseEtaMinutes(a.tiempoRestanteArribo);
     const dist =
       validPos && stopCoords ? distanceMeters(lat, lng, stopCoords.lat, stopCoords.lng) : null;
+    const desvio = parseDesvioHorario(a.desvioHorario);
+    const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
+    const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
 
     return {
-      key: `${a.codigoLinea}-${lineName}-${occ}`,
+      key: occ > 1 ? `${baseId}-${occ}` : baseId,
       codigoLinea: a.codigoLinea,
       descripcionLinea: lineName,
       descripcionBandera: (a.descripcionBandera || a.descripcionCortaBandera || 'Servicio urbano').trim(),
+      descripcionCartelBandera: (a.descripcionCartelBandera || a.descripcionCortaBandera || '').trim(),
       tiempoRaw: a.tiempoRestanteArribo || '',
       eta,
       esAdaptado: Boolean(a.esAdaptado),
@@ -437,7 +452,14 @@ function normalizeArrivals(rawList, stopCoords) {
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
       distanceMeters: dist,
-      proximityPct: computeProximityPercent(eta.minutes, dist)
+      proximityPct: computeProximityPercent(eta.minutes, dist),
+      identificadorCoche: coche,
+      choferNombre: chofer.nombre,
+      choferLegajo: chofer.legajo,
+      choferRaw: chofer.raw,
+      desvio,
+      ultimaFechaHoraGPS: String(a.ultimaFechaHoraGPS || '').trim(),
+      gpsTimeOnly
     };
   });
 }
@@ -517,34 +539,68 @@ function renderArribosList() {
           ? `${formatDistance(bus.distanceMeters)} · ${formatBlocks(bus.distanceMeters)} cuadras`
           : 'Telemetría GPS activa';
 
+      const cocheBadge = bus.identificadorCoche
+        ? `<span class="coche-pill" title="Número de coche">#${escapeHtml(bus.identificadorCoche)}</span>`
+        : '';
+
+      const desvioBadge =
+        bus.desvio && bus.desvio.status !== 'none'
+          ? `<span class="desvio-pill desvio-${bus.desvio.status}" title="Desvío respecto al horario programado">${escapeHtml(
+              bus.desvio.label
+            )}</span>`
+          : '';
+
+      const driverHtml = bus.choferNombre
+        ? `<span class="driver-inline" title="Conductor asignado">
+             <span>Chofer: <strong>${escapeHtml(bus.choferNombre)}</strong></span>
+             ${bus.choferLegajo ? `<span class="legajo-chip">ID ${escapeHtml(bus.choferLegajo)}</span>` : ''}
+           </span>`
+        : `<span class="driver-inline"><span>Unidad sin chofer asignado</span></span>`;
+
+      const gpsHtml = bus.gpsTimeOnly
+        ? `<span class="mono-meta" title="Última señal GPS">GPS ${escapeHtml(bus.gpsTimeOnly)}</span>`
+        : '';
+
       return `
         <div class="arrival-card ${isSelected ? 'is-selected' : ''}" data-bus-key="${escapeHtml(
           bus.key
         )}" style="--line-color:${color}" role="button" tabindex="0">
-          <div class="line-badge">${escapeHtml(bus.descripcionLinea)}</div>
-          <div class="arrival-info">
-            <div class="arrival-bandera" title="${escapeHtml(bus.descripcionBandera)}">${escapeHtml(
-              bus.descripcionBandera
-            )}</div>
-            <div class="arrival-sub-row">
-              <span class="arrival-tag">${escapeHtml(distLabel)}</span>
-              ${bus.esAdaptado ? '<span class="arrival-tag tag-adapted">♿ Adaptado</span>' : ''}
-              ${bus.esLleno ? '<span class="arrival-tag tag-full">Unidad llena</span>' : ''}
+          <div class="arrival-card-main">
+            <div class="line-badge">${escapeHtml(bus.descripcionLinea)}</div>
+            <div class="arrival-info">
+              <div class="arrival-title-row">
+                <div class="arrival-bandera" title="${escapeHtml(bus.descripcionBandera)}">${escapeHtml(
+                  bus.descripcionBandera
+                )}</div>
+              </div>
+              <div class="arrival-sub-row">
+                ${cocheBadge}
+                ${desvioBadge}
+              </div>
+              <div class="arrival-sub-row">
+                <span class="arrival-tag">${escapeHtml(distLabel)}</span>
+                ${bus.esAdaptado ? '<span class="arrival-tag tag-adapted">♿ Adaptado</span>' : ''}
+                ${bus.esLleno ? '<span class="arrival-tag tag-full">Unidad llena</span>' : ''}
+              </div>
+            </div>
+            <div class="arrival-right">
+              <div class="eta-block eta-${bus.eta.urgency}">
+                <span class="eta-value">${escapeHtml(bus.eta.display)}</span>
+                <span class="eta-unit">${escapeHtml(bus.eta.unit || 'aprox')}</span>
+              </div>
+              <button class="alert-bell-btn ${isArmed ? 'is-armed' : ''}" data-alert-line="${escapeHtml(
+                bus.descripcionLinea
+              )}" title="${isArmed ? 'Quitar alerta de llegada' : 'Avisarme cuando falten ≤ 3 min'}">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="${isArmed ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+                  <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+                  <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+                </svg>
+              </button>
             </div>
           </div>
-          <div class="arrival-right">
-            <div class="eta-block eta-${bus.eta.urgency}">
-              <span class="eta-value">${escapeHtml(bus.eta.display)}</span>
-              <span class="eta-unit">${escapeHtml(bus.eta.unit || 'aprox')}</span>
-            </div>
-            <button class="alert-bell-btn ${isArmed ? 'is-armed' : ''}" data-alert-line="${escapeHtml(
-              bus.descripcionLinea
-            )}" title="${isArmed ? 'Quitar alerta de llegada' : 'Avisarme cuando falten ≤ 3 min'}">
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="${isArmed ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
-                <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
-                <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-              </svg>
-            </button>
+          <div class="arrival-card-telemetry">
+            ${driverHtml}
+            ${gpsHtml}
           </div>
           <div class="arrival-progress">
             <div class="arrival-progress-fill" style="width:${bus.proximityPct}%"></div>
@@ -589,8 +645,9 @@ function checkProximityAlerts() {
     ) {
       state.triggeredAlerts.add(bus.descripcionLinea);
       if (state.soundEnabled) playArrivalChime();
+      const cocheTag = bus.identificadorCoche ? ` (Coche #${bus.identificadorCoche})` : '';
       showToast(
-        `¡Línea ${bus.descripcionLinea} llegando a ${state.activeStop.id} (${bus.tiempoRaw})!`,
+        `¡Línea ${bus.descripcionLinea}${cocheTag} llegando a ${state.activeStop.id} (${bus.tiempoRaw})!`,
         'success',
         6500
       );
@@ -610,13 +667,24 @@ function selectBus(busKey, focusMap = false) {
   el.inspLineBadge.textContent = bus.descripcionLinea;
   el.inspLineBadge.style.setProperty('--line-color', color);
   el.inspBandera.textContent = bus.descripcionBandera;
-  el.inspSub.textContent = `Destino hacia parada ${state.activeStop.id}`;
+
+  el.inspCochePill.textContent = bus.identificadorCoche ? `Coche #${bus.identificadorCoche}` : 'Coche s/d';
+  el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status === 'none' ? 'ontime' : bus.desvio.status}`;
+  el.inspDesvioPill.textContent = bus.desvio.status !== 'none' ? bus.desvio.label : 'Sin desvío';
+
+  el.inspChofer.textContent = bus.choferNombre || 'Sin informar';
+  el.inspLegajo.textContent = bus.choferLegajo || '—';
+  el.inspCoche.textContent = bus.identificadorCoche ? `#${bus.identificadorCoche}` : '—';
+
   el.inspEta.textContent = bus.eta.minutes === 0 ? 'Llegando' : `${bus.eta.display} min`;
   el.inspDist.textContent = formatDistance(bus.distanceMeters);
   el.inspBlocks.textContent = formatBlocks(bus.distanceMeters);
   el.inspAccess.textContent = bus.esAdaptado ? '♿ Rampa' : 'Estándar';
-  el.inspGps.textContent =
-    bus.lat !== null ? `GPS: ${bus.lat.toFixed(5)}, ${bus.lng.toFixed(5)}` : 'GPS: sin coordenadas';
+
+  el.inspCartel.textContent = `Cartel: ${bus.descripcionCartelBandera || bus.descripcionBandera}`;
+  const coordsStr = bus.lat !== null ? `${bus.lat.toFixed(5)}, ${bus.lng.toFixed(5)}` : 's/d';
+  el.inspGps.textContent = bus.gpsTimeOnly ? `GPS ${bus.gpsTimeOnly} · ${coordsStr}` : `GPS: ${coordsStr}`;
+
   el.btnInspRoute.dataset.codLinea = bus.codigoLinea;
   el.btnInspRoute.dataset.lineName = bus.descripcionLinea;
 
@@ -922,7 +990,7 @@ function renderDrilldown() {
           </div>
           <div class="stop-card-name">${escapeHtml(p.descripcion)}</div>
           <div class="stop-card-foot">
-            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas las líneas (0)</button>
+            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas las líneas (000)</button>
             <button class="pill-btn pill-btn-ghost btn-open-only" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Solo ${escapeHtml(state.drill.linea.descripcion)}</button>
           </div>
         </div>
@@ -932,7 +1000,7 @@ function renderDrilldown() {
 
     el.lineasContent.querySelectorAll('.btn-open-all').forEach((btn) => {
       btn.addEventListener('click', () => {
-        openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, '0');
+        openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, '000');
       });
     });
     el.lineasContent.querySelectorAll('.btn-open-only').forEach((btn) => {
@@ -1062,7 +1130,7 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
             lat: parseFloat(btn.dataset.lat),
             lng: parseFloat(btn.dataset.lng)
           },
-          '0'
+          '000'
         );
       });
     });
@@ -1111,9 +1179,9 @@ function renderGlobalSearchResults(rawQuery) {
     results.push({
       type: 'direct-stop',
       title: `Ir a parada ${upper}`,
-      sub: 'Consultar arribos de todas las líneas (código 0)',
+      sub: 'Consultar arribos de todas las líneas (código 000)',
       badge: upper,
-      action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '0')
+      action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '000')
     });
   }
 
@@ -1128,9 +1196,9 @@ function renderGlobalSearchResults(rawQuery) {
       results.push({
         type: 'stop',
         title: s.nombre,
-        sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas (0)',
+        sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas (000)',
         badge: s.id,
-        action: () => openStopRadar(s, '0')
+        action: () => openStopRadar(s, '000')
       });
     }
   }
@@ -1192,7 +1260,7 @@ function bindEvents() {
   });
 
   el.btnBrandHome.addEventListener('click', () => {
-    openStopRadar(PILOT_STOP_DEFAULT, '0');
+    openStopRadar(PILOT_STOP_DEFAULT, '000');
   });
 
   el.btnThemeToggle.addEventListener('click', () => {
@@ -1312,10 +1380,10 @@ async function init() {
     showToast('Iniciando con catálogo local de Corrientes', 'warn');
   }
 
-  // Check URL query params (?idParada=CT31498&codLinea=0)
+  // Check URL query params (?idParada=CT31498&codLinea=000)
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || PILOT_STOP_DEFAULT.id).toUpperCase();
-  const paramCodLinea = params.get('codLinea') || '0';
+  const paramCodLinea = params.get('codLinea') || '000';
 
   const matchedKnown =
     state.quickStops.find((s) => s.id === paramStopId) ||
@@ -1378,7 +1446,7 @@ async function searchNearbyStopsQuiet(lat, lng) {
             lat: parseFloat(btn.dataset.lat),
             lng: parseFloat(btn.dataset.lng)
           },
-          '0'
+          '000'
         );
       });
     });

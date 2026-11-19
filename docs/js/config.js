@@ -10,7 +10,7 @@ export const PILOT_STOP_DEFAULT = {
   esPiloto: true
 };
 
-export const REFRESH_INTERVAL_SEC = 25;
+export const REFRESH_INTERVAL_SEC = 15;
 
 // Distinct, high-contrast civic transit palette by Corrientes line family
 const FAMILY_COLORS = {

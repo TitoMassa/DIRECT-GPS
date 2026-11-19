@@ -1,23 +1,21 @@
 # DIRECT GPS · Corrientes
 
-Rework inmersivo y en tiempo real de [Cuando Llega Corrientes](https://cuandollega.smartmovepro.net/corrientes), enfocado en telemetría satelital en vivo sobre un mapa interactivo a pantalla completa.
+Rework inmersivo y en tiempo real de Cuando Llega Corrientes con mapa interactivo **Leaflet** a pantalla completa y conexión directa al servicio SOAP `SWParadas.asmx` (sin límite de consultas).
 
-🌐 **GitHub Pages:** https://titomassa.github.io/DIRECT-GPS/
+🌐 **GitHub Pages:** https://titomassa.github.io/DIRECT-GPS/?idParada=CT31498&codLinea=000
 
-## Características principales
+## Telemetría en tiempo real (`SWParadas.asmx` + `codigoLineaParada = 000`)
 
-- **Radar en Vivo sobre Mapa Full-Screen**: Seguimiento satelital con interpolación suave de colectivos en movimiento, baliza pulsante en la parada activa, vector de distancia en metros y cuadras, y recarga automática con anillo regresivo cada 25 segundos.
-- **Parada Piloto lista al instante**: Abre directamente en **`CT31498 · AV. PEDRO FERRÉ - BRASIL IDA`** con `codLinea=0` (mostrando todas las líneas que pasan por la parada: `102A`, `102B`, `102C`, `106A`, `106B`, `106C`, `904A`, etc.).
-- **Red completa de Corrientes Capital (26 líneas)**: Navegación completa `Línea → Calle → Intersección → Parada` y trazado de recorridos con paradas clickeables sobre el mapa.
-- **Paradas Cercanas & Explorador por Zona**: Búsqueda por GPS del dispositivo, búsqueda por centro del mapa y accesos rápidos a puntos clave de Corrientes (Av. Ferré y Brasil, Plaza 25 de Mayo, Puerto, Terminal, Campus UNNE, Hospital Escuela).
-- **Alertas de Proximidad**: Campana de aviso sonoro (Web Audio API) cuando la línea elegida llega a ≤ 3 minutos.
-- **Favoritas con Etiquetas**: Guardado local en el navegador con soporte para alias personalizados.
-- **Tema Nocturno, Día y Satélite**: Cambio instantáneo entre cartografía nocturna, diurna y vista satelital.
-- **Modo Híbrido (GitHub Pages + Proxy SmartMovePro en vivo)**:
-  - En **GitHub Pages** (`docs/`) funciona de forma 100% estática con telemetría interactiva lista para probar al instante.
-  - Al ejecutar `node server.js` (local o desplegado en Render/Railway/Fly.io), el proxy integrado se conecta en vivo a los endpoints oficiales de SmartMovePro Corrientes gestionando sesiones CSRF, cola anti-saturación y caché. También podés conectar tu propio backend desplegado pasando `?api=https://tu-backend.onrender.com` en la URL de GitHub Pages.
+Cada unidad entrante muestra información operativa completa en las tarjetas de arribos, en los marcadores de **Leaflet** y en el inspector flotante de unidad:
 
-## Cómo ejecutar con telemetría SmartMovePro en vivo
+- **Desvío horario (`+` / `-`)**: Indica exactamente cuánto está **adelantado (`+`)**, **atrasado (`-`)** o **en horario (`00:00`)** cada colectivo.
+- **Chofer e ID / Legajo**: Nombre del conductor y su número de identificación (`IdentificadorChofer`).
+- **Número de coche / interno**: Identificación del vehículo (`IdentificadorCoche`, ej. `#2967`) visible en la tarjeta y directamente sobre el pin del mapa.
+- **Cartel LED y última señal GPS**: Cartel frontal (`DescripcionCartelBandera`), marca temporal GPS (`UltimaFechaHoraGPS`), distancia real y cuadras aproximadas.
+- **Todas las líneas con código `000`**: Abre por defecto en la parada piloto **`CT31498 · AV. PEDRO FERRÉ - BRASIL IDA`** con `codigoLineaParada=000`.
+- **Red completa de Corrientes (33 líneas)**: Navegación `Línea → Calle → Intersección → Parada`, trazado de recorridos reales con paradas clickeables en Leaflet, paradas cercanas por GPS/centro del mapa, favoritas con etiquetas, alertas sonoras (`≤ 3 min`) y temas **Nocturno / Día / Satélite**.
+
+## Cómo ejecutar con telemetría SOAP en vivo
 
 Requiere Node.js 20 o superior (sin dependencias externas):
 
@@ -25,10 +23,10 @@ Requiere Node.js 20 o superior (sin dependencias externas):
 npm start
 ```
 
-### Enlaces directos a paradas
+El servidor ([server.js](server.js) + [lib/smartmove.js](lib/smartmove.js)) realiza las consultas SOAP server-side contra `http://clsw.smartmovepro.net/ModuloParadas/SWParadas.asmx` (evitando bloqueos de CORS / Mixed Content del navegador) y sirve la interfaz desde `docs/`.
 
-Podés abrir cualquier parada directamente por URL usando `idParada` y `codLinea` (`0` = todas las líneas):
+También podés conectar una instancia desplegada de `server.js` (por ejemplo en Render o Railway) directamente a GitHub Pages pasando el parámetro `?api=`:
 
 ```text
-https://titomassa.github.io/DIRECT-GPS/?idParada=CT31498&codLinea=0
+https://titomassa.github.io/DIRECT-GPS/?idParada=CT31498&codLinea=000&api=https://tu-backend.onrender.com
 ```

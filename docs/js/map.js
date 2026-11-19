@@ -141,21 +141,41 @@ export class TransitMap {
     if (dimmed) cls.push('is-dimmed');
 
     const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
+    const cocheHtml = bus.identificadorCoche
+      ? `<span class="bus-pill-coche">#${bus.identificadorCoche}</span>`
+      : '';
+    const dotHtml =
+      bus.desvio && bus.desvio.status !== 'none'
+        ? `<span class="bus-desvio-dot ${bus.desvio.status}"></span>`
+        : '';
 
     return L.divIcon({
       className: 'bus-leaflet-icon',
       html: `
         <div class="${cls.join(' ')}" style="--bus-color:${color}">
           <div class="bus-pill-marker">
+            ${dotHtml}
             <span>${bus.descripcionLinea}</span>
+            ${cocheHtml}
             <span class="bus-pill-eta">${etaShort}</span>
           </div>
           <div class="bus-heading-dot"></div>
         </div>
       `,
-      iconSize: [86, 36],
-      iconAnchor: [43, 34]
+      iconSize: [122, 36],
+      iconAnchor: [61, 34]
     });
+  }
+
+  _buildBusTooltipHtml(bus) {
+    const coche = bus.identificadorCoche ? ` · Coche #${bus.identificadorCoche}` : '';
+    const desvio =
+      bus.desvio && bus.desvio.status !== 'none' ? `<br/>Desvío: <strong>${bus.desvio.label}</strong>` : '';
+    const chofer = bus.choferNombre
+      ? `<br/>Chofer: ${bus.choferNombre}${bus.choferLegajo ? ` (ID ${bus.choferLegajo})` : ''}`
+      : '';
+    const gps = bus.gpsTimeOnly ? `<br/><small>GPS: ${bus.gpsTimeOnly}</small>` : '';
+    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${desvio}${chofer}${gps}`;
   }
 
   updateBuses(buses, { filterLine = 'ALL', selectedBusKey = null } = {}) {
@@ -169,19 +189,23 @@ export class TransitMap {
       const isSelected = bus.key === selectedBusKey;
       const isDimmed = filterLine !== 'ALL' && bus.descripcionLinea !== filterLine;
       const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: isDimmed });
+      const tooltipHtml = this._buildBusTooltipHtml(bus);
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
         const curPos = existing.marker.getLatLng();
         this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng]);
         existing.marker.setIcon(icon);
+        existing.marker.setTooltipContent(tooltipHtml);
         existing.marker.setZIndexOffset(isSelected ? 1000 : isDimmed ? 100 : 500);
         existing.data = bus;
       } else {
         const marker = L.marker([bus.lat, bus.lng], {
           icon,
           zIndexOffset: isSelected ? 1000 : 500
-        }).addTo(this.busLayer);
+        })
+          .addTo(this.busLayer)
+          .bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -28] });
 
         marker.on('click', () => {
           this.onBusSelect(bus.key);

@@ -751,10 +751,9 @@ button {
 /* Arrival Cards */
 .arrival-card {
   position: relative;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   padding: 12px;
   border-radius: var(--radius-lg);
   background: var(--surface-elevated);
@@ -764,6 +763,92 @@ button {
   width: 100%;
   overflow: hidden;
   transition: transform 0.16s var(--ease-spring), border-color 0.18s ease, background 0.18s ease;
+}
+
+.arrival-card-main {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+}
+
+.arrival-card-telemetry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+.driver-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.driver-inline strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.legajo-chip {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+}
+
+.coche-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.desvio-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.desvio-ahead {
+  background: var(--accent-emerald-soft);
+  color: var(--accent-emerald);
+}
+
+.desvio-late {
+  background: var(--accent-rose-soft);
+  color: var(--accent-rose);
+}
+
+.desvio-ontime {
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
 }
 
 .arrival-card:hover {
@@ -823,6 +908,13 @@ button {
   gap: 3px;
 }
 
+.arrival-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .arrival-bandera {
   font-size: 13px;
   font-weight: 600;
@@ -875,7 +967,7 @@ button {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  min-width: 58px;
+  min-width: 54px;
 }
 
 .eta-value {
@@ -1272,7 +1364,7 @@ button {
   position: fixed;
   bottom: 18px;
   left: calc(var(--dock-w) + 28px);
-  width: 340px;
+  width: 372px;
   max-width: calc(100vw - var(--dock-w) - 100px);
   z-index: 460;
   background: var(--surface-glass);
@@ -1284,7 +1376,7 @@ button {
   padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 11px;
+  gap: 10px;
   animation: pop-in 0.24s var(--ease-spring);
 }
 
@@ -1295,7 +1387,7 @@ button {
 
 .bus-inspector-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
 }
 
@@ -1304,7 +1396,14 @@ button {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 5px;
+}
+
+.insp-badges-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .insp-bandera {
@@ -1313,11 +1412,58 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: block;
 }
 
-.insp-sub {
-  font-size: 11.5px;
-  color: var(--text-secondary);
+.insp-driver-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-hairline);
+}
+
+.driver-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.driver-value {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.driver-value.mono-val {
+  font-family: var(--font-mono);
+}
+
+.driver-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--border-hairline);
+  flex-shrink: 0;
+}
+
+.insp-foot-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.insp-foot-meta .mono-meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mini-close-btn {
@@ -1505,6 +1651,13 @@ button {
   white-space: nowrap;
 }
 
+.bus-pill-coche {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  opacity: 0.9;
+}
+
 .bus-pill-eta {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -1513,6 +1666,17 @@ button {
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.28);
 }
+
+.bus-desvio-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.bus-desvio-dot.ahead { background: #34d399; }
+.bus-desvio-dot.late { background: #fda4af; }
+.bus-desvio-dot.ontime { background: rgba(255, 255, 255, 0.7); }
 
 .bus-heading-dot {
   width: 10px;
