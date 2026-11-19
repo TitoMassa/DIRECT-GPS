@@ -14,9 +14,15 @@ import {
   getArgentinaTodayTipo,
   matchBusesWithHorarios
 } from './api.js';
-import { parseRouteBranches, resolveBusTrajectory, sampleTrajectory } from './trajectory.js';
+import { parseRouteBranches, resolveBusTrajectory } from './trajectory.js';
+import { BusSimulator } from './simulator.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
+
+const busSimulator = new BusSimulator();
+let simRafId = null;
+let simLastFrameMs = 0;
+let simLastDomMs = 0;
 
 const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
@@ -391,6 +397,8 @@ function resetToWelcome() {
   state.filterLine = 'ALL';
   state.routesVisible = false;
   state.horariosOpen = false;
+  stopSimLoop();
+  busSimulator.clear();
   el.btnShowRoutes.classList.remove('active');
   el.btnToggleHorarios.classList.remove('active');
   closeBusInspector();
@@ -486,6 +494,7 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   state.horariosTipoDia = getArgentinaTodayTipo();
   state.stopLinesList = [];
   state.lastRealGpsByUnit.clear();
+  busSimulator.clear();
 
   el.btnShowRoutes.classList.remove('active');
   el.btnToggleHorarios.classList.remove('active');
@@ -605,45 +614,8 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
   });
 }
 
-// ZERO-LAG 1-second interpolation tick: no innerHTML rebuild, no Leaflet setIcon()!
-function stepSoapInterpolation() {
-  if (!state.simulateMode || !state.activeStop || state.arribos.length === 0) return;
-
-  for (const bus of state.arribos) {
-    const traj = bus.trajectory;
-    if (!traj || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
-
-    traj.walkedMeters = Math.min(traj.totalMeters, traj.walkedMeters + traj.speedMps);
-    const sample = sampleTrajectory(traj, traj.walkedMeters);
-    if (!sample) continue;
-
-    bus.lat = sample.lat;
-    bus.lng = sample.lng;
-    bus.routeMeters = sample.remainingMeters;
-    bus.isOppositeLeg = sample.inOppositeLeg;
-    bus.isNextCycle = Boolean(sample.inNextCycle);
-    if (sample.currentBandera) bus.realBandera = sample.currentBandera;
-    if (sample.currentBranchColor) bus.realBanderaColor = sample.currentBranchColor;
-    bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining || 0) - 1);
-
-    const mins = Math.ceil(bus.etaSecondsRemaining / 60);
-    if (sample.arrived || bus.etaSecondsRemaining <= 35) {
-      bus.eta = { minutes: 0, display: 'YA', unit: 'Arribando', urgency: 'now' };
-      bus.tiempoRaw = 'Arribando..';
-    } else {
-      bus.eta = {
-        minutes: mins,
-        display: `${mins}`,
-        unit: 'min',
-        urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
-      };
-      bus.tiempoRaw = `${mins} min. aprox.`;
-    }
-    bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
-  }
-
-  transitMap.moveBusPositionsFast(state.arribos);
-
+// Smooth ~30fps kinematic simulation loop (zero DOM rebuilds, zero backward jumps!)
+function syncSimCardsDom() {
   if (!state.horariosOpen) {
     for (const bus of state.arribos) {
       const card = el.arribosList.querySelector(`[data-bus-key="${CSS.escape(bus.key)}"]`);
@@ -668,6 +640,44 @@ function stepSoapInterpolation() {
   if (state.inspectorOpen && state.selectedBusKey) {
     const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
     if (focused) updateInspectorFields(focused);
+  }
+}
+
+function startSimLoop() {
+  if (simRafId !== null) return;
+  simLastFrameMs = performance.now();
+  simLastDomMs = simLastFrameMs;
+
+  const frame = (now) => {
+    if (!state.simulateMode || !state.activeStop) {
+      simRafId = null;
+      return;
+    }
+    const elapsedMs = now - simLastFrameMs;
+    // Target ~30fps (32ms min interval) for buttery smoothness with minimal mobile CPU/battery
+    if (elapsedMs >= 32 && state.arribos.length > 0) {
+      const dtSec = Math.min(0.12, elapsedMs / 1000);
+      simLastFrameMs = now;
+
+      const shouldSyncDom = now - simLastDomMs >= 1000;
+      busSimulator.step(dtSec, state.arribos, { updateEta: shouldSyncDom });
+      transitMap.moveBusPositionsFast(state.arribos);
+
+      if (shouldSyncDom) {
+        simLastDomMs = now;
+        syncSimCardsDom();
+      }
+    }
+    simRafId = requestAnimationFrame(frame);
+  };
+
+  simRafId = requestAnimationFrame(frame);
+}
+
+function stopSimLoop() {
+  if (simRafId !== null) {
+    cancelAnimationFrame(simRafId);
+    simRafId = null;
   }
 }
 
@@ -969,7 +979,8 @@ function focusBusOnMap(busKey) {
   if (!state.horariosOpen) renderArribosList();
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
-    selectedBusKey: state.selectedBusKey
+    selectedBusKey: state.selectedBusKey,
+    simulateMode: state.simulateMode
   });
   transitMap.focusBus(bus, 16);
 }
@@ -989,7 +1000,8 @@ function openBusInspector(busKey) {
   if (!state.horariosOpen) renderArribosList();
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
-    selectedBusKey: state.selectedBusKey
+    selectedBusKey: state.selectedBusKey,
+    simulateMode: state.simulateMode
   });
 }
 
@@ -1000,7 +1012,8 @@ function closeBusInspector() {
   transitMap.drawFocusVector(null);
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
-    selectedBusKey: null
+    selectedBusKey: null,
+    simulateMode: state.simulateMode
   });
   if (state.activeStop && !state.horariosOpen) renderArribosList();
 }
@@ -1085,6 +1098,9 @@ async function fetchArribos(showSkeleton = false) {
 
     state.arribos = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
 
+    // Always learn real speeds & stopped status from fresh GPS fixes; apply smooth non-backjumping reconciliation when in Simulation Mode
+    busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode });
+
     // When viewing a single line, automatically cross-match every car against its official Horarios Programados!
     if (state.focusedLineCode && state.arribos.length > 0) {
       await crossMatchLineHorarios(state.activeStop.id, state.focusedLineCode, state.arribos);
@@ -1104,8 +1120,13 @@ async function fetchArribos(showSkeleton = false) {
 
     transitMap.updateBuses(state.arribos, {
       filterLine: state.filterLine,
-      selectedBusKey: state.selectedBusKey
+      selectedBusKey: state.selectedBusKey,
+      simulateMode: state.simulateMode
     });
+
+    if (state.simulateMode && state.arribos.length > 0) {
+      startSimLoop();
+    }
 
     if (showSkeleton && state.arribos.length > 0) {
       const visibleForFit =
@@ -1820,9 +1841,15 @@ function bindEvents() {
     state.simulateMode = !state.simulateMode;
     updateSignalPill();
     if (state.simulateMode) {
-      showToast('Simulación activa: los coches avanzan sobre su recorrido real', 'success');
-      if (state.arribos.length === 0) await fetchArribos(false);
+      showToast('Simulación fluida activa: velocidad real y frenado en semáforos', 'success');
+      if (state.arribos.length === 0) {
+        await fetchArribos(false);
+      } else {
+        busSimulator.reconcile(state.arribos, { applyPositions: true });
+        startSimLoop();
+      }
     } else {
+      stopSimLoop();
       showToast('Modo EN VIVO: actualización automática cada 15s', 'info');
       fetchArribos(false);
     }
@@ -1934,10 +1961,6 @@ async function init() {
 
   setInterval(() => {
     if (!state.activeStop) return;
-
-    if (state.simulateMode) {
-      stepSoapInterpolation();
-    }
 
     state.countdownSec -= 1;
     if (state.countdownSec <= 0) {

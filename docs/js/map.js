@@ -150,12 +150,15 @@ export class TransitMap {
   }
 
   _animateMarker(marker, fromLatLng, toLatLng, duration = 1100) {
+    const token = (marker._animToken || 0) + 1;
+    marker._animToken = token;
     const start = performance.now();
     const dLat = toLatLng[0] - fromLatLng.lat;
     const dLng = toLatLng[1] - fromLatLng.lng;
     if (Math.abs(dLat) < 1e-6 && Math.abs(dLng) < 1e-6) return;
 
     const step = (now) => {
+      if (marker._animToken !== token) return;
       const t = Math.min(1, (now - start) / duration);
       const eased = 1 - Math.pow(1 - t, 3);
       marker.setLatLng([fromLatLng.lat + dLat * eased, fromLatLng.lng + dLng * eased]);
@@ -172,7 +175,7 @@ export class TransitMap {
 
     const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
     const cocheHtml = bus.identificadorCoche
-      ? `<span class="bus-pill-coche">#${bus.identificadorCoche}</span>`
+      ? `<span class="bus-pill-coche">${bus.identificadorCoche}</span>`
       : '';
     const dotHtml =
       bus.desvio && bus.desvio.status !== 'none'
@@ -197,18 +200,19 @@ export class TransitMap {
     });
   }
 
-  // Zero-lag position-only update for 1-second interpolation ticks (no setIcon / no DOM rebuild!)
+  // Zero-lag 30fps position-only update for smooth simulation (no setIcon / no DOM rebuild!)
   moveBusPositionsFast(buses) {
     for (const bus of buses) {
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       const entry = this.busMarkers.get(bus.key);
       if (!entry) continue;
+      entry.marker._animToken = (entry.marker._animToken || 0) + 1;
       entry.marker.setLatLng([bus.lat, bus.lng]);
       entry.data = bus;
     }
   }
 
-  updateBuses(buses, { filterLine = 'ALL', selectedBusKey = null } = {}) {
+  updateBuses(buses, { filterLine = 'ALL', selectedBusKey = null, simulateMode = false } = {}) {
     this.selectedBusKey = selectedBusKey;
     const incomingKeys = new Set();
 
@@ -225,8 +229,14 @@ export class TransitMap {
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
-        const curPos = existing.marker.getLatLng();
-        this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
+        if (simulateMode) {
+          // Cancel any live-mode tween; BusSimulator already reconciled position continuously with 0 backjumps!
+          existing.marker._animToken = (existing.marker._animToken || 0) + 1;
+          existing.marker.setLatLng([bus.lat, bus.lng]);
+        } else {
+          const curPos = existing.marker.getLatLng();
+          this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
+        }
         existing.marker.setIcon(icon);
         existing.marker.setZIndexOffset(isSelected ? 1000 : 500);
         existing.data = bus;

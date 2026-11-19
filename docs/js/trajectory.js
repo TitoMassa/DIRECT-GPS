@@ -80,9 +80,19 @@ export function parseRouteBranches(recorridos = []) {
         .filter(([la, ln]) => !Number.isNaN(la) && !Number.isNaN(ln));
       if (pts.length < 2) return null;
       const cum = buildCumDist(pts);
-      const stopIds = new Set(
-        (r.paradas || []).map((s) => String(s.identificador || '').trim().toUpperCase()).filter(Boolean)
-      );
+      const stopIds = new Set();
+      const stopAlongs = [];
+      for (const s of r.paradas || []) {
+        const sid = String(s.identificador || '').trim().toUpperCase();
+        if (sid) stopIds.add(sid);
+        const sla = parseFloat(s.latitudParada);
+        const sln = parseFloat(s.longitudParada);
+        if (!Number.isNaN(sla) && !Number.isNaN(sln)) {
+          const p = projectOnPolyline(pts, cum, sla, sln);
+          if (p.perp < 120) stopAlongs.push(p.along);
+        }
+      }
+      stopAlongs.sort((a, b) => a - b);
       return {
         index: idx,
         color: getDirectionColor(idx),
@@ -91,7 +101,8 @@ export function parseRouteBranches(recorridos = []) {
         pts,
         cum,
         totalLen: cum[cum.length - 1] || 0,
-        stopIds
+        stopIds,
+        stopAlongs
       };
     })
     .filter(Boolean);
@@ -328,6 +339,16 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   const stopBandera = stopBranch.bandera || bus.descripcionBandera;
   const stopColor = stopBranch.color;
 
+  const mapStopsInRange = (branch, fromAlong, toAlong, offsetMeters) => {
+    const out = [];
+    for (const sa of branch?.stopAlongs || []) {
+      if (sa > fromAlong + 15 && sa < toAlong - 15) {
+        out.push(offsetMeters + (sa - fromAlong));
+      }
+    }
+    return out;
+  };
+
   if (leg === 'full_cycle' && busOnStop) {
     const stopRemainder = slicePolyline(stopBranch.pts, busOnStop, null);
     const retFull = returnBranch ? returnBranch.pts.slice() : [];
@@ -339,6 +360,12 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const totalMeters = cum[cum.length - 1] || 0;
     const oppStartMeters = buildCumDist(stopRemainder).slice(-1)[0] || 0;
     const turnaroundAtMeters = buildCumDist([...stopRemainder, ...retFull]).slice(-1)[0] || 0;
+
+    const stopAlongs = [
+      ...mapStopsInRange(stopBranch, busOnStop.along, stopBranch.totalLen, 0),
+      ...(returnBranch ? mapStopsInRange(returnBranch, 0, returnBranch.totalLen, oppStartMeters) : []),
+      ...mapStopsInRange(stopBranch, 0, stopProj.along, turnaroundAtMeters)
+    ].sort((a, b) => a - b);
 
     const segments = [
       { pts: stopRemainder, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: oppStartMeters }
@@ -367,13 +394,14 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       realBandera: stopBandera,
       realBanderaColor: stopColor,
       segments,
+      stopAlongs,
       oppStartMeters,
       turnaroundAtMeters,
       pathPts,
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(3.2, Math.min(13.5, totalMeters / etaSec))
+      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
     };
   }
 
@@ -388,6 +416,11 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const totalMeters = cum[cum.length - 1] || 0;
     const turnaroundAtMeters = buildCumDist(oppRemainder).slice(-1)[0] || 0;
 
+    const stopAlongs = [
+      ...mapStopsInRange(oppositeBranch, busOnOpp.along, oppositeBranch.totalLen, 0),
+      ...mapStopsInRange(stopBranch, 0, stopProj.along, turnaroundAtMeters)
+    ].sort((a, b) => a - b);
+
     const segments = [
       { pts: oppRemainder, color: oppColor, bandera: oppBandera, startMeters: 0, endMeters: turnaroundAtMeters },
       { pts: stopApproach, color: stopColor, bandera: stopBandera, startMeters: turnaroundAtMeters, endMeters: totalMeters }
@@ -400,13 +433,14 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       realBandera: oppBandera,
       realBanderaColor: oppColor,
       segments,
+      stopAlongs,
       oppStartMeters: 0,
       turnaroundAtMeters,
       pathPts,
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(3.2, Math.min(13.5, totalMeters / etaSec))
+      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
     };
   }
 
@@ -420,6 +454,9 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
         ];
   const cum = buildCumDist(pathPts);
   const totalMeters = cum[cum.length - 1] || 0;
+  const stopAlongs =
+    directDist < Infinity ? mapStopsInRange(stopBranch, busOnStop.along, stopProj.along, 0) : [];
+
   return {
     leg: 'direct',
     isOppositeLeg: false,
@@ -427,13 +464,63 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     realBandera: stopBandera,
     realBanderaColor: stopColor,
     segments: [{ pts: pathPts, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: totalMeters }],
+    stopAlongs,
     oppStartMeters: 0,
     turnaroundAtMeters: 0,
     pathPts,
     pathCum: cum,
     totalMeters,
     walkedMeters: 0,
-    speedMps: Math.max(3.2, Math.min(13.5, totalMeters / etaSec))
+    speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
+  };
+}
+
+/**
+ * Splices the exact street polyline segment from the previous simulated position (`prevTraj` at `fromMeters`)
+ * to the start of `newTraj`, shifting all cumulative distances and segment offsets seamlessly.
+ */
+export function prependPathToTrajectory(prevTraj, fromMeters, newTraj) {
+  if (!prevTraj || !newTraj || !prevTraj.pathPts?.length || !newTraj.pathPts?.length) {
+    return newTraj;
+  }
+
+  const startSample = sampleTrajectory(prevTraj, fromMeters);
+  if (!startSample) return newTraj;
+
+  const targetStart = newTraj.pathPts[0];
+  const endProj = projectOnPolyline(prevTraj.pathPts, prevTraj.pathCum, targetStart[0], targetStart[1]);
+
+  const prefixPts = [[startSample.lat, startSample.lng]];
+  if (endProj.along > fromMeters + 3) {
+    for (let i = 0; i < prevTraj.pathPts.length; i++) {
+      const m = prevTraj.pathCum[i];
+      if (m > fromMeters + 2 && m < endProj.along - 2) {
+        prefixPts.push(prevTraj.pathPts[i]);
+      }
+    }
+  }
+
+  const mergedPts = [...prefixPts, ...newTraj.pathPts];
+  const mergedCum = buildCumDist(mergedPts);
+  const totalMeters = mergedCum[mergedCum.length - 1] || newTraj.totalMeters;
+  const addedMeters = Math.max(0, totalMeters - newTraj.totalMeters);
+
+  const shiftedSegments = (newTraj.segments || []).map((s, idx) =>
+    idx === 0
+      ? { ...s, pts: [...prefixPts, ...s.pts], startMeters: 0, endMeters: s.endMeters + addedMeters }
+      : { ...s, startMeters: s.startMeters + addedMeters, endMeters: s.endMeters + addedMeters }
+  );
+
+  return {
+    ...newTraj,
+    pathPts: mergedPts,
+    pathCum: mergedCum,
+    totalMeters,
+    segments: shiftedSegments,
+    stopAlongs: (newTraj.stopAlongs || []).map((sa) => sa + addedMeters),
+    oppStartMeters: newTraj.oppStartMeters ? newTraj.oppStartMeters + addedMeters : 0,
+    turnaroundAtMeters: newTraj.turnaroundAtMeters ? newTraj.turnaroundAtMeters + addedMeters : 0,
+    walkedMeters: 0
   };
 }
 
