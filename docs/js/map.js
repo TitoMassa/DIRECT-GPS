@@ -33,16 +33,20 @@ export class TransitMap {
   }
 
   _getPadding() {
-    const isMobile = window.innerWidth <= 820;
+    const isMobile = window.innerWidth <= 860;
     if (isMobile) {
+      const dock = document.getElementById('transit-dock');
+      const bottomPad = dock?.classList.contains('sheet-peek')
+        ? 180
+        : Math.round(window.innerHeight * 0.5);
       return {
-        paddingTopLeft: [24, 90],
-        paddingBottomRight: [24, Math.round(window.innerHeight * 0.52)]
+        paddingTopLeft: [20, 72],
+        paddingBottomRight: [20, bottomPad]
       };
     }
     return {
-      paddingTopLeft: [450, 96],
-      paddingBottomRight: [74, 60]
+      paddingTopLeft: [430, 84],
+      paddingBottomRight: [68, 52]
     };
   }
 
@@ -312,6 +316,17 @@ export class TransitMap {
         })
       }).addTo(this.vectorLayer);
     }
+  }
+
+  focusBus(bus, zoom = 16) {
+    if (!bus || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') return;
+    const targetZoom = Math.max(zoom, Math.min(17, this.map.getZoom()));
+    const pad = this._getPadding();
+    const targetPt = this.map.project([bus.lat, bus.lng], targetZoom);
+    const offsetX = (pad.paddingBottomRight[0] - pad.paddingTopLeft[0]) / 2;
+    const offsetY = (pad.paddingBottomRight[1] - pad.paddingTopLeft[1]) / 2;
+    const shiftedCenter = this.map.unproject(targetPt.add([offsetX, offsetY]), targetZoom);
+    this.map.setView(shiftedCenter, targetZoom, { animate: true });
   }
 
   focusBusAndStop(bus) {

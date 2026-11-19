@@ -28,6 +28,7 @@ const state = {
   focusedLineCode: null, // Numeric codigoLinea when viewing a single line's full fleet
   arribos: [],
   selectedBusKey: null,
+  inspectorOpen: false,
   simulateMode: false,
   horariosOpen: false,
   horariosLineCode: null,
@@ -116,15 +117,13 @@ const el = {
   inspBandera: document.getElementById('insp-bandera'),
   inspCochePill: document.getElementById('insp-coche-pill'),
   inspDesvioPill: document.getElementById('insp-desvio-pill'),
-  inspDirectionNote: document.getElementById('insp-direction-note'),
+  inspTurnoPill: document.getElementById('insp-turno-pill'),
+  inspAccessBadge: document.getElementById('insp-access-badge'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
-  inspCoche: document.getElementById('insp-coche'),
   inspEta: document.getElementById('insp-eta'),
   inspDist: document.getElementById('insp-dist'),
   inspBlocks: document.getElementById('insp-blocks'),
-  inspAccess: document.getElementById('insp-access'),
-  inspCartel: document.getElementById('insp-cartel'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
   btnInspRoute: document.getElementById('btn-insp-route'),
@@ -139,7 +138,7 @@ const el = {
 };
 
 const transitMap = new TransitMap('map', {
-  onBusSelect: (busKey) => selectBus(busKey, true),
+  onBusSelect: (busKey) => openBusInspector(busKey),
   onStopPick: (stop) => openStopRadar(stop, '000')
 });
 
@@ -666,7 +665,7 @@ function stepSoapInterpolation() {
     }
   }
 
-  if (state.selectedBusKey) {
+  if (state.inspectorOpen && state.selectedBusKey) {
     const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
     if (focused) updateInspectorFields(focused);
   }
@@ -768,10 +767,10 @@ function renderArribosList() {
       const distLabel =
         distMeters !== null && distMeters !== undefined
           ? `${formatDistance(distMeters)} · ${formatBlocks(distMeters)} cuadras`
-          : 'GPS activo';
+          : '';
 
       const cocheBadge = bus.identificadorCoche
-        ? `<span class="coche-pill" title="Número de coche">#${escapeHtml(bus.identificadorCoche)}</span>`
+        ? `<span class="coche-pill" title="Coche">${escapeHtml(bus.identificadorCoche)}</span>`
         : '';
 
       const desvioBadge =
@@ -782,25 +781,27 @@ function renderArribosList() {
           : '';
 
       const turnoBadge = bus.turnoProgramado
-        ? `<span class="turno-pill" title="Horario programado estimado que cubre esta unidad">Turno ${escapeHtml(
-            bus.turnoProgramado
-          )}</span>`
+        ? `<span class="turno-pill" title="Turno programado">${escapeHtml(bus.turnoProgramado)}</span>`
+        : '';
+
+      const adaptedBadge = bus.esAdaptado
+        ? `<span class="adapted-icon-badge" title="Unidad adaptada" aria-label="Unidad adaptada">♿</span>`
         : '';
 
       const extBadge = bus.esExtendido
-        ? `<span class="extended-pill" title="Coche detectado en parada anterior (${escapeHtml(
+        ? `<span class="extended-pill" title="Detectado en parada previa (${escapeHtml(
             bus.viaParada || ''
           )})">+Flota</span>`
         : '';
 
       const driverHtml = bus.choferNombre
         ? `<span class="driver-inline">
-             <span>Chofer: <strong>${escapeHtml(bus.choferNombre)}</strong></span>
-             ${bus.choferLegajo ? `<span class="legajo-chip">ID ${escapeHtml(bus.choferLegajo)}</span>` : ''}
+             <strong>${escapeHtml(bus.choferNombre)}</strong>
+             ${bus.choferLegajo ? `<span class="legajo-chip">${escapeHtml(bus.choferLegajo)}</span>` : ''}
            </span>`
-        : `<span class="driver-inline"><span>Sin chofer informado</span></span>`;
+        : `<span class="driver-inline"><span>—</span></span>`;
 
-      const gpsHtml = bus.gpsTimeOnly ? `<span class="mono-meta">GPS ${escapeHtml(bus.gpsTimeOnly)}</span>` : '';
+      const gpsHtml = bus.gpsTimeOnly ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>` : '';
       const currentBandera = bus.realBandera || bus.descripcionBandera;
       const dirColor = bus.realBanderaColor || color;
 
@@ -819,12 +820,10 @@ function renderArribosList() {
                 ${cocheBadge}
                 ${desvioBadge}
                 ${turnoBadge}
+                ${adaptedBadge}
                 ${extBadge}
               </div>
-              <div class="arrival-sub-row">
-                <span class="arrival-tag" data-dist-val>${escapeHtml(distLabel)}</span>
-                ${bus.esAdaptado ? '<span class="arrival-tag tag-adapted">♿ Adaptado</span>' : ''}
-              </div>
+              ${distLabel ? `<div class="arrival-sub-row"><span class="arrival-tag" data-dist-val>${escapeHtml(distLabel)}</span></div>` : ''}
             </div>
             <div class="arrival-right">
               <div class="eta-block eta-${bus.eta.urgency}">
@@ -856,7 +855,7 @@ function renderArribosList() {
   el.arribosList.querySelectorAll('.arrival-card').forEach((card) => {
     card.addEventListener('click', (e) => {
       if (e.target.closest('.alert-bell-btn')) return;
-      selectBus(card.dataset.busKey, true);
+      focusBusOnMap(card.dataset.busKey);
     });
   });
 
@@ -889,7 +888,7 @@ function checkProximityAlerts() {
     ) {
       state.triggeredAlerts.add(bus.descripcionLinea);
       if (state.soundEnabled) playArrivalChime();
-      const cocheTag = bus.identificadorCoche ? ` (Coche #${bus.identificadorCoche})` : '';
+      const cocheTag = bus.identificadorCoche ? ` (${bus.identificadorCoche})` : '';
       showToast(`¡Línea ${bus.descripcionLinea}${cocheTag} arribando (${bus.tiempoRaw})!`, 'success', 6000);
     }
   }
@@ -906,7 +905,13 @@ function updateInspectorFields(bus) {
     currentBandera
   )}</span>`;
 
-  el.inspCochePill.textContent = bus.identificadorCoche ? `Coche #${bus.identificadorCoche}` : 'Coche s/d';
+  if (bus.identificadorCoche) {
+    el.inspCochePill.textContent = bus.identificadorCoche;
+    el.inspCochePill.classList.remove('hidden');
+  } else {
+    el.inspCochePill.classList.add('hidden');
+  }
+
   if (bus.desvio && bus.desvio.status !== 'none' && bus.desvio.label) {
     el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status}`;
     el.inspDesvioPill.textContent = bus.desvio.label;
@@ -915,46 +920,70 @@ function updateInspectorFields(bus) {
     el.inspDesvioPill.textContent = '';
   }
 
-  const notes = [];
   if (bus.turnoProgramado) {
-    notes.push(`Turno programado: ${bus.turnoProgramado} hs.`);
-  }
-  if (bus.esExtendido) {
-    notes.push(`Flota extendida detectada vía parada ${bus.viaParada || ''}.`);
-  }
-  if (notes.length > 0) {
-    el.inspDirectionNote.textContent = notes.join(' ');
-    el.inspDirectionNote.classList.remove('hidden');
+    el.inspTurnoPill.textContent = bus.turnoProgramado;
+    el.inspTurnoPill.classList.remove('hidden');
   } else {
-    el.inspDirectionNote.classList.add('hidden');
+    el.inspTurnoPill.classList.add('hidden');
   }
 
-  el.inspChofer.textContent = bus.choferNombre || 'Sin informar';
-  el.inspLegajo.textContent = bus.choferLegajo || '—';
-  el.inspCoche.textContent = bus.identificadorCoche ? `#${bus.identificadorCoche}` : '—';
+  el.inspAccessBadge.classList.toggle('hidden', !bus.esAdaptado);
 
   const distMeters = bus.routeMeters ?? bus.distanceMeters;
   el.inspEta.textContent = bus.eta.minutes === 0 ? 'Arribando' : `${bus.eta.display} min`;
   el.inspDist.textContent = formatDistance(distMeters);
-  el.inspBlocks.textContent = formatBlocks(distMeters);
-  el.inspAccess.textContent = bus.esAdaptado ? '♿ Rampa' : 'Estándar';
+  el.inspBlocks.textContent = `${formatBlocks(distMeters)} c.`;
 
-  el.inspCartel.textContent = `Sentido: ${currentBandera}`;
-  const coordsStr = bus.lat !== null ? `${bus.lat.toFixed(5)}, ${bus.lng.toFixed(5)}` : 's/d';
-  el.inspGps.textContent = bus.gpsTimeOnly ? `GPS ${bus.gpsTimeOnly} · ${coordsStr}` : `GPS: ${coordsStr}`;
+  el.inspChofer.textContent = bus.choferNombre || '—';
+  if (bus.choferLegajo) {
+    el.inspLegajo.textContent = bus.choferLegajo;
+    el.inspLegajo.classList.remove('hidden');
+  } else {
+    el.inspLegajo.classList.add('hidden');
+  }
+
+  const gpsParts = [];
+  if (bus.gpsTimeOnly) gpsParts.push(bus.gpsTimeOnly);
+  if (bus.esExtendido) gpsParts.push('+Flota');
+  el.inspGps.textContent = gpsParts.join(' · ') || '—';
 
   el.btnInspRoute.dataset.codLinea = bus.codigoLinea;
   el.btnInspRoute.dataset.lineName = bus.descripcionLinea;
 }
 
-function selectBus(busKey, focusMap = false) {
+// Tapping an arrival card in the bottom dock: pan & zoom directly to the bus WITHOUT opening the inspector overlay
+function focusBusOnMap(busKey) {
+  const bus = state.arribos.find((b) => b.key === busKey);
+  if (!bus) return;
+
   state.selectedBusKey = busKey;
+  state.inspectorOpen = false;
+  el.busInspector.classList.add('hidden');
+
+  // If mobile bottom sheet is expanded full-screen, bring it to half so the map is visible
+  if (el.dock.classList.contains('sheet-full')) {
+    el.dock.classList.remove('sheet-full');
+    el.dock.classList.add('sheet-half');
+  }
+
+  if (!state.horariosOpen) renderArribosList();
+  transitMap.updateBuses(state.arribos, {
+    filterLine: state.filterLine,
+    selectedBusKey: state.selectedBusKey
+  });
+  transitMap.focusBus(bus, 16);
+}
+
+// Tapping a bus chip directly on the map: open the ultra-compact inspector card
+function openBusInspector(busKey) {
   const bus = state.arribos.find((b) => b.key === busKey);
   if (!bus) {
     closeBusInspector();
     return;
   }
 
+  state.selectedBusKey = busKey;
+  state.inspectorOpen = true;
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
   if (!state.horariosOpen) renderArribosList();
@@ -962,12 +991,10 @@ function selectBus(busKey, focusMap = false) {
     filterLine: state.filterLine,
     selectedBusKey: state.selectedBusKey
   });
-  if (focusMap) {
-    transitMap.focusBusAndStop(bus);
-  }
 }
 
 function closeBusInspector() {
+  state.inspectorOpen = false;
   state.selectedBusKey = null;
   el.busInspector.classList.add('hidden');
   transitMap.drawFocusVector(null);
@@ -1091,7 +1118,7 @@ async function fetchArribos(showSkeleton = false) {
     if (state.selectedBusKey) {
       const stillHere = state.arribos.find((b) => b.key === state.selectedBusKey);
       if (stillHere) {
-        updateInspectorFields(stillHere);
+        if (state.inspectorOpen) updateInspectorFields(stillHere);
         transitMap.drawFocusVector(stillHere);
       } else {
         closeBusInspector();

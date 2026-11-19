@@ -235,64 +235,33 @@
       </section>
     </aside>
 
-    <!-- Focused Bus Telemetry Inspector -->
+    <!-- Compact Bus Telemetry Inspector (opened only when tapping a bus chip on the map) -->
     <div id="bus-inspector" class="bus-inspector hidden" role="status" aria-live="polite">
       <div class="bus-inspector-head">
-        <span id="insp-line-badge" class="line-badge">106B</span>
+        <span id="insp-line-badge" class="line-badge line-badge-sm">106B</span>
         <div class="insp-title-wrap">
           <strong id="insp-bandera" class="insp-bandera">—</strong>
           <div class="insp-badges-row">
-            <span id="insp-coche-pill" class="coche-pill">Coche #—</span>
+            <span id="insp-coche-pill" class="coche-pill">—</span>
             <span id="insp-desvio-pill" class="desvio-pill hidden"></span>
+            <span id="insp-turno-pill" class="turno-pill hidden" title="Turno programado"></span>
+            <span id="insp-access-badge" class="adapted-icon-badge hidden" title="Unidad adaptada" aria-label="Unidad adaptada">♿</span>
           </div>
         </div>
-        <button id="btn-close-inspector" class="mini-close-btn" aria-label="Cerrar detalle de unidad">✕</button>
+        <button id="btn-close-inspector" class="mini-close-btn" aria-label="Cerrar">✕</button>
       </div>
 
-      <div id="insp-direction-note" class="insp-direction-note hidden"></div>
-
-      <div class="insp-driver-bar">
-        <div class="driver-cell">
-          <span class="metric-label">CHOFER</span>
-          <strong id="insp-chofer" class="driver-value">—</strong>
-        </div>
-        <div class="driver-divider"></div>
-        <div class="driver-cell">
-          <span class="metric-label">ID / LEGAJO</span>
-          <strong id="insp-legajo" class="driver-value mono-val">—</strong>
-        </div>
-        <div class="driver-divider"></div>
-        <div class="driver-cell">
-          <span class="metric-label">COCHE</span>
-          <strong id="insp-coche" class="driver-value mono-val">—</strong>
-        </div>
-      </div>
-
-      <div class="bus-inspector-metrics">
-        <div class="metric-cell">
-          <span class="metric-label">ARRIBO</span>
-          <strong id="insp-eta" class="metric-value">—</strong>
-        </div>
-        <div class="metric-cell">
-          <span class="metric-label">RECORRIDO</span>
-          <strong id="insp-dist" class="metric-value">—</strong>
-        </div>
-        <div class="metric-cell">
-          <span class="metric-label">CUADRAS</span>
-          <strong id="insp-blocks" class="metric-value">—</strong>
-        </div>
-        <div class="metric-cell">
-          <span class="metric-label">ACCESO</span>
-          <strong id="insp-access" class="metric-value">—</strong>
-        </div>
+      <div class="insp-compact-row">
+        <span class="insp-stat-main"><strong id="insp-eta">—</strong> · <span id="insp-dist">—</span> · <span id="insp-blocks">—</span></span>
+        <span class="insp-driver-inline">
+          <strong id="insp-chofer">—</strong>
+          <span id="insp-legajo" class="legajo-chip hidden"></span>
+        </span>
       </div>
 
       <div class="bus-inspector-foot">
-        <div class="insp-foot-meta">
-          <span id="insp-cartel" class="mono-meta">—</span>
-          <span id="insp-gps" class="mono-meta">—</span>
-        </div>
-        <button id="btn-insp-route" class="pill-btn">Recorrido</button>
+        <span id="insp-gps" class="mono-meta">—</span>
+        <button id="btn-insp-route" class="pill-btn pill-btn-xs">Recorrido</button>
       </div>
     </div>
 
