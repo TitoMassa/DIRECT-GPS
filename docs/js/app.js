@@ -97,12 +97,9 @@ const el = {
   btnToggleFav: document.getElementById('btn-toggle-fav'),
   btnShareStop: document.getElementById('btn-share-stop'),
   btnRefresh: document.getElementById('btn-refresh-arribos'),
-  ringProgress: document.getElementById('refresh-ring-progress'),
-  ringLabel: document.getElementById('refresh-countdown-txt'),
   btnShowRoutes: document.getElementById('btn-show-routes'),
   btnToggleHorarios: document.getElementById('btn-toggle-horarios'),
   btnFitFleet: document.getElementById('btn-fit-fleet'),
-  btnOriginalLink: document.getElementById('btn-original-link'),
   lineFilterStrip: document.getElementById('line-filter-strip'),
   horariosPanel: document.getElementById('horarios-panel'),
   arribosList: document.getElementById('arribos-list'),
@@ -457,10 +454,6 @@ function updateStopHeaderUI() {
   } else {
     el.stopCoordsLabel.textContent = 'Corrientes Capital';
   }
-
-  el.btnOriginalLink.href = `https://cuandollega.smartmovepro.net/corrientes/arribos/?codLinea=${encodeURIComponent(
-    isAll ? '0' : state.codLineaQuery
-  )}&idParada=${encodeURIComponent(s.id)}`;
 
   updateFavStarButton();
 
@@ -1153,15 +1146,7 @@ async function fetchArribos(showSkeleton = false) {
   } finally {
     el.btnRefresh.classList.remove('is-loading');
     state.countdownSec = REFRESH_INTERVAL_SEC;
-    updateCountdownRing();
   }
-}
-
-function updateCountdownRing() {
-  const circumference = 2 * Math.PI * 14;
-  const ratio = state.countdownSec / REFRESH_INTERVAL_SEC;
-  el.ringProgress.style.strokeDashoffset = String(circumference * (1 - ratio));
-  el.ringLabel.textContent = String(state.countdownSec);
 }
 
 // ============================================================================
@@ -1850,7 +1835,7 @@ function bindEvents() {
       }
     } else {
       stopSimLoop();
-      showToast('Modo EN VIVO: actualización automática cada 15s', 'info');
+      showToast('Modo EN VIVO: actualización automática cada 10s', 'info');
       fetchArribos(false);
     }
   });
@@ -1967,7 +1952,6 @@ async function init() {
       state.countdownSec = REFRESH_INTERVAL_SEC;
       fetchArribos(false);
     }
-    updateCountdownRing();
   }, 1000);
 }
 

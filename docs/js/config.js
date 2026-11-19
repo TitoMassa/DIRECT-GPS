@@ -4,7 +4,7 @@ export const CORRIENTES_CENTER = {
   zoom: 13
 };
 
-export const REFRESH_INTERVAL_SEC = 15;
+export const REFRESH_INTERVAL_SEC = 10;
 
 // Backend proxy SOAP gratuito desplegado en Cloudflare Workers
 export const DEFAULT_API_BASE = 'https://direct-gps-proxy.tecladotropical.workers.dev';
