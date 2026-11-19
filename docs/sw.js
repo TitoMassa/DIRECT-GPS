@@ -1,5 +1,5 @@
-const CACHE_NAME = 'direct-gps-v4';
-const SHELL_ASSETS = ['./', './css/styles.css', './js/config.js', './js/audio.js', './js/static-data.js', './js/api.js', './js/map.js', './js/app.js', './icon.svg'];
+const CACHE_NAME = 'direct-gps-v5';
+const SHELL_ASSETS = ['./', './css/styles.css', './js/config.js', './js/audio.js', './js/static-data.js', './js/api.js', './js/trajectory.js', './js/map.js', './js/app.js', './icon.svg'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

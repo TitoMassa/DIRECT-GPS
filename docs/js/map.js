@@ -197,11 +197,25 @@ export class TransitMap {
     const coche = bus.identificadorCoche ? ` · Coche #${bus.identificadorCoche}` : '';
     const desvio =
       bus.desvio && bus.desvio.status !== 'none' ? `<br/>Desvío: <strong>${bus.desvio.label}</strong>` : '';
+    const legNote = bus.isOppositeLeg
+      ? `<br/><span style="color:#f59e0b">↺ En tramo previo: ${bus.realBandera}</span>`
+      : '';
     const chofer = bus.choferNombre
       ? `<br/>Chofer: ${bus.choferNombre}${bus.choferLegajo ? ` (ID ${bus.choferLegajo})` : ''}`
       : '';
     const gps = bus.gpsTimeOnly ? `<br/><small>GPS: ${bus.gpsTimeOnly}</small>` : '';
-    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${desvio}${chofer}${gps}`;
+    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${legNote}${desvio}${chofer}${gps}`;
+  }
+
+  // Zero-lag position-only update for 1-second interpolation ticks (no setIcon / no DOM rebuild!)
+  moveBusPositionsFast(buses) {
+    for (const bus of buses) {
+      if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+      const entry = this.busMarkers.get(bus.key);
+      if (!entry) continue;
+      entry.marker.setLatLng([bus.lat, bus.lng]);
+      entry.data = bus;
+    }
   }
 
   updateBuses(buses, { filterLine = 'ALL', selectedBusKey = null } = {}) {
@@ -220,7 +234,7 @@ export class TransitMap {
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
         const curPos = existing.marker.getLatLng();
-        this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng]);
+        this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 800);
         existing.marker.setIcon(icon);
         existing.marker.setTooltipContent(tooltipHtml);
         existing.marker.setZIndexOffset(isSelected ? 1000 : isDimmed ? 100 : 500);
@@ -249,7 +263,6 @@ export class TransitMap {
       }
     }
 
-    // Update focus vector if a bus is selected
     const focused = selectedBusKey ? this.busMarkers.get(selectedBusKey)?.data : null;
     this.drawFocusVector(focused);
   }
@@ -261,28 +274,31 @@ export class TransitMap {
     }
 
     const color = getLineColor(bus.descripcionLinea);
-    const pts = [
-      [bus.lat, bus.lng],
-      [this.activeStopCoords.lat, this.activeStopCoords.lng]
-    ];
+    const hasRealPath = bus.trajectory && Array.isArray(bus.trajectory.pathPts) && bus.trajectory.pathPts.length >= 2;
+    const pts = hasRealPath
+      ? bus.trajectory.pathPts
+      : [
+          [bus.lat, bus.lng],
+          [this.activeStopCoords.lat, this.activeStopCoords.lng]
+        ];
 
     L.polyline(pts, {
       color,
-      weight: 3,
-      opacity: 0.85,
-      dashArray: '7, 8'
+      weight: 3.5,
+      opacity: 0.88,
+      dashArray: bus.isOppositeLeg ? '6, 6' : null
     }).addTo(this.vectorLayer);
 
-    if (bus.distanceMeters !== null) {
-      const midLat = (bus.lat + this.activeStopCoords.lat) / 2;
-      const midLng = (bus.lng + this.activeStopCoords.lng) / 2;
-      L.marker([midLat, midLng], {
+    const displayDist = bus.routeMeters ?? bus.distanceMeters;
+    if (displayDist !== null && displayDist !== undefined) {
+      const midPt = pts[Math.floor(pts.length / 2)];
+      L.marker(midPt, {
         interactive: false,
         icon: L.divIcon({
           className: 'dist-mid-icon',
-          html: `<div class="distance-label-pill">${formatDistance(bus.distanceMeters)}</div>`,
-          iconSize: [74, 24],
-          iconAnchor: [37, 12]
+          html: `<div class="distance-label-pill">${formatDistance(displayDist)}</div>`,
+          iconSize: [78, 24],
+          iconAnchor: [39, 12]
         })
       }).addTo(this.vectorLayer);
     }

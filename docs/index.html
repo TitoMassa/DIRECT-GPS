@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>DIRECT GPS · Radar de Colectivos en Vivo — Corrientes</title>
-  <meta name="description" content="DIRECT GPS: Seguimiento satelital en vivo de colectivos de Corrientes Capital. Arribos en tiempo real, mapa interactivo, todas las líneas, recorridos y paradas cercanas." />
-  <meta name="theme-color" content="#0c1118" id="meta-theme-color" />
+  <title>DIRECT GPS · Transporte en Vivo — Corrientes</title>
+  <meta name="description" content="DIRECT GPS: Seguimiento en tiempo real de colectivos de Corrientes Capital sobre OpenStreetMap con Leaflet. Desvío horario, coche, chofer, horarios programados y recorridos." />
+  <meta name="theme-color" content="#0f141b" id="meta-theme-color" />
   <link rel="icon" type="image/svg+xml" href="./icon.svg" />
   <link rel="manifest" href="./manifest.json" />
 
-  <!-- Typography: Space Grotesk (Display), Plus Jakarta Sans (UI), JetBrains Mono (Telemetry) -->
+  <!-- Sober, crisp editorial typography: Inter + IBM Plex Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-  <!-- Leaflet Interactive Map -->
+  <!-- Leaflet Open-Source Map -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 
@@ -22,28 +22,28 @@
 </head>
 <body>
   <div id="app-shell" class="app-shell">
-    <!-- Full-Viewport Live Transit Map Canvas -->
-    <div id="map" class="map-canvas" aria-label="Mapa satelital en vivo de colectivos de Corrientes"></div>
+    <!-- Full-Viewport Leaflet Map Canvas -->
+    <div id="map" class="map-canvas" aria-label="Mapa en vivo de colectivos de Corrientes"></div>
 
-    <!-- Floating Top Telemetry Bar -->
+    <!-- Floating Top Bar -->
     <header class="top-bar" role="banner">
       <div class="brand-cluster">
         <button id="btn-brand-home" class="brand-btn" title="Volver a la vista general de Corrientes">
           <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 32 32" width="24" height="24" fill="none">
+            <svg viewBox="0 0 32 32" width="20" height="20" fill="none">
               <circle cx="16" cy="16" r="13" stroke="currentColor" stroke-width="1.8" opacity="0.32"/>
-              <circle cx="16" cy="16" r="8" stroke="#10b981" stroke-width="1.8" opacity="0.65"/>
+              <circle cx="16" cy="16" r="8" stroke="#10b981" stroke-width="1.8" opacity="0.7"/>
               <path d="M16 5.5L22.5 22.5L16 18.8L9.5 22.5L16 5.5Z" fill="#38bdf8"/>
             </svg>
           </span>
           <span class="brand-text">
             <h1 class="brand-title">DIRECT GPS</h1>
-            <span class="brand-sub">CORRIENTES</span>
+            <span class="brand-sub">Corrientes</span>
           </span>
         </button>
 
         <div class="quick-search-wrap">
-          <svg class="search-icon" viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
+          <svg class="search-icon" viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8">
             <circle cx="9" cy="9" r="6"/>
             <path d="M13.5 13.5L17.5 17.5" stroke-linecap="round"/>
           </svg>
@@ -51,7 +51,7 @@
             id="global-search-input"
             type="search"
             class="quick-search-input"
-            placeholder="Código parada (ej. CT31498) o línea (102B, 106C)..."
+            placeholder="Parada (ej. CT31498) o línea (106A, 102B)..."
             autocomplete="off"
             aria-label="Buscar parada por código o línea"
           />
@@ -60,17 +60,17 @@
       </div>
 
       <div class="status-cluster">
-        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre telemetría SOAP en vivo e interpolación fluida por segundo sobre datos SOAP">
+        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre telemetría SOAP en vivo e interpolación de trayectoria real por segundo">
           <span class="signal-dot" id="signal-dot"></span>
           <span id="signal-label">EN VIVO</span>
         </button>
 
         <button id="btn-sound-toggle" class="icon-btn" title="Alertas sonoras de arribo" aria-pressed="true">
-          <svg id="icon-sound-on" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg id="icon-sound-on" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
             <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
           </svg>
-          <svg id="icon-sound-off" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg id="icon-sound-off" class="hidden" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
             <path d="M18.63 13A17.89 17.89 0 0 1 18 8"/>
             <path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"/>
@@ -79,80 +79,78 @@
           </svg>
         </button>
 
-        <button id="btn-theme-toggle" class="icon-btn" title="Cambiar tema Nocturno / Día">
-          <svg id="icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <button id="btn-theme-toggle" class="icon-btn" title="Cambiar tema Nocturno / Claro">
+          <svg id="icon-sun" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="4.5"/>
             <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
           </svg>
-          <svg id="icon-moon" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg id="icon-moon" class="hidden" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
           </svg>
         </button>
       </div>
     </header>
 
-    <!-- Main Floating Side Dock (Desktop) / Draggable Bottom Sheet (Mobile) -->
+    <!-- Main Side Dock (Desktop) / Bottom Sheet (Mobile) -->
     <aside id="transit-dock" class="transit-dock sheet-half" role="complementary" aria-label="Panel de control de paradas y líneas">
-      <!-- Mobile Drag Handle -->
-      <div id="sheet-handle" class="sheet-handle" aria-label="Deslizar panel">
+      <div id="sheet-handle" class="sheet-handle" aria-label="Ajustar altura del panel">
         <span class="sheet-handle-bar"></span>
       </div>
 
-      <!-- Primary Mode Navigation -->
+      <!-- Mode Navigation -->
       <nav class="dock-tabs" role="tablist" aria-label="Secciones de DIRECT GPS">
         <button class="dock-tab active" data-tab="radar" role="tab" aria-selected="true" id="tab-radar">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="2"/>
             <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
           </svg>
           <span>Radar</span>
         </button>
         <button class="dock-tab" data-tab="lineas" role="tab" aria-selected="false" id="tab-lineas">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect x="4" y="4" width="16" height="13" rx="3"/>
             <path d="M4 11h16M8 17v3M16 17v3M8.5 14h.01M15.5 14h.01"/>
           </svg>
           <span>Líneas</span>
         </button>
         <button class="dock-tab" data-tab="cercanas" role="tab" aria-selected="false" id="tab-cercanas">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
             <circle cx="12" cy="10" r="3"/>
           </svg>
           <span>Cercanas</span>
         </button>
         <button class="dock-tab" data-tab="favoritas" role="tab" aria-selected="false" id="tab-favoritas">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
           </svg>
           <span>Favoritas</span>
         </button>
       </nav>
 
-      <!-- TAB 1: RADAR EN VIVO (ARRIBOS) -->
+      <!-- TAB 1: RADAR EN VIVO (ARRIBOS + HORARIOS PROGRAMADOS) -->
       <section id="panel-radar" class="dock-panel active" role="tabpanel" aria-labelledby="tab-radar">
-        <!-- Stop Header Card (Hidden until user selects or searches a stop) -->
         <div id="stop-hero" class="stop-hero hidden">
           <div class="stop-hero-top">
             <div class="stop-id-row">
               <span id="stop-code-badge" class="code-badge">—</span>
-              <span id="stop-pilot-tag" class="pilot-tag">TODAS LAS LÍNEAS (000)</span>
+              <span id="stop-pilot-tag" class="pilot-tag">Todas las líneas (000)</span>
             </div>
             <div class="stop-hero-actions">
               <button id="btn-toggle-fav" class="mini-action-btn" title="Guardar parada en favoritas" aria-label="Guardar en favoritas">
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
                   <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
                 </svg>
               </button>
               <button id="btn-share-stop" class="mini-action-btn" title="Copiar enlace directo a esta parada" aria-label="Compartir parada">
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
                   <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
                   <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
                 </svg>
               </button>
               <button id="btn-refresh-arribos" class="refresh-ring-btn" title="Actualizar telemetría ahora" aria-label="Actualizar arribos">
-                <svg class="refresh-svg" viewBox="0 0 36 36" width="32" height="32">
+                <svg class="refresh-svg" viewBox="0 0 36 36" width="30" height="30">
                   <circle class="ring-track" cx="18" cy="18" r="14"/>
                   <circle id="refresh-ring-progress" class="ring-fill" cx="18" cy="18" r="14"/>
                 </svg>
@@ -170,29 +168,25 @@
 
           <div class="stop-quick-bar">
             <button id="btn-show-routes" class="pill-btn" title="Dibujar recorridos reales de las líneas en el mapa">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-              </svg>
-              <span>Ver recorridos</span>
+              <span>Recorridos</span>
+            </button>
+            <button id="btn-toggle-horarios" class="pill-btn" title="Ver horarios programados 24h guardados en caché local">
+              <span>Horarios 24h</span>
             </button>
             <button id="btn-fit-fleet" class="pill-btn" title="Encuadrar todos los colectivos y la parada">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
-              </svg>
               <span>Ver flota</span>
             </button>
-            <a id="btn-original-link" class="pill-btn pill-btn-ghost" href="https://cuandollega.smartmovepro.net/corrientes" target="_blank" rel="noopener noreferrer" title="Abrir fuente oficial SmartMovePro">
-              <span>Fuente</span>
-              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-              </svg>
+            <a id="btn-original-link" class="pill-btn pill-btn-ghost" href="https://cuandollega.smartmovepro.net/corrientes" target="_blank" rel="noopener noreferrer" title="Abrir fuente oficial">
+              <span>Fuente ↗</span>
             </a>
           </div>
         </div>
 
         <!-- Line Filter Chips -->
         <div id="line-filter-strip" class="line-filter-strip hidden" role="group" aria-label="Filtrar arribos por línea"></div>
+
+        <!-- Scheduled 24h Timetables Panel (toggled via Horarios 24h button) -->
+        <div id="horarios-panel" class="horarios-panel hidden"></div>
 
         <!-- Live Arrivals / Clean Welcome Container -->
         <div id="arribos-list" class="dock-scroll-area" aria-live="polite"></div>
@@ -218,21 +212,11 @@
       <section id="panel-cercanas" class="dock-panel" role="tabpanel" aria-labelledby="tab-cercanas">
         <div class="panel-header-sticky">
           <div class="cercanas-actions">
-            <button id="btn-locate-me" class="primary-action-btn">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-              </svg>
-              <span>Usar mi GPS</span>
-            </button>
-            <button id="btn-search-map-center" class="secondary-action-btn">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2"/>
-              </svg>
-              <span>Centro del mapa</span>
-            </button>
+            <button id="btn-locate-me" class="primary-action-btn">Usar mi GPS</button>
+            <button id="btn-search-map-center" class="secondary-action-btn">Centro del mapa</button>
           </div>
           <div class="hubs-section">
-            <span class="micro-heading">Zonas rápidas de Corrientes</span>
+            <span class="micro-heading">Zonas de Corrientes</span>
             <div id="hubs-chips" class="hubs-chips"></div>
           </div>
         </div>
@@ -243,70 +227,70 @@
       <section id="panel-favoritas" class="dock-panel" role="tabpanel" aria-labelledby="tab-favoritas">
         <div class="panel-header-sticky">
           <div class="fav-intro">
-            <h3 class="panel-subtitle">Tus paradas guardadas</h3>
-            <p class="panel-hint">Acceso instantáneo al radar en vivo con código 000 (todas las líneas).</p>
+            <h3 class="panel-subtitle">Paradas guardadas</h3>
+            <p class="panel-hint">Acceso directo al radar con código 000 (todas las líneas).</p>
           </div>
         </div>
         <div id="favoritas-list" class="dock-scroll-area"></div>
       </section>
     </aside>
 
-    <!-- Focused Bus Live Telemetry Overlay Card (Appears on Map when a bus is selected) -->
+    <!-- Focused Bus Telemetry Inspector -->
     <div id="bus-inspector" class="bus-inspector hidden" role="status" aria-live="polite">
       <div class="bus-inspector-head">
         <span id="insp-line-badge" class="line-badge">106B</span>
         <div class="insp-title-wrap">
-          <div class="insp-title-top">
-            <strong id="insp-bandera" class="insp-bandera">BARRIO NUEVO - PUERTO</strong>
-          </div>
+          <strong id="insp-bandera" class="insp-bandera">—</strong>
           <div class="insp-badges-row">
-            <span id="insp-coche-pill" class="coche-pill">Coche #2967</span>
-            <span id="insp-desvio-pill" class="desvio-pill desvio-late">▼ -01:20 Atrasado</span>
+            <span id="insp-coche-pill" class="coche-pill">Coche #—</span>
+            <span id="insp-desvio-pill" class="desvio-pill desvio-ontime">En horario</span>
           </div>
         </div>
         <button id="btn-close-inspector" class="mini-close-btn" aria-label="Cerrar detalle de unidad">✕</button>
       </div>
 
+      <div id="insp-direction-note" class="insp-direction-note hidden"></div>
+
       <div class="insp-driver-bar">
         <div class="driver-cell">
           <span class="metric-label">CHOFER</span>
-          <strong id="insp-chofer" class="driver-value">TOLEDO L.</strong>
+          <strong id="insp-chofer" class="driver-value">—</strong>
         </div>
         <div class="driver-divider"></div>
         <div class="driver-cell">
           <span class="metric-label">ID / LEGAJO</span>
-          <strong id="insp-legajo" class="driver-value mono-val">10465</strong>
+          <strong id="insp-legajo" class="driver-value mono-val">—</strong>
         </div>
         <div class="driver-divider"></div>
         <div class="driver-cell">
           <span class="metric-label">COCHE</span>
-          <strong id="insp-coche" class="driver-value mono-val">#2967</strong>
+          <strong id="insp-coche" class="driver-value mono-val">—</strong>
         </div>
       </div>
 
       <div class="bus-inspector-metrics">
         <div class="metric-cell">
           <span class="metric-label">ARRIBO</span>
-          <strong id="insp-eta" class="metric-value">5 min</strong>
+          <strong id="insp-eta" class="metric-value">—</strong>
         </div>
         <div class="metric-cell">
-          <span class="metric-label">DISTANCIA</span>
-          <strong id="insp-dist" class="metric-value">1.54 km</strong>
+          <span class="metric-label">RECORRIDO</span>
+          <strong id="insp-dist" class="metric-value">—</strong>
         </div>
         <div class="metric-cell">
           <span class="metric-label">CUADRAS</span>
-          <strong id="insp-blocks" class="metric-value">~15</strong>
+          <strong id="insp-blocks" class="metric-value">—</strong>
         </div>
         <div class="metric-cell">
           <span class="metric-label">ACCESO</span>
-          <strong id="insp-access" class="metric-value">Estándar</strong>
+          <strong id="insp-access" class="metric-value">—</strong>
         </div>
       </div>
 
       <div class="bus-inspector-foot">
         <div class="insp-foot-meta">
-          <span id="insp-cartel" class="mono-meta">Cartel: B. NUEVO AL PUERTO</span>
-          <span id="insp-gps" class="mono-meta">GPS: 15:15:33 · -27.47895, -58.80964</span>
+          <span id="insp-cartel" class="mono-meta">—</span>
+          <span id="insp-gps" class="mono-meta">—</span>
         </div>
         <button id="btn-insp-route" class="pill-btn">Recorrido</button>
       </div>
@@ -315,20 +299,20 @@
     <!-- Floating Map Controls (Bottom Right) -->
     <div class="map-controls" role="group" aria-label="Controles de mapa">
       <button id="btn-map-style" class="map-ctrl-btn" title="Cambiar estilo de mapa Leaflet (OSM Nocturno / OSM Clásico / OSM Urbano)">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="12 2 2 7 12 12 22 7 12 2"/>
           <polyline points="2 17 12 22 22 17"/>
           <polyline points="2 12 12 17 22 12"/>
         </svg>
       </button>
       <button id="btn-map-center-stop" class="map-ctrl-btn" title="Centrar en parada activa">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
           <circle cx="12" cy="10" r="3"/>
         </svg>
       </button>
       <button id="btn-map-scan-area" class="map-ctrl-btn" title="Buscar paradas en esta zona del mapa">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6M8 11h6"/>
         </svg>
       </button>
@@ -338,7 +322,6 @@
       </div>
     </div>
 
-    <!-- Toast Notification Area -->
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
   </div>
 

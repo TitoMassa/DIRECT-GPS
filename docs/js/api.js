@@ -19,7 +19,6 @@ function resolveApiBase() {
   const saved = localStorage.getItem('direct_gps_api_base');
   if (saved) return saved;
 
-  // On localhost, prefer local Node server.js; on GitHub Pages / remote hosting, use Cloudflare Worker
   const host = window.location.hostname;
   if (host === 'localhost' || host === '127.0.0.1') {
     return '';
@@ -47,8 +46,34 @@ async function apiGet(path, fallbackFn = null) {
   }
 }
 
-export function getActiveApiBase() {
-  return API_BASE || window.location.origin;
+// Local 24h cache helper for heavy semi-static data (recorridos & horarios programados)
+function getLocalCache(key, maxAgeMs) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Date.now() - parsed.savedAt > maxAgeMs) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return parsed.value;
+  } catch {
+    return null;
+  }
+}
+
+function setLocalCache(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value }));
+  } catch {
+    // Ignore quota errors gracefully
+  }
+}
+
+function getArgentinaDayType() {
+  const art = new Date(Date.now() - 3 * 3600 * 1000);
+  const day = art.getUTCDay(); // 0=Sun, 6=Sat
+  return day === 0 ? 'dom' : day === 6 ? 'sab' : 'hab';
 }
 
 export const api = {
@@ -71,12 +96,34 @@ export const api = {
       `/api/paradas-cercanas?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`,
       () => staticParadasCercanas()
     ),
-  recorridos: (codLinea) =>
-    apiGet(`/api/recorridos?codLinea=${encodeURIComponent(codLinea)}`, () =>
+  recorridos: async (codLinea) => {
+    const cacheKey = `dgps_rec_v1_${codLinea}`;
+    const cached = getLocalCache(cacheKey, 24 * 60 * 60 * 1000);
+    if (cached) return { data: cached, source: 'local-cache', cached: true };
+    const res = await apiGet(`/api/recorridos?codLinea=${encodeURIComponent(codLinea)}`, () =>
       staticRecorridos(codLinea)
-    ),
+    );
+    if (Array.isArray(res?.data) && res.data.length > 0 && res.source !== 'simulation') {
+      setLocalCache(cacheKey, res.data);
+    }
+    return res;
+  },
   banderas: (idParada) =>
     apiGet(`/api/banderas?idParada=${encodeURIComponent(idParada)}`, () => ({ data: [], source: 'fallback' })),
+  horarios: async (idParada, codLinea) => {
+    const dayType = getArgentinaDayType();
+    const cacheKey = `dgps_hor_v1_${String(idParada).toUpperCase()}_${codLinea}_${dayType}`;
+    const cached = getLocalCache(cacheKey, 24 * 60 * 60 * 1000);
+    if (cached) return { data: cached, source: 'local-cache', cached: true };
+
+    const res = await apiGet(
+      `/api/horarios?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(codLinea)}`
+    );
+    if (res?.data?.horarios?.length > 0) {
+      setLocalCache(cacheKey, res.data);
+    }
+    return res;
+  },
   arribos: (idParada, codLinea = '000') => {
     const code = !codLinea || codLinea === '0' ? '000' : String(codLinea);
     return apiGet(`/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(code)}`);
@@ -90,14 +137,14 @@ export function parseDesvioHorario(raw = '') {
   }
   const normalized = clean.replace(/\s+/g, '');
   if (normalized === '00:00' || normalized === '+00:00' || normalized === '-00:00' || normalized === '0') {
-    return { raw: clean, status: 'ontime', label: 'En horario (00:00)', shortLabel: 'En horario', sign: '=' };
+    return { raw: clean, status: 'ontime', label: 'En horario', shortLabel: '00:00', sign: '=' };
   }
   if (normalized.startsWith('+')) {
     return {
       raw: clean,
       status: 'ahead',
       label: `Adelantado ${normalized}`,
-      shortLabel: `▲ ${normalized}`,
+      shortLabel: `+${normalized.slice(1)}`,
       sign: '+'
     };
   }
@@ -106,7 +153,7 @@ export function parseDesvioHorario(raw = '') {
       raw: clean,
       status: 'late',
       label: `Atrasado ${normalized}`,
-      shortLabel: `▼ ${normalized}`,
+      shortLabel: `-${normalized.slice(1)}`,
       sign: '-'
     };
   }
@@ -133,7 +180,6 @@ export function formatGpsTimeOnly(rawStamp = '') {
   return parts.length > 1 ? parts[1] : clean;
 }
 
-// Haversine distance in meters
 export function distanceMeters(lat1, lng1, lat2, lng2) {
   if ([lat1, lng1, lat2, lng2].some((v) => typeof v !== 'number' || Number.isNaN(v))) {
     return null;
@@ -184,123 +230,9 @@ export function parseEtaMinutes(rawText = '') {
 export function computeProximityPercent(etaMinutes, meters) {
   if (etaMinutes <= 1) return 96;
   if (typeof meters === 'number' && !Number.isNaN(meters)) {
-    const pct = 100 - (Math.min(meters, 4000) / 4000) * 90;
+    const pct = 100 - (Math.min(meters, 6000) / 6000) * 90;
     return Math.round(Math.max(8, Math.min(98, pct)));
   }
-  const pct = 100 - (Math.min(etaMinutes, 30) / 30) * 88;
+  const pct = 100 - (Math.min(etaMinutes, 35) / 35) * 88;
   return Math.round(Math.max(10, Math.min(95, pct)));
-}
-
-// ============================================================================
-// SOAP-Driven Trajectory & Polyline Interpolation Helpers
-// Uses real SOAP GPS fixes & real SOAP route polylines for smooth simulation
-// ============================================================================
-function projectOnSegment(pLat, pLng, aLat, aLng, bLat, bLng) {
-  const dx = bLat - aLat;
-  const dy = bLng - aLng;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) return { lat: aLat, lng: aLng, t: 0 };
-  const t = Math.max(0, Math.min(1, ((pLat - aLat) * dx + (pLng - aLng) * dy) / lenSq));
-  return { lat: aLat + dx * t, lng: aLng + dy * t, t };
-}
-
-function findClosestOnPolyline(pts, targetLat, targetLng) {
-  let best = { segIdx: 0, t: 0, lat: pts[0][0], lng: pts[0][1], dist: Infinity };
-  for (let i = 0; i < pts.length - 1; i++) {
-    const proj = projectOnSegment(targetLat, targetLng, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
-    const d = distanceMeters(targetLat, targetLng, proj.lat, proj.lng);
-    if (d !== null && d < best.dist) {
-      best = { segIdx: i, t: proj.t, lat: proj.lat, lng: proj.lng, dist: d };
-    }
-  }
-  return best;
-}
-
-export function extractRoutePolylines(recorridos = []) {
-  return recorridos
-    .map((r) => ({
-      bandera: String(r.abreviaturaBanderaSMP || r.descripcion || '').toUpperCase(),
-      pts: (r.puntos || [])
-        .map((p) => [parseFloat(p.latitud), parseFloat(p.longitud)])
-        .filter(([la, ln]) => !Number.isNaN(la) && !Number.isNaN(ln))
-    }))
-    .filter((r) => r.pts.length > 2);
-}
-
-/**
- * Advances a real SOAP bus along its matching real SOAP route polyline (or straight
- * vector toward the stop if no route polyline is loaded yet) by `stepMeters`.
- */
-export function interpolateSoapBusStep(bus, stopCoords, stepMeters, polylines = []) {
-  if (!stopCoords || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') {
-    return { lat: bus.lat, lng: bus.lng, arrived: false };
-  }
-
-  // Try matching a real SOAP polyline for this line where both bus and stop lie reasonably near
-  let chosenPath = null;
-  let busProj = null;
-  let stopProj = null;
-
-  for (const poly of polylines) {
-    const bp = findClosestOnPolyline(poly.pts, bus.lat, bus.lng);
-    const sp = findClosestOnPolyline(poly.pts, stopCoords.lat, stopCoords.lng);
-    // Bus must be behind the stop along the polyline direction and within ~450m of the route
-    const busOrder = bp.segIdx + bp.t;
-    const stopOrder = sp.segIdx + sp.t;
-    if (bp.dist < 450 && sp.dist < 450 && busOrder < stopOrder) {
-      chosenPath = poly.pts;
-      busProj = bp;
-      stopProj = sp;
-      break;
-    }
-  }
-
-  if (chosenPath && busProj && stopProj) {
-    // Walk forward along the real street polyline from busProj toward stopProj by stepMeters
-    let remaining = stepMeters;
-    let curLat = busProj.lat;
-    let curLng = busProj.lng;
-    let idx = busProj.segIdx;
-
-    while (remaining > 0 && idx < chosenPath.length - 1) {
-      const nextIsStop = idx === stopProj.segIdx;
-      const targetLat = nextIsStop ? stopProj.lat : chosenPath[idx + 1][0];
-      const targetLng = nextIsStop ? stopProj.lng : chosenPath[idx + 1][1];
-      const segDist = distanceMeters(curLat, curLng, targetLat, targetLng) || 0;
-
-      if (segDist <= 1) {
-        if (nextIsStop) return { lat: stopCoords.lat, lng: stopCoords.lng, arrived: true };
-        idx++;
-        continue;
-      }
-
-      if (remaining < segDist) {
-        const frac = remaining / segDist;
-        return {
-          lat: curLat + (targetLat - curLat) * frac,
-          lng: curLng + (targetLng - curLng) * frac,
-          arrived: false
-        };
-      }
-
-      remaining -= segDist;
-      curLat = targetLat;
-      curLng = targetLng;
-      if (nextIsStop) return { lat: stopCoords.lat, lng: stopCoords.lng, arrived: true };
-      idx++;
-    }
-    return { lat: curLat, lng: curLng, arrived: false };
-  }
-
-  // Fallback: direct interpolation from real SOAP bus position toward real SOAP stop position
-  const distToStop = distanceMeters(bus.lat, bus.lng, stopCoords.lat, stopCoords.lng) || 0;
-  if (distToStop <= Math.max(15, stepMeters)) {
-    return { lat: stopCoords.lat, lng: stopCoords.lng, arrived: true };
-  }
-  const frac = stepMeters / distToStop;
-  return {
-    lat: bus.lat + (stopCoords.lat - bus.lat) * frac,
-    lng: bus.lng + (stopCoords.lng - bus.lng) * frac,
-    arrived: false
-  };
 }

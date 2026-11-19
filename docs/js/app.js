@@ -9,10 +9,9 @@ import {
   computeProximityPercent,
   parseDesvioHorario,
   parseChoferInfo,
-  formatGpsTimeOnly,
-  extractRoutePolylines,
-  interpolateSoapBusStep
+  formatGpsTimeOnly
 } from './api.js';
+import { parseRouteBranches, resolveBusTrajectory, sampleTrajectory } from './trajectory.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
 
@@ -20,34 +19,36 @@ const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
 
 const state = {
-  // Active stop & arrivals (starts null = clean interface until user picks/searches a stop)
   activeStop: null,
-  codLineaQuery: '000', // 000 = all lines passing the stop (richer SOAP results)
+  codLineaQuery: '000',
   filterLine: 'ALL',
   arribos: [],
   selectedBusKey: null,
-  simulateMode: false, // Smooth 1s interpolation over real SOAP data & polylines
+  simulateMode: false,
+  horariosOpen: false,
+  horariosLineCode: null,
+  stopLinesList: [], // [{ codigo, descripcion }] for active stop's Horarios 24h
   dataSource: 'smartmovepro-soap',
   lastSyncAt: null,
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
 
-  // Cache of real SOAP route polylines by codigoLinea (used both for map drawing & SOAP interpolation)
-  routePolylinesCache: new Map(),
+  // Real SOAP route branches cache (codigoLinea -> Branch[]) + consecutive GPS fixes per physical bus unit
+  routeBranchesCache: new Map(),
+  lastRealGpsByUnit: new Map(), // busKey -> { lat, lng, ts }
 
-  // Catalog & Drilldown (Lineas -> Calles -> Intersecciones -> Paradas)
+  // Catalog & Drilldown
   lineas: [],
   quickStops: [],
   hubs: [],
   drill: {
-    step: 'lineas', // 'lineas' | 'calles' | 'intersecciones' | 'paradas'
+    step: 'lineas',
     linea: null,
     calle: null,
     interseccion: null,
     items: []
   },
 
-  // Alerts, Favorites, Preferences
   soundEnabled: true,
   armedAlerts: new Set(),
   triggeredAlerts: new Set(),
@@ -55,14 +56,12 @@ const state = {
   nearbyStops: []
 };
 
-// DOM References
 const el = {
   dock: document.getElementById('transit-dock'),
   sheetHandle: document.getElementById('sheet-handle'),
   tabs: document.querySelectorAll('.dock-tab'),
   panels: document.querySelectorAll('.dock-panel'),
 
-  // Top bar
   btnBrandHome: document.getElementById('btn-brand-home'),
   globalSearch: document.getElementById('global-search-input'),
   searchDropdown: document.getElementById('global-search-dropdown'),
@@ -76,7 +75,6 @@ const el = {
   iconMoon: document.getElementById('icon-moon'),
   metaThemeColor: document.getElementById('meta-theme-color'),
 
-  // Radar panel
   stopHero: document.getElementById('stop-hero'),
   stopCodeBadge: document.getElementById('stop-code-badge'),
   stopPilotTag: document.getElementById('stop-pilot-tag'),
@@ -89,31 +87,30 @@ const el = {
   ringProgress: document.getElementById('refresh-ring-progress'),
   ringLabel: document.getElementById('refresh-countdown-txt'),
   btnShowRoutes: document.getElementById('btn-show-routes'),
+  btnToggleHorarios: document.getElementById('btn-toggle-horarios'),
   btnFitFleet: document.getElementById('btn-fit-fleet'),
   btnOriginalLink: document.getElementById('btn-original-link'),
   lineFilterStrip: document.getElementById('line-filter-strip'),
+  horariosPanel: document.getElementById('horarios-panel'),
   arribosList: document.getElementById('arribos-list'),
 
-  // Lineas panel
   lineasBreadcrumb: document.getElementById('lineas-breadcrumb'),
   lineasFilterInput: document.getElementById('lineas-filter-input'),
   lineasContent: document.getElementById('lineas-content'),
 
-  // Cercanas panel
   btnLocateMe: document.getElementById('btn-locate-me'),
   btnSearchMapCenter: document.getElementById('btn-search-map-center'),
   hubsChips: document.getElementById('hubs-chips'),
   cercanasList: document.getElementById('cercanas-list'),
 
-  // Favoritas panel
   favoritasList: document.getElementById('favoritas-list'),
 
-  // Bus Inspector
   busInspector: document.getElementById('bus-inspector'),
   inspLineBadge: document.getElementById('insp-line-badge'),
   inspBandera: document.getElementById('insp-bandera'),
   inspCochePill: document.getElementById('insp-coche-pill'),
   inspDesvioPill: document.getElementById('insp-desvio-pill'),
+  inspDirectionNote: document.getElementById('insp-direction-note'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
   inspCoche: document.getElementById('insp-coche'),
@@ -126,7 +123,6 @@ const el = {
   btnCloseInspector: document.getElementById('btn-close-inspector'),
   btnInspRoute: document.getElementById('btn-insp-route'),
 
-  // Map Controls
   btnMapStyle: document.getElementById('btn-map-style'),
   btnMapCenterStop: document.getElementById('btn-map-center-stop'),
   btnMapScanArea: document.getElementById('btn-map-scan-area'),
@@ -136,14 +132,13 @@ const el = {
   toastContainer: document.getElementById('toast-container')
 };
 
-// Map Instance (Leaflet + OpenStreetMap)
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => selectBus(busKey, true),
   onStopPick: (stop) => openStopRadar(stop, '000')
 });
 
 // ============================================================================
-// Utilities & Toast Notifications
+// Utilities & Toast
 // ============================================================================
 function escapeHtml(str = '') {
   return String(str)
@@ -153,21 +148,20 @@ function escapeHtml(str = '') {
     .replace(/"/g, '&quot;');
 }
 
-function showToast(message, type = 'info', duration = 3600) {
+function showToast(message, type = 'info', duration = 3200) {
   const div = document.createElement('div');
   div.className = `toast toast-${type}`;
   div.textContent = message;
   el.toastContainer.appendChild(div);
   setTimeout(() => {
     div.style.opacity = '0';
-    div.style.transform = 'translateX(16px)';
-    div.style.transition = 'all 0.25s ease';
-    setTimeout(() => div.remove(), 260);
+    div.style.transition = 'opacity 0.2s ease';
+    setTimeout(() => div.remove(), 220);
   }, duration);
 }
 
 // ============================================================================
-// Theme (Leaflet Free OpenStreetMap Nocturno / Clásico)
+// Theme
 // ============================================================================
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
@@ -175,14 +169,14 @@ function applyTheme(theme) {
   const isLight = theme === 'light';
   el.iconSun.classList.toggle('hidden', isLight);
   el.iconMoon.classList.toggle('hidden', !isLight);
-  el.metaThemeColor.setAttribute('content', isLight ? '#e8eef5' : '#0c1118');
+  el.metaThemeColor.setAttribute('content', isLight ? '#e5ebf2' : '#0f141b');
   if (transitMap.tileKey !== 'hot') {
     transitMap.setTileStyle(isLight ? 'light' : 'dark');
   }
 }
 
 // ============================================================================
-// Favorites Storage (Clean empty default — no hardcoded pilot stop)
+// Favorites
 // ============================================================================
 function loadFavorites() {
   try {
@@ -222,13 +216,7 @@ function toggleActiveStopFavorite() {
     state.favorites = state.favorites.filter((f) => f.id !== s.id);
     showToast(`Parada ${s.id} quitada de favoritas`, 'info');
   } else {
-    state.favorites.unshift({
-      id: s.id,
-      nombre: s.nombre,
-      alias: '',
-      lat: s.lat,
-      lng: s.lng
-    });
+    state.favorites.unshift({ id: s.id, nombre: s.nombre, alias: '', lat: s.lat, lng: s.lng });
     showToast(`Parada ${s.id} guardada en favoritas`, 'success');
   }
   saveFavorites();
@@ -263,7 +251,7 @@ function renderFavorites() {
         <div class="stop-card-name">${escapeHtml(f.nombre)}</div>
         <div class="stop-card-foot">
           <span class="mono-meta">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
-          <button class="pill-btn btn-open-fav" data-id="${escapeHtml(f.id)}">Ver Radar →</button>
+          <button class="pill-btn btn-open-fav" data-id="${escapeHtml(f.id)}">Abrir radar →</button>
         </div>
       </div>
     `
@@ -289,7 +277,7 @@ function renderFavorites() {
     btn.addEventListener('click', () => {
       const fav = state.favorites.find((x) => x.id === btn.dataset.id);
       if (!fav) return;
-      const alias = window.prompt('Nombre corto para esta parada (ej. Casa, Trabajo, Facultad):', fav.alias || '');
+      const alias = window.prompt('Etiqueta para esta parada (ej. Casa, Trabajo, Facultad):', fav.alias || '');
       if (alias !== null) {
         fav.alias = alias.trim();
         saveFavorites();
@@ -323,48 +311,40 @@ function setupMobileSheet() {
     el.dock.classList.add(states[idx]);
   };
 
-  el.sheetHandle.addEventListener('click', () => {
-    setSheet((idx + 1) % 3);
-  });
-
-  el.sheetHandle.addEventListener(
-    'touchstart',
-    (e) => {
-      startY = e.touches[0].clientY;
-    },
-    { passive: true }
-  );
-
+  el.sheetHandle.addEventListener('click', () => setSheet((idx + 1) % 3));
+  el.sheetHandle.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; }, { passive: true });
   el.sheetHandle.addEventListener(
     'touchend',
     (e) => {
       const dy = e.changedTouches[0].clientY - startY;
-      if (dy < -36) setSheet(idx + 1);
-      else if (dy > 36) setSheet(idx - 1);
+      if (dy < -32) setSheet(idx + 1);
+      else if (dy > 32) setSheet(idx - 1);
     },
     { passive: true }
   );
 }
 
 // ============================================================================
-// Clean Welcome State (No stop loaded until user searches or selects one)
+// Clean Welcome State
 // ============================================================================
 function renderRadarWelcome() {
   el.stopHero.classList.add('hidden');
   el.lineFilterStrip.classList.add('hidden');
+  el.horariosPanel.classList.add('hidden');
+  el.arribosList.classList.remove('hidden');
 
   el.arribosList.innerHTML = `
     <div class="radar-welcome">
-      <span class="welcome-badge">TELEMETRÍA SOAP EN VIVO · CORRIENTES</span>
-      <h2>Elegí una parada para iniciar el radar</h2>
-      <p>Ingresá el código de una parada para ver todos los colectivos en vivo (coche, chofer, ID y desvío horario +/-), o explorá por línea y cercanía.</p>
+      <span class="welcome-badge">TELEMETRÍA EN VIVO · CORRIENTES</span>
+      <h2>Elegí una parada para iniciar</h2>
+      <p>Ingresá el código de parada para consultar arribos en vivo con coche, chofer, legajo, desvío horario (+/-) y horarios programados 24h.</p>
 
       <form id="welcome-stop-form" class="welcome-code-form">
         <input
           id="welcome-stop-input"
           type="text"
           class="welcome-code-input"
-          placeholder="Ej: CT31498"
+          placeholder="Ej: CT31498 o CT31942"
           autocomplete="off"
           aria-label="Código de parada"
         />
@@ -377,7 +357,7 @@ function renderRadarWelcome() {
       </div>
 
       <div class="welcome-tip">
-        <strong>Tip:</strong> también podés mover el mapa Leaflet sobre cualquier avenida de Corrientes y tocar el botón de lupa inferior derecho para detectar paradas en esa zona.
+        Mové el mapa OpenStreetMap sobre cualquier avenida y usá la lupa inferior derecha para detectar paradas en esa zona.
       </div>
     </div>
   `;
@@ -395,13 +375,8 @@ function renderRadarWelcome() {
     openStopRadar(known || { id: raw, nombre: `Parada ${raw}` }, '000');
   });
 
-  document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => {
-    switchTab('lineas');
-  });
-
-  document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => {
-    switchTab('cercanas');
-  });
+  document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => switchTab('lineas'));
+  document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => switchTab('cercanas'));
 }
 
 function resetToWelcome() {
@@ -410,7 +385,9 @@ function resetToWelcome() {
   state.selectedBusKey = null;
   state.filterLine = 'ALL';
   state.routesVisible = false;
+  state.horariosOpen = false;
   el.btnShowRoutes.classList.remove('active');
+  el.btnToggleHorarios.classList.remove('active');
   closeBusInspector();
   transitMap.clearActiveStop();
   transitMap.clearRoutes();
@@ -426,7 +403,7 @@ function resetToWelcome() {
 }
 
 // ============================================================================
-// Core Radar: Stop Loading, Live SOAP Arrivals & SOAP-Based Interpolation
+// Core Radar: Stop Loading, Direction-Aware Trajectories & Zero-Lag Interpolation
 // ============================================================================
 function updateSignalPill() {
   el.btnLiveMode.classList.remove('is-sim', 'is-warn');
@@ -449,13 +426,13 @@ function updateStopHeaderUI() {
   }
 
   el.stopHero.classList.remove('hidden');
-  el.lineFilterStrip.classList.remove('hidden');
+  el.lineFilterStrip.classList.toggle('hidden', state.horariosOpen);
 
   const s = state.activeStop;
   const isAll = !state.codLineaQuery || state.codLineaQuery === '0' || state.codLineaQuery === '000';
   el.stopCodeBadge.textContent = s.id;
   el.stopTitle.textContent = s.nombre || `Parada ${s.id}`;
-  el.stopPilotTag.textContent = isAll ? 'TODAS LAS LÍNEAS (000)' : `LÍNEA CÓD. ${state.codLineaQuery}`;
+  el.stopPilotTag.textContent = isAll ? 'Todas las líneas (000)' : `Línea cód. ${state.codLineaQuery}`;
 
   if (typeof s.lat === 'number' && typeof s.lng === 'number') {
     el.stopCoordsLabel.textContent = `${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}`;
@@ -490,7 +467,16 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   state.filterLine = 'ALL';
   state.selectedBusKey = null;
   state.routesVisible = false;
+  state.horariosOpen = false;
+  state.horariosLineCode = null;
+  state.stopLinesList = [];
+  state.lastRealGpsByUnit.clear();
+
   el.btnShowRoutes.classList.remove('active');
+  el.btnToggleHorarios.classList.remove('active');
+  el.horariosPanel.classList.add('hidden');
+  el.arribosList.classList.remove('hidden');
+
   transitMap.clearRoutes();
   closeBusInspector();
 
@@ -505,98 +491,122 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   await fetchArribos(true);
 }
 
-function normalizeArrivals(rawList, stopCoords) {
+async function ensureBranchesLoaded(lineCodes) {
+  const missing = lineCodes.filter((c) => c && !state.routeBranchesCache.has(c));
+  if (missing.length === 0) return;
+
+  await Promise.all(
+    missing.map(async (cod) => {
+      try {
+        const res = await api.recorridos(cod);
+        const branches = parseRouteBranches(Array.isArray(res.data) ? res.data : []);
+        state.routeBranchesCache.set(cod, branches);
+      } catch {
+        state.routeBranchesCache.set(cod, []);
+      }
+    })
+  );
+}
+
+function normalizeArrivals(rawList, stopId, stopCoords) {
   const seenCounts = new Map();
+  const now = Date.now();
+
   return (rawList || []).map((a) => {
     const lineName = (a.descripcionLinea || '').trim() || `L${a.codigoLinea}`;
     const coche = String(a.identificadorCoche || '').trim();
     const baseId = coche ? `${a.codigoLinea}-c${coche}` : `${a.codigoLinea}-${lineName}`;
     const occ = (seenCounts.get(baseId) || 0) + 1;
     seenCounts.set(baseId, occ);
+    const key = occ > 1 ? `${baseId}-${occ}` : baseId;
 
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
     const validPos = !Number.isNaN(lat) && !Number.isNaN(lng) && lat !== 0 && lng !== 0;
 
     const eta = parseEtaMinutes(a.tiempoRestanteArribo);
-    const dist =
+    const straightDist =
       validPos && stopCoords ? distanceMeters(lat, lng, stopCoords.lat, stopCoords.lng) : null;
     const desvio = parseDesvioHorario(a.desvioHorario);
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
     const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
 
-    // Derive realistic approach speed (m/s) directly from real SOAP distance & ETA
-    const etaSec = eta.minutes <= 0 ? 40 : eta.minutes * 60;
-    const rawSpeed = dist !== null && etaSec > 0 ? dist / etaSec : 6.5;
-    const speedMps = Math.max(3.5, Math.min(13, rawSpeed));
+    // Consecutive real SOAP GPS tracking for true heading verification
+    const prevFix = state.lastRealGpsByUnit.get(key) || null;
+    const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
+
+    const draftBus = {
+      lat: validPos ? lat : null,
+      lng: validPos ? lng : null,
+      descripcionBandera: (a.descripcionBandera || a.descripcionCortaBandera || 'Servicio urbano').trim(),
+      eta
+    };
+
+    const trajectory =
+      validPos && stopCoords
+        ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, prevFix)
+        : null;
+
+    if (validPos) {
+      // Only update prevFix anchor once bus moved >= 15m so heading stays clean
+      if (!prevFix || (distanceMeters(prevFix.lat, prevFix.lng, lat, lng) || 0) >= 15) {
+        state.lastRealGpsByUnit.set(key, { lat, lng, ts: now });
+      }
+    }
+
+    const routeMeters = trajectory ? trajectory.totalMeters : straightDist;
+    const etaSec = eta.minutes <= 0 ? 45 : eta.minutes * 60;
 
     return {
-      key: occ > 1 ? `${baseId}-${occ}` : baseId,
+      key,
       codigoLinea: a.codigoLinea,
       descripcionLinea: lineName,
-      descripcionBandera: (a.descripcionBandera || a.descripcionCortaBandera || 'Servicio urbano').trim(),
+      descripcionBandera: draftBus.descripcionBandera,
       descripcionCartelBandera: (a.descripcionCartelBandera || a.descripcionCortaBandera || '').trim(),
       tiempoRaw: a.tiempoRestanteArribo || '',
       eta,
       etaSecondsRemaining: etaSec,
-      speedMps,
       esAdaptado: Boolean(a.esAdaptado),
       esLleno: a.esLleno === true,
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
-      distanceMeters: dist,
-      proximityPct: computeProximityPercent(eta.minutes, dist),
+      distanceMeters: straightDist,
+      routeMeters,
+      proximityPct: computeProximityPercent(eta.minutes, routeMeters),
       identificadorCoche: coche,
       choferNombre: chofer.nombre,
       choferLegajo: chofer.legajo,
       choferRaw: chofer.raw,
       desvio,
       ultimaFechaHoraGPS: String(a.ultimaFechaHoraGPS || '').trim(),
-      gpsTimeOnly
+      gpsTimeOnly,
+      trajectory,
+      isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
+      realBandera: trajectory?.realBandera || draftBus.descripcionBandera
     };
   });
 }
 
-// Preload real SOAP route polylines for approaching buses so SOAP interpolation glides along real streets
-async function preloadPolylinesForInterpolation() {
-  const uniqueLineCodes = Array.from(
-    new Set(state.arribos.map((b) => b.codigoLinea).filter((c) => c && !state.routePolylinesCache.has(c)))
-  ).slice(0, 5);
-
-  await Promise.all(
-    uniqueLineCodes.map(async (cod) => {
-      try {
-        const res = await api.recorridos(cod);
-        const polylines = extractRoutePolylines(Array.isArray(res.data) ? res.data : []);
-        state.routePolylinesCache.set(cod, polylines);
-      } catch {
-        state.routePolylinesCache.set(cod, []);
-      }
-    })
-  );
-}
-
-// Smooth 1-second interpolation step powered purely by the latest real SOAP fleet & SOAP polylines
+// ZERO-LAG 1-second interpolation tick: no innerHTML rebuild, no Leaflet setIcon()!
 function stepSoapInterpolation() {
   if (!state.simulateMode || !state.activeStop || state.arribos.length === 0) return;
-  const stopCoords =
-    typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
-      ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
-      : null;
-  if (!stopCoords) return;
 
-  let changed = false;
   for (const bus of state.arribos) {
-    if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
-    const polylines = state.routePolylinesCache.get(bus.codigoLinea) || [];
-    const next = interpolateSoapBusStep(bus, stopCoords, bus.speedMps, polylines);
-    bus.lat = next.lat;
-    bus.lng = next.lng;
-    bus.distanceMeters = distanceMeters(bus.lat, bus.lng, stopCoords.lat, stopCoords.lng);
+    const traj = bus.trajectory;
+    if (!traj || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+
+    traj.walkedMeters = Math.min(traj.totalMeters, traj.walkedMeters + traj.speedMps);
+    const sample = sampleTrajectory(traj, traj.walkedMeters);
+    if (!sample) continue;
+
+    bus.lat = sample.lat;
+    bus.lng = sample.lng;
+    bus.routeMeters = sample.remainingMeters;
+    bus.isOppositeLeg = sample.inOppositeLeg;
     bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining || 0) - 1);
 
     const mins = Math.ceil(bus.etaSecondsRemaining / 60);
-    if (next.arrived || bus.etaSecondsRemaining <= 35) {
+    if (sample.arrived || bus.etaSecondsRemaining <= 35) {
       bus.eta = { minutes: 0, display: 'YA', unit: 'Arribando', urgency: 'now' };
       bus.tiempoRaw = 'Arribando..';
     } else {
@@ -608,21 +618,33 @@ function stepSoapInterpolation() {
       };
       bus.tiempoRaw = `${mins} min. aprox.`;
     }
-    bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.distanceMeters);
-    changed = true;
+    bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
   }
 
-  if (changed) {
-    transitMap.updateBuses(state.arribos, {
-      filterLine: state.filterLine,
-      selectedBusKey: state.selectedBusKey
-    });
-    renderArribosList();
-    if (state.selectedBusKey) {
-      const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
-      if (focused) updateInspectorFields(focused);
+  // Pure GPU marker reposition (0 DOM recreation!)
+  transitMap.moveBusPositionsFast(state.arribos);
+
+  // In-place text updates on existing cards (0 innerHTML thrashing!)
+  if (!state.horariosOpen) {
+    for (const bus of state.arribos) {
+      const card = el.arribosList.querySelector(`[data-bus-key="${CSS.escape(bus.key)}"]`);
+      if (!card) continue;
+      const etaVal = card.querySelector('[data-eta-val]');
+      const etaUnit = card.querySelector('[data-eta-unit]');
+      const distVal = card.querySelector('[data-dist-val]');
+      const fill = card.querySelector('[data-progress-fill]');
+      if (etaVal) etaVal.textContent = bus.eta.display;
+      if (etaUnit) etaUnit.textContent = bus.eta.unit || 'aprox';
+      if (distVal && bus.routeMeters !== null) {
+        distVal.textContent = `${formatDistance(bus.routeMeters)} · ${formatBlocks(bus.routeMeters)} cuadras`;
+      }
+      if (fill) fill.style.width = `${bus.proximityPct}%`;
     }
-    checkProximityAlerts();
+  }
+
+  if (state.selectedBusKey) {
+    const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
+    if (focused) updateInspectorFields(focused);
   }
 }
 
@@ -644,7 +666,7 @@ function renderLineFilters() {
         line
       )}" style="--chip-color:${color}">
         <span class="chip-dot"></span>
-        ${escapeHtml(line)} · ${count}
+        ${escapeHtml(line)} (${count})
       </button>
     `;
   }
@@ -677,15 +699,11 @@ function renderArribosList() {
   if (visible.length === 0) {
     el.arribosList.innerHTML = `
       <div class="empty-state">
-        <div class="empty-state-icon">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>
-          </svg>
-        </div>
+        <div class="empty-state-icon">◎</div>
         <h3>Sin unidades reportando arribos</h3>
-        <p>En este momento el servicio SOAP no reporta colectivos en camino hacia <strong>${escapeHtml(
+        <p>En este momento no hay colectivos en camino hacia <strong>${escapeHtml(
           state.activeStop.id
-        )}</strong>. Podés reintentar en unos segundos o elegir otra parada.</p>
+        )}</strong>. Podés consultar los <strong>Horarios 24h</strong> programados arriba.</p>
       </div>
     `;
     return;
@@ -696,10 +714,11 @@ function renderArribosList() {
       const color = getLineColor(bus.descripcionLinea);
       const isSelected = bus.key === state.selectedBusKey;
       const isArmed = state.armedAlerts.has(bus.descripcionLinea);
+      const distMeters = bus.routeMeters ?? bus.distanceMeters;
       const distLabel =
-        bus.distanceMeters !== null
-          ? `${formatDistance(bus.distanceMeters)} · ${formatBlocks(bus.distanceMeters)} cuadras`
-          : 'Telemetría GPS activa';
+        distMeters !== null && distMeters !== undefined
+          ? `${formatDistance(distMeters)} · ${formatBlocks(distMeters)} cuadras`
+          : 'GPS activo';
 
       const cocheBadge = bus.identificadorCoche
         ? `<span class="coche-pill" title="Número de coche">#${escapeHtml(bus.identificadorCoche)}</span>`
@@ -707,21 +726,25 @@ function renderArribosList() {
 
       const desvioBadge =
         bus.desvio && bus.desvio.status !== 'none'
-          ? `<span class="desvio-pill desvio-${bus.desvio.status}" title="Desvío respecto al horario programado">${escapeHtml(
+          ? `<span class="desvio-pill desvio-${bus.desvio.status}" title="Desvío horario">${escapeHtml(
               bus.desvio.label
             )}</span>`
           : '';
 
+      const oppLegHtml = bus.isOppositeLeg
+        ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Aún circula en sentido contrario antes de dar la vuelta en cabecera">↺ Tramo previo: ${escapeHtml(
+            bus.realBandera
+          )}</span></div>`
+        : '';
+
       const driverHtml = bus.choferNombre
-        ? `<span class="driver-inline" title="Conductor asignado">
+        ? `<span class="driver-inline">
              <span>Chofer: <strong>${escapeHtml(bus.choferNombre)}</strong></span>
              ${bus.choferLegajo ? `<span class="legajo-chip">ID ${escapeHtml(bus.choferLegajo)}</span>` : ''}
            </span>`
-        : `<span class="driver-inline"><span>Unidad sin chofer asignado</span></span>`;
+        : `<span class="driver-inline"><span>Sin chofer informado</span></span>`;
 
-      const gpsHtml = bus.gpsTimeOnly
-        ? `<span class="mono-meta" title="Última señal GPS">GPS ${escapeHtml(bus.gpsTimeOnly)}</span>`
-        : '';
+      const gpsHtml = bus.gpsTimeOnly ? `<span class="mono-meta">GPS ${escapeHtml(bus.gpsTimeOnly)}</span>` : '';
 
       return `
         <div class="arrival-card ${isSelected ? 'is-selected' : ''}" data-bus-key="${escapeHtml(
@@ -730,30 +753,28 @@ function renderArribosList() {
           <div class="arrival-card-main">
             <div class="line-badge">${escapeHtml(bus.descripcionLinea)}</div>
             <div class="arrival-info">
-              <div class="arrival-title-row">
-                <div class="arrival-bandera" title="${escapeHtml(bus.descripcionBandera)}">${escapeHtml(
-                  bus.descripcionBandera
-                )}</div>
-              </div>
+              <div class="arrival-bandera" title="${escapeHtml(bus.descripcionBandera)}">${escapeHtml(
+                bus.descripcionBandera
+              )}</div>
               <div class="arrival-sub-row">
                 ${cocheBadge}
                 ${desvioBadge}
               </div>
+              ${oppLegHtml}
               <div class="arrival-sub-row">
-                <span class="arrival-tag">${escapeHtml(distLabel)}</span>
+                <span class="arrival-tag" data-dist-val>${escapeHtml(distLabel)}</span>
                 ${bus.esAdaptado ? '<span class="arrival-tag tag-adapted">♿ Adaptado</span>' : ''}
-                ${bus.esLleno ? '<span class="arrival-tag tag-full">Unidad llena</span>' : ''}
               </div>
             </div>
             <div class="arrival-right">
               <div class="eta-block eta-${bus.eta.urgency}">
-                <span class="eta-value">${escapeHtml(bus.eta.display)}</span>
-                <span class="eta-unit">${escapeHtml(bus.eta.unit || 'aprox')}</span>
+                <span class="eta-value" data-eta-val>${escapeHtml(bus.eta.display)}</span>
+                <span class="eta-unit" data-eta-unit>${escapeHtml(bus.eta.unit || 'aprox')}</span>
               </div>
               <button class="alert-bell-btn ${isArmed ? 'is-armed' : ''}" data-alert-line="${escapeHtml(
                 bus.descripcionLinea
-              )}" title="${isArmed ? 'Quitar alerta de llegada' : 'Avisarme cuando falten ≤ 3 min'}">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="${isArmed ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+              )}" title="${isArmed ? 'Quitar alerta' : 'Avisarme cuando falten ≤ 3 min'}">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="${isArmed ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
                   <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
                   <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
                 </svg>
@@ -765,7 +786,7 @@ function renderArribosList() {
             ${gpsHtml}
           </div>
           <div class="arrival-progress">
-            <div class="arrival-progress-fill" style="width:${bus.proximityPct}%"></div>
+            <div class="arrival-progress-fill" data-progress-fill style="width:${bus.proximityPct}%"></div>
           </div>
         </div>
       `;
@@ -791,7 +812,7 @@ function renderArribosList() {
         state.armedAlerts.add(line);
         state.triggeredAlerts.delete(line);
         if (state.soundEnabled) playSubtleTick();
-        showToast(`Te avisaremos cuando la línea ${line} esté a ≤ 3 min`, 'success');
+        showToast(`Aviso activado para línea ${line} (≤ 3 min)`, 'success');
       }
       renderArribosList();
     });
@@ -809,11 +830,7 @@ function checkProximityAlerts() {
       state.triggeredAlerts.add(bus.descripcionLinea);
       if (state.soundEnabled) playArrivalChime();
       const cocheTag = bus.identificadorCoche ? ` (Coche #${bus.identificadorCoche})` : '';
-      showToast(
-        `¡Línea ${bus.descripcionLinea}${cocheTag} llegando a ${state.activeStop.id} (${bus.tiempoRaw})!`,
-        'success',
-        6500
-      );
+      showToast(`¡Línea ${bus.descripcionLinea}${cocheTag} arribando (${bus.tiempoRaw})!`, 'success', 6000);
     }
   }
 }
@@ -828,13 +845,21 @@ function updateInspectorFields(bus) {
   el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status === 'none' ? 'ontime' : bus.desvio.status}`;
   el.inspDesvioPill.textContent = bus.desvio.status !== 'none' ? bus.desvio.label : 'Sin desvío';
 
+  if (bus.isOppositeLeg) {
+    el.inspDirectionNote.textContent = `↺ En sentido previo (${bus.realBandera}): aún debe completar ese tramo y girar en cabecera antes de llegar a esta parada.`;
+    el.inspDirectionNote.classList.remove('hidden');
+  } else {
+    el.inspDirectionNote.classList.add('hidden');
+  }
+
   el.inspChofer.textContent = bus.choferNombre || 'Sin informar';
   el.inspLegajo.textContent = bus.choferLegajo || '—';
   el.inspCoche.textContent = bus.identificadorCoche ? `#${bus.identificadorCoche}` : '—';
 
+  const distMeters = bus.routeMeters ?? bus.distanceMeters;
   el.inspEta.textContent = bus.eta.minutes === 0 ? 'Arribando' : `${bus.eta.display} min`;
-  el.inspDist.textContent = formatDistance(bus.distanceMeters);
-  el.inspBlocks.textContent = formatBlocks(bus.distanceMeters);
+  el.inspDist.textContent = formatDistance(distMeters);
+  el.inspBlocks.textContent = formatBlocks(distMeters);
   el.inspAccess.textContent = bus.esAdaptado ? '♿ Rampa' : 'Estándar';
 
   el.inspCartel.textContent = `Cartel: ${bus.descripcionCartelBandera || bus.descripcionBandera}`;
@@ -855,7 +880,7 @@ function selectBus(busKey, focusMap = false) {
 
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
-  renderArribosList();
+  if (!state.horariosOpen) renderArribosList();
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
     selectedBusKey: state.selectedBusKey
@@ -873,14 +898,14 @@ function closeBusInspector() {
     filterLine: state.filterLine,
     selectedBusKey: null
   });
-  if (state.activeStop) renderArribosList();
+  if (state.activeStop && !state.horariosOpen) renderArribosList();
 }
 
 async function fetchArribos(showSkeleton = false) {
   if (!state.activeStop) return;
 
   el.btnRefresh.classList.add('is-loading');
-  if (showSkeleton) {
+  if (showSkeleton && !state.horariosOpen) {
     el.arribosList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
   }
 
@@ -903,12 +928,28 @@ async function fetchArribos(showSkeleton = false) {
       transitMap.setActiveStop(state.activeStop);
     }
 
+    const rawArribos = Array.isArray(payload.arribos) ? payload.arribos : [];
+    const lineCodes = Array.from(new Set(rawArribos.map((a) => Number(a.codigoLinea)).filter(Boolean)));
+
+    // Preload real SOAP route branches (cached 24h in localStorage) BEFORE computing trajectories
+    // so opposite-leg turnaround detection works accurately from the very first load!
+    await ensureBranchesLoaded(lineCodes);
+
+    // Track lines serving this stop for the Horarios 24h panel
+    const linesMap = new Map();
+    for (const a of rawArribos) {
+      if (a.codigoLinea && a.descripcionLinea) {
+        linesMap.set(Number(a.codigoLinea), a.descripcionLinea);
+      }
+    }
+    state.stopLinesList = Array.from(linesMap.entries()).map(([codigo, descripcion]) => ({ codigo, descripcion }));
+
     const stopCoords =
       typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
         ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
         : payload.stopCoords || null;
 
-    state.arribos = normalizeArrivals(payload.arribos, stopCoords);
+    state.arribos = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
     el.lastSyncLabel.textContent = `SOAP ${state.lastSyncAt.toLocaleTimeString('es-AR', {
       hour: '2-digit',
       minute: '2-digit',
@@ -917,7 +958,7 @@ async function fetchArribos(showSkeleton = false) {
 
     updateSignalPill();
     renderLineFilters();
-    renderArribosList();
+    if (!state.horariosOpen) renderArribosList();
     transitMap.updateBuses(state.arribos, {
       filterLine: state.filterLine,
       selectedBusKey: state.selectedBusKey
@@ -929,18 +970,18 @@ async function fetchArribos(showSkeleton = false) {
 
     if (state.selectedBusKey) {
       const stillHere = state.arribos.find((b) => b.key === state.selectedBusKey);
-      if (stillHere) updateInspectorFields(stillHere);
-      else closeBusInspector();
-    }
-
-    if (state.simulateMode) {
-      preloadPolylinesForInterpolation();
+      if (stillHere) {
+        updateInspectorFields(stillHere);
+        transitMap.drawFocusVector(stillHere);
+      } else {
+        closeBusInspector();
+      }
     }
 
     checkProximityAlerts();
   } catch (err) {
     el.lastSyncLabel.textContent = 'Error de conexión';
-    showToast(err.message || 'No se pudieron actualizar los arribos SOAP', 'warn');
+    showToast(err.message || 'No se pudieron actualizar los arribos', 'warn');
   } finally {
     el.btnRefresh.classList.remove('is-loading');
     state.countdownSec = REFRESH_INTERVAL_SEC;
@@ -956,15 +997,174 @@ function updateCountdownRing() {
 }
 
 // ============================================================================
+// Horarios Programados 24h (RecuperarHorariosProgramadosPorLineaParada + 24h cache)
+// ============================================================================
+async function toggleHorariosView() {
+  if (!state.activeStop) return;
+  state.horariosOpen = !state.horariosOpen;
+  el.btnToggleHorarios.classList.toggle('active', state.horariosOpen);
+  el.horariosPanel.classList.toggle('hidden', !state.horariosOpen);
+  el.arribosList.classList.toggle('hidden', state.horariosOpen);
+  el.lineFilterStrip.classList.toggle('hidden', state.horariosOpen);
+
+  if (!state.horariosOpen) return;
+
+  // Discover lines serving this stop (from live arrivals OR /api/banderas matched against state.lineas)
+  if (state.stopLinesList.length === 0) {
+    try {
+      const bRes = await api.banderas(state.activeStop.id);
+      const names = Array.from(new Set((bRes.data || []).map((b) => String(b.DescripcionLinea || '').trim())));
+      state.stopLinesList = names
+        .map((desc) => state.lineas.find((l) => l.descripcion === desc))
+        .filter(Boolean)
+        .map((l) => ({ codigo: l.codigo, descripcion: l.descripcion }));
+    } catch {
+      // ignore
+    }
+  }
+
+  if (state.stopLinesList.length === 0) {
+    el.horariosPanel.innerHTML = `
+      <div class="empty-state">
+        <h3>Sin líneas detectadas</h3>
+        <p>Elegí primero una línea específica desde la pestaña Líneas para ver su grilla horaria 24h.</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (!state.horariosLineCode) {
+    state.horariosLineCode = state.stopLinesList[0].codigo;
+  }
+  await loadAndRenderHorarios(state.horariosLineCode);
+}
+
+async function loadAndRenderHorarios(codLinea) {
+  state.horariosLineCode = Number(codLinea);
+  const lineObj = state.stopLinesList.find((l) => l.codigo === state.horariosLineCode) || {
+    codigo: state.horariosLineCode,
+    descripcion: String(state.horariosLineCode)
+  };
+
+  const tabsHtml = state.stopLinesList
+    .map((l) => {
+      const color = getLineColor(l.descripcion);
+      const active = l.codigo === state.horariosLineCode;
+      return `<button class="filter-chip ${active ? 'active' : ''}" data-hor-line="${l.codigo}" style="--chip-color:${color}">${escapeHtml(
+        l.descripcion
+      )}</button>`;
+    })
+    .join('');
+
+  el.horariosPanel.innerHTML = `
+    <div class="horarios-head">
+      <h3>Horarios programados 24h</h3>
+      <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+    </div>
+    <div class="horarios-line-tabs">${tabsHtml}</div>
+    <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
+  `;
+  bindHorariosControls();
+
+  try {
+    const res = await api.horarios(state.activeStop.id, state.horariosLineCode);
+    const data = res.data || {};
+    const horarios = Array.isArray(data.horarios) ? data.horarios : [];
+
+    const nowArt = new Date(Date.now() - 3 * 3600 * 1000);
+    const nowMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes();
+
+    let nextIdx = horarios.findIndex((h) => h.minuteOfDay >= nowMin);
+    if (nextIdx === -1 && horarios.length > 0) nextIdx = 0;
+
+    const groups = [
+      { title: 'Madrugada y Mañana (00:00 – 11:59)', items: horarios.filter((h) => h.minuteOfDay < 720) },
+      { title: 'Tarde (12:00 – 19:59)', items: horarios.filter((h) => h.minuteOfDay >= 720 && h.minuteOfDay < 1200) },
+      { title: 'Noche (20:00 – 23:59)', items: horarios.filter((h) => h.minuteOfDay >= 1200) }
+    ].filter((g) => g.items.length > 0);
+
+    const nextMinute = nextIdx >= 0 ? horarios[nextIdx].minuteOfDay : -1;
+    const cacheTag = res.cached ? 'Guardado en caché local (24h)' : 'Sincronizado 24h y guardado en caché';
+    const freqText = data.frecuenciaMin ? `Cada ~${data.frecuenciaMin} min` : `${horarios.length} pasos`;
+
+    const bodyHtml =
+      horarios.length === 0
+        ? `<div class="empty-state"><h3>Sin horarios programados</h3><p>No se encontraron salidas programadas para la línea ${escapeHtml(
+            lineObj.descripcion
+          )} en ${escapeHtml(state.activeStop.id)}.</p></div>`
+        : `
+          <div class="horarios-meta-bar">
+            <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong> · ${escapeHtml(freqText)}</span>
+            <span class="mono-meta">${escapeHtml(cacheTag)}</span>
+          </div>
+          ${groups
+            .map(
+              (g) => `
+              <div class="horarios-group">
+                <span class="micro-heading">${escapeHtml(g.title)}</span>
+                <div class="horarios-grid">
+                  ${g.items
+                    .map((h) => {
+                      const cls =
+                        h.minuteOfDay === nextMinute
+                          ? 'is-next'
+                          : h.minuteOfDay < nowMin
+                            ? 'is-past'
+                            : '';
+                      return `<span class="hora-pill ${cls}" title="${escapeHtml(h.bandera)} · ${escapeHtml(
+                        h.horaPaso
+                      )}">${escapeHtml(h.hora)}</span>`;
+                    })
+                    .join('')}
+                </div>
+              </div>
+            `
+            )
+            .join('')}
+        `;
+
+    el.horariosPanel.innerHTML = `
+      <div class="horarios-head">
+        <h3>Horarios programados 24h</h3>
+        <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+      </div>
+      <div class="horarios-line-tabs">${tabsHtml}</div>
+      ${bodyHtml}
+    `;
+    bindHorariosControls();
+  } catch (err) {
+    el.horariosPanel.innerHTML = `
+      <div class="horarios-head">
+        <h3>Horarios programados 24h</h3>
+        <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+      </div>
+      <div class="horarios-line-tabs">${tabsHtml}</div>
+      <div class="empty-state"><h3>Error al cargar horarios</h3><p>${escapeHtml(err.message)}</p></div>
+    `;
+    bindHorariosControls();
+  }
+}
+
+function bindHorariosControls() {
+  document.getElementById('btn-close-horarios')?.addEventListener('click', () => {
+    if (state.horariosOpen) toggleHorariosView();
+  });
+  el.horariosPanel.querySelectorAll('[data-hor-line]').forEach((btn) => {
+    btn.addEventListener('click', () => loadAndRenderHorarios(Number(btn.dataset.horLine)));
+  });
+}
+
+// ============================================================================
 // Route Polylines Overlay
 // ============================================================================
 async function loadRouteForLine(codLinea, lineName, { clearExisting = true, fit = true } = {}) {
   if (clearExisting) transitMap.clearRoutes();
-  showToast(`Cargando recorrido oficial de línea ${lineName}...`, 'info', 2200);
+  showToast(`Cargando recorrido de línea ${lineName}...`, 'info', 2000);
   try {
     const res = await api.recorridos(codLinea);
     const list = Array.isArray(res.data) ? res.data : [];
-    state.routePolylinesCache.set(Number(codLinea), extractRoutePolylines(list));
+    state.routeBranchesCache.set(Number(codLinea), parseRouteBranches(list));
     if (list.length === 0) {
       showToast(`Sin traza disponible para ${lineName}`, 'warn');
       return;
@@ -983,7 +1183,6 @@ async function toggleActiveStopRoutes() {
     transitMap.clearRoutes();
     state.routesVisible = false;
     el.btnShowRoutes.classList.remove('active');
-    showToast('Recorridos ocultos', 'info', 1800);
     return;
   }
 
@@ -1070,9 +1269,7 @@ function renderDrilldown() {
             const color = getLineColor(l.descripcion);
             return `
               <div class="line-tile" style="--line-color:${color}">
-                <div class="line-tile-head">
-                  <span class="line-tile-pill">${escapeHtml(l.descripcion)}</span>
-                </div>
+                <span class="line-tile-pill">${escapeHtml(l.descripcion)}</span>
                 <div class="line-tile-actions">
                   <button class="tile-mini-btn primary btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}">Calles</button>
                   <button class="tile-mini-btn btn-line-map" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}">Mapa</button>
@@ -1085,27 +1282,17 @@ function renderDrilldown() {
     `;
 
     el.lineasContent.querySelectorAll('.btn-line-calles').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openLineCalles({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc });
-      });
+      btn.addEventListener('click', () => openLineCalles({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
-
     el.lineasContent.querySelectorAll('.btn-line-map').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        loadRouteForLine(btn.dataset.cod, btn.dataset.desc, { clearExisting: true, fit: true });
-      });
+      btn.addEventListener('click', () => loadRouteForLine(btn.dataset.cod, btn.dataset.desc, { clearExisting: true, fit: true }));
     });
     return;
   }
 
   const filtered = items.filter((it) => (it.descripcion || '').toLowerCase().includes(query));
   if (filtered.length === 0) {
-    el.lineasContent.innerHTML = `
-      <div class="empty-state">
-        <h3>Sin resultados</h3>
-        <p>Probá con otro término de búsqueda.</p>
-      </div>
-    `;
+    el.lineasContent.innerHTML = `<div class="empty-state"><h3>Sin resultados</h3><p>Probá con otro término.</p></div>`;
     return;
   }
 
@@ -1123,11 +1310,8 @@ function renderDrilldown() {
       `
       )
       .join('');
-
     el.lineasContent.querySelectorAll('.list-row-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openCalleIntersecciones({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc });
-      });
+      btn.addEventListener('click', () => openCalleIntersecciones({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
     return;
   }
@@ -1146,11 +1330,8 @@ function renderDrilldown() {
       `
       )
       .join('');
-
     el.lineasContent.querySelectorAll('.list-row-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openInterseccionParadas({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc });
-      });
+      btn.addEventListener('click', () => openInterseccionParadas({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
     return;
   }
@@ -1165,7 +1346,7 @@ function renderDrilldown() {
           </div>
           <div class="stop-card-name">${escapeHtml(p.descripcion)}</div>
           <div class="stop-card-foot">
-            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas las líneas (000)</button>
+            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas (000)</button>
             <button class="pill-btn pill-btn-ghost btn-open-only" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Solo ${escapeHtml(state.drill.linea.descripcion)}</button>
           </div>
         </div>
@@ -1174,14 +1355,12 @@ function renderDrilldown() {
       .join('');
 
     el.lineasContent.querySelectorAll('.btn-open-all').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, '000');
-      });
+      btn.addEventListener('click', () => openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, '000'));
     });
     el.lineasContent.querySelectorAll('.btn-open-only').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, String(state.drill.linea.codigo));
-      });
+      btn.addEventListener('click', () =>
+        openStopRadar({ id: btn.dataset.id, nombre: btn.dataset.name }, String(state.drill.linea.codigo))
+      );
     });
   }
 }
@@ -1190,8 +1369,7 @@ async function openLineCalles(linea) {
   el.lineasFilterInput.value = '';
   state.drill = { step: 'calles', linea, calle: null, interseccion: null, items: [] };
   renderLineasBreadcrumb();
-  el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
-
+  el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
   try {
     const res = await api.calles(linea.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
@@ -1205,8 +1383,7 @@ async function openCalleIntersecciones(calle) {
   el.lineasFilterInput.value = '';
   state.drill = { ...state.drill, step: 'intersecciones', calle, interseccion: null, items: [] };
   renderLineasBreadcrumb();
-  el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
-
+  el.lineasContent.innerHTML = `<div class="skeleton-card"></div>`;
   try {
     const res = await api.intersecciones(state.drill.linea.codigo, calle.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
@@ -1221,7 +1398,6 @@ async function openInterseccionParadas(interseccion) {
   state.drill = { ...state.drill, step: 'paradas', interseccion, items: [] };
   renderLineasBreadcrumb();
   el.lineasContent.innerHTML = `<div class="skeleton-card"></div>`;
-
   try {
     const res = await api.paradas(state.drill.linea.codigo, state.drill.calle.codigo, interseccion.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
@@ -1232,21 +1408,17 @@ async function openInterseccionParadas(interseccion) {
 }
 
 // ============================================================================
-// TAB 3: Paradas Cercanas & Corrientes Hubs
+// TAB 3: Paradas Cercanas
 // ============================================================================
 function renderHubs() {
   el.hubsChips.innerHTML = state.hubs
-    .map(
-      (h, idx) =>
-        `<button class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name.replace(/\s*\(Piloto\)/i, ''))}</button>`
-    )
+    .map((h, idx) => `<button class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name.replace(/\s*\(Piloto\)/i, ''))}</button>`)
     .join('');
 
   el.hubsChips.querySelectorAll('.hub-chip').forEach((chip) => {
     chip.addEventListener('click', () => {
       const hub = state.hubs[Number(chip.dataset.hubIdx)];
-      if (!hub) return;
-      searchNearbyStops(hub.lat, hub.lng, hub.name);
+      if (hub) searchNearbyStops(hub.lat, hub.lng, hub.name);
     });
   });
 
@@ -1254,14 +1426,14 @@ function renderHubs() {
     <div class="empty-state">
       <div class="empty-state-icon">◎</div>
       <h3>Buscá paradas a tu alrededor</h3>
-      <p>Usá tu GPS, tocá el centro del mapa o elegí una zona rápida de Corrientes arriba.</p>
+      <p>Usá tu GPS, tocá el centro del mapa o elegí una zona de Corrientes.</p>
     </div>
   `;
 }
 
 async function searchNearbyStops(lat, lng, label = 'esta zona') {
   switchTab('cercanas');
-  el.cercanasList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+  el.cercanasList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
 
   try {
     const res = await api.paradasCercanas(lat, lng);
@@ -1269,12 +1441,7 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
     state.nearbyStops = stops;
 
     if (stops.length === 0) {
-      el.cercanasList.innerHTML = `
-        <div class="empty-state">
-          <h3>Sin paradas cercanas</h3>
-          <p>No encontramos paradas cerca de ${escapeHtml(label)}. Probá mover el mapa sobre una avenida de Corrientes.</p>
-        </div>
-      `;
+      el.cercanasList.innerHTML = `<div class="empty-state"><h3>Sin paradas cercanas</h3><p>No encontramos paradas cerca de ${escapeHtml(label)}.</p></div>`;
       return;
     }
 
@@ -1292,12 +1459,12 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
               <span class="mono-meta">${formatDistance(dist)} · ${formatWalkMin(dist)}</span>
             </div>
             <div class="stop-card-name">${escapeHtml(s.descripcion)}</div>
-            <div class="stop-card-lines">${escapeHtml(s.lineas || 'Todas las líneas habilitadas')}</div>
+            <div class="stop-card-lines">${escapeHtml(s.lineas || '')}</div>
             <div class="stop-card-foot">
               <span class="mono-meta">${escapeHtml(s.callePrincipal || '')}</span>
               <button class="pill-btn btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
                 s.descripcion
-              )}" data-lat="${sLat}" data-lng="${sLng}">Ver Radar →</button>
+              )}" data-lat="${sLat}" data-lng="${sLng}">Abrir radar →</button>
             </div>
           </div>
         `;
@@ -1307,12 +1474,7 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
     el.cercanasList.querySelectorAll('.btn-nearby-open').forEach((btn) => {
       btn.addEventListener('click', () => {
         openStopRadar(
-          {
-            id: btn.dataset.id,
-            nombre: btn.dataset.name,
-            lat: parseFloat(btn.dataset.lat),
-            lng: parseFloat(btn.dataset.lng)
-          },
+          { id: btn.dataset.id, nombre: btn.dataset.name, lat: parseFloat(btn.dataset.lat), lng: parseFloat(btn.dataset.lng) },
           '000'
         );
       });
@@ -1324,13 +1486,11 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
 
 function locateUserGps() {
   if (!navigator.geolocation) {
-    showToast('Tu navegador no soporta GPS. Buscando en el centro del mapa.', 'warn');
     const c = transitMap.getCenter();
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
     return;
   }
-
-  showToast('Obteniendo ubicación GPS...', 'info', 2000);
+  showToast('Obteniendo ubicación GPS...', 'info', 1800);
   navigator.geolocation.getCurrentPosition(
     (pos) => {
       const { latitude, longitude, accuracy } = pos.coords;
@@ -1338,7 +1498,7 @@ function locateUserGps() {
       searchNearbyStops(latitude, longitude, 'tu ubicación');
     },
     () => {
-      showToast('Sin permiso GPS. Buscando paradas en el centro de Corrientes.', 'warn');
+      showToast('Sin permiso GPS. Mostrando paradas en el centro de Corrientes.', 'warn');
       searchNearbyStops(CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng, 'Centro de Corrientes');
     },
     { enableHighAccuracy: true, timeout: 7000 }
@@ -1346,7 +1506,7 @@ function locateUserGps() {
 }
 
 // ============================================================================
-// Global Instant Search (Stop Code CTxxxxx, Known Stops, Favorites, Lines)
+// Global Search
 // ============================================================================
 function renderGlobalSearchResults(rawQuery) {
   const q = rawQuery.trim();
@@ -1360,9 +1520,8 @@ function renderGlobalSearchResults(rawQuery) {
 
   if (/^CT\d{3,6}$/.test(upper)) {
     results.push({
-      type: 'direct-stop',
       title: `Ir a parada ${upper}`,
-      sub: 'Consultar arribos SOAP de todas las líneas (código 000)',
+      sub: 'Arribos SOAP de todas las líneas (código 000)',
       badge: upper,
       action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '000')
     });
@@ -1373,10 +1532,8 @@ function renderGlobalSearchResults(rawQuery) {
   for (const s of knownStops) {
     if (seenStop.has(s.id)) continue;
     seenStop.add(s.id);
-    const hay = `${s.id} ${s.nombre} ${s.alias || ''}`.toUpperCase();
-    if (hay.includes(upper)) {
+    if (`${s.id} ${s.nombre} ${s.alias || ''}`.toUpperCase().includes(upper)) {
       results.push({
-        type: 'stop',
         title: s.nombre,
         sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas (000)',
         badge: s.id,
@@ -1388,9 +1545,8 @@ function renderGlobalSearchResults(rawQuery) {
   for (const l of state.lineas) {
     if (l.descripcion.toUpperCase().includes(upper)) {
       results.push({
-        type: 'line',
         title: `Línea ${l.descripcion}`,
-        sub: 'Ver calles, paradas y recorrido en mapa',
+        sub: 'Calles, paradas y recorrido',
         badge: l.descripcion,
         color: getLineColor(l.descripcion),
         action: () => {
@@ -1402,7 +1558,7 @@ function renderGlobalSearchResults(rawQuery) {
   }
 
   if (results.length === 0) {
-    el.searchDropdown.innerHTML = `<div class="search-item"><div class="search-item-main"><span class="search-item-title">Sin coincidencias para "${escapeHtml(q)}"</span><span class="search-item-sub">Ingresá un código como CT31498 o una línea como 102B</span></div></div>`;
+    el.searchDropdown.innerHTML = `<div class="search-item"><div class="search-item-main"><span class="search-item-title">Sin coincidencias</span><span class="search-item-sub">Ingresá un código como CT31498 o una línea como 106A</span></div></div>`;
   } else {
     el.searchDropdown.innerHTML = results
       .slice(0, 8)
@@ -1428,18 +1584,14 @@ function renderGlobalSearchResults(rawQuery) {
       });
     });
   }
-
   el.searchDropdown.classList.remove('hidden');
 }
 
 // ============================================================================
-// Event Bindings & Clean Startup
+// Events & Clean Init
 // ============================================================================
 function bindEvents() {
-  el.tabs.forEach((tab) => {
-    tab.addEventListener('click', () => switchTab(tab.dataset.tab));
-  });
-
+  el.tabs.forEach((tab) => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
   el.btnBrandHome.addEventListener('click', resetToWelcome);
 
   el.btnThemeToggle.addEventListener('click', () => {
@@ -1453,22 +1605,18 @@ function bindEvents() {
     el.iconSoundOn.classList.toggle('hidden', !state.soundEnabled);
     el.iconSoundOff.classList.toggle('hidden', state.soundEnabled);
     if (state.soundEnabled) playSubtleTick();
-    showToast(state.soundEnabled ? 'Alertas sonoras activadas' : 'Alertas sonoras silenciadas', 'info', 2000);
   });
 
   el.btnLiveMode.addEventListener('click', async () => {
     if (!state.activeStop) {
-      showToast('Primero buscá o elegí una parada para interpolar sus colectivos SOAP en vivo', 'info');
+      showToast('Buscá una parada primero para activar la interpolación sobre datos SOAP', 'info');
       return;
     }
     state.simulateMode = !state.simulateMode;
     updateSignalPill();
     if (state.simulateMode) {
-      showToast('Interpolación fluida activada usando posiciones y recorridos reales SOAP', 'success');
-      if (state.arribos.length === 0) {
-        await fetchArribos(false);
-      }
-      await preloadPolylinesForInterpolation();
+      showToast('Interpolación activada: sigue el sentido real y giro en cabecera de cada unidad SOAP', 'success');
+      if (state.arribos.length === 0) await fetchArribos(false);
     } else {
       showToast('Modo EN VIVO: sincronizando directo cada 15s con SOAP', 'info');
       fetchArribos(false);
@@ -1476,13 +1624,11 @@ function bindEvents() {
   });
 
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
-
   el.btnShareStop.addEventListener('click', async () => {
     if (!state.activeStop) return;
-    const shareUrl = window.location.href;
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      showToast(`Enlace copiado para parada ${state.activeStop.id}`, 'success');
+      await navigator.clipboard.writeText(window.location.href);
+      showToast(`Enlace copiado para ${state.activeStop.id}`, 'success');
     } catch {
       showToast(`Parada actual: ${state.activeStop.id}`, 'info');
     }
@@ -1490,9 +1636,9 @@ function bindEvents() {
 
   el.btnRefresh.addEventListener('click', () => fetchArribos(false));
   el.btnShowRoutes.addEventListener('click', toggleActiveStopRoutes);
+  el.btnToggleHorarios.addEventListener('click', toggleHorariosView);
   el.btnFitFleet.addEventListener('click', () => transitMap.fitFleet(state.arribos));
 
-  // Inspector
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
   el.btnInspRoute.addEventListener('click', () => {
     const cod = el.btnInspRoute.dataset.codLinea;
@@ -1500,30 +1646,25 @@ function bindEvents() {
     if (cod) loadRouteForLine(cod, name, { clearExisting: true, fit: true });
   });
 
-  // Map controls
   el.btnZoomIn.addEventListener('click', () => transitMap.zoomIn());
   el.btnZoomOut.addEventListener('click', () => transitMap.zoomOut());
   el.btnMapCenterStop.addEventListener('click', () => transitMap.focusStop(16));
   el.btnMapStyle.addEventListener('click', () => {
     const cfg = transitMap.cycleTileStyle();
-    showToast(`Mapa Leaflet: ${cfg.label}`, 'info', 1600);
+    showToast(`Mapa: ${cfg.label}`, 'info', 1500);
   });
   el.btnMapScanArea.addEventListener('click', () => {
     const c = transitMap.getCenter();
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
   });
 
-  // Cercanas buttons
   el.btnLocateMe.addEventListener('click', locateUserGps);
   el.btnSearchMapCenter.addEventListener('click', () => {
     const c = transitMap.getCenter();
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
   });
 
-  // Lineas filter
   el.lineasFilterInput.addEventListener('input', renderDrilldown);
-
-  // Global search
   el.globalSearch.addEventListener('input', (e) => renderGlobalSearchResults(e.target.value));
   el.globalSearch.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -1534,9 +1675,7 @@ function bindEvents() {
     }
   });
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('.quick-search-wrap')) {
-      el.searchDropdown.classList.add('hidden');
-    }
+    if (!e.target.closest('.quick-search-wrap')) el.searchDropdown.classList.add('hidden');
   });
 
   setupMobileSheet();
@@ -1554,7 +1693,6 @@ async function init() {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
-  // Bootstrap real Corrientes catalog (33 lines + hubs) without opening any pilot stop
   try {
     const boot = await api.bootstrap();
     state.lineas = Array.isArray(boot.lineas) ? boot.lineas : [];
@@ -1564,27 +1702,25 @@ async function init() {
     renderDrilldown();
     renderHubs();
   } catch {
-    showToast('No se pudo cargar el catálogo inicial de líneas', 'warn');
+    showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // Only open a stop automatically if explicitly provided via URL (?idParada=...)
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
   const paramCodLinea = params.get('codLinea') || '000';
 
   if (paramStopId) {
-    const matchedKnown =
+    const known =
       state.quickStops.find((s) => s.id === paramStopId) ||
       state.favorites.find((f) => f.id === paramStopId) || {
         id: paramStopId,
         nombre: `Parada ${paramStopId}`
       };
-    await openStopRadar(matchedKnown, paramCodLinea);
+    await openStopRadar(known, paramCodLinea);
   } else {
     renderRadarWelcome();
   }
 
-  // 1-second loop: live countdown + smooth 1s SOAP interpolation when simulation mode is enabled
   setInterval(() => {
     if (!state.activeStop) return;
 

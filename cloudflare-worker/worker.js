@@ -351,6 +351,86 @@ export default {
         return jsonResponse({ data: res?.banderas || [], source: 'smartmovepro-soap', savedAt: Date.now() });
       }
 
+      if (pathname === '/api/horarios') {
+        const stopId = String(searchParams.get('idParada') || '').trim().toUpperCase();
+        const lineNum = Number(searchParams.get('codLinea'));
+        if (!stopId || !lineNum) {
+          return jsonResponse({ error: 'Faltan parámetros idParada o codLinea' }, 400);
+        }
+
+        const nowArt = new Date(Date.now() - 3 * 3600 * 1000);
+        const pad = (n) => String(n).padStart(2, '0');
+        const fmtIso = (d) =>
+          `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+        const dayKey = `${nowArt.getUTCFullYear()}-${pad(nowArt.getUTCMonth() + 1)}-${pad(nowArt.getUTCDate())}`;
+        const todayStr = `${pad(nowArt.getUTCDate())}/${pad(nowArt.getUTCMonth() + 1)}/${nowArt.getUTCFullYear()}`;
+
+        const baseMs = nowArt.getTime() + 2 * 60 * 1000;
+        const windows = [];
+        for (let i = 0; i < 12; i++) {
+          const wStart = new Date(baseMs + i * 2 * 3600 * 1000);
+          const wEnd = new Date(baseMs + (i + 1) * 2 * 3600 * 1000 - 60 * 1000);
+          windows.push([fmtIso(wStart), fmtIso(wEnd)]);
+        }
+
+        const results = await Promise.all(
+          windows.map(([desde, hasta]) =>
+            soapRequest(
+              'RecuperarHorariosProgramadosPorLineaParada',
+              `<usuario i:type="d:string">${SOAP_USER}</usuario>
+               <clave i:type="d:string">${SOAP_PASS}</clave>
+               <identificadorParada i:type="d:string">${escapeXml(stopId)}</identificadorParada>
+               <codigoLineaParada i:type="d:int">${lineNum}</codigoLineaParada>
+               <fechaHoraDesde i:type="d:dateTime">${desde}</fechaHoraDesde>
+               <fechaHoraHasta i:type="d:dateTime">${hasta}</fechaHoraHasta>`
+            ).catch(() => null)
+          )
+        );
+
+        const seen = new Set();
+        const horarios = [];
+        for (const r of results) {
+          const list = Array.isArray(r?.HorariossProgramados)
+            ? r.HorariossProgramados
+            : Array.isArray(r?.HorariosProgramados)
+              ? r.HorariosProgramados
+              : [];
+          for (const item of list) {
+            const rawPaso = String(item.HoraPaso || '').trim();
+            if (!rawPaso || seen.has(rawPaso)) continue;
+            seen.add(rawPaso);
+            const [datePart = '', timePart = ''] = rawPaso.split(' ');
+            const hhmm = timePart.slice(0, 5);
+            const [hh = '0', mm = '0'] = hhmm.split(':');
+            const minuteOfDay = parseInt(hh, 10) * 60 + parseInt(mm, 10);
+            horarios.push({
+              codigoLinea: Number(item.CodigoLinea) || lineNum,
+              identificadorParada: item.IdentificadorParada || stopId,
+              bandera: String(item.DescripcionBandera || '').trim(),
+              horaPaso: rawPaso,
+              hora: hhmm,
+              minuteOfDay,
+              esHoy: datePart === todayStr
+            });
+          }
+        }
+        horarios.sort((a, b) => a.minuteOfDay - b.minuteOfDay);
+
+        const diffs = [];
+        for (let i = 1; i < horarios.length; i++) {
+          const d = horarios[i].minuteOfDay - horarios[i - 1].minuteOfDay;
+          if (d >= 2 && d <= 90) diffs.push(d);
+        }
+        diffs.sort((a, b) => a - b);
+        const frecuenciaMin = diffs.length > 0 ? diffs[Math.floor(diffs.length / 2)] : null;
+
+        return jsonResponse({
+          data: { idParada: stopId, codigoLinea: lineNum, horarios, frecuenciaMin, fetchedDay: dayKey },
+          source: 'smartmovepro-soap',
+          savedAt: Date.now()
+        });
+      }
+
       if (pathname === '/api/arribos') {
         const stopId = String(searchParams.get('idParada') || PILOT_STOP.id).trim().toUpperCase();
         const rawCode = String(searchParams.get('codLinea') || '000').trim();
