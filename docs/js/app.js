@@ -438,7 +438,12 @@ function updateStopHeaderUI() {
   const isAll = !state.codLineaQuery || state.codLineaQuery === '0' || state.codLineaQuery === '000';
   el.stopCodeBadge.textContent = s.id;
   el.stopTitle.textContent = s.nombre || `Parada ${s.id}`;
-  el.stopPilotTag.textContent = isAll ? 'Todas las líneas (000)' : `Línea cód. ${state.codLineaQuery}`;
+  const focusedLineName = !isAll
+    ? state.stopLinesList.find((l) => String(l.codigo) === String(state.codLineaQuery))?.descripcion ||
+      state.lineas.find((l) => String(l.codigo) === String(state.codLineaQuery))?.descripcion ||
+      (state.filterLine !== 'ALL' ? state.filterLine : state.codLineaQuery)
+    : '';
+  el.stopPilotTag.textContent = isAll ? 'Todas las líneas' : `Línea ${focusedLineName}`;
 
   if (typeof s.lat === 'number' && typeof s.lng === 'number') {
     el.stopCoordsLabel.textContent = `${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}`;
@@ -892,8 +897,13 @@ function updateInspectorFields(bus) {
   el.inspBandera.textContent = bus.descripcionBandera;
 
   el.inspCochePill.textContent = bus.identificadorCoche ? `Coche #${bus.identificadorCoche}` : 'Coche s/d';
-  el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status === 'none' ? 'ontime' : bus.desvio.status}`;
-  el.inspDesvioPill.textContent = bus.desvio.status !== 'none' ? bus.desvio.label : 'Sin desvío';
+  if (bus.desvio && bus.desvio.status !== 'none' && bus.desvio.label) {
+    el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status}`;
+    el.inspDesvioPill.textContent = bus.desvio.label;
+  } else {
+    el.inspDesvioPill.className = 'desvio-pill hidden';
+    el.inspDesvioPill.textContent = '';
+  }
 
   const notes = [];
   if (bus.isOppositeLeg) {
@@ -1047,10 +1057,11 @@ async function fetchArribos(showSkeleton = false) {
     }
 
     const extLabel = payload.extendedCount > 0 ? ` · +${payload.extendedCount} flota` : '';
-    el.lastSyncLabel.textContent = `SOAP ${state.lastSyncAt.toLocaleTimeString('es-AR', {
+    el.lastSyncLabel.textContent = `Act. ${state.lastSyncAt.toLocaleTimeString('es-AR', {
       hour: '2-digit',
       minute: '2-digit',
-      second: '2-digit'
+      second: '2-digit',
+      hour12: false
     })}${extLabel}`;
 
     updateSignalPill();
@@ -1506,7 +1517,7 @@ function renderDrilldown() {
           </div>
           <div class="stop-card-name">${escapeHtml(p.descripcion)}</div>
           <div class="stop-card-foot">
-            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas (000)</button>
+            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas las líneas</button>
             <button class="pill-btn pill-btn-ghost btn-open-only" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Solo ${escapeHtml(state.drill.linea.descripcion)}</button>
           </div>
         </div>
@@ -1681,7 +1692,7 @@ function renderGlobalSearchResults(rawQuery) {
   if (/^CT\d{3,6}$/.test(upper)) {
     results.push({
       title: `Ir a parada ${upper}`,
-      sub: 'Arribos SOAP de todas las líneas (código 000)',
+      sub: 'Consultar arribos de todas las líneas',
       badge: upper,
       action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '000')
     });
@@ -1695,7 +1706,7 @@ function renderGlobalSearchResults(rawQuery) {
     if (`${s.id} ${s.nombre} ${s.alias || ''}`.toUpperCase().includes(upper)) {
       results.push({
         title: s.nombre,
-        sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas (000)',
+        sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas',
         badge: s.id,
         action: () => openStopRadar(s, '000')
       });
@@ -1769,16 +1780,16 @@ function bindEvents() {
 
   el.btnLiveMode.addEventListener('click', async () => {
     if (!state.activeStop) {
-      showToast('Buscá una parada primero para activar la interpolación sobre datos SOAP', 'info');
+      showToast('Buscá una parada primero para activar el modo simulación', 'info');
       return;
     }
     state.simulateMode = !state.simulateMode;
     updateSignalPill();
     if (state.simulateMode) {
-      showToast('Interpolación activada: sigue el sentido real y giro en cabecera de cada unidad SOAP', 'success');
+      showToast('Simulación activa: los coches avanzan sobre su recorrido real', 'success');
       if (state.arribos.length === 0) await fetchArribos(false);
     } else {
-      showToast('Modo EN VIVO: sincronizando directo cada 15s con SOAP', 'info');
+      showToast('Modo EN VIVO: actualización automática cada 15s', 'info');
       fetchArribos(false);
     }
   });
@@ -1797,7 +1808,13 @@ function bindEvents() {
   el.btnRefresh.addEventListener('click', () => fetchArribos(false));
   el.btnShowRoutes.addEventListener('click', toggleActiveStopRoutes);
   el.btnToggleHorarios.addEventListener('click', toggleHorariosView);
-  el.btnFitFleet.addEventListener('click', () => transitMap.fitFleet(state.arribos));
+  el.btnFitFleet.addEventListener('click', () => {
+    const visible =
+      state.filterLine === 'ALL'
+        ? state.arribos
+        : state.arribos.filter((b) => b.descripcionLinea === state.filterLine);
+    transitMap.fitFleet(visible);
+  });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
   el.btnInspRoute.addEventListener('click', () => {

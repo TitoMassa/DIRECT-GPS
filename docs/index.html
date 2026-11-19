@@ -60,7 +60,7 @@
       </div>
 
       <div class="status-cluster">
-        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre telemetría SOAP en vivo e interpolación de trayectoria real por segundo">
+        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre seguimiento en vivo y movimiento continuo estimado">
           <span class="signal-dot" id="signal-dot"></span>
           <span id="signal-label">EN VIVO</span>
         </button>
@@ -134,7 +134,7 @@
           <div class="stop-hero-top">
             <div class="stop-id-row">
               <span id="stop-code-badge" class="code-badge">—</span>
-              <span id="stop-pilot-tag" class="pilot-tag">Todas las líneas (000)</span>
+              <span id="stop-pilot-tag" class="pilot-tag">Todas las líneas</span>
             </div>
             <div class="stop-hero-actions">
               <button id="btn-toggle-fav" class="mini-action-btn" title="Guardar parada en favoritas" aria-label="Guardar en favoritas">
@@ -228,7 +228,7 @@
         <div class="panel-header-sticky">
           <div class="fav-intro">
             <h3 class="panel-subtitle">Paradas guardadas</h3>
-            <p class="panel-hint">Acceso directo al radar con código 000 (todas las líneas).</p>
+            <p class="panel-hint">Acceso directo al radar con todas las líneas.</p>
           </div>
         </div>
         <div id="favoritas-list" class="dock-scroll-area"></div>
@@ -243,7 +243,7 @@
           <strong id="insp-bandera" class="insp-bandera">—</strong>
           <div class="insp-badges-row">
             <span id="insp-coche-pill" class="coche-pill">Coche #—</span>
-            <span id="insp-desvio-pill" class="desvio-pill desvio-ontime">En horario</span>
+            <span id="insp-desvio-pill" class="desvio-pill hidden"></span>
           </div>
         </div>
         <button id="btn-close-inspector" class="mini-close-btn" aria-label="Cerrar detalle de unidad">✕</button>

@@ -193,22 +193,6 @@ export class TransitMap {
     });
   }
 
-  _buildBusTooltipHtml(bus) {
-    const coche = bus.identificadorCoche ? ` · Coche #${bus.identificadorCoche}` : '';
-    const ext = bus.esExtendido ? ` <span style="opacity:0.8">(Flota extendida)</span>` : '';
-    const turno = bus.turnoProgramado ? `<br/>Turno programado: <strong>${bus.turnoProgramado}</strong>` : '';
-    const desvio =
-      bus.desvio && bus.desvio.status !== 'none' ? `<br/>Desvío: <strong>${bus.desvio.label}</strong>` : '';
-    const legNote = bus.isOppositeLeg
-      ? `<br/><span style="color:#f59e0b">↺ En tramo previo: ${bus.realBandera}</span>`
-      : '';
-    const chofer = bus.choferNombre
-      ? `<br/>Chofer: ${bus.choferNombre}${bus.choferLegajo ? ` (ID ${bus.choferLegajo})` : ''}`
-      : '';
-    const gps = bus.gpsTimeOnly ? `<br/><small>GPS: ${bus.gpsTimeOnly}</small>` : '';
-    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}${ext}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${turno}${legNote}${desvio}${chofer}${gps}`;
-  }
-
   // Zero-lag position-only update for 1-second interpolation ticks (no setIcon / no DOM rebuild!)
   moveBusPositionsFast(buses) {
     for (const bus of buses) {
@@ -234,23 +218,19 @@ export class TransitMap {
 
       const isSelected = bus.key === selectedBusKey;
       const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: false });
-      const tooltipHtml = this._buildBusTooltipHtml(bus);
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
         const curPos = existing.marker.getLatLng();
         this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
         existing.marker.setIcon(icon);
-        existing.marker.setTooltipContent(tooltipHtml);
         existing.marker.setZIndexOffset(isSelected ? 1000 : 500);
         existing.data = bus;
       } else {
         const marker = L.marker([bus.lat, bus.lng], {
           icon,
           zIndexOffset: isSelected ? 1000 : 500
-        })
-          .addTo(this.busLayer)
-          .bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -28] });
+        }).addTo(this.busLayer);
 
         marker.on('click', () => {
           this.onBusSelect(bus.key);

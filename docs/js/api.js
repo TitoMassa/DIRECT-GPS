@@ -143,36 +143,41 @@ export const api = {
 export function parseDesvioHorario(raw = '') {
   const clean = String(raw || '').trim();
   if (!clean) {
-    return { raw: '', status: 'none', label: 'Sin desvío', shortLabel: '—', sign: '', minutes: 0 };
+    return { raw: '', status: 'none', label: '', shortLabel: '', sign: '', minutes: 0, seconds: 0 };
   }
   const normalized = clean.replace(/\s+/g, '');
   if (normalized === '00:00' || normalized === '+00:00' || normalized === '-00:00' || normalized === '0') {
-    return { raw: clean, status: 'ontime', label: 'En horario', shortLabel: '00:00', sign: '=', minutes: 0 };
+    return { raw: clean, status: 'ok', label: '00:00', shortLabel: '00:00', sign: '=', minutes: 0, seconds: 0 };
   }
-  const m = normalized.match(/^([+-])(\d{1,2}):(\d{2})$/);
-  const signedMin = m ? (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) + parseInt(m[3], 10) / 60) : 0;
 
-  if (normalized.startsWith('+')) {
-    return {
-      raw: clean,
-      status: 'ahead',
-      label: `Adelantado ${normalized}`,
-      shortLabel: `+${normalized.slice(1)}`,
-      sign: '+',
-      minutes: signedMin
-    };
+  const m = normalized.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  if (!m) {
+    return { raw: clean, status: 'ok', label: normalized, shortLabel: normalized, sign: '', minutes: 0, seconds: 0 };
   }
-  if (normalized.startsWith('-')) {
-    return {
-      raw: clean,
-      status: 'late',
-      label: `Atrasado ${normalized}`,
-      shortLabel: `-${normalized.slice(1)}`,
-      sign: '-',
-      minutes: signedMin
-    };
-  }
-  return { raw: clean, status: 'ontime', label: clean, shortLabel: clean, sign: '', minutes: 0 };
+
+  const sign = m[1];
+  const mins = parseInt(m[2], 10);
+  const secs = parseInt(m[3], 10);
+  const signedSec = (sign === '+' ? 1 : -1) * (mins * 60 + secs);
+  const signedMin = signedSec / 60;
+
+  // Thresholds:
+  // -03:00 .. +03:00 (|sec| <= 180) -> 'ok' (green)
+  // +03:01 or more  (sec > 180)     -> 'ahead' (blue)
+  // -03:01 or more  (sec < -180)    -> 'late' (red)
+  let status = 'ok';
+  if (signedSec > 180) status = 'ahead';
+  else if (signedSec < -180) status = 'late';
+
+  return {
+    raw: clean,
+    status,
+    label: normalized,
+    shortLabel: normalized,
+    sign,
+    minutes: signedMin,
+    seconds: signedSec
+  };
 }
 
 /**
