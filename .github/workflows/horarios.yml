@@ -1,0 +1,63 @@
+name: Archivo de horarios programados
+
+# Escanea todas las líneas × todas las paradas en SmartMovePro y guarda la grilla completa de cada
+# tipo de día en docs/data/horarios/. Corre todas las noches a las 03:30 (hora de Corrientes):
+# SmartMovePro publica con 48 h de anticipación, así que cada noche se capturan los 2 días siguientes
+# y a lo largo de la semana quedan cubiertos Lun–Vie, Sábado y Domingo.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+    inputs:
+      offsets:
+        description: 'Días a futuro a escanear (separados por coma)'
+        required: false
+        default: '1,2'
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: horarios-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Escanear horarios
+        run: node scripts/scan-horarios.mjs --offsets="${{ github.event.inputs.offsets || '1,2' }}"
+
+      - name: Guardar cambios
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/horarios
+          if git diff --cached --quiet; then
+            echo "Sin cambios."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "data: horarios programados $(date -u +%F)"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && break
+            sleep 5
+          done
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar en GitHub Pages
+        if: steps.commit.outputs.pushed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || true

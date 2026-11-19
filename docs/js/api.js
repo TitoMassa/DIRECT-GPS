@@ -69,6 +69,65 @@ function setLocalCache(key, value) {
   }
 }
 
+// ── Permanent timetable archive (docs/data/horarios/<codLinea>.json, refreshed nightly) ──
+const archiveByLine = new Map(); // codLinea -> Promise<file|null>
+
+function loadArchiveLine(codLinea) {
+  const key = String(Number(codLinea));
+  if (!archiveByLine.has(key)) {
+    const url = new URL(`../data/horarios/${key}.json`, import.meta.url);
+    const p = fetch(url, { cache: 'no-cache' })
+      .then((res) => (res.ok ? res.json() : null))
+      .catch(() => null)
+      .then((file) => {
+        if (!file) archiveByLine.delete(key); // retry on next request
+        return file;
+      });
+    archiveByLine.set(key, p);
+  }
+  return archiveByLine.get(key);
+}
+
+async function getArchivedHorarios(stopId, codLinea, tipoDia) {
+  const file = await loadArchiveLine(codLinea);
+  const list = file?.paradas?.[stopId]?.[tipoDia];
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const banderas = Array.isArray(file.banderas) ? file.banderas : [];
+
+  const horarios = list
+    .map((s) => {
+      const [time, idx = '0'] = String(s).split('|');
+      const hora = time.slice(0, 5);
+      const [hh = '0', mm = '0'] = hora.split(':');
+      return {
+        codigoLinea: Number(codLinea),
+        identificadorParada: stopId,
+        bandera: banderas[Number(idx)] || '',
+        horaPaso: time,
+        hora,
+        minuteOfDay: parseInt(hh, 10) * 60 + parseInt(mm, 10)
+      };
+    })
+    .sort((a, b) => a.minuteOfDay - b.minuteOfDay);
+
+  const diffs = [];
+  for (let i = 1; i < horarios.length; i++) {
+    const d = horarios[i].minuteOfDay - horarios[i - 1].minuteOfDay;
+    if (d >= 2 && d <= 90) diffs.push(d);
+  }
+  diffs.sort((a, b) => a - b);
+
+  return {
+    idParada: stopId,
+    codigoLinea: Number(codLinea),
+    tipoDia,
+    available: true,
+    partial: false,
+    horarios,
+    frecuenciaMin: diffs.length ? diffs[Math.floor(diffs.length / 2)] : null
+  };
+}
+
 export function getArgentinaNow() {
   return new Date(Date.now() - 3 * 3600 * 1000);
 }
@@ -117,7 +176,11 @@ export const api = {
     const resolvedTipo = tipoDia === 'auto' ? getArgentinaTodayTipo() : tipoDia;
     const cacheKey = `dgps_hor_v2_${cleanStop}_${codLinea}_${resolvedTipo}`;
 
-    // Persistent 14-day cache per day-type (habil / sabado / domingo) — full 24h schedules never expire daily!
+    // 1) Permanent shared archive (scanned nightly by GitHub Actions, survives any cache clearing).
+    const archived = await getArchivedHorarios(cleanStop, codLinea, resolvedTipo);
+    if (archived) return { data: archived, source: 'archivo', archived: true };
+
+    // 2) Persistent 14-day cache per day-type (habil / sabado / domingo) — full 24h schedules never expire daily!
     const cached = getLocalCache(cacheKey, 14 * 24 * 60 * 60 * 1000);
     if (cached && cached.available && !cached.partial && cached.horarios?.length > 0) {
       return { data: cached, source: 'local-cache', cached: true };

@@ -1,0 +1,261 @@
+{
+  "version": 1,
+  "lineas": {
+    "94": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "102A",
+      "paradas": 61
+    },
+    "96": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "102C",
+      "paradas": 67
+    },
+    "97": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "102B",
+      "paradas": 58
+    },
+    "113": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "104A",
+      "paradas": 62
+    },
+    "114": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "104C",
+      "paradas": 117
+    },
+    "115": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "104B",
+      "paradas": 74
+    },
+    "118": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "104D",
+      "paradas": 71
+    },
+    "132": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "103A",
+      "paradas": 83
+    },
+    "133": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "103B",
+      "paradas": 59
+    },
+    "134": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "103C",
+      "paradas": 60
+    },
+    "342": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "109A",
+      "paradas": 128
+    },
+    "346": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "105A",
+      "paradas": 78
+    },
+    "347": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "105B",
+      "paradas": 77
+    },
+    "348": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "105C",
+      "paradas": 83
+    },
+    "350": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "106A",
+      "paradas": 77
+    },
+    "351": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "106B",
+      "paradas": 91
+    },
+    "352": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "106C",
+      "paradas": 103
+    },
+    "353": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "109B",
+      "paradas": 110
+    },
+    "356": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "108A",
+      "paradas": 99
+    },
+    "357": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "108C",
+      "paradas": 60
+    },
+    "433": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "RIACHUELO - ERSA",
+      "paradas": 90
+    },
+    "517": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904A CAMPUS / NAC",
+      "paradas": 0
+    },
+    "607": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904B SARM / NAC",
+      "paradas": 0
+    },
+    "608": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904C BQRAS / NAC",
+      "paradas": 0
+    },
+    "705": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "SANTA ANA-INGENIO",
+      "paradas": 30
+    },
+    "744": {
+      "tipos": {},
+      "descripcion": "AEROBUS",
+      "paradas": 0
+    },
+    "851": {
+      "tipos": {},
+      "descripcion": "LINEA 110 / PROV",
+      "paradas": 0
+    },
+    "852": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "CHAC CORR /NAC",
+      "paradas": 0
+    },
+    "853": {
+      "tipos": {},
+      "descripcion": "CHAC RES / NAC",
+      "paradas": 0
+    },
+    "854": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "PTO. TIROL / PROV",
+      "paradas": 0
+    },
+    "1037": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904A",
+      "paradas": 82
+    },
+    "1038": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904B",
+      "paradas": 45
+    },
+    "1039": {
+      "tipos": {
+        "habil": "2026-11-20",
+        "sabado": "2026-11-21"
+      },
+      "descripcion": "904C",
+      "paradas": 46
+    }
+  },
+  "updatedAt": "2026-11-19T22:53:31.212Z"
+}

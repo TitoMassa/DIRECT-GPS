@@ -1269,11 +1269,13 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
     ].filter((g) => g.items.length > 0);
 
     const freqText = data.frecuenciaMin ? `Cada ~${data.frecuenciaMin} min` : `${horarios.length} pasos`;
-    const statusTag = res.cached
-      ? 'Caché 24h local'
-      : data.partial
-        ? 'Restante de hoy (sin mezclar días)'
-        : `Día completo (${data.fechaConsultada || '24h'})`;
+    const statusTag = res.archived
+      ? 'Grilla completa'
+      : res.cached
+        ? 'Caché 24h local'
+        : data.partial
+          ? 'Restante de hoy (sin mezclar días)'
+          : `Día completo (${data.fechaConsultada || '24h'})`;
 
     let bodyHtml;
     if (!data.available || horarios.length === 0) {
