@@ -63,11 +63,19 @@ export class BusSimulator {
       const gpsAgeSec = rawAgeSec >= 0 && rawAgeSec < 7200 ? rawAgeSec : 0;
       const isStaleTracker = gpsAgeSec > 45;
 
+      // Terminal layover (descanso en cabecera / punta de línea):
+      // If a bus is physically at a terminal (within ~165 m of branch start/end), especially with
+      // positive schedule deviation (+MM:SS adelanto), assume it is resting until fresh GPS proves departure!
+      const isAtTerminal = Boolean(newTraj.isAtTerminal);
+      const aheadSec = bus.desvio?.seconds || 0;
+      const likelyTerminalRest = isAtTerminal && aheadSec >= 60;
+
       // Conservative initial speed before 2 distinct GPS timestamps have been observed
       const etaSec = Math.max(60, (bus.eta?.minutes || 10) * 60);
-      const conservativeInitSpeed = isStaleTracker
-        ? 0
-        : clamp((newRealRem / etaSec) * 0.62, 1.8, 3.8);
+      const conservativeInitSpeed =
+        isStaleTracker || isAtTerminal
+          ? 0
+          : clamp((newRealRem / etaSec) * 0.62, 1.8, 3.8);
 
       if (!prev) {
         const entry = {
@@ -78,7 +86,9 @@ export class BusSimulator {
           observedSpeedMps: null,
           cruiseSpeedMps: conservativeInitSpeed,
           currentSpeedMps: conservativeInitSpeed * 0.4,
-          isStopped: isStaleTracker,
+          isStopped: isStaleTracker || isAtTerminal,
+          isAtTerminal,
+          aheadSec,
           overshootMeters: 0,
           lagMeters: 0,
           deadReckonMeters: 0,
@@ -89,6 +99,9 @@ export class BusSimulator {
         this.units.set(bus.key, entry);
         continue;
       }
+
+      prev.isAtTerminal = isAtTerminal;
+      prev.aheadSec = aheadSec;
 
       // Did the bus tracker emit a genuinely NEW GPS fix since last poll?
       const movedFromLastReal = Math.abs(prev.lastRealRem - newRealRem);
@@ -106,15 +119,17 @@ export class BusSimulator {
             : Math.max(5, (nowMs - prev.lastGpsPollMs) / 1000);
 
         const realAdvance = prev.lastRealRem - newRealRem;
+        // At terminals, GPS drift on parked vehicles can bounce 12-16m -> use a slightly higher departure threshold (20m)
+        const minMoveThreshold = isAtTerminal ? 20 : 11;
 
-        if (realAdvance < 11 && dtReal >= 7) {
-          // Bus barely moved over >= 7s -> red light, bus stop, or terminal wait!
+        if ((realAdvance < minMoveThreshold && dtReal >= 7) || (likelyTerminalRest && realAdvance < 28)) {
+          // Bus barely moved -> red light, bus stop, or terminal layover (descanso en cabecera)!
           prev.isStopped = true;
           prev.cruiseSpeedMps = 0;
           if (prev.observedSpeedMps !== null) {
             prev.observedSpeedMps = Math.max(2.2, prev.observedSpeedMps * 0.85);
           }
-        } else if (realAdvance >= 11 && realAdvance < 900) {
+        } else if (realAdvance >= minMoveThreshold && realAdvance < 900) {
           const instSpeed = clamp(realAdvance / dtReal, 0.9, 10.5); // ~3 to 38 km/h urban Corrientes
           prev.observedSpeedMps =
             prev.observedSpeedMps !== null ? 0.62 * instSpeed + 0.38 * prev.observedSpeedMps : instSpeed;
@@ -126,9 +141,9 @@ export class BusSimulator {
         prev.lastGpsMs = gpsMs ?? prev.lastGpsMs;
         prev.lastGpsPollMs = nowMs;
         prev.lastRealRem = newRealRem;
-      } else if (isSameGpsTimestamp || isStaleTracker) {
+      } else if (isSameGpsTimestamp || isStaleTracker || likelyTerminalRest) {
         const silentSec = (nowMs - prev.lastGpsPollMs) / 1000;
-        if (silentSec > 24 || isStaleTracker) {
+        if (silentSec > 24 || isStaleTracker || likelyTerminalRest) {
           prev.isStopped = true;
           prev.cruiseSpeedMps = 0;
         }
@@ -224,6 +239,11 @@ export class BusSimulator {
         ? clamp((st.observedSpeedMps || 3.5) * 13, 42, 80)
         : 40;
 
+      // Check if simulated bus has reached a terminal turnaround along the trajectory and should pause for layover
+      const reachedTurnaround =
+        (traj.turnaroundAtMeters > 40 && Math.abs(st.walkedMeters - traj.turnaroundAtMeters) < 25) ||
+        (traj.oppStartMeters > 40 && Math.abs(st.walkedMeters - traj.oppStartMeters) < 25);
+
       let targetSpeed = 0;
 
       if (st.lagMeters > 3) {
@@ -231,8 +251,8 @@ export class BusSimulator {
         const baseCruise = st.isStopped ? 1.8 : Math.max(2.2, st.cruiseSpeedMps);
         const catchupBoost = clamp(st.lagMeters / 8.5, 0.4, 3.6);
         targetSpeed = clamp(baseCruise + catchupBoost, 1.5, 10.8);
-      } else if (st.isStopped || st.overshootMeters > 6) {
-        // Bus is stopped at a red light / bus stop, OR simulated marker is ahead of last real GPS -> smooth brake & HOLD!
+      } else if (st.isStopped || st.overshootMeters > 6 || (reachedTurnaround && st.aheadSec >= 45)) {
+        // Bus is stopped (red light / bus stop / terminal descanso), or arrived at cabecera ahead of schedule -> HOLD!
         targetSpeed = 0;
       } else {
         // Normal cruising along street polyline

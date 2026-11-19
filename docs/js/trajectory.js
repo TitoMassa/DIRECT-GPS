@@ -339,6 +339,21 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   const stopBandera = stopBranch.bandera || bus.descripcionBandera;
   const stopColor = stopBranch.color;
 
+  // Detect if the bus is currently parked/resting at a line terminal (cabecera / punta de línea)
+  const terminalPts = [
+    stopBranch.pts[0],
+    stopBranch.pts[stopBranch.pts.length - 1]
+  ];
+  if (oppositeBranch) {
+    terminalPts.push(oppositeBranch.pts[0], oppositeBranch.pts[oppositeBranch.pts.length - 1]);
+  }
+  if (returnBranch && returnBranch !== oppositeBranch) {
+    terminalPts.push(returnBranch.pts[0], returnBranch.pts[returnBranch.pts.length - 1]);
+  }
+  const isAtTerminal = terminalPts.some(
+    (pt) => (distanceMeters(bus.lat, bus.lng, pt[0], pt[1]) ?? Infinity) <= 165
+  );
+
   const mapStopsInRange = (branch, fromAlong, toAlong, offsetMeters) => {
     const out = [];
     for (const sa of branch?.stopAlongs || []) {
@@ -391,6 +406,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       leg: 'full_cycle',
       isOppositeLeg: false,
       isNextCycle: true,
+      isAtTerminal,
       realBandera: stopBandera,
       realBanderaColor: stopColor,
       segments,
@@ -430,6 +446,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       leg: 'previous_leg',
       isOppositeLeg: true,
       isNextCycle: false,
+      isAtTerminal,
       realBandera: oppBandera,
       realBanderaColor: oppColor,
       segments,
@@ -461,6 +478,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     leg: 'direct',
     isOppositeLeg: false,
     isNextCycle: false,
+    isAtTerminal,
     realBandera: stopBandera,
     realBanderaColor: stopColor,
     segments: [{ pts: pathPts, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: totalMeters }],
