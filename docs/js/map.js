@@ -172,6 +172,7 @@ export class TransitMap {
     const cls = ['bus-marker-wrap'];
     if (selected) cls.push('is-selected');
     if (dimmed) cls.push('is-dimmed');
+    if (bus.isPredicted || bus.gpsLost) cls.push('is-predicted');
 
     const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
     const cocheHtml = bus.identificadorCoche
@@ -180,7 +181,9 @@ export class TransitMap {
     const dotHtml =
       bus.desvio && bus.desvio.status !== 'none'
         ? `<span class="bus-desvio-dot ${bus.desvio.status}"></span>`
-        : '';
+        : bus.isPredicted || bus.gpsLost
+          ? `<span class="bus-desvio-dot pred"></span>`
+          : '';
 
     return L.divIcon({
       className: 'bus-leaflet-icon',

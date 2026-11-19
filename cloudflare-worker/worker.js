@@ -163,8 +163,397 @@ async function getLineas() {
   return normalized;
 }
 
-export default {
+function getArgentinaDayKey(nowMs = Date.now()) {
+  const d = new Date(nowMs - 3 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+function parseDesvioSeconds(raw = '') {
+  const clean = String(raw || '').replace(/\s+/g, '');
+  const m = clean.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  if (!m) return 0;
+  return (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
+}
+
+// Persistent SQLite-backed Durable Object (Workers Free tier): stores last-seen online
+// vehicle/driver/turn assignments system-wide across all users and sessions.
+export class FleetMemory {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.sql = ctx.storage.sql;
+    this._ready = false;
+  }
+
+  _ensureSchema() {
+    if (this._ready) return;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS trip_assignments (
+        day_key TEXT NOT NULL,
+        codigo_linea INTEGER NOT NULL,
+        trip_key TEXT NOT NULL,
+        turno_hora TEXT DEFAULT '',
+        coche TEXT NOT NULL,
+        chofer_nombre TEXT DEFAULT '',
+        chofer_legajo TEXT DEFAULT '',
+        chofer_raw TEXT DEFAULT '',
+        es_adaptado INTEGER DEFAULT 0,
+        desvio_sec INTEGER DEFAULT 0,
+        desvio_raw TEXT DEFAULT '',
+        ultima_gps TEXT DEFAULT '',
+        lat REAL,
+        lng REAL,
+        stop_id TEXT DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (day_key, codigo_linea, trip_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_trip_day_line ON trip_assignments (day_key, codigo_linea);
+
+      CREATE TABLE IF NOT EXISTS unit_last_seen (
+        codigo_linea INTEGER NOT NULL,
+        coche TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        trip_key TEXT DEFAULT '',
+        chofer_nombre TEXT DEFAULT '',
+        chofer_legajo TEXT DEFAULT '',
+        chofer_raw TEXT DEFAULT '',
+        es_adaptado INTEGER DEFAULT 0,
+        desvio_sec INTEGER DEFAULT 0,
+        desvio_raw TEXT DEFAULT '',
+        bandera TEXT DEFAULT '',
+        ultima_gps TEXT DEFAULT '',
+        lat REAL,
+        lng REAL,
+        stop_id TEXT DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (codigo_linea, coche)
+      );
+      CREATE INDEX IF NOT EXISTS idx_unit_line ON unit_last_seen (codigo_linea);
+    `);
+    this._ready = true;
+  }
+
+  _pruneOld(nowMs) {
+    const cutoff = nowMs - 4 * 86400 * 1000;
+    this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', cutoff);
+    this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
+  }
+
   async fetch(request) {
+    this._ensureSchema();
+    const url = new URL(request.url);
+    const nowMs = Date.now();
+    const todayKey = getArgentinaDayKey(nowMs);
+
+    if (request.method === 'POST' && url.pathname === '/record-units') {
+      const body = await request.json().catch(() => ({}));
+      const units = Array.isArray(body.units) ? body.units : [];
+      let count = 0;
+      for (const u of units) {
+        const cod = Number(u.codigoLinea);
+        const coche = String(u.coche || '').trim();
+        if (!cod || !coche) continue;
+        this.sql.exec(
+          `INSERT INTO unit_last_seen (
+            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+            day_key = excluded.day_key,
+            trip_key = CASE WHEN excluded.trip_key != '' THEN excluded.trip_key ELSE unit_last_seen.trip_key END,
+            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+            es_adaptado = excluded.es_adaptado,
+            desvio_sec = excluded.desvio_sec,
+            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+            lat = COALESCE(excluded.lat, unit_last_seen.lat),
+            lng = COALESCE(excluded.lng, unit_last_seen.lng),
+            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+            updated_at = excluded.updated_at`,
+          cod,
+          coche,
+          todayKey,
+          String(u.tripKey || '').trim(),
+          String(u.choferNombre || '').trim(),
+          String(u.choferLegajo || '').trim(),
+          String(u.choferRaw || '').trim(),
+          u.esAdaptado ? 1 : 0,
+          Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+          String(u.desvioRaw || '').trim(),
+          String(u.bandera || '').trim(),
+          String(u.ultimaGps || '').trim(),
+          Number.isFinite(u.lat) ? u.lat : null,
+          Number.isFinite(u.lng) ? u.lng : null,
+          String(u.stopId || '').trim().toUpperCase(),
+          nowMs
+        );
+        count++;
+      }
+      return Response.json({ ok: true, count });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/record-trips') {
+      const body = await request.json().catch(() => ({}));
+      const entries = Array.isArray(body.entries) ? body.entries : [];
+      const dayKey = String(body.dayKey || todayKey).slice(0, 10);
+      let count = 0;
+
+      for (const e of entries) {
+        const cod = Number(e.codigoLinea ?? body.codigoLinea);
+        const tripKey = String(e.tripKey || '').trim();
+        const coche = String(e.coche || '').trim();
+        if (!cod || !tripKey || !coche) continue;
+
+        const lat = Number.isFinite(Number(e.lat)) ? Number(e.lat) : null;
+        const lng = Number.isFinite(Number(e.lng)) ? Number(e.lng) : null;
+        const desvioSec = Number.isFinite(Number(e.desvioSec)) ? Math.round(Number(e.desvioSec)) : 0;
+
+        this.sql.exec(
+          `INSERT INTO trip_assignments (
+            day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
+            chofer_raw, es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(day_key, codigo_linea, trip_key) DO UPDATE SET
+            turno_hora = CASE WHEN excluded.turno_hora != '' THEN excluded.turno_hora ELSE trip_assignments.turno_hora END,
+            coche = excluded.coche,
+            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE trip_assignments.chofer_nombre END,
+            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE trip_assignments.chofer_legajo END,
+            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE trip_assignments.chofer_raw END,
+            es_adaptado = excluded.es_adaptado,
+            desvio_sec = excluded.desvio_sec,
+            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE trip_assignments.desvio_raw END,
+            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE trip_assignments.ultima_gps END,
+            lat = COALESCE(excluded.lat, trip_assignments.lat),
+            lng = COALESCE(excluded.lng, trip_assignments.lng),
+            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE trip_assignments.stop_id END,
+            updated_at = excluded.updated_at`,
+          dayKey,
+          cod,
+          tripKey,
+          String(e.turnoHora || '').trim(),
+          coche,
+          String(e.choferNombre || '').trim(),
+          String(e.choferLegajo || '').trim(),
+          String(e.choferRaw || '').trim(),
+          e.esAdaptado ? 1 : 0,
+          desvioSec,
+          String(e.desvioRaw || '').trim(),
+          String(e.ultimaGps || '').trim(),
+          lat,
+          lng,
+          String(e.stopId || '').trim().toUpperCase(),
+          nowMs
+        );
+
+        this.sql.exec(
+          `INSERT INTO unit_last_seen (
+            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+            day_key = excluded.day_key,
+            trip_key = excluded.trip_key,
+            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+            es_adaptado = excluded.es_adaptado,
+            desvio_sec = excluded.desvio_sec,
+            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+            lat = COALESCE(excluded.lat, unit_last_seen.lat),
+            lng = COALESCE(excluded.lng, unit_last_seen.lng),
+            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+            updated_at = excluded.updated_at`,
+          cod,
+          coche,
+          dayKey,
+          tripKey,
+          String(e.choferNombre || '').trim(),
+          String(e.choferLegajo || '').trim(),
+          String(e.choferRaw || '').trim(),
+          e.esAdaptado ? 1 : 0,
+          desvioSec,
+          String(e.desvioRaw || '').trim(),
+          String(e.bandera || '').trim(),
+          String(e.ultimaGps || '').trim(),
+          lat,
+          lng,
+          String(e.stopId || '').trim().toUpperCase(),
+          nowMs
+        );
+        count++;
+      }
+
+      if (Math.random() < 0.05) this._pruneOld(nowMs);
+      return Response.json({ ok: true, count, dayKey });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/query') {
+      const rawLineas = url.searchParams.get('lineas') || url.searchParams.get('codLinea') || '';
+      const lineCodes = rawLineas
+        .split(',')
+        .map((n) => Number(n.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      const dayKey = String(url.searchParams.get('dayKey') || todayKey).slice(0, 10);
+
+      let tripRows;
+      let unitRows;
+      if (lineCodes.length > 0) {
+        const ph = lineCodes.map(() => '?').join(',');
+        tripRows = this.sql
+          .exec(
+            `SELECT codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, chofer_raw,
+                    es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+             FROM trip_assignments
+             WHERE day_key = ? AND codigo_linea IN (${ph})
+             ORDER BY updated_at DESC`,
+            dayKey,
+            ...lineCodes
+          )
+          .toArray();
+        unitRows = this.sql
+          .exec(
+            `SELECT codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+             FROM unit_last_seen
+             WHERE codigo_linea IN (${ph}) AND updated_at > ?
+             ORDER BY updated_at DESC`,
+            ...lineCodes,
+            nowMs - 24 * 3600 * 1000
+          )
+          .toArray();
+      } else {
+        tripRows = this.sql
+          .exec(
+            `SELECT codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, chofer_raw,
+                    es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+             FROM trip_assignments
+             WHERE day_key = ?
+             ORDER BY updated_at DESC LIMIT 600`,
+            dayKey
+          )
+          .toArray();
+        unitRows = this.sql
+          .exec(
+            `SELECT codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+             FROM unit_last_seen
+             WHERE updated_at > ?
+             ORDER BY updated_at DESC LIMIT 600`,
+            nowMs - 24 * 3600 * 1000
+          )
+          .toArray();
+      }
+
+      return Response.json({
+        dayKey,
+        trips: tripRows.map((r) => ({
+          codigoLinea: r.codigo_linea,
+          tripKey: r.trip_key,
+          turnoHora: r.turno_hora,
+          coche: r.coche,
+          choferNombre: r.chofer_nombre,
+          choferLegajo: r.chofer_legajo,
+          choferRaw: r.chofer_raw,
+          esAdaptado: Boolean(r.es_adaptado),
+          desvioSec: r.desvio_sec,
+          desvioRaw: r.desvio_raw,
+          ultimaGps: r.ultima_gps,
+          lat: r.lat,
+          lng: r.lng,
+          stopId: r.stop_id,
+          updatedAt: r.updated_at
+        })),
+        units: unitRows.map((r) => ({
+          codigoLinea: r.codigo_linea,
+          coche: r.coche,
+          dayKey: r.day_key,
+          tripKey: r.trip_key,
+          choferNombre: r.chofer_nombre,
+          choferLegajo: r.chofer_legajo,
+          choferRaw: r.chofer_raw,
+          esAdaptado: Boolean(r.es_adaptado),
+          desvioSec: r.desvio_sec,
+          desvioRaw: r.desvio_raw,
+          bandera: r.bandera,
+          ultimaGps: r.ultima_gps,
+          lat: r.lat,
+          lng: r.lng,
+          stopId: r.stop_id,
+          updatedAt: r.updated_at
+        }))
+      });
+    }
+
+    return Response.json({ error: 'Not found' }, { status: 404 });
+  }
+}
+
+// Isolate-level throttle & fallback store when Durable Object isn't bound
+const isolateWriteThrottle = new Map(); // `${cod}:${coche}` -> { ts, sig }
+const fallbackTrips = new Map();
+const fallbackUnits = new Map();
+
+function getFleetStub(env) {
+  if (!env?.FLEET_MEMORY) return null;
+  return env.FLEET_MEMORY.get(env.FLEET_MEMORY.idFromName('corrientes-v1'));
+}
+
+async function recordObservedUnits(env, arribos = [], stopId = '') {
+  if (!Array.isArray(arribos) || arribos.length === 0) return;
+  const nowMs = Date.now();
+  const batch = [];
+  for (const a of arribos) {
+    const cod = Number(a.codigoLinea);
+    const coche = String(a.identificadorCoche || '').trim();
+    if (!cod || !coche) continue;
+    const sig = `${a.choferNombre || ''}|${a.choferLegajo || ''}|${a.desvioHorario || ''}|${a.ultimaFechaHoraGPS || ''}`;
+    const k = `${cod}:${coche}`;
+    const prev = isolateWriteThrottle.get(k);
+    if (prev && prev.sig === sig && nowMs - prev.ts < 45000) continue;
+    isolateWriteThrottle.set(k, { ts: nowMs, sig });
+    const lat = parseFloat(a.latitud);
+    const lng = parseFloat(a.longitud);
+    const item = {
+      codigoLinea: cod,
+      coche,
+      choferNombre: a.choferNombre || '',
+      choferLegajo: a.choferLegajo || '',
+      choferRaw: a.identificadorChofer || '',
+      esAdaptado: Boolean(a.esAdaptado),
+      desvioSec: parseDesvioSeconds(a.desvioHorario),
+      desvioRaw: a.desvioHorario || '',
+      bandera: a.descripcionBandera || '',
+      ultimaGps: a.ultimaFechaHoraGPS || '',
+      lat: !Number.isNaN(lat) && lat !== 0 ? lat : null,
+      lng: !Number.isNaN(lng) && lng !== 0 ? lng : null,
+      stopId,
+      updatedAt: nowMs
+    };
+    batch.push(item);
+    fallbackUnits.set(k, { ...item, dayKey: getArgentinaDayKey(nowMs), tripKey: '' });
+  }
+  if (batch.length === 0) return;
+  const stub = getFleetStub(env);
+  if (!stub) return;
+  try {
+    await stub.fetch('https://fleet-memory/record-units', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ units: batch })
+    });
+  } catch {
+    // Non-fatal: never block live arrivals
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -174,7 +563,95 @@ export default {
 
     try {
       if (pathname === '/' || pathname === '/api/health') {
-        return jsonResponse({ ok: true, service: 'DIRECT GPS · Cloudflare SOAP Proxy', timestamp: Date.now() });
+        return jsonResponse({
+          ok: true,
+          version: '2.0',
+          service: 'DIRECT GPS · Cloudflare SOAP Proxy',
+          fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
+          timestamp: Date.now()
+        });
+      }
+
+      if (pathname === '/api/fleet-memory' && request.method === 'GET') {
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch(`https://fleet-memory/query${url.search}`);
+            const data = await doRes.json();
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+          } catch {
+            // Fall through to in-memory fallback
+          }
+        }
+        const dayKey = getArgentinaDayKey();
+        const rawLineas = searchParams.get('lineas') || searchParams.get('codLinea') || '';
+        const filterSet = new Set(
+          rawLineas
+            .split(',')
+            .map((n) => Number(n.trim()))
+            .filter((n) => Number.isInteger(n) && n > 0)
+        );
+        const trips = Array.from(fallbackTrips.values()).filter(
+          (t) => t.dayKey === dayKey && (filterSet.size === 0 || filterSet.has(t.codigoLinea))
+        );
+        const units = Array.from(fallbackUnits.values()).filter(
+          (u) => filterSet.size === 0 || filterSet.has(u.codigoLinea)
+        );
+        return jsonResponse({
+          data: { dayKey, trips, units },
+          source: 'fleet-memory-mem',
+          savedAt: Date.now()
+        });
+      }
+
+      if (pathname === '/api/fleet-seen' && request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        const entries = Array.isArray(body.entries) ? body.entries.slice(0, 60) : [];
+        const dayKey = String(body.dayKey || getArgentinaDayKey()).slice(0, 10);
+        const nowMs = Date.now();
+
+        for (const e of entries) {
+          const cod = Number(e.codigoLinea ?? body.codigoLinea);
+          const tripKey = String(e.tripKey || '').trim();
+          const coche = String(e.coche || '').trim();
+          if (!cod || !tripKey || !coche) continue;
+          const rec = {
+            dayKey,
+            codigoLinea: cod,
+            tripKey,
+            turnoHora: String(e.turnoHora || '').trim(),
+            coche,
+            choferNombre: String(e.choferNombre || '').trim(),
+            choferLegajo: String(e.choferLegajo || '').trim(),
+            choferRaw: String(e.choferRaw || '').trim(),
+            esAdaptado: Boolean(e.esAdaptado),
+            desvioSec: Number.isFinite(Number(e.desvioSec)) ? Math.round(Number(e.desvioSec)) : 0,
+            desvioRaw: String(e.desvioRaw || '').trim(),
+            ultimaGps: String(e.ultimaGps || '').trim(),
+            lat: Number.isFinite(Number(e.lat)) ? Number(e.lat) : null,
+            lng: Number.isFinite(Number(e.lng)) ? Number(e.lng) : null,
+            stopId: String(e.stopId || '').trim().toUpperCase(),
+            updatedAt: nowMs
+          };
+          fallbackTrips.set(`${dayKey}:${cod}:${tripKey}`, rec);
+          fallbackUnits.set(`${cod}:${coche}`, { ...rec, bandera: String(e.bandera || '').trim() });
+        }
+
+        const stub = getFleetStub(env);
+        if (stub && entries.length > 0) {
+          try {
+            const doRes = await stub.fetch('https://fleet-memory/record-trips', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ dayKey, codigoLinea: body.codigoLinea, entries })
+            });
+            const saved = await doRes.json();
+            return jsonResponse({ ok: true, ...saved, storage: 'durable-object-sqlite' });
+          } catch (err) {
+            return jsonResponse({ ok: true, count: entries.length, storage: 'memory', warn: err.message });
+          }
+        }
+        return jsonResponse({ ok: true, count: entries.length, storage: 'memory' });
       }
 
       if (pathname === '/api/bootstrap') {
@@ -661,6 +1138,7 @@ export default {
             .sort((a, b) => (a.etaMin ?? 999) - (b.etaMin ?? 999))
             .map((x) => x.arribo);
 
+          if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, merged, stopId));
           return jsonResponse({
             data: {
               ...basePayload,
@@ -673,6 +1151,7 @@ export default {
           });
         }
 
+        if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, basePayload.arribos, stopId));
         return jsonResponse({ data: basePayload, source: 'smartmovepro-soap', savedAt: Date.now() });
       }
 

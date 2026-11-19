@@ -19,7 +19,7 @@ function unitVector(lat1, lng1, lat2, lng2) {
   return [dx / len, dy / len];
 }
 
-function projectOnPolyline(pts, cum, lat, lng) {
+export function projectOnPolyline(pts, cum, lat, lng, minAlong = -Infinity) {
   let best = {
     segIdx: 0,
     t: 0,
@@ -31,6 +31,9 @@ function projectOnPolyline(pts, cum, lat, lng) {
   };
 
   for (let i = 0; i < pts.length - 1; i++) {
+    const segStartAlong = cum[i] || 0;
+    const segEndAlong = cum[i + 1] || 0;
+    if (segEndAlong < minAlong) continue;
     const aLat = pts[i][0];
     const aLng = pts[i][1];
     const bLat = pts[i + 1][0];
@@ -41,15 +44,16 @@ function projectOnPolyline(pts, cum, lat, lng) {
     const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((lat - aLat) * dx + (lng - aLng) * dy) / lenSq));
     const pLat = aLat + dx * t;
     const pLng = aLng + dy * t;
+    const along = segStartAlong + (segEndAlong - segStartAlong) * t;
+    if (along < minAlong) continue;
     const perp = distanceMeters(lat, lng, pLat, pLng);
     if (perp !== null && perp < best.perp) {
-      const segLen = (cum[i + 1] || 0) - (cum[i] || 0);
       best = {
         segIdx: i,
         t,
         lat: pLat,
         lng: pLng,
-        along: (cum[i] || 0) + segLen * t,
+        along,
         perp,
         tangent: unitVector(aLat, aLng, bLat, bLng)
       };
@@ -72,6 +76,30 @@ function slicePolyline(pts, startProj, endProj) {
   return out;
 }
 
+export function sampleBranchAtAlong(branch, alongMeters) {
+  const { pts, cum, totalLen } = branch;
+  if (!pts || pts.length === 0) return null;
+  if (pts.length === 1 || alongMeters <= 0) {
+    return { segIdx: 0, t: 0, lat: pts[0][0], lng: pts[0][1], along: 0 };
+  }
+  if (alongMeters >= totalLen) {
+    const lastIdx = pts.length - 1;
+    return { segIdx: Math.max(0, lastIdx - 1), t: 1, lat: pts[lastIdx][0], lng: pts[lastIdx][1], along: totalLen };
+  }
+  let i = 0;
+  while (i < cum.length - 2 && cum[i + 1] < alongMeters) i++;
+  const segStart = cum[i];
+  const segLen = Math.max(0.001, cum[i + 1] - segStart);
+  const t = Math.max(0, Math.min(1, (alongMeters - segStart) / segLen));
+  return {
+    segIdx: i,
+    t,
+    lat: pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t,
+    lng: pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t,
+    along: alongMeters
+  };
+}
+
 export function parseRouteBranches(recorridos = []) {
   return (recorridos || [])
     .map((r, idx) => {
@@ -82,17 +110,37 @@ export function parseRouteBranches(recorridos = []) {
       const cum = buildCumDist(pts);
       const stopIds = new Set();
       const stopAlongs = [];
+      const orderedStops = [];
+      let prevAlong = -Infinity;
+
       for (const s of r.paradas || []) {
         const sid = String(s.identificador || '').trim().toUpperCase();
         if (sid) stopIds.add(sid);
         const sla = parseFloat(s.latitudParada);
         const sln = parseFloat(s.longitudParada);
         if (!Number.isNaN(sla) && !Number.isNaN(sln)) {
-          const p = projectOnPolyline(pts, cum, sla, sln);
-          if (p.perp < 120) stopAlongs.push(p.along);
+          // Prefer monotonic forward projection along the branch so loop routes keep sequential stop order
+          let p = prevAlong > -Infinity ? projectOnPolyline(pts, cum, sla, sln, Math.max(0, prevAlong - 45)) : null;
+          if (!p || p.perp > 120) {
+            p = projectOnPolyline(pts, cum, sla, sln);
+          }
+          if (p.perp < 160) {
+            stopAlongs.push(p.along);
+            if (sid) {
+              orderedStops.push({
+                id: sid,
+                along: p.along,
+                lat: p.lat,
+                lng: p.lng,
+                descripcion: String(s.descripcion || '').trim()
+              });
+            }
+            if (p.along >= prevAlong - 45) prevAlong = Math.max(prevAlong, p.along);
+          }
         }
       }
       stopAlongs.sort((a, b) => a - b);
+      orderedStops.sort((a, b) => a.along - b.along);
       return {
         index: idx,
         color: getDirectionColor(idx),
@@ -102,13 +150,14 @@ export function parseRouteBranches(recorridos = []) {
         cum,
         totalLen: cum[cum.length - 1] || 0,
         stopIds,
-        stopAlongs
+        stopAlongs,
+        orderedStops
       };
     })
     .filter(Boolean);
 }
 
-function pickStopBranch(branches, stopId, stopCoords, stopBandera = '') {
+export function pickStopBranch(branches, stopId, stopCoords, stopBandera = '') {
   if (!branches || branches.length === 0) return null;
 
   const cleanId = String(stopId || '').trim().toUpperCase();
@@ -155,7 +204,7 @@ function pickBestOppositeBranch(branches, stopBranch, busLat, busLng) {
  * Picks the exact paired return branch for `stopBranch` (start near stopBranch's end,
  * end near stopBranch's start). Crucial for 3-4 branch lines like 103C, 104A, 104D.
  */
-function pickPairedReturnBranch(branches, stopBranch) {
+export function pickPairedReturnBranch(branches, stopBranch) {
   const candidates = branches.filter((b) => b !== stopBranch && b.pts.length >= 6);
   if (candidates.length === 0) return null;
 
@@ -176,6 +225,101 @@ function pickPairedReturnBranch(branches, stopBranch) {
     }
   }
   return best;
+}
+
+/**
+ * Builds an exact BusSimulator/TransitMap trajectory starting at `activeAlong` on `activeBranch`
+ * (either `stopBranch` directly or its paired return branch `prevBranch`) and ending at `stopProj` on `stopBranch`.
+ */
+export function buildTrajectoryFromBranchAlong(
+  activeBranch,
+  activeAlong,
+  stopBranch,
+  stopProj,
+  { isAtTerminal = false, etaSec = 600 } = {}
+) {
+  if (!activeBranch || !stopBranch || !stopProj) return null;
+
+  const mapStopsInRange = (branch, fromAlong, toAlong, offsetMeters) => {
+    const out = [];
+    for (const sa of branch?.stopAlongs || []) {
+      if (sa > fromAlong + 15 && sa < toAlong - 15) {
+        out.push(offsetMeters + (sa - fromAlong));
+      }
+    }
+    return out;
+  };
+
+  const stopBandera = stopBranch.bandera || '';
+  const stopColor = stopBranch.color;
+
+  if (activeBranch === stopBranch) {
+    const clampedAlong = Math.max(0, Math.min(stopProj.along, activeAlong));
+    const startProj = sampleBranchAtAlong(stopBranch, clampedAlong);
+    const pathPts = slicePolyline(stopBranch.pts, startProj, stopProj);
+    const cum = buildCumDist(pathPts);
+    const totalMeters = cum[cum.length - 1] || 0;
+    const stopAlongs = mapStopsInRange(stopBranch, clampedAlong, stopProj.along, 0);
+
+    return {
+      leg: 'direct',
+      isOppositeLeg: false,
+      isNextCycle: false,
+      isAtTerminal,
+      realBandera: stopBandera,
+      realBanderaColor: stopColor,
+      segments: [{ pts: pathPts, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: totalMeters }],
+      stopAlongs,
+      oppStartMeters: 0,
+      turnaroundAtMeters: 0,
+      pathPts,
+      pathCum: cum,
+      totalMeters,
+      walkedMeters: 0,
+      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+    };
+  }
+
+  // Bus is currently on the paired return branch (`activeBranch`) heading to the turnaround before `stopBranch`
+  const clampedAlong = Math.max(0, Math.min(activeBranch.totalLen, activeAlong));
+  const startProj = sampleBranchAtAlong(activeBranch, clampedAlong);
+  const oppRemainder = slicePolyline(activeBranch.pts, startProj, null);
+  const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
+  const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
+  const pathPts = [...oppRemainder, ...stopApproach];
+  const cum = buildCumDist(pathPts);
+  const totalMeters = cum[cum.length - 1] || 0;
+  const turnaroundAtMeters = buildCumDist(oppRemainder).slice(-1)[0] || 0;
+  const oppBandera = activeBranch.bandera || 'Sentido opuesto';
+  const oppColor = activeBranch.color;
+
+  const stopAlongs = [
+    ...mapStopsInRange(activeBranch, clampedAlong, activeBranch.totalLen, 0),
+    ...mapStopsInRange(stopBranch, 0, stopProj.along, turnaroundAtMeters)
+  ].sort((a, b) => a - b);
+
+  const segments = [
+    { pts: oppRemainder, color: oppColor, bandera: oppBandera, startMeters: 0, endMeters: turnaroundAtMeters },
+    { pts: stopApproach, color: stopColor, bandera: stopBandera, startMeters: turnaroundAtMeters, endMeters: totalMeters }
+  ];
+
+  return {
+    leg: 'previous_leg',
+    isOppositeLeg: true,
+    isNextCycle: false,
+    isAtTerminal,
+    realBandera: oppBandera,
+    realBanderaColor: oppColor,
+    segments,
+    stopAlongs,
+    oppStartMeters: 0,
+    turnaroundAtMeters,
+    pathPts,
+    pathCum: cum,
+    totalMeters,
+    walkedMeters: 0,
+    speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+  };
 }
 
 /**

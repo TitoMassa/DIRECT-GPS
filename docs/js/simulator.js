@@ -1,5 +1,6 @@
 import { sampleTrajectory, prependPathToTrajectory } from './trajectory.js';
 import { computeProximityPercent } from './api.js';
+import { evaluateTripState, getArgentinaSecOfDay } from './predictor.js';
 
 /**
  * Parses SmartMovePro GPS timestamp ("DD/MM/YYYY HH:MM:SS" in Argentina UTC-3) into UTC epoch ms.
@@ -24,12 +25,13 @@ function clamp(v, min, max) {
 }
 
 /**
- * Physically-faithful, zero-backjump kinematic vehicle predictor for Simulation Mode.
+ * Physically-faithful, zero-backjump kinematic vehicle predictor for EN VIVO mode.
  *
- * Separates three distinct quantities per unit:
- *  - `overshootMeters`: how far ahead of the freshly-confirmed real GPS the marker sits (triggers smooth hold, NEVER jumps backwards)
- *  - `lagMeters`: how far behind the freshly-confirmed real GPS the marker sits (triggers smooth curve-hugging catch-up)
- *  - `deadReckonMeters`: how far we've cruised since the last GPS fix (capped smoothly so stopped buses never run away)
+ * Supports two seamless operating modes per unit:
+ *  - 'gps': tracks fresh real GPS fixes with velocity EMA, zero-backjump hold on overshoot,
+ *    curve-hugging catch-up on lag, stop micro-deceleration, and terminal layover hold.
+ *  - 'schedule': tracks the official stop-by-stop timetable curve `along(now + desvio)` along
+ *    the real street polylines when the phone is offline, a unit has no GPS, or GPS goes silent.
  */
 export class BusSimulator {
   constructor() {
@@ -41,11 +43,25 @@ export class BusSimulator {
   }
 
   /**
-   * Reconciles a fresh poll of normalized buses with persistent kinematic state.
-   * Call on EVERY poll (with applyPositions = state.simulateMode) so real velocities
-   * and stopped states are already known the moment Simulation Mode is turned on.
+   * Transfers persistent kinematic state from `oldKey` to `newKey` so handoffs between
+   * timetable-predicted units (`pred:...`) and live GPS units (`codLinea-cXXXX`) happen
+   * with zero visual jump or duplicate markers.
    */
-  reconcile(buses = [], { applyPositions = false } = {}) {
+  transferState(oldKey, newKey) {
+    if (!oldKey || !newKey || oldKey === newKey) return false;
+    const prev = this.units.get(oldKey);
+    if (!prev || this.units.has(newKey)) return false;
+    this.units.set(newKey, prev);
+    this.units.delete(oldKey);
+    return true;
+  }
+
+  /**
+   * Reconciles a fresh poll (or offline prediction cycle) of normalized buses with persistent
+   * kinematic state. Call on EVERY poll (with applyPositions = state.simulateMode) so real
+   * velocities and stopped states are already known when switching between ULT. GPS and EN VIVO.
+   */
+  reconcile(buses = [], { applyPositions = false, stopId = '' } = {}) {
     const nowMs = Date.now();
     const seen = new Set();
 
@@ -55,23 +71,91 @@ export class BusSimulator {
 
       const newTraj = bus.trajectory;
       const newRealRem = newTraj.totalMeters;
-      const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
       const prev = this.units.get(bus.key);
+      const etaSec = Math.max(45, bus.etaSecondsRemaining || (bus.eta?.minutes || 10) * 60);
 
-      // Compute GPS staleness safely (ignoring absurd client clock skew > 2h)
+      // ── Case 1: Timetable-predicted unit (offline or running without GPS) ──
+      if (bus.isPredicted && bus.scheduledTrip && bus.stopProj) {
+        const desvioSec = bus.predDesvioSec || bus.desvio?.seconds || 0;
+        if (!prev) {
+          const initSpeed = newTraj.isAtTerminal ? 0 : clamp(newTraj.speedMps || 4.2, 0, 7.5);
+          this.units.set(bus.key, {
+            mode: 'schedule',
+            scheduledTrip: bus.scheduledTrip,
+            stopProj: bus.stopProj,
+            stopId: stopId || bus.stopId || '',
+            predDesvioSec: desvioSec,
+            lastGpsMs: null,
+            lastGpsPollMs: nowMs,
+            lastRealRem: newRealRem,
+            hasConfirmedFix: false,
+            observedSpeedMps: null,
+            cruiseSpeedMps: initSpeed,
+            currentSpeedMps: initSpeed * 0.55,
+            isStopped: newTraj.isAtTerminal,
+            isAtTerminal: Boolean(newTraj.isAtTerminal),
+            aheadSec: desvioSec,
+            overshootMeters: 0,
+            lagMeters: 0,
+            deadReckonMeters: 0,
+            activeTraj: newTraj,
+            walkedMeters: 0,
+            etaSecondsRemaining: etaSec
+          });
+          continue;
+        }
+
+        // Transitioning smoothly from previous state (either already 'schedule' or just lost GPS!)
+        prev.mode = 'schedule';
+        prev.scheduledTrip = bus.scheduledTrip;
+        prev.stopProj = bus.stopProj;
+        prev.stopId = stopId || bus.stopId || prev.stopId || '';
+        prev.predDesvioSec = desvioSec;
+        prev.isAtTerminal = Boolean(newTraj.isAtTerminal);
+        prev.aheadSec = desvioSec;
+
+        if (!applyPositions) {
+          prev.activeTraj = newTraj;
+          prev.walkedMeters = 0;
+          prev.etaSecondsRemaining = etaSec;
+          continue;
+        }
+
+        const prevSimRem = Math.max(0, prev.activeTraj.totalMeters - prev.walkedMeters);
+        const deltaRem = newRealRem - prevSimRem;
+        const sameLeg = prev.activeTraj.leg === newTraj.leg;
+
+        // If already smoothly on the same leg within 220 m, keep exact visual path and let 30fps tracker converge!
+        if (!sameLeg || Math.abs(deltaRem) > 220) {
+          if (sameLeg && deltaRem < 0 && -deltaRem <= 320) {
+            prev.activeTraj = prependPathToTrajectory(prev.activeTraj, prev.walkedMeters, newTraj);
+            prev.walkedMeters = 0;
+          } else {
+            prev.activeTraj = newTraj;
+            prev.walkedMeters = 0;
+          }
+        }
+
+        prev.etaSecondsRemaining = etaSec;
+        this._applySampleToBus(bus, prev, false);
+        continue;
+      }
+
+      // ── Case 2: Live GPS unit ──
+      const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
       const rawAgeSec = gpsMs ? (nowMs - gpsMs) / 1000 : 0;
       const gpsAgeSec = rawAgeSec >= 0 && rawAgeSec < 7200 ? rawAgeSec : 0;
       const isStaleTracker = gpsAgeSec > 45;
 
-      // Terminal layover (descanso en cabecera / punta de línea):
-      // If a bus is physically at a terminal (within ~165 m of branch start/end), especially with
-      // positive schedule deviation (+MM:SS adelanto), assume it is resting until fresh GPS proves departure!
       const isAtTerminal = Boolean(newTraj.isAtTerminal);
       const aheadSec = bus.desvio?.seconds || 0;
       const likelyTerminalRest = isAtTerminal && aheadSec >= 60;
 
-      // Conservative initial speed before 2 distinct GPS timestamps have been observed
-      const etaSec = Math.max(60, (bus.eta?.minutes || 10) * 60);
+      // Detect genuine mid-route GPS signal loss (>95 s stale while NOT parked at a cabecera):
+      // when we know the bus's scheduled trip, keep it moving smoothly via timetable prediction!
+      const lostGpsMidRoute =
+        applyPositions && gpsAgeSec > 95 && !isAtTerminal && Boolean(bus.scheduledTrip && bus.stopProj);
+
       const conservativeInitSpeed =
         isStaleTracker || isAtTerminal
           ? 0
@@ -79,6 +163,11 @@ export class BusSimulator {
 
       if (!prev) {
         const entry = {
+          mode: lostGpsMidRoute ? 'schedule' : 'gps',
+          scheduledTrip: bus.scheduledTrip || null,
+          stopProj: bus.stopProj || null,
+          stopId: stopId || bus.stopId || '',
+          predDesvioSec: aheadSec,
           lastGpsMs: gpsMs,
           lastGpsPollMs: nowMs,
           lastRealRem: newRealRem,
@@ -86,7 +175,7 @@ export class BusSimulator {
           observedSpeedMps: null,
           cruiseSpeedMps: conservativeInitSpeed,
           currentSpeedMps: conservativeInitSpeed * 0.4,
-          isStopped: isStaleTracker || isAtTerminal,
+          isStopped: !lostGpsMidRoute && (isStaleTracker || isAtTerminal),
           isAtTerminal,
           aheadSec,
           overshootMeters: 0,
@@ -94,14 +183,21 @@ export class BusSimulator {
           deadReckonMeters: 0,
           activeTraj: newTraj,
           walkedMeters: 0,
-          etaSecondsRemaining: bus.etaSecondsRemaining || etaSec
+          etaSecondsRemaining: etaSec
         };
+        if (lostGpsMidRoute) bus.gpsLost = true;
         this.units.set(bus.key, entry);
         continue;
       }
 
       prev.isAtTerminal = isAtTerminal;
       prev.aheadSec = aheadSec;
+      if (bus.scheduledTrip && bus.stopProj) {
+        prev.scheduledTrip = bus.scheduledTrip;
+        prev.stopProj = bus.stopProj;
+        prev.stopId = stopId || bus.stopId || prev.stopId || '';
+        prev.predDesvioSec = aheadSec;
+      }
 
       // Did the bus tracker emit a genuinely NEW GPS fix since last poll?
       const movedFromLastReal = Math.abs(prev.lastRealRem - newRealRem);
@@ -109,7 +205,21 @@ export class BusSimulator {
       const isSameGpsTimestamp = gpsTimeDeltaSec !== null && gpsTimeDeltaSec < 2;
       const isFreshFix =
         (gpsTimeDeltaSec !== null && gpsTimeDeltaSec >= 3) ||
-        (gpsTimeDeltaSec === null && movedFromLastReal >= 8);
+        (gpsTimeDeltaSec === null && movedFromLastReal >= 8) ||
+        (prev.mode === 'schedule' && !lostGpsMidRoute);
+
+      // Handle mid-route GPS dropout seamlessly: switch to timetable curve until fresh GPS returns
+      if (lostGpsMidRoute) {
+        prev.mode = 'schedule';
+        bus.gpsLost = true;
+        this._applySampleToBus(bus, prev, false);
+        continue;
+      }
+
+      // Fresh or active GPS -> ensure mode is 'gps'
+      const recoveredFromSchedule = prev.mode === 'schedule';
+      prev.mode = 'gps';
+      bus.gpsLost = false;
 
       // 1. Update real velocity / stopped state ONLY on genuinely fresh GPS fixes
       if (isFreshFix) {
@@ -119,22 +229,23 @@ export class BusSimulator {
             : Math.max(5, (nowMs - prev.lastGpsPollMs) / 1000);
 
         const realAdvance = prev.lastRealRem - newRealRem;
-        // At terminals, GPS drift on parked vehicles can bounce 12-16m -> use a slightly higher departure threshold (20m)
         const minMoveThreshold = isAtTerminal ? 20 : 11;
 
         if ((realAdvance < minMoveThreshold && dtReal >= 7) || (likelyTerminalRest && realAdvance < 28)) {
-          // Bus barely moved -> red light, bus stop, or terminal layover (descanso en cabecera)!
           prev.isStopped = true;
           prev.cruiseSpeedMps = 0;
           if (prev.observedSpeedMps !== null) {
             prev.observedSpeedMps = Math.max(2.2, prev.observedSpeedMps * 0.85);
           }
         } else if (realAdvance >= minMoveThreshold && realAdvance < 900) {
-          const instSpeed = clamp(realAdvance / dtReal, 0.9, 10.5); // ~3 to 38 km/h urban Corrientes
+          const instSpeed = clamp(realAdvance / dtReal, 0.9, 10.5);
           prev.observedSpeedMps =
             prev.observedSpeedMps !== null ? 0.62 * instSpeed + 0.38 * prev.observedSpeedMps : instSpeed;
           prev.cruiseSpeedMps = prev.observedSpeedMps;
           prev.isStopped = false;
+        } else if (recoveredFromSchedule) {
+          prev.isStopped = isAtTerminal;
+          prev.cruiseSpeedMps = isAtTerminal ? 0 : Math.max(2.8, prev.currentSpeedMps || 4.0);
         }
 
         prev.hasConfirmedFix = true;
@@ -149,41 +260,35 @@ export class BusSimulator {
         }
       }
 
-      // 2. Smoothly reconcile position without ANY backward jumps when in Simulation Mode
+      // 2. Smoothly reconcile position without ANY backward jumps when in EN VIVO mode
       if (!applyPositions) {
         prev.activeTraj = newTraj;
         prev.walkedMeters = 0;
         prev.overshootMeters = 0;
         prev.lagMeters = 0;
         prev.deadReckonMeters = 0;
-        prev.etaSecondsRemaining = bus.etaSecondsRemaining || etaSec;
+        prev.etaSecondsRemaining = etaSec;
         continue;
       }
 
-      // If the tracker hasn't sent a fresh timestamp yet, keep cruising seamlessly without touching position!
-      if (isSameGpsTimestamp) {
+      if (isSameGpsTimestamp && !recoveredFromSchedule) {
         this._applySampleToBus(bus, prev, false);
         continue;
       }
 
       const prevSimRem = Math.max(0, prev.activeTraj.totalMeters - prev.walkedMeters);
       const deltaRem = newRealRem - prevSimRem;
-      // deltaRem > 0 => sim is AHEAD of real GPS (bus slowed down or hit a red light)
-      // deltaRem < 0 => sim is BEHIND real GPS (bus accelerated after green light)
-
       const sameLegType = prev.activeTraj.leg === newTraj.leg;
 
-      if (sameLegType && deltaRem >= 0 && deltaRem <= 150) {
-        // Sim is ahead by up to 150 m: KEEP exact visual position on newTraj (0.0 m jump!)
-        // and let the controller smoothly brake & hold until the real bus catches up.
+      if (sameLegType && deltaRem >= 0 && deltaRem <= 180) {
+        // Sim is ahead by up to 180 m: keep visual position on newTraj (0.0 m jump!) & hold smoothly
         prev.activeTraj = newTraj;
         prev.walkedMeters = clamp(deltaRem, 0, newTraj.totalMeters);
         prev.overshootMeters = deltaRem;
         prev.lagMeters = 0;
         prev.deadReckonMeters = 0;
-      } else if (sameLegType && deltaRem < 0 && -deltaRem <= 280) {
-        // Sim is behind by up to 280 m: splice exact street polyline from current simulated spot
-        // into the front of newTraj so the bus smoothly accelerates along the curve to catch up!
+      } else if (sameLegType && deltaRem < 0 && -deltaRem <= 340) {
+        // Sim is behind by up to 340 m: splice street curve & catch up smoothly
         const lag = -deltaRem;
         const spliced = prependPathToTrajectory(prev.activeTraj, prev.walkedMeters, newTraj);
         prev.activeTraj = spliced;
@@ -192,7 +297,7 @@ export class BusSimulator {
         prev.lagMeters = lag;
         prev.deadReckonMeters = 0;
       } else {
-        // Large genuine discontinuity (>280 m or leg changed): re-anchor cleanly
+        // Large genuine discontinuity (>340 m or leg changed): re-anchor cleanly
         prev.activeTraj = newTraj;
         prev.walkedMeters = 0;
         prev.overshootMeters = 0;
@@ -201,15 +306,13 @@ export class BusSimulator {
         prev.currentSpeedMps = Math.min(prev.currentSpeedMps, prev.cruiseSpeedMps);
       }
 
-      // Blend ETA gently instead of abrupt jumps
-      const targetEtaSec = bus.etaSecondsRemaining || etaSec;
+      const targetEtaSec = etaSec;
       if (Math.abs(targetEtaSec - prev.etaSecondsRemaining) <= 180) {
         prev.etaSecondsRemaining = prev.etaSecondsRemaining * 0.4 + targetEtaSec * 0.6;
       } else {
         prev.etaSecondsRemaining = targetEtaSec;
       }
 
-      // Immediately project reconciled position onto `bus` so `updateBuses` renders zero snap
       this._applySampleToBus(bus, prev, false);
     }
 
@@ -220,26 +323,67 @@ export class BusSimulator {
   }
 
   /**
-   * Advances all simulated buses smoothly by `dtSec` (typically ~0.033s at 30fps).
+   * Advances all buses smoothly by `dtSec` (~0.033 s at 30fps).
    */
   step(dtSec, buses = [], { updateEta = false } = {}) {
     const dt = clamp(dtSec, 0.005, 0.15);
     const nowMs = Date.now();
+    const nowSec = getArgentinaSecOfDay(new Date(nowMs));
 
     for (const bus of buses) {
       const st = this.units.get(bus.key);
       if (!st || !st.activeTraj) continue;
 
       const traj = st.activeTraj;
-      const silentSec = (nowMs - st.lastGpsPollMs) / 1000;
 
-      // Conservative lookahead cap beyond the last confirmed real GPS fix:
-      // 40 m before 2nd fix (so a bus stopped at a red light never runs away), up to 80 m once cruising speed is confirmed.
+      // ── Mode A: Timetable-driven smooth 30fps tracking (offline / no-GPS / lost-GPS) ──
+      if (st.mode === 'schedule' && st.scheduledTrip && st.stopProj) {
+        const ev = evaluateTripState(st.scheduledTrip, st.stopId, st.stopProj, nowSec, st.predDesvioSec || 0);
+        let targetSpeed = 0;
+
+        if (!ev) {
+          targetSpeed = 0;
+          st.etaSecondsRemaining = 0;
+        } else {
+          const targetWalked = clamp(traj.totalMeters - ev.remainingMeters, 0, traj.totalMeters);
+          const err = targetWalked - st.walkedMeters;
+
+          if (ev.speedMps <= 0.05 || ev.isAtTerminal) {
+            // Resting at cabecera or arrived at stop -> smooth stop & hold at 0 m/s
+            targetSpeed = 0;
+          } else if (err < -4) {
+            // Slightly ahead of schedule curve -> gently ease off (NEVER jump backwards!)
+            targetSpeed = clamp(ev.speedMps * 0.25, 0, 2.0);
+          } else {
+            // Track exact timetable speed + gentle proportional convergence
+            targetSpeed = clamp(ev.speedMps + clamp(err / 6.5, 0, 3.0), 0, 11.0);
+          }
+
+          st.etaSecondsRemaining = ev.etaSec;
+        }
+
+        const maxAccel = 0.85;
+        const maxBrake = 1.85;
+        const dv = targetSpeed - st.currentSpeedMps;
+        if (dv > 0) st.currentSpeedMps += Math.min(dv, maxAccel * dt);
+        else st.currentSpeedMps += Math.max(dv, -maxBrake * dt);
+        if (st.currentSpeedMps < 0.04 && targetSpeed === 0) st.currentSpeedMps = 0;
+
+        const advance = st.currentSpeedMps * dt;
+        if (advance > 0) {
+          st.walkedMeters = Math.min(traj.totalMeters, st.walkedMeters + advance);
+        }
+
+        this._applySampleToBus(bus, st, updateEta);
+        continue;
+      }
+
+      // ── Mode B: Live GPS kinematic prediction ──
+      const silentSec = (nowMs - st.lastGpsPollMs) / 1000;
       const maxLookahead = st.hasConfirmedFix
         ? clamp((st.observedSpeedMps || 3.5) * 13, 42, 80)
         : 40;
 
-      // Check if simulated bus has reached a terminal turnaround along the trajectory and should pause for layover
       const reachedTurnaround =
         (traj.turnaroundAtMeters > 40 && Math.abs(st.walkedMeters - traj.turnaroundAtMeters) < 25) ||
         (traj.oppStartMeters > 40 && Math.abs(st.walkedMeters - traj.oppStartMeters) < 25);
@@ -247,31 +391,25 @@ export class BusSimulator {
       let targetSpeed = 0;
 
       if (st.lagMeters > 3) {
-        // Real bus is AHEAD of simulated marker -> smooth catch-up along street curve
         const baseCruise = st.isStopped ? 1.8 : Math.max(2.2, st.cruiseSpeedMps);
         const catchupBoost = clamp(st.lagMeters / 8.5, 0.4, 3.6);
         targetSpeed = clamp(baseCruise + catchupBoost, 1.5, 10.8);
       } else if (st.isStopped || st.overshootMeters > 6 || (reachedTurnaround && st.aheadSec >= 45)) {
-        // Bus is stopped (red light / bus stop / terminal descanso), or arrived at cabecera ahead of schedule -> HOLD!
         targetSpeed = 0;
       } else {
-        // Normal cruising along street polyline
         targetSpeed = st.cruiseSpeedMps;
 
-        // Soft lookahead ceiling: smoothly taper down as deadReckonMeters nears maxLookahead without a new GPS fix
         const taperStart = maxLookahead * 0.62;
         if (st.deadReckonMeters > taperStart) {
           const ratio = clamp(1 - (st.deadReckonMeters - taperStart) / (maxLookahead - taperStart), 0, 1);
           targetSpeed *= ratio;
         }
 
-        // Extra quiet-tracker damping if >16s since last fresh GPS packet
         if (silentSec > 16) {
           targetSpeed *= clamp(1 - (silentSec - 16) / 10, 0, 1);
         }
       }
 
-      // Organic micro-deceleration when passing within 28 m before an intermediate bus stop
       if (targetSpeed > 1.8 && Array.isArray(traj.stopAlongs) && traj.stopAlongs.length > 0) {
         const w = st.walkedMeters;
         for (let i = 0; i < traj.stopAlongs.length; i++) {
@@ -284,9 +422,8 @@ export class BusSimulator {
         }
       }
 
-      // Apply realistic bus inertia (bounded acceleration & braking)
-      const maxAccel = 0.85; // m/s² (gentle realistic pull-out)
-      const maxBrake = 1.85; // m/s² (smooth stop without jerk)
+      const maxAccel = 0.85;
+      const maxBrake = 1.85;
       const dv = targetSpeed - st.currentSpeedMps;
       if (dv > 0) {
         st.currentSpeedMps += Math.min(dv, maxAccel * dt);
@@ -312,7 +449,6 @@ export class BusSimulator {
         }
       }
 
-      // Only decrement ETA countdown when moving
       if (st.currentSpeedMps > 0.35) {
         st.etaSecondsRemaining = Math.max(0, st.etaSecondsRemaining - dt);
       }
@@ -348,7 +484,7 @@ export class BusSimulator {
           unit: 'min',
           urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
         };
-        bus.tiempoRaw = `${mins} min. aprox.`;
+        bus.tiempoRaw = bus.isPredicted ? `${mins} min. est.` : `${mins} min. aprox.`;
       }
       bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
     }

@@ -1,6 +1,7 @@
 import { CORRIENTES_CENTER, REFRESH_INTERVAL_SEC, getLineColor } from './config.js';
 import {
   api,
+  warmOfflineArchive,
   distanceMeters,
   formatDistance,
   formatBlocks,
@@ -15,6 +16,13 @@ import {
   matchBusesWithHorarios
 } from './api.js';
 import { parseRouteBranches, resolveBusTrajectory } from './trajectory.js';
+import {
+  buildLineScheduleModel,
+  matchLiveBusesToTrips,
+  predictLineBusesForStop,
+  getArgentinaSecOfDay,
+  getArgentinaDayKey
+} from './predictor.js';
 import { BusSimulator } from './simulator.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
@@ -35,7 +43,8 @@ const state = {
   arribos: [],
   selectedBusKey: null,
   inspectorOpen: false,
-  simulateMode: false,
+  simulateMode: true, // Default mode: EN VIVO (green) — smooth motion + offline/no-GPS timetable prediction
+  isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
   horariosOpen: false,
   horariosLineCode: null,
   horariosTipoDia: getArgentinaTodayTipo(),
@@ -45,10 +54,15 @@ const state = {
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
 
-  // Real SOAP route branches & today's horarios cache per line
+  // Offline archives & system FleetMemory caches
+  catalogo: null,
   routeBranchesCache: new Map(),
+  horariosArchiveCache: new Map(), // codLinea -> full horarios/<codLinea>.json
   horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
   lastRealGpsByUnit: new Map(), // busKey -> { lat, lng, ts }
+  fleetMemory: { dayKey: '', trips: [], units: [] },
+  fleetMemoryLastFetchMs: 0,
+  sessionObservedTrips: new Map(), // `${codLinea}:${tripKey}` -> latest online observation
 
   // Catalog & Drilldown
   lineas: [],
@@ -415,15 +429,14 @@ function resetToWelcome() {
 // Core Radar: Stop Loading, Direction-Aware Trajectories & Zero-Lag Interpolation
 // ============================================================================
 function updateSignalPill() {
-  el.btnLiveMode.classList.remove('is-sim', 'is-warn');
+  el.btnLiveMode.classList.remove('is-gps', 'is-warn');
   if (state.simulateMode) {
-    el.btnLiveMode.classList.add('is-sim');
-    el.signalLabel.textContent = 'SIMULACIÓN';
-  } else if (state.dataSource === 'smartmovepro-cache') {
-    el.btnLiveMode.classList.add('is-warn');
-    el.signalLabel.textContent = 'CACHÉ';
-  } else {
     el.signalLabel.textContent = 'EN VIVO';
+    el.btnLiveMode.title = 'EN VIVO: movimiento continuo y predicción por horarios · Tocá para ver ULT. GPS';
+  } else {
+    el.btnLiveMode.classList.add('is-gps');
+    el.signalLabel.textContent = 'ULT. GPS';
+    el.btnLiveMode.title = 'ULT. GPS: última posición satelital reportada · Tocá para volver a EN VIVO';
   }
 }
 
@@ -467,14 +480,34 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   const stopId = String(stopInfo.id || stopInfo.identificador || '').trim().toUpperCase();
   if (!stopId) return;
 
+  // Enrich stop name, coordinates, and serving lines immediately from offline catalogo.json
+  if (!state.catalogo) {
+    state.catalogo = await api.catalogo().catch(() => null);
+  }
+  const catStop = state.catalogo?.stopById?.get(stopId) || null;
+
   const isAll = !rawCode || rawCode === '0' || rawCode === '000';
   const lineObj = !isAll ? state.lineas.find((l) => String(l.codigo) === rawCode) : null;
 
+  const rawName = stopInfo.nombre || stopInfo.descripcion || '';
+  const bestName =
+    rawName && rawName !== `Parada ${stopId}`
+      ? rawName
+      : catStop?.nombre || `Parada ${stopId}`;
+  const bestLat =
+    typeof stopInfo.lat === 'number' && !Number.isNaN(stopInfo.lat)
+      ? stopInfo.lat
+      : parseFloat(stopInfo.latitud) || catStop?.lat || null;
+  const bestLng =
+    typeof stopInfo.lng === 'number' && !Number.isNaN(stopInfo.lng)
+      ? stopInfo.lng
+      : parseFloat(stopInfo.longitud) || catStop?.lng || null;
+
   state.activeStop = {
     id: stopId,
-    nombre: stopInfo.nombre || stopInfo.descripcion || `Parada ${stopId}`,
-    lat: typeof stopInfo.lat === 'number' ? stopInfo.lat : parseFloat(stopInfo.latitud) || null,
-    lng: typeof stopInfo.lng === 'number' ? stopInfo.lng : parseFloat(stopInfo.longitud) || null
+    nombre: bestName,
+    lat: bestLat,
+    lng: bestLng
   };
   state.codLineaQuery = isAll ? '000' : rawCode;
   state.focusedLineCode = isAll ? null : Number(rawCode);
@@ -484,7 +517,15 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   state.horariosOpen = false;
   state.horariosLineCode = isAll ? null : Number(rawCode);
   state.horariosTipoDia = getArgentinaTodayTipo();
-  state.stopLinesList = [];
+  state.stopLinesList = (catStop?.lineas || [])
+    .map((cod) => {
+      const l = state.catalogo?.lineByCode?.get(Number(cod)) || state.lineas.find((x) => Number(x.codigo) === Number(cod));
+      return l ? { codigo: Number(l.codigo), descripcion: l.descripcion } : null;
+    })
+    .filter(Boolean);
+  if (state.focusedLineCode && !state.stopLinesList.some((l) => l.codigo === state.focusedLineCode) && lineObj) {
+    state.stopLinesList.push({ codigo: Number(lineObj.codigo), descripcion: lineObj.descripcion });
+  }
   state.lastRealGpsByUnit.clear();
   busSimulator.clear();
 
@@ -508,20 +549,48 @@ async function openStopRadar(stopInfo, codLinea = '000') {
 }
 
 async function ensureBranchesLoaded(lineCodes) {
-  const missing = lineCodes.filter((c) => c && !state.routeBranchesCache.has(c));
+  const missing = lineCodes.filter((c) => c && !state.routeBranchesCache.has(Number(c)));
   if (missing.length === 0) return;
 
   await Promise.all(
     missing.map(async (cod) => {
+      const numCod = Number(cod);
       try {
-        const res = await api.recorridos(cod);
+        const res = await api.recorridos(numCod);
         const branches = parseRouteBranches(Array.isArray(res.data) ? res.data : []);
-        state.routeBranchesCache.set(cod, branches);
+        state.routeBranchesCache.set(numCod, branches);
       } catch {
-        state.routeBranchesCache.set(cod, []);
+        state.routeBranchesCache.set(numCod, []);
       }
     })
   );
+}
+
+async function ensureScheduleAssetsLoaded(lineCodes) {
+  const cleanCodes = Array.from(new Set((lineCodes || []).map(Number).filter(Boolean)));
+  if (cleanCodes.length === 0) return;
+  await Promise.all([
+    ensureBranchesLoaded(cleanCodes),
+    ...cleanCodes
+      .filter((c) => !state.horariosArchiveCache.has(c))
+      .map(async (c) => {
+        const file = await api.horariosLineArchive(c).catch(() => null);
+        if (file) state.horariosArchiveCache.set(c, file);
+      })
+  ]);
+}
+
+async function syncFleetMemory(lineCodes, { force = false } = {}) {
+  const nowMs = Date.now();
+  if (!force && nowMs - state.fleetMemoryLastFetchMs < 45000 && state.fleetMemory.trips.length > 0) {
+    return state.fleetMemory;
+  }
+  state.fleetMemoryLastFetchMs = nowMs;
+  const mem = await api.getFleetMemory(lineCodes).catch(() => null);
+  if (mem) {
+    state.fleetMemory = mem;
+  }
+  return state.fleetMemory;
 }
 
 function normalizeArrivals(rawList, stopId, stopCoords) {
@@ -803,12 +872,19 @@ function renderArribosList() {
            </span>`
         : `<span class="driver-inline"><span>—</span></span>`;
 
-      const gpsHtml = bus.gpsTimeOnly ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>` : '';
+      const gpsHtml =
+        bus.isPredicted || bus.gpsLost
+          ? `<span class="pred-meta" title="Posición estimada por horarios programados">${escapeHtml(
+              bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario'
+            )}</span>`
+          : bus.gpsTimeOnly
+            ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>`
+            : '';
       const currentBandera = bus.realBandera || bus.descripcionBandera;
       const dirColor = bus.realBanderaColor || color;
 
       return `
-        <div class="arrival-card ${isSelected ? 'is-selected' : ''}" data-bus-key="${escapeHtml(
+        <div class="arrival-card ${isSelected ? 'is-selected' : ''} ${bus.isPredicted || bus.gpsLost ? 'is-predicted' : ''}" data-bus-key="${escapeHtml(
           bus.key
         )}" style="--line-color:${color}" role="button" tabindex="0">
           <div class="arrival-card-main">
@@ -945,8 +1021,12 @@ function updateInspectorFields(bus) {
   }
 
   const gpsParts = [];
-  if (bus.gpsTimeOnly) gpsParts.push(bus.gpsTimeOnly);
-  if (bus.esExtendido) gpsParts.push('+Flota');
+  if (bus.isPredicted || bus.gpsLost) {
+    gpsParts.push(bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario');
+  } else {
+    if (bus.gpsTimeOnly) gpsParts.push(bus.gpsTimeOnly);
+    if (bus.esExtendido) gpsParts.push('+Flota');
+  }
   el.inspGps.textContent = gpsParts.join(' · ') || '—';
 
   el.btnInspRoute.dataset.codLinea = bus.codigoLinea;
@@ -1010,28 +1090,292 @@ function closeBusInspector() {
   if (state.activeStop && !state.horariosOpen) renderArribosList();
 }
 
-async function crossMatchLineHorarios(stopId, codLinea, buses) {
-  const todayTipo = getArgentinaTodayTipo();
-  const memKey = `${stopId}:${codLinea}:${todayTipo}`;
-  let horarios = state.horariosByLineCache.get(memKey);
+function getMergedFleetMemory() {
+  const merged = new Map();
+  for (const t of state.fleetMemory?.trips || []) {
+    merged.set(`${t.codigoLinea}:${t.tripKey}`, t);
+  }
+  const todayKey = getArgentinaDayKey();
+  for (const [k, rec] of state.sessionObservedTrips.entries()) {
+    if (rec.dayKey === todayKey) {
+      merged.set(k, rec);
+    }
+  }
+  return {
+    dayKey: todayKey,
+    trips: Array.from(merged.values()),
+    units: state.fleetMemory?.units || []
+  };
+}
 
-  if (!horarios) {
-    try {
-      const hRes = await api.horarios(stopId, codLinea, todayTipo);
-      horarios = hRes?.data?.horarios || [];
-      if (horarios.length > 0) {
-        state.horariosByLineCache.set(memKey, horarios);
+/**
+ * Unified Online <-> Lost-GPS <-> Offline <-> GPS-Recovery continuity engine:
+ *  1) Matches every live GPS bus to its canonical scheduled `tripKey` & `turnoProgramado`.
+ *  2) Reports fresh `(tripKey -> coche, chofer, desvio)` assignments to central system FleetMemory.
+ *  3) Transfers BusSimulator kinematic state across `predicted <-> gps` handoffs (0 m jump!).
+ *  4) In EN VIVO mode, predicts positions along street polylines for offline / no-GPS / lost-GPS turns.
+ */
+function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLineCodes, { isOffline = false } = {}) {
+  const prevArribos = state.arribos || [];
+  const prevByTripKey = new Map();
+  const prevByCoche = new Map();
+  for (const b of prevArribos) {
+    if (b.tripKey) prevByTripKey.set(`${b.codigoLinea}:${b.tripKey}`, b);
+    if (b.identificadorCoche) prevByCoche.set(`${b.codigoLinea}:${b.identificadorCoche}`, b);
+  }
+
+  const nowSec = getArgentinaSecOfDay();
+  const todayTipo = getArgentinaTodayTipo();
+  const todayDayKey = getArgentinaDayKey();
+  const nowMs = Date.now();
+
+  const liveByLine = new Map();
+  for (const b of liveBuses) {
+    const cod = Number(b.codigoLinea);
+    if (!liveByLine.has(cod)) liveByLine.set(cod, []);
+    liveByLine.get(cod).push(b);
+  }
+
+  const liveMatchedTripKeysByLine = new Map();
+  const liveMatchedCochesByLine = new Map();
+  const seenReports = [];
+
+  for (const [cod, buses] of liveByLine.entries()) {
+    const branches = state.routeBranchesCache.get(cod) || [];
+    const horFile = state.horariosArchiveCache.get(cod) || null;
+    const model = buildLineScheduleModel(cod, branches, horFile, todayTipo);
+
+    const matchedTrips = new Set();
+    const matchedCoches = new Set();
+    liveMatchedTripKeysByLine.set(cod, matchedTrips);
+    liveMatchedCochesByLine.set(cod, matchedCoches);
+
+    for (const b of buses) {
+      if (b.identificadorCoche) matchedCoches.add(b.identificadorCoche);
+    }
+
+    if (model && stopCoords) {
+      const matches = matchLiveBusesToTrips(model, stopId, stopCoords, buses, nowSec);
+      for (const b of buses) {
+        const m = matches.get(b.key);
+        if (!m) continue;
+        matchedTrips.add(m.tripKey);
+
+        // Seamless GPS recovery handoff: transfer simulator state from prior predicted marker!
+        const predKey = `pred:${cod}:${m.tripKey}`;
+        if (busSimulator.transferState(predKey, b.key)) {
+          if (state.selectedBusKey === predKey) state.selectedBusKey = b.key;
+        }
+
+        // Persist last-seen online vehicle & driver into central system FleetMemory
+        if (b.identificadorCoche) {
+          const rec = {
+            dayKey: todayDayKey,
+            codigoLinea: cod,
+            tripKey: m.tripKey,
+            turnoHora: m.turnoHora,
+            coche: b.identificadorCoche,
+            choferNombre: b.choferNombre || '',
+            choferLegajo: b.choferLegajo || '',
+            choferRaw: b.choferRaw || '',
+            esAdaptado: Boolean(b.esAdaptado),
+            desvioSec: b.desvio?.seconds || 0,
+            desvioRaw: b.desvio?.raw || '',
+            bandera: b.realBandera || b.descripcionBandera || '',
+            ultimaGps: b.ultimaFechaHoraGPS || '',
+            lat: b.lat,
+            lng: b.lng,
+            stopId,
+            updatedAt: nowMs
+          };
+          state.sessionObservedTrips.set(`${cod}:${m.tripKey}`, rec);
+          seenReports.push(rec);
+        }
       }
-    } catch {
-      horarios = [];
     }
   }
 
-  if (horarios.length > 0) {
-    const targetBuses = buses.filter((b) => Number(b.codigoLinea) === Number(codLinea));
-    return matchBusesWithHorarios(targetBuses, horarios);
+  if (seenReports.length > 0 && !isOffline) {
+    api.reportFleetSeen(seenReports, todayDayKey);
   }
-  return new Map();
+
+  // ULT. GPS (blue mode): show ONLY static last GPS positions without schedule-synthesized units
+  if (!state.simulateMode) {
+    return liveBuses;
+  }
+
+  // EN VIVO (green mode): synthesize realistic street-following buses for active turns without live GPS
+  const fleetMem = getMergedFleetMemory();
+  const predictedAll = [];
+  const lineNameOf = (cod) =>
+    state.stopLinesList.find((l) => Number(l.codigo) === Number(cod))?.descripcion ||
+    state.catalogo?.lineByCode?.get(Number(cod))?.descripcion ||
+    state.lineas.find((l) => Number(l.codigo) === Number(cod))?.descripcion ||
+    `L${cod}`;
+
+  const isSingleLine = Boolean(state.focusedLineCode);
+  const maxUpcoming = isSingleLine ? 6 : isOffline ? 3 : 2;
+  const maxAheadMin = isSingleLine ? 95 : isOffline ? 55 : 40;
+
+  for (const cod of targetLineCodes) {
+    const branches = state.routeBranchesCache.get(cod) || [];
+    const horFile = state.horariosArchiveCache.get(cod) || null;
+    if (!branches.length || !horFile || !stopCoords) continue;
+
+    const matchedTrips = liveMatchedTripKeysByLine.get(cod) || new Set();
+    const matchedCoches = liveMatchedCochesByLine.get(cod) || new Set();
+    const lineLive = liveByLine.get(cod) || [];
+
+    const preds = predictLineBusesForStop({
+      codLinea: cod,
+      lineName: lineNameOf(cod),
+      stopId,
+      stopCoords,
+      branches,
+      horariosFile: horFile,
+      tipoDia: todayTipo,
+      nowSec,
+      liveMatchedTripKeys: matchedTrips,
+      liveMatchedCoches: matchedCoches,
+      fleetMemory: fleetMem,
+      maxUpcoming,
+      maxAheadMin
+    });
+
+    for (const p of preds) {
+      // Spatial de-duplication: if an unmatched live GPS bus of the same line & branch is right next to
+      // this predicted slot (e.g., running >15 min late), bind the live bus instead of spawning a ghost!
+      const nearbyUnmatchedLive = lineLive.find(
+        (lb) =>
+          !lb.tripKey &&
+          typeof lb.lat === 'number' &&
+          typeof lb.lng === 'number' &&
+          (distanceMeters(lb.lat, lb.lng, p.lat, p.lng) ?? Infinity) <= 380 &&
+          lb.realBandera === p.realBandera
+      );
+      if (nearbyUnmatchedLive) {
+        nearbyUnmatchedLive.tripKey = p.tripKey;
+        nearbyUnmatchedLive.turnoProgramado = p.turnoProgramado;
+        nearbyUnmatchedLive.scheduledTrip = p.scheduledTrip;
+        nearbyUnmatchedLive.stopProj = p.stopProj;
+        matchedTrips.add(p.tripKey);
+        const predKey = p.key;
+        if (busSimulator.transferState(predKey, nearbyUnmatchedLive.key)) {
+          if (state.selectedBusKey === predKey) state.selectedBusKey = nearbyUnmatchedLive.key;
+        }
+        continue;
+      }
+
+      // Seamless GPS-loss handoff: if a live unit just disappeared from SmartMovePro on this trip/coche,
+      // transfer its exact visual position & speed to the predicted unit!
+      const prevSameTrip = prevByTripKey.get(`${cod}:${p.tripKey}`);
+      const prevSameCoche = p.identificadorCoche ? prevByCoche.get(`${cod}:${p.identificadorCoche}`) : null;
+      const prevSource = prevSameTrip && !prevSameTrip.isPredicted ? prevSameTrip : prevSameCoche && !prevSameCoche.isPredicted ? prevSameCoche : null;
+      if (prevSource) {
+        if (busSimulator.transferState(prevSource.key, p.key)) {
+          if (state.selectedBusKey === prevSource.key) state.selectedBusKey = p.key;
+        }
+      }
+
+      p.stopId = stopId;
+      predictedAll.push(p);
+    }
+  }
+
+  return [...liveBuses, ...predictedAll].sort(
+    (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
+  );
+}
+
+async function renderOfflineOrFallback(showSkeleton = false) {
+  if (!state.activeStop) return;
+  const stopId = state.activeStop.id;
+
+  if (!state.catalogo) {
+    state.catalogo = await api.catalogo().catch(() => null);
+  }
+  const catStop = state.catalogo?.stopById?.get(stopId) || null;
+  if (catStop) {
+    if (state.activeStop.nombre === `Parada ${stopId}` && catStop.nombre) {
+      state.activeStop.nombre = catStop.nombre;
+    }
+    if (!state.activeStop.lat && catStop.lat) {
+      state.activeStop.lat = catStop.lat;
+      state.activeStop.lng = catStop.lng;
+      updateStopHeaderUI();
+    }
+    if (state.stopLinesList.length === 0 && catStop.lineas?.length) {
+      state.stopLinesList = catStop.lineas
+        .map((cod) => {
+          const l = state.catalogo.lineByCode.get(Number(cod)) || state.lineas.find((x) => Number(x.codigo) === Number(cod));
+          return l ? { codigo: Number(l.codigo), descripcion: l.descripcion } : null;
+        })
+        .filter(Boolean);
+    }
+  }
+
+  if (state.activeStop.lat && state.activeStop.lng) {
+    transitMap.setActiveStop(state.activeStop);
+  }
+
+  const targetLineCodes = state.focusedLineCode
+    ? [state.focusedLineCode]
+    : state.stopLinesList.map((l) => Number(l.codigo)).filter(Boolean);
+
+  await ensureScheduleAssetsLoaded(targetLineCodes);
+  await syncFleetMemory(targetLineCodes, { force: false });
+
+  const stopCoords =
+    typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
+      ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
+      : null;
+
+  if (state.simulateMode) {
+    state.dataSource = 'offline-schedule';
+    state.arribos = reconcileWithSchedulePrediction([], stopId, stopCoords, targetLineCodes, { isOffline: true });
+    busSimulator.reconcile(state.arribos, { applyPositions: true, stopId });
+    el.lastSyncLabel.textContent = 'Sin conexión · Por horarios';
+  } else {
+    el.lastSyncLabel.textContent = state.lastSyncAt
+      ? `Sin conexión · Últ. GPS ${state.lastSyncAt.toLocaleTimeString('es-AR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
+        })}`
+      : 'Sin conexión · Cambiá a EN VIVO';
+  }
+
+  updateSignalPill();
+  renderLineFilters();
+  if (!state.horariosOpen) renderArribosList();
+
+  transitMap.updateBuses(state.arribos, {
+    filterLine: state.filterLine,
+    selectedBusKey: state.selectedBusKey,
+    simulateMode: state.simulateMode
+  });
+
+  if (state.simulateMode && state.arribos.length > 0) {
+    startSimLoop();
+  }
+
+  if (showSkeleton && state.arribos.length > 0) {
+    const visibleForFit =
+      state.filterLine === 'ALL'
+        ? state.arribos
+        : state.arribos.filter((b) => b.descripcionLinea === state.filterLine);
+    transitMap.fitFleet(visibleForFit);
+  }
+
+  if (state.selectedBusKey) {
+    const stillHere = state.arribos.find((b) => b.key === state.selectedBusKey);
+    if (stillHere) {
+      if (state.inspectorOpen) updateInspectorFields(stillHere);
+      transitMap.drawFocusVector(stillHere);
+    } else {
+      closeBusInspector();
+    }
+  }
 }
 
 async function fetchArribos(showSkeleton = false) {
@@ -1046,6 +1390,12 @@ async function fetchArribos(showSkeleton = false) {
     const res = state.focusedLineCode
       ? await api.arribosLineaCompleto(state.activeStop.id, state.focusedLineCode)
       : await api.arribos(state.activeStop.id, '000');
+
+    const wasOffline = state.isOffline;
+    state.isOffline = false;
+    if (wasOffline) {
+      showToast('Conexión recuperada · GPS en línea', 'success', 2400);
+    }
 
     const payload = res.data || {};
     state.dataSource = res.source || 'smartmovepro-soap';
@@ -1065,13 +1415,10 @@ async function fetchArribos(showSkeleton = false) {
     }
 
     const rawArribos = Array.isArray(payload.arribos) ? payload.arribos : [];
-    const lineCodes = Array.from(new Set(rawArribos.map((a) => Number(a.codigoLinea)).filter(Boolean)));
 
-    await ensureBranchesLoaded(lineCodes);
-
-    // Keep full stopLinesList when viewing '000' (so user can switch back and forth between lines cleanly)
+    // Keep full stopLinesList when viewing '000' (merged with offline catalogo + live lines)
     if (!state.focusedLineCode) {
-      const linesMap = new Map(state.stopLinesList.map((l) => [l.codigo, l.descripcion]));
+      const linesMap = new Map(state.stopLinesList.map((l) => [Number(l.codigo), l.descripcion]));
       for (const a of rawArribos) {
         if (a.codigoLinea && a.descripcionLinea) {
           linesMap.set(Number(a.codigoLinea), a.descripcionLinea);
@@ -1082,20 +1429,36 @@ async function fetchArribos(showSkeleton = false) {
       state.stopLinesList = [{ codigo: state.focusedLineCode, descripcion: rawArribos[0].descripcionLinea }];
     }
 
+    const targetLineCodes = state.focusedLineCode
+      ? [state.focusedLineCode]
+      : Array.from(
+          new Set([
+            ...state.stopLinesList.map((l) => Number(l.codigo)),
+            ...rawArribos.map((a) => Number(a.codigoLinea))
+          ].filter(Boolean))
+        );
+
+    await Promise.all([
+      ensureScheduleAssetsLoaded(targetLineCodes),
+      syncFleetMemory(targetLineCodes, { force: showSkeleton || wasOffline })
+    ]);
+
     const stopCoords =
       typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
         ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
         : payload.stopCoords || null;
 
-    state.arribos = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
+    const liveBuses = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
+    state.arribos = reconcileWithSchedulePrediction(
+      liveBuses,
+      state.activeStop.id,
+      stopCoords,
+      targetLineCodes,
+      { isOffline: false }
+    );
 
-    // Always learn real speeds & stopped status from fresh GPS fixes; apply smooth non-backjumping reconciliation when in Simulation Mode
-    busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode });
-
-    // When viewing a single line, automatically cross-match every car against its official Horarios Programados!
-    if (state.focusedLineCode && state.arribos.length > 0) {
-      await crossMatchLineHorarios(state.activeStop.id, state.focusedLineCode, state.arribos);
-    }
+    // Always learn real speeds & stopped states from fresh GPS fixes; apply smooth non-backjumping motion in EN VIVO
+    busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode, stopId: state.activeStop.id });
 
     const extLabel = payload.extendedCount > 0 ? ` · +${payload.extendedCount} flota` : '';
     el.lastSyncLabel.textContent = `Act. ${state.lastSyncAt.toLocaleTimeString('es-AR', {
@@ -1139,8 +1502,18 @@ async function fetchArribos(showSkeleton = false) {
 
     checkProximityAlerts();
   } catch (err) {
-    el.lastSyncLabel.textContent = 'Error de conexión';
-    showToast(err.message || 'No se pudieron actualizar los arribos', 'warn');
+    const enteringOffline = !state.isOffline;
+    state.isOffline = true;
+    if (enteringOffline) {
+      showToast(
+        state.simulateMode
+          ? 'Sin conexión · Predicción activa por horarios'
+          : 'Sin conexión · Cambiá a EN VIVO para predicción por horarios',
+        'info',
+        3200
+      );
+    }
+    await renderOfflineOrFallback(showSkeleton);
   } finally {
     state.countdownSec = REFRESH_INTERVAL_SEC;
   }
@@ -1728,21 +2101,26 @@ function renderGlobalSearchResults(rawQuery) {
   const upper = q.toUpperCase();
   const results = [];
 
-  if (/^CT\d{3,6}$/.test(upper)) {
+  if (/^CT\d{3,6}V?$/.test(upper)) {
+    const catHit = state.catalogo?.stopById?.get(upper);
     results.push({
-      title: `Ir a parada ${upper}`,
+      title: catHit ? catHit.nombre : `Ir a parada ${upper}`,
       sub: 'Consultar arribos de todas las líneas',
       badge: upper,
-      action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '000')
+      action: () =>
+        openStopRadar(
+          catHit || { id: upper, nombre: `Parada ${upper}` },
+          '000'
+        )
     });
   }
 
   const knownStops = [...state.favorites, ...state.quickStops];
-  const seenStop = new Set();
+  const seenStop = new Set(results.map((r) => r.badge));
   for (const s of knownStops) {
     if (seenStop.has(s.id)) continue;
-    seenStop.add(s.id);
     if (`${s.id} ${s.nombre} ${s.alias || ''}`.toUpperCase().includes(upper)) {
+      seenStop.add(s.id);
       results.push({
         title: s.nombre,
         sub: s.alias ? `${s.alias} · Todas las líneas` : 'Parada · Todas las líneas',
@@ -1764,6 +2142,28 @@ function renderGlobalSearchResults(rawQuery) {
           openLineCalles(l);
         }
       });
+    }
+  }
+
+  // Search full offline Corrientes stops catalog (1,000+ stops by code or street name)
+  if (q.length >= 2 && state.catalogo?.paradas?.length && results.length < 8) {
+    for (const s of state.catalogo.paradas) {
+      if (results.length >= 8) break;
+      if (seenStop.has(s.id)) continue;
+      if (`${s.id} ${s.nombre}`.toUpperCase().includes(upper)) {
+        seenStop.add(s.id);
+        const linesTxt = (s.lineas || [])
+          .map((c) => state.catalogo.lineByCode.get(Number(c))?.descripcion)
+          .filter(Boolean)
+          .slice(0, 5)
+          .join(', ');
+        results.push({
+          title: s.nombre,
+          sub: linesTxt || 'Parada · Todas las líneas',
+          badge: s.id,
+          action: () => openStopRadar(s, '000')
+        });
+      }
     }
   }
 
@@ -1818,24 +2218,26 @@ function bindEvents() {
   });
 
   el.btnLiveMode.addEventListener('click', async () => {
-    if (!state.activeStop) {
-      showToast('Buscá una parada primero para activar el modo simulación', 'info');
-      return;
-    }
     state.simulateMode = !state.simulateMode;
     updateSignalPill();
     if (state.simulateMode) {
-      showToast('Simulación fluida activa: velocidad real y frenado en semáforos', 'success');
-      if (state.arribos.length === 0) {
+      showToast('EN VIVO: movimiento continuo y predicción por horarios', 'success');
+      if (state.activeStop) {
         await fetchArribos(false);
-      } else {
-        busSimulator.reconcile(state.arribos, { applyPositions: true });
-        startSimLoop();
+        if (state.arribos.length > 0) startSimLoop();
       }
     } else {
       stopSimLoop();
-      showToast('Modo EN VIVO: actualización automática cada 10s', 'info');
-      fetchArribos(false);
+      showToast('ULT. GPS: última actualización satelital estática', 'info');
+      if (state.activeStop) {
+        if (state.isOffline) {
+          // Drop schedule-only synthetic buses when viewing static ULT. GPS offline
+          state.arribos = state.arribos.filter((b) => !b.isPredicted);
+          await renderOfflineOrFallback(false);
+        } else {
+          await fetchArribos(false);
+        }
+      }
     }
   });
 
@@ -1899,6 +2301,25 @@ function bindEvents() {
     if (!e.target.closest('.quick-search-wrap')) el.searchDropdown.classList.add('hidden');
   });
 
+  window.addEventListener('offline', () => {
+    state.isOffline = true;
+    showToast(
+      state.simulateMode
+        ? 'Sin conexión · Predicción activa por horarios'
+        : 'Sin conexión · Cambiá a EN VIVO para predicción por horarios',
+      'info',
+      3000
+    );
+    if (state.activeStop) renderOfflineOrFallback(false);
+  });
+
+  window.addEventListener('online', () => {
+    if (state.isOffline) {
+      showToast('Conexión recuperada · Sincronizando GPS...', 'success', 2200);
+      if (state.activeStop) fetchArribos(false);
+    }
+  });
+
   setupMobileSheet();
 }
 
@@ -1915,8 +2336,9 @@ async function init() {
   }
 
   try {
-    const boot = await api.bootstrap();
-    state.lineas = Array.isArray(boot.lineas) ? boot.lineas : [];
+    const [boot, cat] = await Promise.all([api.bootstrap(), api.catalogo().catch(() => null)]);
+    state.catalogo = cat;
+    state.lineas = Array.isArray(boot.lineas) && boot.lineas.length > 0 ? boot.lineas : cat?.lineas || [];
     state.quickStops = Array.isArray(boot.quickStops) ? boot.quickStops : [];
     state.hubs = Array.isArray(boot.hubs) ? boot.hubs : [];
     state.drill.items = state.lineas;
@@ -1926,6 +2348,9 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
+  // Gently warm all 33 routes + 24h schedules into Service Worker cache in background when online
+  setTimeout(() => warmOfflineArchive(), 3500);
+
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
   const paramCodLinea = params.get('codLinea') || '000';
@@ -1933,7 +2358,8 @@ async function init() {
   if (paramStopId) {
     const known =
       state.quickStops.find((s) => s.id === paramStopId) ||
-      state.favorites.find((f) => f.id === paramStopId) || {
+      state.favorites.find((f) => f.id === paramStopId) ||
+      state.catalogo?.stopById?.get(paramStopId) || {
         id: paramStopId,
         nombre: `Parada ${paramStopId}`
       };

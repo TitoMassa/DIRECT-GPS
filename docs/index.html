@@ -14,9 +14,9 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-  <!-- Leaflet Open-Source Map -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <!-- Leaflet Open-Source Map (vendored locally for 100% offline support) -->
+  <link rel="stylesheet" href="./vendor/leaflet/leaflet.css" />
+  <script src="./vendor/leaflet/leaflet.js"></script>
 
   <link rel="stylesheet" href="./css/styles.css" />
 </head>
@@ -60,7 +60,7 @@
       </div>
 
       <div class="status-cluster">
-        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre seguimiento en vivo y movimiento continuo estimado">
+        <button id="btn-live-mode" class="telemetry-pill" title="EN VIVO: seguimiento continuo con predicción por horarios · Tocá para ver ULT. GPS">
           <span class="signal-dot" id="signal-dot"></span>
           <span id="signal-label">EN VIVO</span>
         </button>

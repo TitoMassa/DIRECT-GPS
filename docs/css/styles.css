@@ -330,14 +330,14 @@ button {
   white-space: nowrap;
 }
 
-.telemetry-pill.is-sim {
-  background: var(--accent-amber-soft);
-  color: var(--accent-amber);
+.telemetry-pill.is-gps {
+  background: var(--accent-sky-soft);
+  color: var(--accent-sky);
 }
 
 .telemetry-pill.is-warn {
-  background: var(--accent-rose-soft);
-  color: var(--accent-rose);
+  background: var(--accent-amber-soft);
+  color: var(--accent-amber);
 }
 
 .signal-dot {
@@ -1675,6 +1675,21 @@ button {
 .bus-desvio-dot.ontime { background: #34d399; }
 .bus-desvio-dot.ahead { background: #38bdf8; }
 .bus-desvio-dot.late { background: #fb7185; }
+.bus-desvio-dot.pred {
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.25);
+}
+
+.bus-marker-wrap.is-predicted .bus-pill-marker {
+  border-style: dashed;
+  opacity: 0.94;
+}
+
+.pred-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
 
 .bus-heading-dot {
   width: 8px;

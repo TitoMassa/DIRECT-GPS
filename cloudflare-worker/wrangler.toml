@@ -1,3 +1,11 @@
 name = "direct-gps-proxy"
 main = "worker.js"
 compatibility_date = "2026-01-01"
+
+[[durable_objects.bindings]]
+name = "FLEET_MEMORY"
+class_name = "FleetMemory"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FleetMemory"]
