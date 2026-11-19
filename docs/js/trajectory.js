@@ -138,10 +138,37 @@ function pickBestOppositeBranch(branches, stopBranch, busLat, busLng) {
 }
 
 /**
+ * Picks the exact paired return branch for `stopBranch` (start near stopBranch's end,
+ * end near stopBranch's start). Crucial for 3-4 branch lines like 103C, 104A, 104D.
+ */
+function pickPairedReturnBranch(branches, stopBranch) {
+  const candidates = branches.filter((b) => b !== stopBranch && b.pts.length >= 6);
+  if (candidates.length === 0) return null;
+
+  const stopStart = stopBranch.pts[0];
+  const stopEnd = stopBranch.pts[stopBranch.pts.length - 1];
+  let best = null;
+  let bestGap = Infinity;
+
+  for (const b of candidates) {
+    const bStart = b.pts[0];
+    const bEnd = b.pts[b.pts.length - 1];
+    const gap =
+      (distanceMeters(stopEnd[0], stopEnd[1], bStart[0], bStart[1]) || 0) +
+      (distanceMeters(bEnd[0], bEnd[1], stopStart[0], stopStart[1]) || 0);
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = b;
+    }
+  }
+  return best;
+}
+
+/**
  * Resolves the true direction & cycle of a live bus:
  *  - 'direct': on stopBranch approaching the stop directly
  *  - 'previous_leg': on oppositeBranch heading to turnaround terminal before stopBranch
- *  - 'full_cycle': on stopBranch AFTER the stop (already passed it) -> far terminal -> full oppositeBranch -> turnaround -> stop
+ *  - 'full_cycle': on stopBranch AFTER the stop (already passed it) -> far terminal -> full paired returnBranch -> turnaround -> stop
  * Computes exact remaining routeMeters along the real street polylines for all 3 cases.
  */
 export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], prevFix = null) {
@@ -179,6 +206,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   const stopProj = projectOnPolyline(stopBranch.pts, stopBranch.cum, stopCoords.lat, stopCoords.lng);
   const busOnStop = projectOnPolyline(stopBranch.pts, stopBranch.cum, bus.lat, bus.lng);
   const { oppositeBranch, busOnOpp } = pickBestOppositeBranch(branches, stopBranch, bus.lat, bus.lng);
+  const returnBranch = pickPairedReturnBranch(branches, stopBranch);
 
   // Hypothesis 1: bus is already on stopBranch BEFORE stop, heading directly toward stop
   const directDist =
@@ -186,33 +214,36 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
 
   // Hypothesis 2: bus is finishing oppositeBranch -> turnaround -> start of stopBranch -> stop
   let loopDist = Infinity;
-  let turnGapOppToStop = 0;
   if (oppositeBranch && busOnOpp) {
     const oppEnd = oppositeBranch.pts[oppositeBranch.pts.length - 1];
     const stopStart = stopBranch.pts[0];
-    turnGapOppToStop = distanceMeters(oppEnd[0], oppEnd[1], stopStart[0], stopStart[1]) || 0;
-    loopDist = Math.max(0, oppositeBranch.totalLen - busOnOpp.along) + turnGapOppToStop + stopProj.along;
+    const gapOppToStop = distanceMeters(oppEnd[0], oppEnd[1], stopStart[0], stopStart[1]) || 0;
+    loopDist = Math.max(0, oppositeBranch.totalLen - busOnOpp.along) + gapOppToStop + stopProj.along;
   }
 
-  // Hypothesis 3: bus is on stopBranch AFTER the stop (or just passing it) -> far terminal -> full oppositeBranch -> turnaround -> stop
+  // Hypothesis 3: bus is on stopBranch AFTER the stop (or just passing it) -> far terminal -> full returnBranch -> turnaround -> stop
   let fullCycleDist = Infinity;
-  let turnGapStopToOpp = 0;
-  if (oppositeBranch && busOnStop) {
+  if (busOnStop) {
     const stopEnd = stopBranch.pts[stopBranch.pts.length - 1];
-    const oppStart = oppositeBranch.pts[0];
-    turnGapStopToOpp = distanceMeters(stopEnd[0], stopEnd[1], oppStart[0], oppStart[1]) || 0;
-    fullCycleDist =
-      Math.max(0, stopBranch.totalLen - busOnStop.along) +
-      turnGapStopToOpp +
-      oppositeBranch.totalLen +
-      turnGapOppToStop +
-      stopProj.along;
+    const stopStart = stopBranch.pts[0];
+    if (returnBranch) {
+      const retStart = returnBranch.pts[0];
+      const retEnd = returnBranch.pts[returnBranch.pts.length - 1];
+      const gap1 = distanceMeters(stopEnd[0], stopEnd[1], retStart[0], retStart[1]) || 0;
+      const gap2 = distanceMeters(retEnd[0], retEnd[1], stopStart[0], stopStart[1]) || 0;
+      fullCycleDist =
+        Math.max(0, stopBranch.totalLen - busOnStop.along) + gap1 + returnBranch.totalLen + gap2 + stopProj.along;
+    } else {
+      // Single-branch circular route fallback
+      const gapClose = distanceMeters(stopEnd[0], stopEnd[1], stopStart[0], stopStart[1]) || 0;
+      fullCycleDist = Math.max(0, stopBranch.totalLen - busOnStop.along) + gapClose + stopProj.along;
+    }
   }
 
   // Realistic urban Corrientes commercial speed estimates (including stops + terminal layovers)
   const estDirectMin = directDist < Infinity ? directDist / 230 : Infinity;
   const estOppMin = loopDist < Infinity ? loopDist / 210 + 3 : Infinity;
-  const estCycleMin = fullCycleDist < Infinity ? fullCycleDist / 210 + 6 : Infinity;
+  const estCycleMin = fullCycleDist < Infinity ? fullCycleDist / 210 + (returnBranch ? 6 : 3) : Infinity;
 
   // Signal 1: Real observed GPS heading vector between consecutive polls for this exact bus unit
   let headingDir = null; // 'stop' | 'opp' | null
@@ -267,8 +298,8 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     leg = 'previous_leg';
   } else if (headingDir === 'stop') {
     if (directDist === Infinity) {
-      leg = hasOpposite ? 'full_cycle' : 'direct';
-    } else if (hasOpposite && etaMin >= 25 && Math.abs(estCycleMin - etaMin) + 12 < Math.abs(estDirectMin - etaMin)) {
+      leg = 'full_cycle';
+    } else if (etaMin >= 25 && Math.abs(estCycleMin - etaMin) + 12 < Math.abs(estDirectMin - etaMin)) {
       // Bus is on stopBranch lane, moving in stopBranch direction, just barely before/at stop yet ETA is ~1 full loop
       leg = 'full_cycle';
     } else {
@@ -293,25 +324,28 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
         leg = bestIndirect;
       }
     }
+  } else if (directDist === Infinity) {
+    // Circular single-branch route where bus already passed the stop
+    leg = 'full_cycle';
   }
 
   let pathPts;
   let realBandera;
   let totalMeters;
 
-  if (leg === 'full_cycle' && oppositeBranch && busOnStop) {
+  if (leg === 'full_cycle' && busOnStop) {
     const stopRemainder = slicePolyline(stopBranch.pts, busOnStop, null);
-    const oppFull = oppositeBranch.pts.slice();
+    const retFull = returnBranch ? returnBranch.pts.slice() : [];
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
 
-    pathPts = [...stopRemainder, ...oppFull, ...stopApproach];
+    pathPts = [...stopRemainder, ...retFull, ...stopApproach];
     realBandera = stopBranch.bandera || bus.descripcionBandera;
 
     const cum = buildCumDist(pathPts);
     totalMeters = cum[cum.length - 1] || 0;
     const oppStartMeters = buildCumDist(stopRemainder).slice(-1)[0] || 0;
-    const turnaroundAtMeters = buildCumDist([...stopRemainder, ...oppFull]).slice(-1)[0] || 0;
+    const turnaroundAtMeters = buildCumDist([...stopRemainder, ...retFull]).slice(-1)[0] || 0;
 
     return {
       leg: 'full_cycle',
