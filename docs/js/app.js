@@ -1,4 +1,4 @@
-import { PILOT_STOP_DEFAULT, REFRESH_INTERVAL_SEC, getLineColor } from './config.js';
+import { CORRIENTES_CENTER, REFRESH_INTERVAL_SEC, getLineColor } from './config.js';
 import {
   api,
   distanceMeters,
@@ -9,30 +9,35 @@ import {
   computeProximityPercent,
   parseDesvioHorario,
   parseChoferInfo,
-  formatGpsTimeOnly
+  formatGpsTimeOnly,
+  extractRoutePolylines,
+  interpolateSoapBusStep
 } from './api.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
 
-const STORAGE_FAVS_KEY = 'direct_gps_favs_v1';
+const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
 
 const state = {
-  // Active stop & arrivals
-  activeStop: { ...PILOT_STOP_DEFAULT },
+  // Active stop & arrivals (starts null = clean interface until user picks/searches a stop)
+  activeStop: null,
   codLineaQuery: '000', // 000 = all lines passing the stop (richer SOAP results)
   filterLine: 'ALL',
   arribos: [],
   selectedBusKey: null,
-  simulateMode: false,
+  simulateMode: false, // Smooth 1s interpolation over real SOAP data & polylines
   dataSource: 'smartmovepro-soap',
   lastSyncAt: null,
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
 
+  // Cache of real SOAP route polylines by codigoLinea (used both for map drawing & SOAP interpolation)
+  routePolylinesCache: new Map(),
+
   // Catalog & Drilldown (Lineas -> Calles -> Intersecciones -> Paradas)
   lineas: [],
-  quickStops: [PILOT_STOP_DEFAULT],
+  quickStops: [],
   hubs: [],
   drill: {
     step: 'lineas', // 'lineas' | 'calles' | 'intersecciones' | 'paradas'
@@ -44,7 +49,7 @@ const state = {
 
   // Alerts, Favorites, Preferences
   soundEnabled: true,
-  armedAlerts: new Set(), // line names armed for <= 3 min proximity alert
+  armedAlerts: new Set(),
   triggeredAlerts: new Set(),
   favorites: [],
   nearbyStops: []
@@ -72,6 +77,7 @@ const el = {
   metaThemeColor: document.getElementById('meta-theme-color'),
 
   // Radar panel
+  stopHero: document.getElementById('stop-hero'),
   stopCodeBadge: document.getElementById('stop-code-badge'),
   stopPilotTag: document.getElementById('stop-pilot-tag'),
   stopTitle: document.getElementById('stop-title'),
@@ -130,7 +136,7 @@ const el = {
   toastContainer: document.getElementById('toast-container')
 };
 
-// Map Instance
+// Map Instance (Leaflet + OpenStreetMap)
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => selectBus(busKey, true),
   onStopPick: (stop) => openStopRadar(stop, '000')
@@ -161,7 +167,7 @@ function showToast(message, type = 'info', duration = 3600) {
 }
 
 // ============================================================================
-// Theme & PWA Registration
+// Theme (Leaflet Free OpenStreetMap Nocturno / Clásico)
 // ============================================================================
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
@@ -170,34 +176,27 @@ function applyTheme(theme) {
   el.iconSun.classList.toggle('hidden', isLight);
   el.iconMoon.classList.toggle('hidden', !isLight);
   el.metaThemeColor.setAttribute('content', isLight ? '#e8eef5' : '#0c1118');
-  if (transitMap.tileKey !== 'satellite') {
+  if (transitMap.tileKey !== 'hot') {
     transitMap.setTileStyle(isLight ? 'light' : 'dark');
   }
 }
 
 // ============================================================================
-// Favorites Storage
+// Favorites Storage (Clean empty default — no hardcoded pilot stop)
 // ============================================================================
 function loadFavorites() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_FAVS_KEY) || 'null');
-    if (Array.isArray(saved) && saved.length > 0) {
+    if (Array.isArray(saved)) {
       state.favorites = saved;
+      renderFavorites();
       return;
     }
   } catch {
     // ignore
   }
-  state.favorites = [
-    {
-      id: PILOT_STOP_DEFAULT.id,
-      nombre: PILOT_STOP_DEFAULT.nombre,
-      alias: 'Parada Piloto · Av. Ferré y Brasil',
-      lat: PILOT_STOP_DEFAULT.lat,
-      lng: PILOT_STOP_DEFAULT.lng
-    }
-  ];
-  saveFavorites();
+  state.favorites = [];
+  renderFavorites();
 }
 
 function saveFavorites() {
@@ -207,16 +206,17 @@ function saveFavorites() {
 }
 
 function isFavorite(stopId) {
-  return state.favorites.some((f) => f.id === stopId);
+  return Boolean(stopId) && state.favorites.some((f) => f.id === stopId);
 }
 
 function updateFavStarButton() {
-  const fav = isFavorite(state.activeStop.id);
+  const fav = state.activeStop ? isFavorite(state.activeStop.id) : false;
   el.btnToggleFav.classList.toggle('is-fav', fav);
   el.btnToggleFav.title = fav ? 'Quitar de favoritas' : 'Guardar parada en favoritas';
 }
 
 function toggleActiveStopFavorite() {
+  if (!state.activeStop) return;
   const s = state.activeStop;
   if (isFavorite(s.id)) {
     state.favorites = state.favorites.filter((f) => f.id !== s.id);
@@ -240,7 +240,7 @@ function renderFavorites() {
       <div class="empty-state">
         <div class="empty-state-icon">★</div>
         <h3>Sin paradas favoritas</h3>
-        <p>Tocá la estrella en cualquier parada para tenerla siempre a mano.</p>
+        <p>Buscá una parada y tocá la estrella para guardarla acá con acceso directo.</p>
       </div>
     `;
     return;
@@ -347,11 +347,90 @@ function setupMobileSheet() {
 }
 
 // ============================================================================
-// Core Radar: Stop Loading, Live Arrivals & Telemetry
+// Clean Welcome State (No stop loaded until user searches or selects one)
+// ============================================================================
+function renderRadarWelcome() {
+  el.stopHero.classList.add('hidden');
+  el.lineFilterStrip.classList.add('hidden');
+
+  el.arribosList.innerHTML = `
+    <div class="radar-welcome">
+      <span class="welcome-badge">TELEMETRÍA SOAP EN VIVO · CORRIENTES</span>
+      <h2>Elegí una parada para iniciar el radar</h2>
+      <p>Ingresá el código de una parada para ver todos los colectivos en vivo (coche, chofer, ID y desvío horario +/-), o explorá por línea y cercanía.</p>
+
+      <form id="welcome-stop-form" class="welcome-code-form">
+        <input
+          id="welcome-stop-input"
+          type="text"
+          class="welcome-code-input"
+          placeholder="Ej: CT31498"
+          autocomplete="off"
+          aria-label="Código de parada"
+        />
+        <button type="submit" class="primary-action-btn">Buscar</button>
+      </form>
+
+      <div class="welcome-actions">
+        <button id="btn-welcome-lineas" class="secondary-action-btn">Explorar líneas</button>
+        <button id="btn-welcome-cercanas" class="secondary-action-btn">Paradas cercanas</button>
+      </div>
+
+      <div class="welcome-tip">
+        <strong>Tip:</strong> también podés mover el mapa Leaflet sobre cualquier avenida de Corrientes y tocar el botón de lupa inferior derecho para detectar paradas en esa zona.
+      </div>
+    </div>
+  `;
+
+  const form = document.getElementById('welcome-stop-form');
+  const input = document.getElementById('welcome-stop-input');
+  form?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const raw = (input?.value || '').trim().toUpperCase();
+    if (!raw) {
+      showToast('Ingresá un código de parada (ej. CT31498)', 'info');
+      return;
+    }
+    const known = state.quickStops.find((s) => s.id === raw) || state.favorites.find((f) => f.id === raw);
+    openStopRadar(known || { id: raw, nombre: `Parada ${raw}` }, '000');
+  });
+
+  document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => {
+    switchTab('lineas');
+  });
+
+  document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => {
+    switchTab('cercanas');
+  });
+}
+
+function resetToWelcome() {
+  state.activeStop = null;
+  state.arribos = [];
+  state.selectedBusKey = null;
+  state.filterLine = 'ALL';
+  state.routesVisible = false;
+  el.btnShowRoutes.classList.remove('active');
+  closeBusInspector();
+  transitMap.clearActiveStop();
+  transitMap.clearRoutes();
+  transitMap.resetViewToCity();
+
+  const url = new URL(window.location.href);
+  url.searchParams.delete('idParada');
+  url.searchParams.delete('codLinea');
+  window.history.replaceState({}, '', url.toString());
+
+  switchTab('radar');
+  renderRadarWelcome();
+}
+
+// ============================================================================
+// Core Radar: Stop Loading, Live SOAP Arrivals & SOAP-Based Interpolation
 // ============================================================================
 function updateSignalPill() {
   el.btnLiveMode.classList.remove('is-sim', 'is-warn');
-  if (state.simulateMode || state.dataSource === 'simulation' || state.dataSource === 'fallback') {
+  if (state.simulateMode) {
     el.btnLiveMode.classList.add('is-sim');
     el.signalLabel.textContent = 'SIMULACIÓN';
   } else if (state.dataSource === 'smartmovepro-cache') {
@@ -363,15 +442,20 @@ function updateSignalPill() {
 }
 
 function updateStopHeaderUI() {
+  if (!state.activeStop) {
+    el.stopHero.classList.add('hidden');
+    el.lineFilterStrip.classList.add('hidden');
+    return;
+  }
+
+  el.stopHero.classList.remove('hidden');
+  el.lineFilterStrip.classList.remove('hidden');
+
   const s = state.activeStop;
   const isAll = !state.codLineaQuery || state.codLineaQuery === '0' || state.codLineaQuery === '000';
   el.stopCodeBadge.textContent = s.id;
   el.stopTitle.textContent = s.nombre || `Parada ${s.id}`;
-  el.stopPilotTag.textContent = isAll
-    ? s.id === PILOT_STOP_DEFAULT.id
-      ? 'PILOTO · TODAS LAS LÍNEAS (000)'
-      : 'TODAS LAS LÍNEAS (000)'
-    : `LÍNEA CÓD. ${state.codLineaQuery}`;
+  el.stopPilotTag.textContent = isAll ? 'TODAS LAS LÍNEAS (000)' : `LÍNEA CÓD. ${state.codLineaQuery}`;
 
   if (typeof s.lat === 'number' && typeof s.lng === 'number') {
     el.stopCoordsLabel.textContent = `${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}`;
@@ -385,7 +469,6 @@ function updateStopHeaderUI() {
 
   updateFavStarButton();
 
-  // Sync URL cleanly for sharing
   const url = new URL(window.location.href);
   url.searchParams.set('idParada', s.id);
   url.searchParams.set('codLinea', isAll ? '000' : state.codLineaQuery);
@@ -394,9 +477,12 @@ function updateStopHeaderUI() {
 
 async function openStopRadar(stopInfo, codLinea = '000') {
   const rawCode = String(codLinea ?? '000').trim();
+  const stopId = String(stopInfo.id || stopInfo.identificador || '').trim().toUpperCase();
+  if (!stopId) return;
+
   state.activeStop = {
-    id: String(stopInfo.id || stopInfo.identificador || PILOT_STOP_DEFAULT.id).toUpperCase(),
-    nombre: stopInfo.nombre || stopInfo.descripcion || `Parada ${stopInfo.id}`,
+    id: stopId,
+    nombre: stopInfo.nombre || stopInfo.descripcion || `Parada ${stopId}`,
     lat: typeof stopInfo.lat === 'number' ? stopInfo.lat : parseFloat(stopInfo.latitud) || null,
     lng: typeof stopInfo.lng === 'number' ? stopInfo.lng : parseFloat(stopInfo.longitud) || null
   };
@@ -439,6 +525,11 @@ function normalizeArrivals(rawList, stopCoords) {
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
     const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
 
+    // Derive realistic approach speed (m/s) directly from real SOAP distance & ETA
+    const etaSec = eta.minutes <= 0 ? 40 : eta.minutes * 60;
+    const rawSpeed = dist !== null && etaSec > 0 ? dist / etaSec : 6.5;
+    const speedMps = Math.max(3.5, Math.min(13, rawSpeed));
+
     return {
       key: occ > 1 ? `${baseId}-${occ}` : baseId,
       codigoLinea: a.codigoLinea,
@@ -447,6 +538,8 @@ function normalizeArrivals(rawList, stopCoords) {
       descripcionCartelBandera: (a.descripcionCartelBandera || a.descripcionCortaBandera || '').trim(),
       tiempoRaw: a.tiempoRestanteArribo || '',
       eta,
+      etaSecondsRemaining: etaSec,
+      speedMps,
       esAdaptado: Boolean(a.esAdaptado),
       esLleno: a.esLleno === true,
       lat: validPos ? lat : null,
@@ -462,6 +555,75 @@ function normalizeArrivals(rawList, stopCoords) {
       gpsTimeOnly
     };
   });
+}
+
+// Preload real SOAP route polylines for approaching buses so SOAP interpolation glides along real streets
+async function preloadPolylinesForInterpolation() {
+  const uniqueLineCodes = Array.from(
+    new Set(state.arribos.map((b) => b.codigoLinea).filter((c) => c && !state.routePolylinesCache.has(c)))
+  ).slice(0, 5);
+
+  await Promise.all(
+    uniqueLineCodes.map(async (cod) => {
+      try {
+        const res = await api.recorridos(cod);
+        const polylines = extractRoutePolylines(Array.isArray(res.data) ? res.data : []);
+        state.routePolylinesCache.set(cod, polylines);
+      } catch {
+        state.routePolylinesCache.set(cod, []);
+      }
+    })
+  );
+}
+
+// Smooth 1-second interpolation step powered purely by the latest real SOAP fleet & SOAP polylines
+function stepSoapInterpolation() {
+  if (!state.simulateMode || !state.activeStop || state.arribos.length === 0) return;
+  const stopCoords =
+    typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
+      ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
+      : null;
+  if (!stopCoords) return;
+
+  let changed = false;
+  for (const bus of state.arribos) {
+    if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+    const polylines = state.routePolylinesCache.get(bus.codigoLinea) || [];
+    const next = interpolateSoapBusStep(bus, stopCoords, bus.speedMps, polylines);
+    bus.lat = next.lat;
+    bus.lng = next.lng;
+    bus.distanceMeters = distanceMeters(bus.lat, bus.lng, stopCoords.lat, stopCoords.lng);
+    bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining || 0) - 1);
+
+    const mins = Math.ceil(bus.etaSecondsRemaining / 60);
+    if (next.arrived || bus.etaSecondsRemaining <= 35) {
+      bus.eta = { minutes: 0, display: 'YA', unit: 'Arribando', urgency: 'now' };
+      bus.tiempoRaw = 'Arribando..';
+    } else {
+      bus.eta = {
+        minutes: mins,
+        display: `${mins}`,
+        unit: 'min',
+        urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
+      };
+      bus.tiempoRaw = `${mins} min. aprox.`;
+    }
+    bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.distanceMeters);
+    changed = true;
+  }
+
+  if (changed) {
+    transitMap.updateBuses(state.arribos, {
+      filterLine: state.filterLine,
+      selectedBusKey: state.selectedBusKey
+    });
+    renderArribosList();
+    if (state.selectedBusKey) {
+      const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
+      if (focused) updateInspectorFields(focused);
+    }
+    checkProximityAlerts();
+  }
 }
 
 function renderLineFilters() {
@@ -502,6 +664,11 @@ function renderLineFilters() {
 }
 
 function renderArribosList() {
+  if (!state.activeStop) {
+    renderRadarWelcome();
+    return;
+  }
+
   const visible =
     state.filterLine === 'ALL'
       ? state.arribos
@@ -516,16 +683,11 @@ function renderArribosList() {
           </svg>
         </div>
         <h3>Sin unidades reportando arribos</h3>
-        <p>En este momento no hay colectivos transmitiendo GPS hacia <strong>${escapeHtml(
+        <p>En este momento el servicio SOAP no reporta colectivos en camino hacia <strong>${escapeHtml(
           state.activeStop.id
-        )}</strong>. Podés reintentar o activar el modo simulación para probar el radar.</p>
-        <button id="btn-empty-sim" class="pill-btn" style="margin-top:6px">Probar en modo Simulación</button>
+        )}</strong>. Podés reintentar en unos segundos o elegir otra parada.</p>
       </div>
     `;
-    document.getElementById('btn-empty-sim')?.addEventListener('click', () => {
-      state.simulateMode = true;
-      fetchArribos(true);
-    });
     return;
   }
 
@@ -637,6 +799,7 @@ function renderArribosList() {
 }
 
 function checkProximityAlerts() {
+  if (!state.activeStop) return;
   for (const bus of state.arribos) {
     if (
       state.armedAlerts.has(bus.descripcionLinea) &&
@@ -655,14 +818,7 @@ function checkProximityAlerts() {
   }
 }
 
-function selectBus(busKey, focusMap = false) {
-  state.selectedBusKey = busKey;
-  const bus = state.arribos.find((b) => b.key === busKey);
-  if (!bus) {
-    closeBusInspector();
-    return;
-  }
-
+function updateInspectorFields(bus) {
   const color = getLineColor(bus.descripcionLinea);
   el.inspLineBadge.textContent = bus.descripcionLinea;
   el.inspLineBadge.style.setProperty('--line-color', color);
@@ -676,7 +832,7 @@ function selectBus(busKey, focusMap = false) {
   el.inspLegajo.textContent = bus.choferLegajo || '—';
   el.inspCoche.textContent = bus.identificadorCoche ? `#${bus.identificadorCoche}` : '—';
 
-  el.inspEta.textContent = bus.eta.minutes === 0 ? 'Llegando' : `${bus.eta.display} min`;
+  el.inspEta.textContent = bus.eta.minutes === 0 ? 'Arribando' : `${bus.eta.display} min`;
   el.inspDist.textContent = formatDistance(bus.distanceMeters);
   el.inspBlocks.textContent = formatBlocks(bus.distanceMeters);
   el.inspAccess.textContent = bus.esAdaptado ? '♿ Rampa' : 'Estándar';
@@ -687,7 +843,17 @@ function selectBus(busKey, focusMap = false) {
 
   el.btnInspRoute.dataset.codLinea = bus.codigoLinea;
   el.btnInspRoute.dataset.lineName = bus.descripcionLinea;
+}
 
+function selectBus(busKey, focusMap = false) {
+  state.selectedBusKey = busKey;
+  const bus = state.arribos.find((b) => b.key === busKey);
+  if (!bus) {
+    closeBusInspector();
+    return;
+  }
+
+  updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
   renderArribosList();
   transitMap.updateBuses(state.arribos, {
@@ -707,22 +873,27 @@ function closeBusInspector() {
     filterLine: state.filterLine,
     selectedBusKey: null
   });
-  renderArribosList();
+  if (state.activeStop) renderArribosList();
 }
 
 async function fetchArribos(showSkeleton = false) {
+  if (!state.activeStop) return;
+
   el.btnRefresh.classList.add('is-loading');
   if (showSkeleton) {
     el.arribosList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
   }
 
   try {
-    const res = await api.arribos(state.activeStop.id, state.codLineaQuery, state.simulateMode);
+    const res = await api.arribos(state.activeStop.id, state.codLineaQuery);
     const payload = res.data || {};
-    state.dataSource = res.source || 'smartmovepro';
+    state.dataSource = res.source || 'smartmovepro-soap';
     state.lastSyncAt = new Date();
 
-    // Update stop coordinates if discovered from live SmartMovePro payload
+    if (payload.knownStop && state.activeStop.nombre === `Parada ${state.activeStop.id}`) {
+      state.activeStop.nombre = payload.knownStop.nombre;
+    }
+
     if (payload.stopCoords && (!state.activeStop.lat || !state.activeStop.lng)) {
       state.activeStop.lat = payload.stopCoords.lat;
       state.activeStop.lng = payload.stopCoords.lng;
@@ -738,7 +909,7 @@ async function fetchArribos(showSkeleton = false) {
         : payload.stopCoords || null;
 
     state.arribos = normalizeArrivals(payload.arribos, stopCoords);
-    el.lastSyncLabel.textContent = `Sync ${state.lastSyncAt.toLocaleTimeString('es-AR', {
+    el.lastSyncLabel.textContent = `SOAP ${state.lastSyncAt.toLocaleTimeString('es-AR', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit'
@@ -758,14 +929,18 @@ async function fetchArribos(showSkeleton = false) {
 
     if (state.selectedBusKey) {
       const stillHere = state.arribos.find((b) => b.key === state.selectedBusKey);
-      if (stillHere) selectBus(stillHere.key, false);
+      if (stillHere) updateInspectorFields(stillHere);
       else closeBusInspector();
+    }
+
+    if (state.simulateMode) {
+      preloadPolylinesForInterpolation();
     }
 
     checkProximityAlerts();
   } catch (err) {
     el.lastSyncLabel.textContent = 'Error de conexión';
-    showToast(err.message || 'No se pudieron actualizar los arribos', 'warn');
+    showToast(err.message || 'No se pudieron actualizar los arribos SOAP', 'warn');
   } finally {
     el.btnRefresh.classList.remove('is-loading');
     state.countdownSec = REFRESH_INTERVAL_SEC;
@@ -774,7 +949,7 @@ async function fetchArribos(showSkeleton = false) {
 }
 
 function updateCountdownRing() {
-  const circumference = 2 * Math.PI * 14; // 87.96
+  const circumference = 2 * Math.PI * 14;
   const ratio = state.countdownSec / REFRESH_INTERVAL_SEC;
   el.ringProgress.style.strokeDashoffset = String(circumference * (1 - ratio));
   el.ringLabel.textContent = String(state.countdownSec);
@@ -789,6 +964,7 @@ async function loadRouteForLine(codLinea, lineName, { clearExisting = true, fit 
   try {
     const res = await api.recorridos(codLinea);
     const list = Array.isArray(res.data) ? res.data : [];
+    state.routePolylinesCache.set(Number(codLinea), extractRoutePolylines(list));
     if (list.length === 0) {
       showToast(`Sin traza disponible para ${lineName}`, 'warn');
       return;
@@ -811,13 +987,12 @@ async function toggleActiveStopRoutes() {
     return;
   }
 
-  // Load up to 2 unique lines currently arriving at this stop (respecting SmartMovePro rate limits)
   const unique = [];
   for (const a of state.arribos) {
     if (!unique.some((u) => u.codigoLinea === a.codigoLinea)) {
       unique.push({ codigoLinea: a.codigoLinea, lineName: a.descripcionLinea });
     }
-    if (unique.length >= 2) break;
+    if (unique.length >= 3) break;
   }
   if (unique.length === 0) {
     showToast('Seleccioná una línea en la pestaña Líneas para trazar su recorrido', 'info');
@@ -1063,7 +1238,7 @@ function renderHubs() {
   el.hubsChips.innerHTML = state.hubs
     .map(
       (h, idx) =>
-        `<button class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name)}</button>`
+        `<button class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name.replace(/\s*\(Piloto\)/i, ''))}</button>`
     )
     .join('');
 
@@ -1074,6 +1249,14 @@ function renderHubs() {
       searchNearbyStops(hub.lat, hub.lng, hub.name);
     });
   });
+
+  el.cercanasList.innerHTML = `
+    <div class="empty-state">
+      <div class="empty-state-icon">◎</div>
+      <h3>Buscá paradas a tu alrededor</h3>
+      <p>Usá tu GPS, tocá el centro del mapa o elegí una zona rápida de Corrientes arriba.</p>
+    </div>
+  `;
 }
 
 async function searchNearbyStops(lat, lng, label = 'esta zona') {
@@ -1141,12 +1324,13 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
 
 function locateUserGps() {
   if (!navigator.geolocation) {
-    showToast('Tu navegador no soporta GPS. Mostrando zona Av. Ferré y Brasil.', 'warn');
-    searchNearbyStops(PILOT_STOP_DEFAULT.lat, PILOT_STOP_DEFAULT.lng, 'Av. Ferré y Brasil');
+    showToast('Tu navegador no soporta GPS. Buscando en el centro del mapa.', 'warn');
+    const c = transitMap.getCenter();
+    searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
     return;
   }
 
-  showToast('Obteniendo ubicación satelital...', 'info', 2000);
+  showToast('Obteniendo ubicación GPS...', 'info', 2000);
   navigator.geolocation.getCurrentPosition(
     (pos) => {
       const { latitude, longitude, accuracy } = pos.coords;
@@ -1154,15 +1338,15 @@ function locateUserGps() {
       searchNearbyStops(latitude, longitude, 'tu ubicación');
     },
     () => {
-      showToast('Sin permiso GPS. Buscando paradas cerca de Av. Ferré y Brasil.', 'warn');
-      searchNearbyStops(PILOT_STOP_DEFAULT.lat, PILOT_STOP_DEFAULT.lng, 'Av. Ferré y Brasil');
+      showToast('Sin permiso GPS. Buscando paradas en el centro de Corrientes.', 'warn');
+      searchNearbyStops(CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng, 'Centro de Corrientes');
     },
     { enableHighAccuracy: true, timeout: 7000 }
   );
 }
 
 // ============================================================================
-// Global Instant Search (Stop Code CTxxxxx, Quick Stops, Favorites, Lines)
+// Global Instant Search (Stop Code CTxxxxx, Known Stops, Favorites, Lines)
 // ============================================================================
 function renderGlobalSearchResults(rawQuery) {
   const q = rawQuery.trim();
@@ -1174,18 +1358,16 @@ function renderGlobalSearchResults(rawQuery) {
   const upper = q.toUpperCase();
   const results = [];
 
-  // Direct CTxxxxx stop code jump
   if (/^CT\d{3,6}$/.test(upper)) {
     results.push({
       type: 'direct-stop',
       title: `Ir a parada ${upper}`,
-      sub: 'Consultar arribos de todas las líneas (código 000)',
+      sub: 'Consultar arribos SOAP de todas las líneas (código 000)',
       badge: upper,
       action: () => openStopRadar({ id: upper, nombre: `Parada ${upper}` }, '000')
     });
   }
 
-  // Matching quick stops & favorites
   const knownStops = [...state.favorites, ...state.quickStops];
   const seenStop = new Set();
   for (const s of knownStops) {
@@ -1203,7 +1385,6 @@ function renderGlobalSearchResults(rawQuery) {
     }
   }
 
-  // Matching lines
   for (const l of state.lineas) {
     if (l.descripcion.toUpperCase().includes(upper)) {
       results.push({
@@ -1252,16 +1433,14 @@ function renderGlobalSearchResults(rawQuery) {
 }
 
 // ============================================================================
-// Event Bindings & Bootstrap
+// Event Bindings & Clean Startup
 // ============================================================================
 function bindEvents() {
   el.tabs.forEach((tab) => {
     tab.addEventListener('click', () => switchTab(tab.dataset.tab));
   });
 
-  el.btnBrandHome.addEventListener('click', () => {
-    openStopRadar(PILOT_STOP_DEFAULT, '000');
-  });
+  el.btnBrandHome.addEventListener('click', resetToWelcome);
 
   el.btnThemeToggle.addEventListener('click', () => {
     const cur = document.documentElement.getAttribute('data-theme');
@@ -1277,20 +1456,29 @@ function bindEvents() {
     showToast(state.soundEnabled ? 'Alertas sonoras activadas' : 'Alertas sonoras silenciadas', 'info', 2000);
   });
 
-  el.btnLiveMode.addEventListener('click', () => {
+  el.btnLiveMode.addEventListener('click', async () => {
+    if (!state.activeStop) {
+      showToast('Primero buscá o elegí una parada para interpolar sus colectivos SOAP en vivo', 'info');
+      return;
+    }
     state.simulateMode = !state.simulateMode;
-    showToast(
-      state.simulateMode
-        ? 'Modo Simulación activado (telemetría sintética)'
-        : 'Conectando a telemetría EN VIVO SmartMovePro...',
-      state.simulateMode ? 'warn' : 'success'
-    );
-    fetchArribos(true);
+    updateSignalPill();
+    if (state.simulateMode) {
+      showToast('Interpolación fluida activada usando posiciones y recorridos reales SOAP', 'success');
+      if (state.arribos.length === 0) {
+        await fetchArribos(false);
+      }
+      await preloadPolylinesForInterpolation();
+    } else {
+      showToast('Modo EN VIVO: sincronizando directo cada 15s con SOAP', 'info');
+      fetchArribos(false);
+    }
   });
 
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
 
   el.btnShareStop.addEventListener('click', async () => {
+    if (!state.activeStop) return;
     const shareUrl = window.location.href;
     try {
       await navigator.clipboard.writeText(shareUrl);
@@ -1318,7 +1506,7 @@ function bindEvents() {
   el.btnMapCenterStop.addEventListener('click', () => transitMap.focusStop(16));
   el.btnMapStyle.addEventListener('click', () => {
     const cfg = transitMap.cycleTileStyle();
-    showToast(`Mapa: ${cfg.label}`, 'info', 1600);
+    showToast(`Mapa Leaflet: ${cfg.label}`, 'info', 1600);
   });
   el.btnMapScanArea.addEventListener('click', () => {
     const c = transitMap.getCenter();
@@ -1355,50 +1543,55 @@ function bindEvents() {
 }
 
 async function init() {
-  // Restore theme
   const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || 'dark';
   applyTheme(savedTheme);
 
   loadFavorites();
   bindEvents();
+  updateSignalPill();
 
-  // Register PWA service worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
-  // Bootstrap catalog (lines, hubs, pilot stop)
+  // Bootstrap real Corrientes catalog (33 lines + hubs) without opening any pilot stop
   try {
     const boot = await api.bootstrap();
     state.lineas = Array.isArray(boot.lineas) ? boot.lineas : [];
-    state.quickStops = Array.isArray(boot.quickStops) ? boot.quickStops : [PILOT_STOP_DEFAULT];
+    state.quickStops = Array.isArray(boot.quickStops) ? boot.quickStops : [];
     state.hubs = Array.isArray(boot.hubs) ? boot.hubs : [];
     state.drill.items = state.lineas;
     renderDrilldown();
     renderHubs();
   } catch {
-    showToast('Iniciando con catálogo local de Corrientes', 'warn');
+    showToast('No se pudo cargar el catálogo inicial de líneas', 'warn');
   }
 
-  // Check URL query params (?idParada=CT31498&codLinea=000)
+  // Only open a stop automatically if explicitly provided via URL (?idParada=...)
   const params = new URLSearchParams(window.location.search);
-  const paramStopId = (params.get('idParada') || PILOT_STOP_DEFAULT.id).toUpperCase();
+  const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
   const paramCodLinea = params.get('codLinea') || '000';
 
-  const matchedKnown =
-    state.quickStops.find((s) => s.id === paramStopId) ||
-    state.favorites.find((f) => f.id === paramStopId) || {
-      id: paramStopId,
-      nombre: paramStopId === PILOT_STOP_DEFAULT.id ? PILOT_STOP_DEFAULT.nombre : `Parada ${paramStopId}`
-    };
+  if (paramStopId) {
+    const matchedKnown =
+      state.quickStops.find((s) => s.id === paramStopId) ||
+      state.favorites.find((f) => f.id === paramStopId) || {
+        id: paramStopId,
+        nombre: `Parada ${paramStopId}`
+      };
+    await openStopRadar(matchedKnown, paramCodLinea);
+  } else {
+    renderRadarWelcome();
+  }
 
-  await openStopRadar(matchedKnown, paramCodLinea);
-
-  // Preload nearby stops silently around Av. Ferré y Brasil so Cercanas tab is immediately rich
-  searchNearbyStopsQuiet(PILOT_STOP_DEFAULT.lat, PILOT_STOP_DEFAULT.lng);
-
-  // Auto-refresh live GPS countdown every 1s
+  // 1-second loop: live countdown + smooth 1s SOAP interpolation when simulation mode is enabled
   setInterval(() => {
+    if (!state.activeStop) return;
+
+    if (state.simulateMode) {
+      stepSoapInterpolation();
+    }
+
     state.countdownSec -= 1;
     if (state.countdownSec <= 0) {
       state.countdownSec = REFRESH_INTERVAL_SEC;
@@ -1406,53 +1599,6 @@ async function init() {
     }
     updateCountdownRing();
   }, 1000);
-}
-
-async function searchNearbyStopsQuiet(lat, lng) {
-  try {
-    const res = await api.paradasCercanas(lat, lng);
-    const stops = Array.isArray(res.data) ? res.data : [];
-    if (stops.length === 0) return;
-    el.cercanasList.innerHTML = stops
-      .map((s) => {
-        const sLat = parseFloat(s.latitud);
-        const sLng = parseFloat(s.longitud);
-        const dist = distanceMeters(lat, lng, sLat, sLng);
-        return `
-          <div class="stop-list-card">
-            <div class="stop-card-top">
-              <span class="code-badge">${escapeHtml(s.identificador)}</span>
-              <span class="mono-meta">${formatDistance(dist)} · ${formatWalkMin(dist)}</span>
-            </div>
-            <div class="stop-card-name">${escapeHtml(s.descripcion)}</div>
-            <div class="stop-card-lines">${escapeHtml(s.lineas || '')}</div>
-            <div class="stop-card-foot">
-              <span class="mono-meta">${escapeHtml(s.callePrincipal || '')}</span>
-              <button class="pill-btn btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
-                s.descripcion
-              )}" data-lat="${sLat}" data-lng="${sLng}">Ver Radar →</button>
-            </div>
-          </div>
-        `;
-      })
-      .join('');
-
-    el.cercanasList.querySelectorAll('.btn-nearby-open').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        openStopRadar(
-          {
-            id: btn.dataset.id,
-            nombre: btn.dataset.name,
-            lat: parseFloat(btn.dataset.lat),
-            lng: parseFloat(btn.dataset.lng)
-          },
-          '000'
-        );
-      });
-    });
-  } catch {
-    // Non-fatal
-  }
 }
 
 init();

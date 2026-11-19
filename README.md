@@ -1,32 +1,22 @@
 # DIRECT GPS · Corrientes
 
-Rework inmersivo y en tiempo real de Cuando Llega Corrientes con mapa interactivo **Leaflet** a pantalla completa y conexión directa al servicio SOAP `SWParadas.asmx` (sin límite de consultas).
+Rework inmersivo y en tiempo real de Cuando Llega Corrientes con mapa libre **Leaflet + OpenStreetMap** (sin API keys ni mapas satelitales pagos) y conexión directa en vivo al servicio SOAP `SWParadas.asmx` a través de **Cloudflare Workers**.
 
-🌐 **GitHub Pages:** https://titomassa.github.io/DIRECT-GPS/?idParada=CT31498&codLinea=000
+🌐 **Aplicación en vivo (GitHub Pages):** https://titomassa.github.io/DIRECT-GPS/
 
-## Telemetría en tiempo real (`SWParadas.asmx` + `codigoLineaParada = 000`)
+## Características principales
 
-Cada unidad entrante muestra información operativa completa en las tarjetas de arribos, en los marcadores de **Leaflet** y en el inspector flotante de unidad:
+- **Inicio limpio**: Abre directamente sobre la vista general de Corrientes Capital sin cargar ninguna parada hasta que el usuario busque un código (ej. `CT31498`), navegue por **Líneas** (`Línea → Calle → Intersección → Parada`) o explore **Paradas Cercanas**.
+- **Mapas 100% libres con Leaflet + OpenStreetMap**: Tres estilos sin API key (**OSM Nocturno**, **OSM Clásico** y **OSM Urbano HOT**).
+- **Telemetría SOAP en vivo (`codigoLineaParada = 000`)**:
+  - **Desvío horario (`+` / `-`)**: Adelantado (`▲ +`), atrasado (`▼ -`) o en horario (`00:00`).
+  - **Número de coche (`IdentificadorCoche`)**, **Chofer** y **ID / Legajo** (`IdentificadorChofer`).
+  - **Cartel LED**, **última señal GPS**, distancia real y cuadras aproximadas.
+- **Modo Simulación por Interpolación SOAP**: En lugar de datos ficticios, toma las unidades reales devueltas por `SWParadas.asmx` y sus recorridos reales (`RecuperarRecorridoParaMapaAbrevYAmpliPorEntidadYLinea`), interpolando su avance segundo a segundo sobre las calles reales de Corrientes entre cada refresco SOAP.
+- **Red completa de Corrientes (33 líneas)**, recorridos interactivos, alertas sonoras (`≤ 3 min`) y favoritas guardadas localmente.
 
-- **Desvío horario (`+` / `-`)**: Indica exactamente cuánto está **adelantado (`+`)**, **atrasado (`-`)** o **en horario (`00:00`)** cada colectivo.
-- **Chofer e ID / Legajo**: Nombre del conductor y su número de identificación (`IdentificadorChofer`).
-- **Número de coche / interno**: Identificación del vehículo (`IdentificadorCoche`, ej. `#2967`) visible en la tarjeta y directamente sobre el pin del mapa.
-- **Cartel LED y última señal GPS**: Cartel frontal (`DescripcionCartelBandera`), marca temporal GPS (`UltimaFechaHoraGPS`), distancia real y cuadras aproximadas.
-- **Todas las líneas con código `000`**: Abre por defecto en la parada piloto **`CT31498 · AV. PEDRO FERRÉ - BRASIL IDA`** con `codigoLineaParada=000`.
-- **Red completa de Corrientes (33 líneas)**: Navegación `Línea → Calle → Intersección → Parada`, trazado de recorridos reales con paradas clickeables en Leaflet, paradas cercanas por GPS/centro del mapa, favoritas con etiquetas, alertas sonoras (`≤ 3 min`) y temas **Nocturno / Día / Satélite**.
+## Arquitectura
 
-## Cómo ejecutar con telemetría SOAP en vivo
-
-Requiere Node.js 20 o superior (sin dependencias externas):
-
-```bash
-npm start
-```
-
-El servidor ([server.js](server.js) + [lib/smartmove.js](lib/smartmove.js)) realiza las consultas SOAP server-side contra `http://clsw.smartmovepro.net/ModuloParadas/SWParadas.asmx` (evitando bloqueos de CORS / Mixed Content del navegador) y sirve la interfaz desde `docs/`.
-
-También podés conectar una instancia desplegada de `server.js` (por ejemplo en Render o Railway) directamente a GitHub Pages pasando el parámetro `?api=`:
-
-```text
-https://titomassa.github.io/DIRECT-GPS/?idParada=CT31498&codLinea=000&api=https://tu-backend.onrender.com
-```
+- **Frontend estático (GitHub Pages)**: [docs/](docs/) conectado por defecto a `https://direct-gps-proxy.tecladotropical.workers.dev` ([`DEFAULT_API_BASE`](docs/js/config.js)).
+- **Proxy SOAP en el borde (Cloudflare Workers)**: [cloudflare-worker/worker.js](cloudflare-worker/worker.js).
+- **Servidor Node.js local opcional**: `npm start` ([server.js](server.js) + [lib/smartmove.js](lib/smartmove.js)).

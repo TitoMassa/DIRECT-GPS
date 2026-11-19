@@ -131,6 +131,11 @@ button {
   font-family: var(--font-ui);
 }
 
+/* Free OpenStreetMap Nocturne theme via pure CSS (zero API key required) */
+.leaflet-tile-pane.osm-dark-filter {
+  filter: invert(100%) hue-rotate(180deg) brightness(92%) contrast(92%) saturate(85%);
+}
+
 .leaflet-control-attribution {
   background: var(--surface-glass) !important;
   color: var(--text-muted) !important;
@@ -1761,6 +1766,91 @@ button {
   font-size: 12.5px;
   line-height: 1.5;
   max-width: 280px;
+}
+
+.radar-welcome {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 10px 12px;
+}
+
+.welcome-badge {
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 4px 9px;
+  border-radius: 7px;
+  background: var(--accent-sky-soft);
+  color: var(--accent-sky);
+}
+
+.radar-welcome h2 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.22;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.radar-welcome p {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.welcome-code-form {
+  display: flex;
+  gap: 7px;
+}
+
+.welcome-code-input {
+  flex: 1;
+  height: 40px;
+  padding: 0 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  outline: none;
+  transition: border-color 0.16s ease;
+}
+
+.welcome-code-input:focus {
+  border-color: var(--accent-sky);
+}
+
+.welcome-code-input::placeholder {
+  text-transform: none;
+  font-family: var(--font-ui);
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.welcome-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.welcome-tip {
+  padding: 11px 12px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-hairline);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.welcome-tip strong {
+  color: var(--text-primary);
 }
 
 .skeleton-card {

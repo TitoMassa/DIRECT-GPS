@@ -1,4 +1,4 @@
-import { MAP_TILES, getLineColor } from './config.js';
+import { CORRIENTES_CENTER, MAP_TILES, getLineColor } from './config.js';
 import { formatDistance } from './api.js';
 
 export class TransitMap {
@@ -7,8 +7,8 @@ export class TransitMap {
     this.onStopPick = onStopPick || (() => {});
 
     this.map = L.map(containerId, {
-      center: [-27.476965, -58.825184],
-      zoom: 15,
+      center: [CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng],
+      zoom: CORRIENTES_CENTER.zoom,
       zoomControl: false,
       attributionControl: true
     });
@@ -48,19 +48,28 @@ export class TransitMap {
 
   setTileStyle(styleKey) {
     const cfg = MAP_TILES[styleKey] || MAP_TILES.dark;
+    const prevUrl = this.tileLayer ? this.tileLayer._url : null;
     this.tileKey = cfg.id;
-    if (this.tileLayer) {
-      this.map.removeLayer(this.tileLayer);
+
+    if (!this.tileLayer || prevUrl !== cfg.url) {
+      if (this.tileLayer) {
+        this.map.removeLayer(this.tileLayer);
+      }
+      this.tileLayer = L.tileLayer(cfg.url, {
+        attribution: cfg.attribution,
+        maxZoom: cfg.maxZoom
+      }).addTo(this.map);
     }
-    this.tileLayer = L.tileLayer(cfg.url, {
-      attribution: cfg.attribution,
-      maxZoom: cfg.maxZoom
-    }).addTo(this.map);
+
+    const tilePane = this.map.getPane('tilePane');
+    if (tilePane) {
+      tilePane.classList.toggle('osm-dark-filter', Boolean(cfg.darkFilter));
+    }
     return cfg;
   }
 
   cycleTileStyle() {
-    const order = ['dark', 'light', 'satellite'];
+    const order = ['dark', 'light', 'hot'];
     const next = order[(order.indexOf(this.tileKey) + 1) % order.length];
     return this.setTileStyle(next);
   }
@@ -76,6 +85,20 @@ export class TransitMap {
   getCenter() {
     const c = this.map.getCenter();
     return { lat: c.lat, lng: c.lng };
+  }
+
+  resetViewToCity() {
+    this.map.setView([CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng], CORRIENTES_CENTER.zoom, { animate: true });
+  }
+
+  clearActiveStop() {
+    this.stopLayer.clearLayers();
+    this.busLayer.clearLayers();
+    this.vectorLayer.clearLayers();
+    this.busMarkers.clear();
+    this.stopMarker = null;
+    this.activeStopCoords = null;
+    this.selectedBusKey = null;
   }
 
   setActiveStop(stop) {
@@ -108,7 +131,10 @@ export class TransitMap {
   }
 
   focusStop(zoom = 15) {
-    if (!this.activeStopCoords) return;
+    if (!this.activeStopCoords) {
+      this.resetViewToCity();
+      return;
+    }
     const { lat, lng } = this.activeStopCoords;
     this.map.fitBounds(
       L.latLngBounds([

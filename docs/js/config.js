@@ -1,20 +1,13 @@
-export const PILOT_STOP_DEFAULT = {
-  id: 'CT31498',
-  codigo: '20129',
-  nombre: 'AV. PEDRO FERRÉ - BRASIL IDA',
-  callePrincipal: 'AVENIDA PEDRO FERRÉ',
-  calleInterseccion: 'BRASIL',
-  lat: -27.476965,
-  lng: -58.825184,
-  lineas: ['102A', '102B', '102C', '106A', '106B', '106C', '904A'],
-  esPiloto: true
+export const CORRIENTES_CENTER = {
+  lat: -27.4712,
+  lng: -58.8322,
+  zoom: 13
 };
 
 export const REFRESH_INTERVAL_SEC = 15;
 
-// Pegá aquí la URL de tu Cloudflare Worker (ej: 'https://direct-gps-proxy.tu-usuario.workers.dev')
-// para que GitHub Pages se conecte automáticamente en vivo para todos los usuarios.
-export const DEFAULT_API_BASE = '';
+// Backend proxy SOAP gratuito desplegado en Cloudflare Workers
+export const DEFAULT_API_BASE = 'https://direct-gps-proxy.tecladotropical.workers.dev';
 
 // Distinct, high-contrast civic transit palette by Corrientes line family
 const FAMILY_COLORS = {
@@ -31,7 +24,6 @@ const FAMILY_COLORS = {
   SAN: '#dc2626'    // Santa Ana Red
 };
 
-// Subtle shade shifts for branch variants (A/B/C/D) so 102A/102B/102C stay visually distinct
 const BRANCH_OVERRIDES = {
   '102A': '#0284c7',
   '102B': '#0369a1',
@@ -66,26 +58,30 @@ export function getLineColor(lineName = '') {
   return '#0284c7';
 }
 
+// 100% libres, sin API key, mapas no satelitales sobre Leaflet + OpenStreetMap
 export const MAP_TILES = {
   dark: {
     id: 'dark',
-    label: 'Nocturno',
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; OpenStreetMap &copy; CARTO',
-    maxZoom: 19
+    label: 'OSM Nocturno',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+    darkFilter: true
   },
   light: {
     id: 'light',
-    label: 'Día',
-    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; OpenStreetMap &copy; CARTO',
-    maxZoom: 19
+    label: 'OSM Clásico',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+    darkFilter: false
   },
-  satellite: {
-    id: 'satellite',
-    label: 'Satélite',
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    attribution: '&copy; Esri World Imagery',
-    maxZoom: 19
+  hot: {
+    id: 'hot',
+    label: 'OSM Urbano',
+    url: 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · HOT',
+    maxZoom: 19,
+    darkFilter: false
   }
 };

@@ -1,8 +1,8 @@
 {
   "name": "DIRECT GPS · Corrientes",
   "short_name": "DIRECT GPS",
-  "description": "Radar satelital en tiempo real del transporte público de Corrientes Capital",
-  "start_url": "./?idParada=CT31498&codLinea=000",
+  "description": "Radar en tiempo real del transporte público de Corrientes Capital",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#0c1118",
   "theme_color": "#0c1118",
