@@ -96,7 +96,6 @@ const el = {
   lastSyncLabel: document.getElementById('last-sync-label'),
   btnToggleFav: document.getElementById('btn-toggle-fav'),
   btnShareStop: document.getElementById('btn-share-stop'),
-  btnRefresh: document.getElementById('btn-refresh-arribos'),
   btnShowRoutes: document.getElementById('btn-show-routes'),
   btnToggleHorarios: document.getElementById('btn-toggle-horarios'),
   btnFitFleet: document.getElementById('btn-fit-fleet'),
@@ -1038,7 +1037,6 @@ async function crossMatchLineHorarios(stopId, codLinea, buses) {
 async function fetchArribos(showSkeleton = false) {
   if (!state.activeStop) return;
 
-  el.btnRefresh.classList.add('is-loading');
   if (showSkeleton && !state.horariosOpen) {
     el.arribosList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
   }
@@ -1144,7 +1142,6 @@ async function fetchArribos(showSkeleton = false) {
     el.lastSyncLabel.textContent = 'Error de conexión';
     showToast(err.message || 'No se pudieron actualizar los arribos', 'warn');
   } finally {
-    el.btnRefresh.classList.remove('is-loading');
     state.countdownSec = REFRESH_INTERVAL_SEC;
   }
 }
@@ -1851,7 +1848,6 @@ function bindEvents() {
     }
   });
 
-  el.btnRefresh.addEventListener('click', () => fetchArribos(false));
   el.btnShowRoutes.addEventListener('click', toggleActiveStopRoutes);
   el.btnToggleHorarios.addEventListener('click', toggleHorariosView);
   el.btnFitFleet.addEventListener('click', () => {
