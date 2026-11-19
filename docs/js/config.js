@@ -12,6 +12,10 @@ export const PILOT_STOP_DEFAULT = {
 
 export const REFRESH_INTERVAL_SEC = 15;
 
+// Pegá aquí la URL de tu Cloudflare Worker (ej: 'https://direct-gps-proxy.tu-usuario.workers.dev')
+// para que GitHub Pages se conecte automáticamente en vivo para todos los usuarios.
+export const DEFAULT_API_BASE = '';
+
 // Distinct, high-contrast civic transit palette by Corrientes line family
 const FAMILY_COLORS = {
   '102': '#0284c7', // Corrientes River Blue

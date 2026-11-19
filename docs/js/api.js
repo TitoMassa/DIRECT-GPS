@@ -1,3 +1,4 @@
+import { DEFAULT_API_BASE } from './config.js';
 import {
   staticBootstrap,
   staticCalles,
@@ -8,7 +9,7 @@ import {
   staticArribos
 } from './static-data.js';
 
-// Supports optional custom backend proxy via ?api=https://mi-proxy.onrender.com
+// Supports optional custom backend proxy via ?api=https://mi-proxy.workers.dev or DEFAULT_API_BASE
 function resolveApiBase() {
   const params = new URLSearchParams(window.location.search);
   const custom = params.get('api');
@@ -19,6 +20,7 @@ function resolveApiBase() {
   }
   const saved = localStorage.getItem('direct_gps_api_base');
   if (saved) return saved;
+  if (DEFAULT_API_BASE) return DEFAULT_API_BASE.replace(/\/+$/, '');
   return '';
 }
 
