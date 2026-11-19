@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="es-AR" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>DIRECT GPS · Radar de Colectivos en Vivo — Corrientes</title>
+  <meta name="description" content="DIRECT GPS: Seguimiento satelital en vivo de colectivos de Corrientes Capital. Arribos en tiempo real, mapa interactivo, todas las líneas, recorridos y paradas cercanas." />
+  <meta name="theme-color" content="#0c1118" id="meta-theme-color" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="manifest" href="./manifest.json" />
+
+  <!-- Typography: Space Grotesk (Display), Plus Jakarta Sans (UI), JetBrains Mono (Telemetry) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet" />
+
+  <!-- Leaflet Interactive Map -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <link rel="stylesheet" href="./css/styles.css" />
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <!-- Full-Viewport Live Transit Map Canvas -->
+    <div id="map" class="map-canvas" aria-label="Mapa satelital en vivo de colectivos de Corrientes"></div>
+
+    <!-- Floating Top Telemetry Bar -->
+    <header class="top-bar" role="banner">
+      <div class="brand-cluster">
+        <button id="btn-brand-home" class="brand-btn" title="Volver a parada piloto Av. Ferré y Brasil">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" width="24" height="24" fill="none">
+              <circle cx="16" cy="16" r="13" stroke="currentColor" stroke-width="1.8" opacity="0.32"/>
+              <circle cx="16" cy="16" r="8" stroke="#10b981" stroke-width="1.8" opacity="0.65"/>
+              <path d="M16 5.5L22.5 22.5L16 18.8L9.5 22.5L16 5.5Z" fill="#38bdf8"/>
+            </svg>
+          </span>
+          <span class="brand-text">
+            <h1 class="brand-title">DIRECT GPS</h1>
+            <span class="brand-sub">CORRIENTES</span>
+          </span>
+        </button>
+
+        <div class="quick-search-wrap">
+          <svg class="search-icon" viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8">
+            <circle cx="9" cy="9" r="6"/>
+            <path d="M13.5 13.5L17.5 17.5" stroke-linecap="round"/>
+          </svg>
+          <input
+            id="global-search-input"
+            type="search"
+            class="quick-search-input"
+            placeholder="Código parada (ej. CT31498) o línea (102B, 106C)..."
+            autocomplete="off"
+            aria-label="Buscar parada por código o línea"
+          />
+          <div id="global-search-dropdown" class="search-dropdown hidden" role="listbox"></div>
+        </div>
+      </div>
+
+      <div class="status-cluster">
+        <button id="btn-live-mode" class="telemetry-pill" title="Alternar entre telemetría real SmartMovePro y modo simulación">
+          <span class="signal-dot" id="signal-dot"></span>
+          <span id="signal-label">EN VIVO</span>
+        </button>
+
+        <button id="btn-sound-toggle" class="icon-btn" title="Alertas sonoras de arribo" aria-pressed="true">
+          <svg id="icon-sound-on" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+          </svg>
+          <svg id="icon-sound-off" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            <path d="M18.63 13A17.89 17.89 0 0 1 18 8"/>
+            <path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"/>
+            <path d="M18 8a6 6 0 0 0-9.33-5"/>
+            <line x1="1" y1="1" x2="23" y2="23"/>
+          </svg>
+        </button>
+
+        <button id="btn-theme-toggle" class="icon-btn" title="Cambiar tema Nocturno / Día">
+          <svg id="icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4.5"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+          </svg>
+          <svg id="icon-moon" class="hidden" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Floating Side Dock (Desktop) / Draggable Bottom Sheet (Mobile) -->
+    <aside id="transit-dock" class="transit-dock sheet-half" role="complementary" aria-label="Panel de control de paradas y líneas">
+      <!-- Mobile Drag Handle -->
+      <div id="sheet-handle" class="sheet-handle" aria-label="Deslizar panel">
+        <span class="sheet-handle-bar"></span>
+      </div>
+
+      <!-- Primary Mode Navigation -->
+      <nav class="dock-tabs" role="tablist" aria-label="Secciones de DIRECT GPS">
+        <button class="dock-tab active" data-tab="radar" role="tab" aria-selected="true" id="tab-radar">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="2"/>
+            <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
+          </svg>
+          <span>Radar</span>
+        </button>
+        <button class="dock-tab" data-tab="lineas" role="tab" aria-selected="false" id="tab-lineas">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="4" width="16" height="13" rx="3"/>
+            <path d="M4 11h16M8 17v3M16 17v3M8.5 14h.01M15.5 14h.01"/>
+          </svg>
+          <span>Líneas</span>
+        </button>
+        <button class="dock-tab" data-tab="cercanas" role="tab" aria-selected="false" id="tab-cercanas">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+            <circle cx="12" cy="10" r="3"/>
+          </svg>
+          <span>Cercanas</span>
+        </button>
+        <button class="dock-tab" data-tab="favoritas" role="tab" aria-selected="false" id="tab-favoritas">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+          </svg>
+          <span>Favoritas</span>
+        </button>
+      </nav>
+
+      <!-- TAB 1: RADAR EN VIVO (ARRIBOS) -->
+      <section id="panel-radar" class="dock-panel active" role="tabpanel" aria-labelledby="tab-radar">
+        <!-- Stop Header Card -->
+        <div class="stop-hero">
+          <div class="stop-hero-top">
+            <div class="stop-id-row">
+              <span id="stop-code-badge" class="code-badge">CT31498</span>
+              <span id="stop-pilot-tag" class="pilot-tag">PILOTO · TODAS LAS LÍNEAS</span>
+            </div>
+            <div class="stop-hero-actions">
+              <button id="btn-toggle-fav" class="mini-action-btn" title="Guardar parada en favoritas" aria-label="Guardar en favoritas">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+                </svg>
+              </button>
+              <button id="btn-share-stop" class="mini-action-btn" title="Copiar enlace directo a esta parada" aria-label="Compartir parada">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+                  <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                  <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                </svg>
+              </button>
+              <button id="btn-refresh-arribos" class="refresh-ring-btn" title="Actualizar telemetría ahora" aria-label="Actualizar arribos">
+                <svg class="refresh-svg" viewBox="0 0 36 36" width="32" height="32">
+                  <circle class="ring-track" cx="18" cy="18" r="14"/>
+                  <circle id="refresh-ring-progress" class="ring-fill" cx="18" cy="18" r="14"/>
+                </svg>
+                <span id="refresh-countdown-txt" class="ring-label">25</span>
+              </button>
+            </div>
+          </div>
+
+          <h2 id="stop-title" class="stop-title">AV. PEDRO FERRÉ - BRASIL IDA</h2>
+          <div class="stop-meta-row">
+            <span id="stop-coords-label" class="mono-meta">-27.47697, -58.82518</span>
+            <span class="meta-dot">•</span>
+            <span id="last-sync-label" class="mono-meta">Sincronizando...</span>
+          </div>
+
+          <div class="stop-quick-bar">
+            <button id="btn-show-routes" class="pill-btn" title="Dibujar recorridos reales de las líneas en el mapa">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+              </svg>
+              <span>Ver recorridos</span>
+            </button>
+            <button id="btn-fit-fleet" class="pill-btn" title="Encuadrar todos los colectivos y la parada">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+              </svg>
+              <span>Ver flota</span>
+            </button>
+            <a id="btn-original-link" class="pill-btn pill-btn-ghost" href="https://cuandollega.smartmovepro.net/corrientes/arribos/?codLinea=0&idParada=CT31498" target="_blank" rel="noopener noreferrer" title="Abrir fuente oficial SmartMovePro">
+              <span>Fuente</span>
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+              </svg>
+            </a>
+          </div>
+        </div>
+
+        <!-- Line Filter Chips -->
+        <div id="line-filter-strip" class="line-filter-strip" role="group" aria-label="Filtrar arribos por línea"></div>
+
+        <!-- Live Arrivals Container -->
+        <div id="arribos-list" class="dock-scroll-area" aria-live="polite"></div>
+      </section>
+
+      <!-- TAB 2: LÍNEAS -> CALLES -> INTERSECCIONES -> PARADAS -->
+      <section id="panel-lineas" class="dock-panel" role="tabpanel" aria-labelledby="tab-lineas">
+        <div class="panel-header-sticky">
+          <div id="lineas-breadcrumb" class="breadcrumb-bar">
+            <span class="crumb-current">Todas las líneas · Corrientes (26)</span>
+          </div>
+          <div class="panel-search-box">
+            <svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="9" cy="9" r="6"/><path d="M13.5 13.5L17.5 17.5" stroke-linecap="round"/>
+            </svg>
+            <input id="lineas-filter-input" type="search" placeholder="Filtrar línea, calle o intersección..." autocomplete="off" />
+          </div>
+        </div>
+        <div id="lineas-content" class="dock-scroll-area"></div>
+      </section>
+
+      <!-- TAB 3: PARADAS CERCANAS & EXPLORADOR -->
+      <section id="panel-cercanas" class="dock-panel" role="tabpanel" aria-labelledby="tab-cercanas">
+        <div class="panel-header-sticky">
+          <div class="cercanas-actions">
+            <button id="btn-locate-me" class="primary-action-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+              </svg>
+              <span>Usar mi GPS</span>
+            </button>
+            <button id="btn-search-map-center" class="secondary-action-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2"/>
+              </svg>
+              <span>Centro del mapa</span>
+            </button>
+          </div>
+          <div class="hubs-section">
+            <span class="micro-heading">Zonas rápidas de Corrientes</span>
+            <div id="hubs-chips" class="hubs-chips"></div>
+          </div>
+        </div>
+        <div id="cercanas-list" class="dock-scroll-area"></div>
+      </section>
+
+      <!-- TAB 4: PARADAS FAVORITAS -->
+      <section id="panel-favoritas" class="dock-panel" role="tabpanel" aria-labelledby="tab-favoritas">
+        <div class="panel-header-sticky">
+          <div class="fav-intro">
+            <h3 class="panel-subtitle">Tus paradas guardadas</h3>
+            <p class="panel-hint">Acceso instantáneo al radar en vivo con código 0 (todas las líneas).</p>
+          </div>
+        </div>
+        <div id="favoritas-list" class="dock-scroll-area"></div>
+      </section>
+    </aside>
+
+    <!-- Focused Bus Live Telemetry Overlay Card (Appears on Map when a bus is selected) -->
+    <div id="bus-inspector" class="bus-inspector hidden" role="status" aria-live="polite">
+      <div class="bus-inspector-head">
+        <span id="insp-line-badge" class="line-badge">102B</span>
+        <div class="insp-title-wrap">
+          <strong id="insp-bandera" class="insp-bandera">LAGUNA SECA - PUERTO</strong>
+          <span id="insp-sub" class="insp-sub">Aprox. 1.1 km de la parada</span>
+        </div>
+        <button id="btn-close-inspector" class="mini-close-btn" aria-label="Cerrar detalle de unidad">✕</button>
+      </div>
+      <div class="bus-inspector-metrics">
+        <div class="metric-cell">
+          <span class="metric-label">ARRIBO</span>
+          <strong id="insp-eta" class="metric-value">4 min</strong>
+        </div>
+        <div class="metric-cell">
+          <span class="metric-label">DISTANCIA</span>
+          <strong id="insp-dist" class="metric-value">1.12 km</strong>
+        </div>
+        <div class="metric-cell">
+          <span class="metric-label">CUADRAS</span>
+          <strong id="insp-blocks" class="metric-value">~11</strong>
+        </div>
+        <div class="metric-cell">
+          <span class="metric-label">ACCESIBILIDAD</span>
+          <strong id="insp-access" class="metric-value">Estándar</strong>
+        </div>
+      </div>
+      <div class="bus-inspector-foot">
+        <span id="insp-gps" class="mono-meta">GPS: -27.48234, -58.81542</span>
+        <button id="btn-insp-route" class="pill-btn">Trazar recorrido</button>
+      </div>
+    </div>
+
+    <!-- Floating Map Controls (Bottom Right) -->
+    <div class="map-controls" role="group" aria-label="Controles de mapa">
+      <button id="btn-map-style" class="map-ctrl-btn" title="Cambiar capa de mapa (Nocturno / Día / Satélite)">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+          <polyline points="2 17 12 22 22 17"/>
+          <polyline points="2 12 12 17 22 12"/>
+        </svg>
+      </button>
+      <button id="btn-map-center-stop" class="map-ctrl-btn" title="Centrar en parada activa">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+          <circle cx="12" cy="10" r="3"/>
+        </svg>
+      </button>
+      <button id="btn-map-scan-area" class="map-ctrl-btn" title="Buscar paradas en esta zona del mapa">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6M8 11h6"/>
+        </svg>
+      </button>
+      <div class="map-zoom-stack">
+        <button id="btn-zoom-in" class="map-ctrl-btn" title="Acercar mapa" aria-label="Acercar">+</button>
+        <button id="btn-zoom-out" class="map-ctrl-btn" title="Alejar mapa" aria-label="Alejar">−</button>
+      </div>
+    </div>
+
+    <!-- Toast Notification Area -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
