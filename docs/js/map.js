@@ -1,4 +1,4 @@
-import { CORRIENTES_CENTER, MAP_TILES, getLineColor } from './config.js';
+import { CORRIENTES_CENTER, MAP_TILES, getLineColor, getDirectionColor } from './config.js';
 import { formatDistance } from './api.js';
 
 export class TransitMap {
@@ -258,25 +258,50 @@ export class TransitMap {
       return;
     }
 
-    const color = getLineColor(bus.descripcionLinea);
-    const hasRealPath = bus.trajectory && Array.isArray(bus.trajectory.pathPts) && bus.trajectory.pathPts.length >= 2;
-    const pts = hasRealPath
-      ? bus.trajectory.pathPts
-      : [
-          [bus.lat, bus.lng],
-          [this.activeStopCoords.lat, this.activeStopCoords.lng]
-        ];
+    const fallbackColor = bus.realBanderaColor || getLineColor(bus.descripcionLinea);
+    const segments = Array.isArray(bus.trajectory?.segments) && bus.trajectory.segments.length > 0
+      ? bus.trajectory.segments
+      : null;
 
-    L.polyline(pts, {
-      color,
-      weight: 3.5,
-      opacity: 0.88,
-      dashArray: bus.isOppositeLeg || bus.isNextCycle ? '6, 6' : null
-    }).addTo(this.vectorLayer);
+    let allPts;
+    if (segments) {
+      allPts = [];
+      segments.forEach((seg, idx) => {
+        if (!Array.isArray(seg.pts) || seg.pts.length < 2) return;
+        allPts.push(...seg.pts);
+        const segColor = seg.color || fallbackColor;
+        L.polyline(seg.pts, {
+          color: '#0b1017',
+          weight: idx === 0 ? 6.5 : 5,
+          opacity: 0.45
+        }).addTo(this.vectorLayer);
+
+        L.polyline(seg.pts, {
+          color: segColor,
+          weight: idx === 0 ? 4 : 3,
+          opacity: idx === 0 ? 0.94 : 0.72,
+          dashArray: idx === 0 ? null : '7, 6'
+        }).addTo(this.vectorLayer);
+      });
+    } else {
+      const hasRealPath = bus.trajectory && Array.isArray(bus.trajectory.pathPts) && bus.trajectory.pathPts.length >= 2;
+      allPts = hasRealPath
+        ? bus.trajectory.pathPts
+        : [
+            [bus.lat, bus.lng],
+            [this.activeStopCoords.lat, this.activeStopCoords.lng]
+          ];
+
+      L.polyline(allPts, {
+        color: fallbackColor,
+        weight: 3.5,
+        opacity: 0.88
+      }).addTo(this.vectorLayer);
+    }
 
     const displayDist = bus.routeMeters ?? bus.distanceMeters;
-    if (displayDist !== null && displayDist !== undefined) {
-      const midPt = pts[Math.floor(pts.length / 2)];
+    if (displayDist !== null && displayDist !== undefined && allPts.length > 0) {
+      const midPt = allPts[Math.floor(allPts.length / 2)];
       L.marker(midPt, {
         interactive: false,
         icon: L.divIcon({
@@ -331,28 +356,27 @@ export class TransitMap {
   }
 
   drawRouteCollection(recorridos, lineName, { showStops = true, fit = false } = {}) {
-    const color = getLineColor(lineName);
     const allPts = [];
 
     recorridos.forEach((rec, idx) => {
+      const branchColor = getDirectionColor(idx);
       const pts = (rec.puntos || [])
         .map((p) => [parseFloat(p.latitud), parseFloat(p.longitud)])
         .filter(([la, ln]) => !Number.isNaN(la) && !Number.isNaN(ln));
 
       if (pts.length > 1) {
         allPts.push(...pts);
-        // Subtle outer glow casing + crisp core stroke
+        // Subtle dark casing + distinct solid color per direction (IDA vs VTA)
         L.polyline(pts, {
           color: '#0b1017',
-          weight: idx === 0 ? 7 : 5,
+          weight: 6.5,
           opacity: 0.45
         }).addTo(this.routeLayer);
 
         L.polyline(pts, {
-          color,
-          weight: idx === 0 ? 4 : 3,
-          opacity: idx === 0 ? 0.92 : 0.65,
-          dashArray: idx === 0 ? null : '6, 6'
+          color: branchColor,
+          weight: 3.8,
+          opacity: 0.9
         })
           .bindTooltip(`${lineName} · ${rec.abreviaturaBanderaSMP || 'Recorrido'}`, { sticky: true })
           .addTo(this.routeLayer);
@@ -367,7 +391,7 @@ export class TransitMap {
           const dot = L.marker([la, ln], {
             icon: L.divIcon({
               className: 'route-stop-leaflet',
-              html: `<div class="route-stop-dot" style="--line-color:${color}"></div>`,
+              html: `<div class="route-stop-dot" style="--line-color:${branchColor}"></div>`,
               iconSize: [12, 12],
               iconAnchor: [6, 6]
             }),

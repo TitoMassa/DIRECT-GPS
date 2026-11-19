@@ -58,6 +58,14 @@ export function getLineColor(lineName = '') {
   return '#0284c7';
 }
 
+// Distinct high-contrast colors per route direction (IDA vs VTA / multi-branch)
+export const DIRECTION_COLORS = ['#0ea5e9', '#f59e0b', '#a855f7', '#10b981', '#ec4899', '#ef4444'];
+
+export function getDirectionColor(branchIndex = 0) {
+  const idx = Math.abs(Number(branchIndex) || 0);
+  return DIRECTION_COLORS[idx % DIRECTION_COLORS.length];
+}
+
 // 100% libres, sin API key, mapas no satelitales sobre Leaflet + OpenStreetMap
 export const MAP_TILES = {
   dark: {

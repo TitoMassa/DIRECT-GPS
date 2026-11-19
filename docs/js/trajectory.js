@@ -1,4 +1,5 @@
 import { distanceMeters } from './api.js';
+import { getDirectionColor } from './config.js';
 
 function buildCumDist(pts) {
   const cum = [0];
@@ -73,7 +74,7 @@ function slicePolyline(pts, startProj, endProj) {
 
 export function parseRouteBranches(recorridos = []) {
   return (recorridos || [])
-    .map((r) => {
+    .map((r, idx) => {
       const pts = (r.puntos || [])
         .map((p) => [parseFloat(p.latitud), parseFloat(p.longitud)])
         .filter(([la, ln]) => !Number.isNaN(la) && !Number.isNaN(ln));
@@ -83,6 +84,8 @@ export function parseRouteBranches(recorridos = []) {
         (r.paradas || []).map((s) => String(s.identificador || '').trim().toUpperCase()).filter(Boolean)
       );
       return {
+        index: idx,
+        color: getDirectionColor(idx),
         bandera: String(r.abreviaturaBanderaSMP || r.descripcion || '').trim(),
         git: String(r.abreviaturaGit || '').trim(),
         pts,
@@ -169,30 +172,32 @@ function pickPairedReturnBranch(branches, stopBranch) {
  *  - 'direct': on stopBranch approaching the stop directly
  *  - 'previous_leg': on oppositeBranch heading to turnaround terminal before stopBranch
  *  - 'full_cycle': on stopBranch AFTER the stop (already passed it) -> far terminal -> full paired returnBranch -> turnaround -> stop
- * Computes exact remaining routeMeters along the real street polylines for all 3 cases.
+ * Computes exact remaining routeMeters along the real street polylines and per-direction color segments.
  */
 export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], prevFix = null) {
   if (!stopCoords || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') {
     return null;
   }
 
-  const etaMin = bus.eta?.minutes ?? 10;
+  const etaMin = bus.eta?.valid === false ? 10 : (bus.eta?.minutes ?? 10);
   const etaSec = etaMin <= 0 ? 45 : etaMin * 60;
   const stopBranch = pickStopBranch(branches, stopId, stopCoords, bus.descripcionBandera);
 
   if (!stopBranch) {
-    // Fallback straight path if line polylines haven't loaded yet
     const directPts = [
       [bus.lat, bus.lng],
       [stopCoords.lat, stopCoords.lng]
     ];
     const cum = buildCumDist(directPts);
     const total = cum[cum.length - 1] || 0;
+    const fallbackColor = getDirectionColor(0);
     return {
       leg: 'direct',
       isOppositeLeg: false,
       isNextCycle: false,
       realBandera: bus.descripcionBandera,
+      realBanderaColor: fallbackColor,
+      segments: [{ pts: directPts, color: fallbackColor, bandera: bus.descripcionBandera, startMeters: 0, endMeters: total }],
       turnaroundAtMeters: 0,
       oppStartMeters: 0,
       pathPts: directPts,
@@ -234,7 +239,6 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       fullCycleDist =
         Math.max(0, stopBranch.totalLen - busOnStop.along) + gap1 + returnBranch.totalLen + gap2 + stopProj.along;
     } else {
-      // Single-branch circular route fallback
       const gapClose = distanceMeters(stopEnd[0], stopEnd[1], stopStart[0], stopStart[1]) || 0;
       fullCycleDist = Math.max(0, stopBranch.totalLen - busOnStop.along) + gapClose + stopProj.along;
     }
@@ -275,17 +279,13 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const oppErr = Math.abs(estOppMin - etaMin);
     const cycleErr = Math.abs(estCycleMin - etaMin);
 
-    // If bus is right at the far terminal where both distances are nearly identical (< 1.5 km apart),
-    // prefer previous_leg so it isn't flagged as "next cycle" right after turning around.
     if (Math.abs(fullCycleDist - loopDist) < 1500) {
       return oppErr <= cycleErr + 6 ? 'previous_leg' : 'full_cycle';
     }
 
-    // Prefer full_cycle when ETA clearly fits the full round-trip much better than oppositeBranch alone
     if (cycleErr + 4 < oppErr) return 'full_cycle';
     if (oppErr + 4 < cycleErr) return 'previous_leg';
 
-    // Tie-breaker: physical lane proximity
     if (busOnStop.perp + 15 < busOnOpp.perp) return 'full_cycle';
     return 'previous_leg';
   };
@@ -300,7 +300,6 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     if (directDist === Infinity) {
       leg = 'full_cycle';
     } else if (etaMin >= 25 && Math.abs(estCycleMin - etaMin) + 12 < Math.abs(estDirectMin - etaMin)) {
-      // Bus is on stopBranch lane, moving in stopBranch direction, just barely before/at stop yet ETA is ~1 full loop
       leg = 'full_cycle';
     } else {
       leg = 'direct';
@@ -312,11 +311,9 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       const bestIndirect = pickIndirectLeg();
       const bestIndirectEst = bestIndirect === 'full_cycle' ? estCycleMin : estOppMin;
 
-      // Case A: Bus is way too close on stopBranch for the reported ETA (e.g., 150m away yet 30 min or 115 min ETA)
       const directImplausiblySlow = etaMin >= 7 && directDist < etaMin * 105;
       const indirectMatchesBetter = Math.abs(bestIndirectEst - etaMin) + 3 < Math.abs(estDirectMin - etaMin);
 
-      // Case B: Bus is physically closer to oppositeBranch lane AND ETA is far longer than direct distance
       const physicallyOnOppLane =
         bestIndirect === 'previous_leg' && busOnOpp.perp + 18 < busOnStop.perp && etaMin >= 6 && directDist < 1400;
 
@@ -325,13 +322,11 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       }
     }
   } else if (directDist === Infinity) {
-    // Circular single-branch route where bus already passed the stop
     leg = 'full_cycle';
   }
 
-  let pathPts;
-  let realBandera;
-  let totalMeters;
+  const stopBandera = stopBranch.bandera || bus.descripcionBandera;
+  const stopColor = stopBranch.color;
 
   if (leg === 'full_cycle' && busOnStop) {
     const stopRemainder = slicePolyline(stopBranch.pts, busOnStop, null);
@@ -339,19 +334,39 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
 
-    pathPts = [...stopRemainder, ...retFull, ...stopApproach];
-    realBandera = stopBranch.bandera || bus.descripcionBandera;
-
+    const pathPts = [...stopRemainder, ...retFull, ...stopApproach];
     const cum = buildCumDist(pathPts);
-    totalMeters = cum[cum.length - 1] || 0;
+    const totalMeters = cum[cum.length - 1] || 0;
     const oppStartMeters = buildCumDist(stopRemainder).slice(-1)[0] || 0;
     const turnaroundAtMeters = buildCumDist([...stopRemainder, ...retFull]).slice(-1)[0] || 0;
+
+    const segments = [
+      { pts: stopRemainder, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: oppStartMeters }
+    ];
+    if (returnBranch && retFull.length >= 2) {
+      segments.push({
+        pts: retFull,
+        color: returnBranch.color,
+        bandera: returnBranch.bandera || 'Sentido opuesto',
+        startMeters: oppStartMeters,
+        endMeters: turnaroundAtMeters
+      });
+    }
+    segments.push({
+      pts: stopApproach,
+      color: stopColor,
+      bandera: stopBandera,
+      startMeters: turnaroundAtMeters,
+      endMeters: totalMeters
+    });
 
     return {
       leg: 'full_cycle',
       isOppositeLeg: false,
       isNextCycle: true,
-      realBandera,
+      realBandera: stopBandera,
+      realBanderaColor: stopColor,
+      segments,
       oppStartMeters,
       turnaroundAtMeters,
       pathPts,
@@ -366,17 +381,27 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const oppRemainder = slicePolyline(oppositeBranch.pts, busOnOpp, null);
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
-    pathPts = [...oppRemainder, ...stopApproach];
-    realBandera = oppositeBranch.bandera || 'Sentido opuesto';
+    const pathPts = [...oppRemainder, ...stopApproach];
+    const oppBandera = oppositeBranch.bandera || 'Sentido opuesto';
+    const oppColor = oppositeBranch.color;
     const cum = buildCumDist(pathPts);
-    totalMeters = cum[cum.length - 1] || 0;
+    const totalMeters = cum[cum.length - 1] || 0;
+    const turnaroundAtMeters = buildCumDist(oppRemainder).slice(-1)[0] || 0;
+
+    const segments = [
+      { pts: oppRemainder, color: oppColor, bandera: oppBandera, startMeters: 0, endMeters: turnaroundAtMeters },
+      { pts: stopApproach, color: stopColor, bandera: stopBandera, startMeters: turnaroundAtMeters, endMeters: totalMeters }
+    ];
+
     return {
       leg: 'previous_leg',
       isOppositeLeg: true,
       isNextCycle: false,
-      realBandera,
+      realBandera: oppBandera,
+      realBanderaColor: oppColor,
+      segments,
       oppStartMeters: 0,
-      turnaroundAtMeters: buildCumDist(oppRemainder).slice(-1)[0] || 0,
+      turnaroundAtMeters,
       pathPts,
       pathCum: cum,
       totalMeters,
@@ -386,21 +411,22 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   }
 
   // Direct approach along stopBranch
-  if (directDist < Infinity) {
-    pathPts = slicePolyline(stopBranch.pts, busOnStop, stopProj);
-  } else {
-    pathPts = [
-      [bus.lat, bus.lng],
-      [stopCoords.lat, stopCoords.lng]
-    ];
-  }
+  const pathPts =
+    directDist < Infinity
+      ? slicePolyline(stopBranch.pts, busOnStop, stopProj)
+      : [
+          [bus.lat, bus.lng],
+          [stopCoords.lat, stopCoords.lng]
+        ];
   const cum = buildCumDist(pathPts);
-  totalMeters = cum[cum.length - 1] || 0;
+  const totalMeters = cum[cum.length - 1] || 0;
   return {
     leg: 'direct',
     isOppositeLeg: false,
     isNextCycle: false,
-    realBandera: stopBranch.bandera || bus.descripcionBandera,
+    realBandera: stopBandera,
+    realBanderaColor: stopColor,
+    segments: [{ pts: pathPts, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: totalMeters }],
     oppStartMeters: 0,
     turnaroundAtMeters: 0,
     pathPts,
@@ -412,11 +438,22 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
 }
 
 export function sampleTrajectory(traj, walkedMeters) {
-  const { pathPts, pathCum, totalMeters } = traj;
+  const { pathPts, pathCum, totalMeters, segments = [] } = traj;
   if (!pathPts || pathPts.length === 0) return null;
+
+  const lastSeg = segments[segments.length - 1] || { bandera: traj.realBandera, color: traj.realBanderaColor };
   if (walkedMeters >= totalMeters || pathPts.length === 1) {
     const last = pathPts[pathPts.length - 1];
-    return { lat: last[0], lng: last[1], remainingMeters: 0, arrived: true, inOppositeLeg: false, inNextCycle: false };
+    return {
+      lat: last[0],
+      lng: last[1],
+      remainingMeters: 0,
+      arrived: true,
+      inOppositeLeg: false,
+      inNextCycle: false,
+      currentBandera: lastSeg.bandera,
+      currentBranchColor: lastSeg.color
+    };
   }
 
   const clamped = Math.max(0, walkedMeters);
@@ -429,6 +466,9 @@ export function sampleTrajectory(traj, walkedMeters) {
   const frac = Math.max(0, Math.min(1, (clamped - segStart) / segLen));
   const lat = pathPts[i][0] + (pathPts[i + 1][0] - pathPts[i][0]) * frac;
   const lng = pathPts[i][1] + (pathPts[i + 1][1] - pathPts[i][1]) * frac;
+
+  const activeSeg =
+    segments.find((s) => clamped >= s.startMeters && clamped <= s.endMeters) || segments[0] || lastSeg;
 
   let inOppositeLeg = false;
   let inNextCycle = false;
@@ -448,6 +488,8 @@ export function sampleTrajectory(traj, walkedMeters) {
     remainingMeters: Math.max(0, totalMeters - clamped),
     arrived: false,
     inOppositeLeg,
-    inNextCycle
+    inNextCycle,
+    currentBandera: activeSeg.bandera,
+    currentBranchColor: activeSeg.color
   };
 }

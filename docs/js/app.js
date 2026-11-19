@@ -600,7 +600,8 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       trajectory,
       isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
       isNextCycle: Boolean(trajectory?.isNextCycle),
-      realBandera: trajectory?.realBandera || draftBus.descripcionBandera
+      realBandera: trajectory?.realBandera || draftBus.descripcionBandera,
+      realBanderaColor: trajectory?.realBanderaColor || getLineColor(lineName)
     };
   });
 }
@@ -622,6 +623,8 @@ function stepSoapInterpolation() {
     bus.routeMeters = sample.remainingMeters;
     bus.isOppositeLeg = sample.inOppositeLeg;
     bus.isNextCycle = Boolean(sample.inNextCycle);
+    if (sample.currentBandera) bus.realBandera = sample.currentBandera;
+    if (sample.currentBranchColor) bus.realBanderaColor = sample.currentBranchColor;
     bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining || 0) - 1);
 
     const mins = Math.ceil(bus.etaSecondsRemaining / 60);
@@ -650,12 +653,16 @@ function stepSoapInterpolation() {
       const etaUnit = card.querySelector('[data-eta-unit]');
       const distVal = card.querySelector('[data-dist-val]');
       const fill = card.querySelector('[data-progress-fill]');
+      const banderaTxt = card.querySelector('[data-bandera-txt]');
+      const banderaDot = card.querySelector('[data-bandera-dot]');
       if (etaVal) etaVal.textContent = bus.eta.display;
       if (etaUnit) etaUnit.textContent = bus.eta.unit || 'aprox';
       if (distVal && bus.routeMeters !== null) {
         distVal.textContent = `${formatDistance(bus.routeMeters)} · ${formatBlocks(bus.routeMeters)} cuadras`;
       }
       if (fill) fill.style.width = `${bus.proximityPct}%`;
+      if (banderaTxt && bus.realBandera) banderaTxt.textContent = bus.realBandera;
+      if (banderaDot && bus.realBanderaColor) banderaDot.style.background = bus.realBanderaColor;
     }
   }
 
@@ -786,16 +793,6 @@ function renderArribosList() {
           )})">+Flota</span>`
         : '';
 
-      const oppLegHtml = bus.isOppositeLeg
-        ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Aún circula en sentido contrario antes de dar la vuelta en cabecera">↺ Tramo previo: ${escapeHtml(
-            bus.realBandera
-          )}</span></div>`
-        : bus.isNextCycle
-          ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Ya pasó esta parada y volverá al completar la vuelta completa">↻ Vuelta siguiente · ${escapeHtml(
-              bus.realBandera
-            )}</span></div>`
-          : '';
-
       const driverHtml = bus.choferNombre
         ? `<span class="driver-inline">
              <span>Chofer: <strong>${escapeHtml(bus.choferNombre)}</strong></span>
@@ -804,6 +801,8 @@ function renderArribosList() {
         : `<span class="driver-inline"><span>Sin chofer informado</span></span>`;
 
       const gpsHtml = bus.gpsTimeOnly ? `<span class="mono-meta">GPS ${escapeHtml(bus.gpsTimeOnly)}</span>` : '';
+      const currentBandera = bus.realBandera || bus.descripcionBandera;
+      const dirColor = bus.realBanderaColor || color;
 
       return `
         <div class="arrival-card ${isSelected ? 'is-selected' : ''}" data-bus-key="${escapeHtml(
@@ -812,16 +811,16 @@ function renderArribosList() {
           <div class="arrival-card-main">
             <div class="line-badge">${escapeHtml(bus.descripcionLinea)}</div>
             <div class="arrival-info">
-              <div class="arrival-bandera" title="${escapeHtml(bus.descripcionBandera)}">${escapeHtml(
-                bus.descripcionBandera
-              )}</div>
+              <div class="arrival-bandera" title="${escapeHtml(currentBandera)}">
+                <span class="dir-dot" data-bandera-dot style="background:${dirColor}"></span>
+                <span class="arrival-bandera-txt" data-bandera-txt>${escapeHtml(currentBandera)}</span>
+              </div>
               <div class="arrival-sub-row">
                 ${cocheBadge}
                 ${desvioBadge}
                 ${turnoBadge}
                 ${extBadge}
               </div>
-              ${oppLegHtml}
               <div class="arrival-sub-row">
                 <span class="arrival-tag" data-dist-val>${escapeHtml(distLabel)}</span>
                 ${bus.esAdaptado ? '<span class="arrival-tag tag-adapted">♿ Adaptado</span>' : ''}
@@ -898,9 +897,14 @@ function checkProximityAlerts() {
 
 function updateInspectorFields(bus) {
   const color = getLineColor(bus.descripcionLinea);
+  const currentBandera = bus.realBandera || bus.descripcionBandera;
+  const dirColor = bus.realBanderaColor || color;
+
   el.inspLineBadge.textContent = bus.descripcionLinea;
   el.inspLineBadge.style.setProperty('--line-color', color);
-  el.inspBandera.textContent = bus.descripcionBandera;
+  el.inspBandera.innerHTML = `<span class="dir-dot" style="background:${dirColor}"></span><span class="arrival-bandera-txt">${escapeHtml(
+    currentBandera
+  )}</span>`;
 
   el.inspCochePill.textContent = bus.identificadorCoche ? `Coche #${bus.identificadorCoche}` : 'Coche s/d';
   if (bus.desvio && bus.desvio.status !== 'none' && bus.desvio.label) {
@@ -912,16 +916,11 @@ function updateInspectorFields(bus) {
   }
 
   const notes = [];
-  if (bus.isOppositeLeg) {
-    notes.push(`↺ Tramo previo (${bus.realBandera}): aún debe girar en cabecera antes de llegar a esta parada.`);
-  } else if (bus.isNextCycle) {
-    notes.push(`↻ Vuelta siguiente (${bus.realBandera}): ya pasó por esta parada y volverá al completar la vuelta completa.`);
-  }
   if (bus.turnoProgramado) {
-    notes.push(`Turno programado estimado: ${bus.turnoProgramado} hs.`);
+    notes.push(`Turno programado: ${bus.turnoProgramado} hs.`);
   }
   if (bus.esExtendido) {
-    notes.push(`Unidad extendida (+Flota) calculada vía parada previa ${bus.viaParada || ''}.`);
+    notes.push(`Flota extendida detectada vía parada ${bus.viaParada || ''}.`);
   }
   if (notes.length > 0) {
     el.inspDirectionNote.textContent = notes.join(' ');
@@ -940,7 +939,7 @@ function updateInspectorFields(bus) {
   el.inspBlocks.textContent = formatBlocks(distMeters);
   el.inspAccess.textContent = bus.esAdaptado ? '♿ Rampa' : 'Estándar';
 
-  el.inspCartel.textContent = `Cartel: ${bus.descripcionCartelBandera || bus.descripcionBandera}`;
+  el.inspCartel.textContent = `Sentido: ${currentBandera}`;
   const coordsStr = bus.lat !== null ? `${bus.lat.toFixed(5)}, ${bus.lng.toFixed(5)}` : 's/d';
   el.inspGps.textContent = bus.gpsTimeOnly ? `GPS ${bus.gpsTimeOnly} · ${coordsStr}` : `GPS: ${coordsStr}`;
 
