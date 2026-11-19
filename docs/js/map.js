@@ -271,7 +271,7 @@ export class TransitMap {
       color,
       weight: 3.5,
       opacity: 0.88,
-      dashArray: bus.isOppositeLeg ? '6, 6' : null
+      dashArray: bus.isOppositeLeg || bus.isNextCycle ? '6, 6' : null
     }).addTo(this.vectorLayer);
 
     const displayDist = bus.routeMeters ?? bus.distanceMeters;

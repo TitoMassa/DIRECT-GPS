@@ -599,6 +599,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       gpsTimeOnly,
       trajectory,
       isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
+      isNextCycle: Boolean(trajectory?.isNextCycle),
       realBandera: trajectory?.realBandera || draftBus.descripcionBandera
     };
   });
@@ -620,6 +621,7 @@ function stepSoapInterpolation() {
     bus.lng = sample.lng;
     bus.routeMeters = sample.remainingMeters;
     bus.isOppositeLeg = sample.inOppositeLeg;
+    bus.isNextCycle = Boolean(sample.inNextCycle);
     bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining || 0) - 1);
 
     const mins = Math.ceil(bus.etaSecondsRemaining / 60);
@@ -788,7 +790,11 @@ function renderArribosList() {
         ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Aún circula en sentido contrario antes de dar la vuelta en cabecera">↺ Tramo previo: ${escapeHtml(
             bus.realBandera
           )}</span></div>`
-        : '';
+        : bus.isNextCycle
+          ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Ya pasó esta parada y volverá al completar la vuelta completa">↻ Vuelta siguiente · ${escapeHtml(
+              bus.realBandera
+            )}</span></div>`
+          : '';
 
       const driverHtml = bus.choferNombre
         ? `<span class="driver-inline">
@@ -908,6 +914,8 @@ function updateInspectorFields(bus) {
   const notes = [];
   if (bus.isOppositeLeg) {
     notes.push(`↺ Tramo previo (${bus.realBandera}): aún debe girar en cabecera antes de llegar a esta parada.`);
+  } else if (bus.isNextCycle) {
+    notes.push(`↻ Vuelta siguiente (${bus.realBandera}): ya pasó por esta parada y volverá al completar la vuelta completa.`);
   }
   if (bus.turnoProgramado) {
     notes.push(`Turno programado estimado: ${bus.turnoProgramado} hs.`);
