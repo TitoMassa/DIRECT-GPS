@@ -192,13 +192,20 @@ export function matchBusesWithHorarios(buses = [], horarios = []) {
   const nowMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes() + nowArt.getUTCSeconds() / 60;
   const usedSlots = new Set();
 
-  for (const bus of buses) {
-    if (!bus.eta || bus.eta.minutes >= 99) continue;
+  // Sort closest buses first so direct arrivals claim their exact slot before extended (+Flota) units
+  const ordered = [...buses].sort((a, b) => (a.eta?.minutes ?? 999) - (b.eta?.minutes ?? 999));
+
+  for (const bus of ordered) {
+    if (!bus.eta || bus.eta.valid === false || typeof bus.eta.minutes !== 'number' || bus.eta.minutes > 240) {
+      bus.turnoProgramado = null;
+      continue;
+    }
     const desvioMin = bus.desvio?.minutes || 0;
     const expectedSchedMin = (nowMin + bus.eta.minutes + desvioMin) % 1440;
 
     let bestSlot = null;
-    let bestDiff = 9; // max tolerance ±9 min
+    // Extended (+Flota) units accumulate a few extra minutes of propagation variance over >60 min ETAs
+    let bestDiff = bus.esExtendido ? 14 : 10;
     for (const slot of horarios) {
       if (usedSlots.has(slot.hora)) continue;
       let diff = Math.abs(slot.minuteOfDay - expectedSchedMin);
@@ -274,17 +281,17 @@ export function formatWalkMin(meters) {
 
 export function parseEtaMinutes(rawText = '') {
   const lower = String(rawText).trim().toLowerCase();
-  if (!lower) return { minutes: 99, display: '—', unit: '', urgency: 'later' };
+  if (!lower) return { minutes: 999, valid: false, display: '—', unit: '', urgency: 'later' };
   if (lower.includes('llegando') || lower.includes('arribando') || lower === '0' || lower.startsWith('0 ')) {
-    return { minutes: 0, display: 'YA', unit: 'Arribando', urgency: 'now' };
+    return { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' };
   }
   const m = lower.match(/(\d+)/);
   if (m) {
     const mins = parseInt(m[1], 10);
     const urgency = mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later';
-    return { minutes: mins, display: `${mins}`, unit: 'min', urgency };
+    return { minutes: mins, valid: true, display: `${mins}`, unit: 'min', urgency };
   }
-  return { minutes: 99, display: rawText, unit: '', urgency: 'later' };
+  return { minutes: 999, valid: false, display: rawText, unit: '', urgency: 'later' };
 }
 
 export function computeProximityPercent(etaMinutes, meters) {
