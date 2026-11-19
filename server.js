@@ -143,10 +143,21 @@ async function handleApi(req, res, urlObj) {
     if (pathname === '/api/horarios') {
       const idParada = searchParams.get('idParada');
       const codLinea = searchParams.get('codLinea');
+      const tipoDia = searchParams.get('tipoDia') || 'auto';
       if (!idParada || !codLinea) {
         return sendJson(res, 400, { error: 'Faltan parámetros idParada o codLinea' });
       }
-      const result = await smartmove.getHorariosProgramados(idParada, codLinea);
+      const result = await smartmove.getHorariosProgramados(idParada, codLinea, tipoDia);
+      return sendJson(res, 200, result);
+    }
+
+    if (pathname === '/api/arribos-linea') {
+      const idParada = searchParams.get('idParada');
+      const codLinea = searchParams.get('codLinea');
+      if (!idParada || !codLinea) {
+        return sendJson(res, 400, { error: 'Faltan parámetros idParada o codLinea' });
+      }
+      const result = await smartmove.getArribosLineaCompleto(idParada, codLinea);
       return sendJson(res, 200, result);
     }
 

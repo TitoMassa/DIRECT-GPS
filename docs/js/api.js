@@ -46,7 +46,6 @@ async function apiGet(path, fallbackFn = null) {
   }
 }
 
-// Local 24h cache helper for heavy semi-static data (recorridos & horarios programados)
 function getLocalCache(key, maxAgeMs) {
   try {
     const raw = localStorage.getItem(key);
@@ -66,14 +65,17 @@ function setLocalCache(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value }));
   } catch {
-    // Ignore quota errors gracefully
+    // Ignore storage quota errors
   }
 }
 
-function getArgentinaDayType() {
-  const art = new Date(Date.now() - 3 * 3600 * 1000);
-  const day = art.getUTCDay(); // 0=Sun, 6=Sat
-  return day === 0 ? 'dom' : day === 6 ? 'sab' : 'hab';
+export function getArgentinaNow() {
+  return new Date(Date.now() - 3 * 3600 * 1000);
+}
+
+export function getArgentinaTodayTipo() {
+  const dow = getArgentinaNow().getUTCDay();
+  return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
 }
 
 export const api = {
@@ -110,42 +112,54 @@ export const api = {
   },
   banderas: (idParada) =>
     apiGet(`/api/banderas?idParada=${encodeURIComponent(idParada)}`, () => ({ data: [], source: 'fallback' })),
-  horarios: async (idParada, codLinea) => {
-    const dayType = getArgentinaDayType();
-    const cacheKey = `dgps_hor_v1_${String(idParada).toUpperCase()}_${codLinea}_${dayType}`;
-    const cached = getLocalCache(cacheKey, 24 * 60 * 60 * 1000);
-    if (cached) return { data: cached, source: 'local-cache', cached: true };
+  horarios: async (idParada, codLinea, tipoDia = 'auto') => {
+    const cleanStop = String(idParada).toUpperCase();
+    const resolvedTipo = tipoDia === 'auto' ? getArgentinaTodayTipo() : tipoDia;
+    const cacheKey = `dgps_hor_v2_${cleanStop}_${codLinea}_${resolvedTipo}`;
+
+    // Persistent 14-day cache per day-type (habil / sabado / domingo) — full 24h schedules never expire daily!
+    const cached = getLocalCache(cacheKey, 14 * 24 * 60 * 60 * 1000);
+    if (cached && cached.available && !cached.partial && cached.horarios?.length > 0) {
+      return { data: cached, source: 'local-cache', cached: true };
+    }
 
     const res = await apiGet(
-      `/api/horarios?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(codLinea)}`
+      `/api/horarios?idParada=${encodeURIComponent(cleanStop)}&codLinea=${encodeURIComponent(codLinea)}&tipoDia=${encodeURIComponent(resolvedTipo)}`
     );
-    if (res?.data?.horarios?.length > 0) {
-      setLocalCache(cacheKey, res.data);
+    const data = res?.data;
+    if (data?.available && !data.partial && data.horarios?.length > 0) {
+      setLocalCache(cacheKey, data);
     }
     return res;
   },
   arribos: (idParada, codLinea = '000') => {
     const code = !codLinea || codLinea === '0' ? '000' : String(codLinea);
     return apiGet(`/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(code)}`);
-  }
+  },
+  arribosLineaCompleto: (idParada, codLinea) =>
+    apiGet(`/api/arribos-linea?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(codLinea)}`)
 };
 
 export function parseDesvioHorario(raw = '') {
   const clean = String(raw || '').trim();
   if (!clean) {
-    return { raw: '', status: 'none', label: 'Sin desvío', shortLabel: '—', sign: '' };
+    return { raw: '', status: 'none', label: 'Sin desvío', shortLabel: '—', sign: '', minutes: 0 };
   }
   const normalized = clean.replace(/\s+/g, '');
   if (normalized === '00:00' || normalized === '+00:00' || normalized === '-00:00' || normalized === '0') {
-    return { raw: clean, status: 'ontime', label: 'En horario', shortLabel: '00:00', sign: '=' };
+    return { raw: clean, status: 'ontime', label: 'En horario', shortLabel: '00:00', sign: '=', minutes: 0 };
   }
+  const m = normalized.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  const signedMin = m ? (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) + parseInt(m[3], 10) / 60) : 0;
+
   if (normalized.startsWith('+')) {
     return {
       raw: clean,
       status: 'ahead',
       label: `Adelantado ${normalized}`,
       shortLabel: `+${normalized.slice(1)}`,
-      sign: '+'
+      sign: '+',
+      minutes: signedMin
     };
   }
   if (normalized.startsWith('-')) {
@@ -154,10 +168,51 @@ export function parseDesvioHorario(raw = '') {
       status: 'late',
       label: `Atrasado ${normalized}`,
       shortLabel: `-${normalized.slice(1)}`,
-      sign: '-'
+      sign: '-',
+      minutes: signedMin
     };
   }
-  return { raw: clean, status: 'ontime', label: clean, shortLabel: clean, sign: '' };
+  return { raw: clean, status: 'ontime', label: clean, shortLabel: clean, sign: '', minutes: 0 };
+}
+
+/**
+ * Cross-matches live buses against official scheduled pass times (Horarios Programados).
+ * Formula: ExpectedScheduledPass = Now + ETA + Desvio (ahead '+' -> scheduled later; late '-' -> scheduled earlier).
+ */
+export function matchBusesWithHorarios(buses = [], horarios = []) {
+  const slotToBus = new Map(); // hora ('17:05') -> bus
+  if (!Array.isArray(horarios) || horarios.length === 0) return slotToBus;
+
+  const nowArt = getArgentinaNow();
+  const nowMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes() + nowArt.getUTCSeconds() / 60;
+  const usedSlots = new Set();
+
+  for (const bus of buses) {
+    if (!bus.eta || bus.eta.minutes >= 99) continue;
+    const desvioMin = bus.desvio?.minutes || 0;
+    const expectedSchedMin = (nowMin + bus.eta.minutes + desvioMin) % 1440;
+
+    let bestSlot = null;
+    let bestDiff = 9; // max tolerance ±9 min
+    for (const slot of horarios) {
+      if (usedSlots.has(slot.hora)) continue;
+      let diff = Math.abs(slot.minuteOfDay - expectedSchedMin);
+      if (diff > 720) diff = 1440 - diff; // midnight wrap
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestSlot = slot;
+      }
+    }
+
+    if (bestSlot) {
+      usedSlots.add(bestSlot.hora);
+      bus.turnoProgramado = bestSlot.hora;
+      slotToBus.set(bestSlot.hora, bus);
+    } else {
+      bus.turnoProgramado = null;
+    }
+  }
+  return slotToBus;
 }
 
 export function parseChoferInfo(raw = '', existingNombre = '', existingLegajo = '') {

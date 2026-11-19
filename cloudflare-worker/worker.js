@@ -354,23 +354,73 @@ export default {
       if (pathname === '/api/horarios') {
         const stopId = String(searchParams.get('idParada') || '').trim().toUpperCase();
         const lineNum = Number(searchParams.get('codLinea'));
+        const tipoDia = String(searchParams.get('tipoDia') || 'auto').trim().toLowerCase();
         if (!stopId || !lineNum) {
           return jsonResponse({ error: 'Faltan parámetros idParada o codLinea' }, 400);
         }
 
         const nowArt = new Date(Date.now() - 3 * 3600 * 1000);
         const pad = (n) => String(n).padStart(2, '0');
-        const fmtIso = (d) =>
-          `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-        const dayKey = `${nowArt.getUTCFullYear()}-${pad(nowArt.getUTCMonth() + 1)}-${pad(nowArt.getUTCDate())}`;
-        const todayStr = `${pad(nowArt.getUTCDate())}/${pad(nowArt.getUTCMonth() + 1)}/${nowArt.getUTCFullYear()}`;
+        const getTipo = (dow) => (dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil');
+        const dayStartUtcMs = Date.UTC(nowArt.getUTCFullYear(), nowArt.getUTCMonth(), nowArt.getUTCDate(), 0, 0, 0);
+        const todayTipo = getTipo(nowArt.getUTCDay());
+        const requestedTipo = tipoDia === 'auto' ? todayTipo : tipoDia;
 
-        const baseMs = nowArt.getTime() + 2 * 60 * 1000;
+        let targetOffset = null;
+        if (requestedTipo === 'hoy') {
+          targetOffset = 0;
+        } else {
+          for (const offset of [1, 2]) {
+            const d = new Date(dayStartUtcMs + offset * 86400 * 1000);
+            if (getTipo(d.getUTCDay()) === requestedTipo) {
+              targetOffset = offset;
+              break;
+            }
+          }
+          if (targetOffset === null && requestedTipo === todayTipo) {
+            targetOffset = 0;
+          }
+        }
+
+        if (targetOffset === null) {
+          const labelMap = { habil: 'Lun–Vie', sabado: 'Sábado', domingo: 'Domingo' };
+          return jsonResponse({
+            data: {
+              idParada: stopId,
+              codigoLinea: lineNum,
+              tipoDia: requestedTipo,
+              available: false,
+              partial: false,
+              horarios: [],
+              frecuenciaMin: null,
+              mensaje: `SmartMovePro habilita la programación de ${labelMap[requestedTipo] || requestedTipo} con hasta 48h de anticipación.`
+            },
+            source: 'smartmovepro-soap',
+            savedAt: Date.now()
+          });
+        }
+
+        const targetDate = new Date(dayStartUtcMs + targetOffset * 86400 * 1000);
+        const dateIsoPrefix = `${targetDate.getUTCFullYear()}-${pad(targetDate.getUTCMonth() + 1)}-${pad(targetDate.getUTCDate())}`;
+
         const windows = [];
-        for (let i = 0; i < 12; i++) {
-          const wStart = new Date(baseMs + i * 2 * 3600 * 1000);
-          const wEnd = new Date(baseMs + (i + 1) * 2 * 3600 * 1000 - 60 * 1000);
-          windows.push([fmtIso(wStart), fmtIso(wEnd)]);
+        if (targetOffset === 0) {
+          let curMs = nowArt.getTime() + 2 * 60 * 1000;
+          const endOfTodayMs = dayStartUtcMs + 23 * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000;
+          while (curMs < endOfTodayMs) {
+            const nextMs = Math.min(endOfTodayMs, curMs + 119 * 60 * 1000);
+            const s = new Date(curMs);
+            const e = new Date(nextMs);
+            windows.push([
+              `${dateIsoPrefix}T${pad(s.getUTCHours())}:${pad(s.getUTCMinutes())}:${pad(s.getUTCSeconds())}`,
+              `${dateIsoPrefix}T${pad(e.getUTCHours())}:${pad(e.getUTCMinutes())}:${pad(e.getUTCSeconds())}`
+            ]);
+            curMs = nextMs + 1000;
+          }
+        } else {
+          for (let h = 0; h < 24; h += 2) {
+            windows.push([`${dateIsoPrefix}T${pad(h)}:00:00`, `${dateIsoPrefix}T${pad(h + 1)}:59:59`]);
+          }
         }
 
         const results = await Promise.all(
@@ -399,18 +449,16 @@ export default {
             const rawPaso = String(item.HoraPaso || '').trim();
             if (!rawPaso || seen.has(rawPaso)) continue;
             seen.add(rawPaso);
-            const [datePart = '', timePart = ''] = rawPaso.split(' ');
+            const timePart = (rawPaso.split(' ')[1] || '').trim();
             const hhmm = timePart.slice(0, 5);
             const [hh = '0', mm = '0'] = hhmm.split(':');
-            const minuteOfDay = parseInt(hh, 10) * 60 + parseInt(mm, 10);
             horarios.push({
               codigoLinea: Number(item.CodigoLinea) || lineNum,
               identificadorParada: item.IdentificadorParada || stopId,
               bandera: String(item.DescripcionBandera || '').trim(),
               horaPaso: rawPaso,
               hora: hhmm,
-              minuteOfDay,
-              esHoy: datePart === todayStr
+              minuteOfDay: parseInt(hh, 10) * 60 + parseInt(mm, 10)
             });
           }
         }
@@ -425,81 +473,207 @@ export default {
         const frecuenciaMin = diffs.length > 0 ? diffs[Math.floor(diffs.length / 2)] : null;
 
         return jsonResponse({
-          data: { idParada: stopId, codigoLinea: lineNum, horarios, frecuenciaMin, fetchedDay: dayKey },
+          data: {
+            idParada: stopId,
+            codigoLinea: lineNum,
+            tipoDia: requestedTipo === 'hoy' ? todayTipo : requestedTipo,
+            fechaConsultada: dateIsoPrefix,
+            available: true,
+            partial: targetOffset === 0,
+            horarios,
+            frecuenciaMin
+          },
           source: 'smartmovepro-soap',
           savedAt: Date.now()
         });
       }
 
-      if (pathname === '/api/arribos') {
+      if (pathname === '/api/arribos' || pathname === '/api/arribos-linea') {
         const stopId = String(searchParams.get('idParada') || PILOT_STOP.id).trim().toUpperCase();
         const rawCode = String(searchParams.get('codLinea') || '000').trim();
         const lineCode = !rawCode || rawCode === '0' ? '000' : rawCode;
 
-        const raw = await soapRequest(
-          'RecuperarProximosArribos',
-          `<identificadorParada i:type="d:string">${escapeXml(stopId)}</identificadorParada>
-           <codigoLineaParada i:type="d:int">${escapeXml(lineCode)}</codigoLineaParada>
-           <codigoAplicacion i:type="d:int">${SOAP_APP_CODE}</codigoAplicacion>
-           <localidad i:type="d:string">${escapeXml(SOAP_LOCALIDAD)}</localidad>
-           <usuario i:type="d:string">${SOAP_USER}</usuario>
-           <clave i:type="d:string">${SOAP_PASS}</clave>`
-        );
-
-        const rawArribos = Array.isArray(raw?.arribos) ? raw.arribos : [];
-        let stopLat = null;
-        let stopLng = null;
-        for (const a of rawArribos) {
-          if (a.LatitudParada && a.LongitudParada) {
-            stopLat = parseFloat(a.LatitudParada);
-            stopLng = parseFloat(a.LongitudParada);
-            break;
+        const fetchOneStop = async (sid, lcode) => {
+          const raw = await soapRequest(
+            'RecuperarProximosArribos',
+            `<identificadorParada i:type="d:string">${escapeXml(sid)}</identificadorParada>
+             <codigoLineaParada i:type="d:int">${escapeXml(lcode)}</codigoLineaParada>
+             <codigoAplicacion i:type="d:int">${SOAP_APP_CODE}</codigoAplicacion>
+             <localidad i:type="d:string">${escapeXml(SOAP_LOCALIDAD)}</localidad>
+             <usuario i:type="d:string">${SOAP_USER}</usuario>
+             <clave i:type="d:string">${SOAP_PASS}</clave>`
+          );
+          const rawArribos = Array.isArray(raw?.arribos) ? raw.arribos : [];
+          let sLat = null;
+          let sLng = null;
+          for (const a of rawArribos) {
+            if (a.LatitudParada && a.LongitudParada) {
+              sLat = parseFloat(a.LatitudParada);
+              sLng = parseFloat(a.LongitudParada);
+              break;
+            }
           }
-        }
-        const known = QUICK_STOPS.find((s) => s.id === stopId);
-        if ((stopLat === null || Number.isNaN(stopLat)) && known) {
-          stopLat = known.lat;
-          stopLng = known.lng;
-        }
-
-        const arribos = rawArribos.map((a) => {
-          const chofer = parseChofer(a.IdentificadorChofer);
+          const known = QUICK_STOPS.find((s) => s.id === sid);
+          if ((sLat === null || Number.isNaN(sLat)) && known) {
+            sLat = known.lat;
+            sLng = known.lng;
+          }
+          const arribos = rawArribos.map((a) => {
+            const chofer = parseChofer(a.IdentificadorChofer);
+            return {
+              codigoLinea: Number(a.CodigoLineaParada) || 0,
+              tiempoRestanteArribo: String(a.Arribo || '').trim(),
+              descripcionLinea: String(a.DescripcionLinea || '').trim(),
+              descripcionBandera: String(a.DescripcionBandera || '').trim(),
+              descripcionCortaBandera: String(a.DescripcionCortaBandera || '').trim(),
+              descripcionCartelBandera: String(a.DescripcionCartelBandera || '').trim(),
+              esAdaptado: String(a.EsAdaptado || '').toLowerCase() === 'true',
+              latitud: String(a.Latitud || ''),
+              longitud: String(a.Longitud || ''),
+              latitudParada: String(a.LatitudParada || (sLat ?? '')),
+              longitudParada: String(a.LongitudParada || (sLng ?? '')),
+              esLleno: false,
+              identificadorCoche: String(a.IdentificadorCoche || '').trim(),
+              identificadorChofer: chofer.choferRaw,
+              choferNombre: chofer.choferNombre,
+              choferLegajo: chofer.choferLegajo,
+              desvioHorario: String(a.DesvioHorario || '').trim(),
+              ultimaFechaHoraGPS: String(a.UltimaFechaHoraGPS || '').trim(),
+              mensajeError: String(a.MensajeError || '').trim()
+            };
+          });
           return {
-            codigoLinea: Number(a.CodigoLineaParada) || 0,
-            tiempoRestanteArribo: String(a.Arribo || '').trim(),
-            descripcionLinea: String(a.DescripcionLinea || '').trim(),
-            descripcionBandera: String(a.DescripcionBandera || '').trim(),
-            descripcionCortaBandera: String(a.DescripcionCortaBandera || '').trim(),
-            descripcionCartelBandera: String(a.DescripcionCartelBandera || '').trim(),
-            esAdaptado: String(a.EsAdaptado || '').toLowerCase() === 'true',
-            latitud: String(a.Latitud || ''),
-            longitud: String(a.Longitud || ''),
-            latitudParada: String(a.LatitudParada || (stopLat ?? '')),
-            longitudParada: String(a.LongitudParada || (stopLng ?? '')),
-            esLleno: false,
-            identificadorCoche: String(a.IdentificadorCoche || '').trim(),
-            identificadorChofer: chofer.choferRaw,
-            choferNombre: chofer.choferNombre,
-            choferLegajo: chofer.choferLegajo,
-            desvioHorario: String(a.DesvioHorario || '').trim(),
-            ultimaFechaHoraGPS: String(a.UltimaFechaHoraGPS || '').trim(),
-            mensajeError: String(a.MensajeError || '').trim()
-          };
-        });
-
-        return jsonResponse({
-          data: {
             arribos,
-            idParada: stopId,
-            codLinea: lineCode,
-            stopCoords: stopLat !== null && stopLng !== null ? { lat: stopLat, lng: stopLng } : null,
+            idParada: sid,
+            codLinea: lcode,
+            stopCoords: sLat !== null && sLng !== null ? { lat: sLat, lng: sLng } : null,
             knownStop: known || null,
             codigoEstado: raw?.CodigoEstado ?? 0,
             mensaje: raw?.MensajeEstado || null
-          },
-          source: 'smartmovepro-soap',
-          savedAt: Date.now()
-        });
+          };
+        };
+
+        const basePayload = await fetchOneStop(stopId, lineCode);
+
+        // Full-fleet upstream anchor discovery when /api/arribos-linea is requested for a specific line
+        if (pathname === '/api/arribos-linea' && lineCode !== '000' && basePayload.arribos.length >= 3) {
+          const lineNum = Number(lineCode);
+          const stopsRes = await soapRequest(
+            'RecuperarParadasCompletoPorLinea',
+            `<usuario i:type="d:string">${SOAP_USER}</usuario>
+             <clave i:type="d:string">${SOAP_PASS}</clave>
+             <codigoLineaParada i:type="d:int">${lineNum}</codigoLineaParada>
+             <isSublinea i:type="d:boolean">false</isSublinea>
+             <isInteligente i:type="d:boolean">false</isInteligente>`
+          ).catch(() => ({ paradas: {} }));
+
+          const branches = Object.values(stopsRes?.paradas || {}).filter((arr) => Array.isArray(arr) && arr.length > 0);
+          const stopBranch =
+            branches.find((arr) => arr.some((p) => String(p.Identificador).toUpperCase() === stopId)) || branches[0] || [];
+          const oppBranch = branches.find((arr) => arr !== stopBranch && arr.length >= 5) || [];
+          const idx = stopBranch.findIndex((p) => String(p.Identificador).toUpperCase() === stopId);
+
+          const upstream = [];
+          if (idx >= 0) {
+            for (let i = idx - 1; i >= 0; i--) upstream.push(stopBranch[i]);
+            for (let i = oppBranch.length - 1; i >= 0; i--) upstream.push(oppBranch[i]);
+            for (let i = stopBranch.length - 1; i > idx; i--) upstream.push(stopBranch[i]);
+          }
+
+          const probes = [];
+          const numProbes = Math.min(6, upstream.length);
+          for (let k = 1; k <= numProbes; k++) {
+            const pIdx = Math.min(upstream.length - 1, Math.floor((k * upstream.length) / (numProbes + 1)));
+            const st = upstream[pIdx];
+            if (st?.Identificador && !probes.some((p) => p.Identificador === st.Identificador)) {
+              probes.push(st);
+            }
+          }
+
+          const probeResults = await Promise.all(
+            probes.map(async (st) => {
+              try {
+                const r = await fetchOneStop(String(st.Identificador).toUpperCase(), lineCode);
+                return { stopId: String(st.Identificador).toUpperCase(), arribos: r.arribos || [] };
+              } catch {
+                return { stopId: String(st.Identificador).toUpperCase(), arribos: [] };
+              }
+            })
+          );
+
+          const parseMin = (txt) => {
+            const l = String(txt || '').toLowerCase();
+            if (l.includes('arriband') || l.includes('llegand')) return 0.5;
+            const m = l.match(/(\d+)/);
+            return m ? parseInt(m[1], 10) : null;
+          };
+
+          const fleet = new Map();
+          for (const a of basePayload.arribos) {
+            const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+            fleet.set(cid, {
+              arribo: { ...a, esExtendido: false, viaParada: null },
+              etaMin: parseMin(a.tiempoRestanteArribo)
+            });
+          }
+
+          for (let pass = 0; pass < 4; pass++) {
+            let added = false;
+            for (const pr of probeResults) {
+              const deltas = [];
+              for (const a of pr.arribos) {
+                const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+                const pMin = parseMin(a.tiempoRestanteArribo);
+                if (fleet.has(cid) && pMin !== null && fleet.get(cid).etaMin !== null) {
+                  const d = fleet.get(cid).etaMin - pMin;
+                  if (d >= 0 && d <= 100) deltas.push(d);
+                }
+              }
+              if (deltas.length === 0) continue;
+              deltas.sort((a, b) => a - b);
+              const travelDelta = deltas[Math.floor(deltas.length / 2)];
+
+              for (const a of pr.arribos) {
+                const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+                const pMin = parseMin(a.tiempoRestanteArribo);
+                if (!fleet.has(cid) && pMin !== null) {
+                  const estMin = Math.max(1, Math.round(pMin + travelDelta));
+                  fleet.set(cid, {
+                    arribo: {
+                      ...a,
+                      tiempoRestanteArribo: `${estMin} min. est.`,
+                      descripcionBandera: basePayload.arribos[0]?.descripcionBandera || a.descripcionBandera,
+                      latitudParada: String(basePayload.stopCoords?.lat ?? ''),
+                      longitudParada: String(basePayload.stopCoords?.lng ?? ''),
+                      esExtendido: true,
+                      viaParada: pr.stopId
+                    },
+                    etaMin: estMin
+                  });
+                  added = true;
+                }
+              }
+            }
+            if (!added) break;
+          }
+
+          const merged = Array.from(fleet.values())
+            .sort((a, b) => (a.etaMin ?? 999) - (b.etaMin ?? 999))
+            .map((x) => x.arribo);
+
+          return jsonResponse({
+            data: {
+              ...basePayload,
+              arribos: merged,
+              extendedCount: merged.filter((x) => x.esExtendido).length,
+              fullFleet: true
+            },
+            source: 'smartmovepro-soap',
+            savedAt: Date.now()
+          });
+        }
+
+        return jsonResponse({ data: basePayload, source: 'smartmovepro-soap', savedAt: Date.now() });
       }
 
       return jsonResponse({ error: 'Endpoint no encontrado' }, 404);

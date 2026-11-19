@@ -195,6 +195,8 @@ export class TransitMap {
 
   _buildBusTooltipHtml(bus) {
     const coche = bus.identificadorCoche ? ` · Coche #${bus.identificadorCoche}` : '';
+    const ext = bus.esExtendido ? ` <span style="opacity:0.8">(Flota extendida)</span>` : '';
+    const turno = bus.turnoProgramado ? `<br/>Turno programado: <strong>${bus.turnoProgramado}</strong>` : '';
     const desvio =
       bus.desvio && bus.desvio.status !== 'none' ? `<br/>Desvío: <strong>${bus.desvio.label}</strong>` : '';
     const legNote = bus.isOppositeLeg
@@ -204,7 +206,7 @@ export class TransitMap {
       ? `<br/>Chofer: ${bus.choferNombre}${bus.choferLegajo ? ` (ID ${bus.choferLegajo})` : ''}`
       : '';
     const gps = bus.gpsTimeOnly ? `<br/><small>GPS: ${bus.gpsTimeOnly}</small>` : '';
-    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${legNote}${desvio}${chofer}${gps}`;
+    return `<strong>${bus.descripcionLinea}${coche}</strong> · ${bus.tiempoRaw}${ext}<br/>${bus.descripcionCartelBandera || bus.descripcionBandera}${turno}${legNote}${desvio}${chofer}${gps}`;
   }
 
   // Zero-lag position-only update for 1-second interpolation ticks (no setIcon / no DOM rebuild!)
@@ -222,22 +224,25 @@ export class TransitMap {
     this.selectedBusKey = selectedBusKey;
     const incomingKeys = new Set();
 
-    for (const bus of buses) {
+    // STRICT LINE FILTER: When a single line is selected, completely omit all other lines from Leaflet!
+    const visibleBuses =
+      filterLine === 'ALL' ? buses : buses.filter((b) => b.descripcionLinea === filterLine);
+
+    for (const bus of visibleBuses) {
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       incomingKeys.add(bus.key);
 
       const isSelected = bus.key === selectedBusKey;
-      const isDimmed = filterLine !== 'ALL' && bus.descripcionLinea !== filterLine;
-      const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: isDimmed });
+      const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: false });
       const tooltipHtml = this._buildBusTooltipHtml(bus);
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
         const curPos = existing.marker.getLatLng();
-        this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 800);
+        this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
         existing.marker.setIcon(icon);
         existing.marker.setTooltipContent(tooltipHtml);
-        existing.marker.setZIndexOffset(isSelected ? 1000 : isDimmed ? 100 : 500);
+        existing.marker.setZIndexOffset(isSelected ? 1000 : 500);
         existing.data = bus;
       } else {
         const marker = L.marker([bus.lat, bus.lng], {
@@ -255,7 +260,7 @@ export class TransitMap {
       }
     }
 
-    // Remove departed buses
+    // Remove hidden or departed buses completely from the Leaflet layer
     for (const [key, entry] of this.busMarkers.entries()) {
       if (!incomingKeys.has(key)) {
         this.busLayer.removeLayer(entry.marker);

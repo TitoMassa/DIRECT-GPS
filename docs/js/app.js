@@ -9,7 +9,10 @@ import {
   computeProximityPercent,
   parseDesvioHorario,
   parseChoferInfo,
-  formatGpsTimeOnly
+  formatGpsTimeOnly,
+  getArgentinaNow,
+  getArgentinaTodayTipo,
+  matchBusesWithHorarios
 } from './api.js';
 import { parseRouteBranches, resolveBusTrajectory, sampleTrajectory } from './trajectory.js';
 import { TransitMap } from './map.js';
@@ -22,19 +25,22 @@ const state = {
   activeStop: null,
   codLineaQuery: '000',
   filterLine: 'ALL',
+  focusedLineCode: null, // Numeric codigoLinea when viewing a single line's full fleet
   arribos: [],
   selectedBusKey: null,
   simulateMode: false,
   horariosOpen: false,
   horariosLineCode: null,
-  stopLinesList: [], // [{ codigo, descripcion }] for active stop's Horarios 24h
+  horariosTipoDia: getArgentinaTodayTipo(),
+  stopLinesList: [], // [{ codigo, descripcion }] for active stop
   dataSource: 'smartmovepro-soap',
   lastSyncAt: null,
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
 
-  // Real SOAP route branches cache (codigoLinea -> Branch[]) + consecutive GPS fixes per physical bus unit
+  // Real SOAP route branches & today's horarios cache per line
   routeBranchesCache: new Map(),
+  horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
   lastRealGpsByUnit: new Map(), // busKey -> { lat, lng, ts }
 
   // Catalog & Drilldown
@@ -457,18 +463,23 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   const stopId = String(stopInfo.id || stopInfo.identificador || '').trim().toUpperCase();
   if (!stopId) return;
 
+  const isAll = !rawCode || rawCode === '0' || rawCode === '000';
+  const lineObj = !isAll ? state.lineas.find((l) => String(l.codigo) === rawCode) : null;
+
   state.activeStop = {
     id: stopId,
     nombre: stopInfo.nombre || stopInfo.descripcion || `Parada ${stopId}`,
     lat: typeof stopInfo.lat === 'number' ? stopInfo.lat : parseFloat(stopInfo.latitud) || null,
     lng: typeof stopInfo.lng === 'number' ? stopInfo.lng : parseFloat(stopInfo.longitud) || null
   };
-  state.codLineaQuery = !rawCode || rawCode === '0' ? '000' : rawCode;
-  state.filterLine = 'ALL';
+  state.codLineaQuery = isAll ? '000' : rawCode;
+  state.focusedLineCode = isAll ? null : Number(rawCode);
+  state.filterLine = lineObj ? lineObj.descripcion : 'ALL';
   state.selectedBusKey = null;
   state.routesVisible = false;
   state.horariosOpen = false;
-  state.horariosLineCode = null;
+  state.horariosLineCode = isAll ? null : Number(rawCode);
+  state.horariosTipoDia = getArgentinaTodayTipo();
   state.stopLinesList = [];
   state.lastRealGpsByUnit.clear();
 
@@ -531,7 +542,6 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
     const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
 
-    // Consecutive real SOAP GPS tracking for true heading verification
     const prevFix = state.lastRealGpsByUnit.get(key) || null;
     const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
 
@@ -548,7 +558,6 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
         : null;
 
     if (validPos) {
-      // Only update prevFix anchor once bus moved >= 15m so heading stays clean
       if (!prevFix || (distanceMeters(prevFix.lat, prevFix.lng, lat, lng) || 0) >= 15) {
         state.lastRealGpsByUnit.set(key, { lat, lng, ts: now });
       }
@@ -568,6 +577,9 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       etaSecondsRemaining: etaSec,
       esAdaptado: Boolean(a.esAdaptado),
       esLleno: a.esLleno === true,
+      esExtendido: Boolean(a.esExtendido),
+      viaParada: a.viaParada || null,
+      turnoProgramado: null,
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
       distanceMeters: straightDist,
@@ -621,10 +633,8 @@ function stepSoapInterpolation() {
     bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
   }
 
-  // Pure GPU marker reposition (0 DOM recreation!)
   transitMap.moveBusPositionsFast(state.arribos);
 
-  // In-place text updates on existing cards (0 innerHTML thrashing!)
   if (!state.horariosOpen) {
     for (const bus of state.arribos) {
       const card = el.arribosList.querySelector(`[data-bus-key="${CSS.escape(bus.key)}"]`);
@@ -649,38 +659,64 @@ function stepSoapInterpolation() {
 }
 
 function renderLineFilters() {
-  const uniqueLines = Array.from(new Set(state.arribos.map((a) => a.descripcionLinea)));
-  const totalCount = state.arribos.length;
+  // Always keep every known line for this stop selectable in the strip
+  const lineEntries =
+    state.stopLinesList.length > 0
+      ? state.stopLinesList
+      : Array.from(new Map(state.arribos.map((a) => [a.codigoLinea, { codigo: a.codigoLinea, descripcion: a.descripcionLinea }])).values());
 
   let html = `
-    <button class="filter-chip ${state.filterLine === 'ALL' ? 'active' : ''}" data-line="ALL" style="--chip-color:#0284c7">
-      Todas (${totalCount})
+    <button class="filter-chip ${state.filterLine === 'ALL' ? 'active' : ''}" data-line="ALL" data-cod="000" style="--chip-color:#0284c7">
+      Todas
     </button>
   `;
 
-  for (const line of uniqueLines) {
+  for (const item of lineEntries) {
+    const line = item.descripcion;
     const color = getLineColor(line);
     const count = state.arribos.filter((a) => a.descripcionLinea === line).length;
+    const countLabel = state.filterLine === line && count > 0 ? ` (${count})` : state.filterLine === 'ALL' && count > 0 ? ` (${count})` : '';
     html += `
       <button class="filter-chip ${state.filterLine === line ? 'active' : ''}" data-line="${escapeHtml(
         line
-      )}" style="--chip-color:${color}">
+      )}" data-cod="${item.codigo}" style="--chip-color:${color}">
         <span class="chip-dot"></span>
-        ${escapeHtml(line)} (${count})
+        ${escapeHtml(line)}${countLabel}
       </button>
     `;
   }
 
   el.lineFilterStrip.innerHTML = html;
   el.lineFilterStrip.querySelectorAll('.filter-chip').forEach((chip) => {
-    chip.addEventListener('click', () => {
-      state.filterLine = chip.dataset.line;
+    chip.addEventListener('click', async () => {
+      const selectedLine = chip.dataset.line;
+      const selectedCod = chip.dataset.cod;
+      if (selectedLine === state.filterLine) return;
+
+      closeBusInspector();
+      state.filterLine = selectedLine;
+      if (selectedLine === 'ALL') {
+        state.focusedLineCode = null;
+        state.codLineaQuery = '000';
+      } else {
+        state.focusedLineCode = Number(selectedCod) || null;
+        state.codLineaQuery = String(selectedCod);
+      }
+
+      updateStopHeaderUI();
       renderLineFilters();
-      renderArribosList();
+
+      // Immediately hide non-selected lines from Leaflet (zero ghost markers!)
       transitMap.updateBuses(state.arribos, {
         filterLine: state.filterLine,
-        selectedBusKey: state.selectedBusKey
+        selectedBusKey: null
       });
+
+      // When focusing a single line, automatically fetch its FULL ACTIVE FLEET (> 3 cars) via upstream probe propagation!
+      if (state.focusedLineCode) {
+        showToast(`Buscando toda la flota activa de ${selectedLine}...`, 'info', 2000);
+      }
+      await fetchArribos(true);
     });
   });
 }
@@ -731,6 +767,18 @@ function renderArribosList() {
             )}</span>`
           : '';
 
+      const turnoBadge = bus.turnoProgramado
+        ? `<span class="turno-pill" title="Horario programado estimado que cubre esta unidad">Turno ${escapeHtml(
+            bus.turnoProgramado
+          )}</span>`
+        : '';
+
+      const extBadge = bus.esExtendido
+        ? `<span class="extended-pill" title="Coche detectado en parada anterior (${escapeHtml(
+            bus.viaParada || ''
+          )})">+Flota</span>`
+        : '';
+
       const oppLegHtml = bus.isOppositeLeg
         ? `<div class="arrival-sub-row"><span class="opposite-leg-badge" title="Aún circula en sentido contrario antes de dar la vuelta en cabecera">↺ Tramo previo: ${escapeHtml(
             bus.realBandera
@@ -759,6 +807,8 @@ function renderArribosList() {
               <div class="arrival-sub-row">
                 ${cocheBadge}
                 ${desvioBadge}
+                ${turnoBadge}
+                ${extBadge}
               </div>
               ${oppLegHtml}
               <div class="arrival-sub-row">
@@ -845,8 +895,18 @@ function updateInspectorFields(bus) {
   el.inspDesvioPill.className = `desvio-pill desvio-${bus.desvio.status === 'none' ? 'ontime' : bus.desvio.status}`;
   el.inspDesvioPill.textContent = bus.desvio.status !== 'none' ? bus.desvio.label : 'Sin desvío';
 
+  const notes = [];
   if (bus.isOppositeLeg) {
-    el.inspDirectionNote.textContent = `↺ En sentido previo (${bus.realBandera}): aún debe completar ese tramo y girar en cabecera antes de llegar a esta parada.`;
+    notes.push(`↺ Tramo previo (${bus.realBandera}): aún debe girar en cabecera antes de llegar a esta parada.`);
+  }
+  if (bus.turnoProgramado) {
+    notes.push(`Turno programado estimado: ${bus.turnoProgramado} hs.`);
+  }
+  if (bus.esExtendido) {
+    notes.push(`Unidad extendida (+Flota) calculada vía parada previa ${bus.viaParada || ''}.`);
+  }
+  if (notes.length > 0) {
+    el.inspDirectionNote.textContent = notes.join(' ');
     el.inspDirectionNote.classList.remove('hidden');
   } else {
     el.inspDirectionNote.classList.add('hidden');
@@ -901,6 +961,30 @@ function closeBusInspector() {
   if (state.activeStop && !state.horariosOpen) renderArribosList();
 }
 
+async function crossMatchLineHorarios(stopId, codLinea, buses) {
+  const todayTipo = getArgentinaTodayTipo();
+  const memKey = `${stopId}:${codLinea}:${todayTipo}`;
+  let horarios = state.horariosByLineCache.get(memKey);
+
+  if (!horarios) {
+    try {
+      const hRes = await api.horarios(stopId, codLinea, todayTipo);
+      horarios = hRes?.data?.horarios || [];
+      if (horarios.length > 0) {
+        state.horariosByLineCache.set(memKey, horarios);
+      }
+    } catch {
+      horarios = [];
+    }
+  }
+
+  if (horarios.length > 0) {
+    const targetBuses = buses.filter((b) => Number(b.codigoLinea) === Number(codLinea));
+    return matchBusesWithHorarios(targetBuses, horarios);
+  }
+  return new Map();
+}
+
 async function fetchArribos(showSkeleton = false) {
   if (!state.activeStop) return;
 
@@ -910,7 +994,11 @@ async function fetchArribos(showSkeleton = false) {
   }
 
   try {
-    const res = await api.arribos(state.activeStop.id, state.codLineaQuery);
+    // When focused on a single line, query /api/arribos-linea to discover ALL active cars (> 3) in parallel!
+    const res = state.focusedLineCode
+      ? await api.arribosLineaCompleto(state.activeStop.id, state.focusedLineCode)
+      : await api.arribos(state.activeStop.id, '000');
+
     const payload = res.data || {};
     state.dataSource = res.source || 'smartmovepro-soap';
     state.lastSyncAt = new Date();
@@ -931,18 +1019,20 @@ async function fetchArribos(showSkeleton = false) {
     const rawArribos = Array.isArray(payload.arribos) ? payload.arribos : [];
     const lineCodes = Array.from(new Set(rawArribos.map((a) => Number(a.codigoLinea)).filter(Boolean)));
 
-    // Preload real SOAP route branches (cached 24h in localStorage) BEFORE computing trajectories
-    // so opposite-leg turnaround detection works accurately from the very first load!
     await ensureBranchesLoaded(lineCodes);
 
-    // Track lines serving this stop for the Horarios 24h panel
-    const linesMap = new Map();
-    for (const a of rawArribos) {
-      if (a.codigoLinea && a.descripcionLinea) {
-        linesMap.set(Number(a.codigoLinea), a.descripcionLinea);
+    // Keep full stopLinesList when viewing '000' (so user can switch back and forth between lines cleanly)
+    if (!state.focusedLineCode) {
+      const linesMap = new Map(state.stopLinesList.map((l) => [l.codigo, l.descripcion]));
+      for (const a of rawArribos) {
+        if (a.codigoLinea && a.descripcionLinea) {
+          linesMap.set(Number(a.codigoLinea), a.descripcionLinea);
+        }
       }
+      state.stopLinesList = Array.from(linesMap.entries()).map(([codigo, descripcion]) => ({ codigo, descripcion }));
+    } else if (state.stopLinesList.length === 0 && rawArribos.length > 0) {
+      state.stopLinesList = [{ codigo: state.focusedLineCode, descripcion: rawArribos[0].descripcionLinea }];
     }
-    state.stopLinesList = Array.from(linesMap.entries()).map(([codigo, descripcion]) => ({ codigo, descripcion }));
 
     const stopCoords =
       typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
@@ -950,22 +1040,34 @@ async function fetchArribos(showSkeleton = false) {
         : payload.stopCoords || null;
 
     state.arribos = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
+
+    // When viewing a single line, automatically cross-match every car against its official Horarios Programados!
+    if (state.focusedLineCode && state.arribos.length > 0) {
+      await crossMatchLineHorarios(state.activeStop.id, state.focusedLineCode, state.arribos);
+    }
+
+    const extLabel = payload.extendedCount > 0 ? ` · +${payload.extendedCount} flota` : '';
     el.lastSyncLabel.textContent = `SOAP ${state.lastSyncAt.toLocaleTimeString('es-AR', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit'
-    })}`;
+    })}${extLabel}`;
 
     updateSignalPill();
     renderLineFilters();
     if (!state.horariosOpen) renderArribosList();
+
     transitMap.updateBuses(state.arribos, {
       filterLine: state.filterLine,
       selectedBusKey: state.selectedBusKey
     });
 
     if (showSkeleton && state.arribos.length > 0) {
-      transitMap.fitFleet(state.arribos);
+      const visibleForFit =
+        state.filterLine === 'ALL'
+          ? state.arribos
+          : state.arribos.filter((b) => b.descripcionLinea === state.filterLine);
+      transitMap.fitFleet(visibleForFit);
     }
 
     if (state.selectedBusKey) {
@@ -997,7 +1099,8 @@ function updateCountdownRing() {
 }
 
 // ============================================================================
-// Horarios Programados 24h (RecuperarHorariosProgramadosPorLineaParada + 24h cache)
+// Horarios Programados 24h — Separado por tipo de día (Lun-Vie / Sábado / Domingo)
+// Nunca mezcla medianoche; cacheado 14 días por tipo de día + cruce con coches en vivo
 // ============================================================================
 async function toggleHorariosView() {
   if (!state.activeStop) return;
@@ -1009,7 +1112,6 @@ async function toggleHorariosView() {
 
   if (!state.horariosOpen) return;
 
-  // Discover lines serving this stop (from live arrivals OR /api/banderas matched against state.lineas)
   if (state.stopLinesList.length === 0) {
     try {
       const bRes = await api.banderas(state.activeStop.id);
@@ -1027,20 +1129,24 @@ async function toggleHorariosView() {
     el.horariosPanel.innerHTML = `
       <div class="empty-state">
         <h3>Sin líneas detectadas</h3>
-        <p>Elegí primero una línea específica desde la pestaña Líneas para ver su grilla horaria 24h.</p>
+        <p>Elegí una parada o línea primero para ver sus horarios programados.</p>
       </div>
     `;
     return;
   }
 
-  if (!state.horariosLineCode) {
+  if (state.focusedLineCode) {
+    state.horariosLineCode = state.focusedLineCode;
+  } else if (!state.horariosLineCode) {
     state.horariosLineCode = state.stopLinesList[0].codigo;
   }
-  await loadAndRenderHorarios(state.horariosLineCode);
+  await loadAndRenderHorarios(state.horariosLineCode, state.horariosTipoDia);
 }
 
-async function loadAndRenderHorarios(codLinea) {
+async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) {
   state.horariosLineCode = Number(codLinea);
+  state.horariosTipoDia = tipoDia;
+
   const lineObj = state.stopLinesList.find((l) => l.codigo === state.horariosLineCode) || {
     codigo: state.horariosLineCode,
     descripcion: String(state.horariosLineCode)
@@ -1056,27 +1162,57 @@ async function loadAndRenderHorarios(codLinea) {
     })
     .join('');
 
+  const dayTabs = [
+    { key: 'habil', label: 'Lun–Vie' },
+    { key: 'sabado', label: 'Sábado' },
+    { key: 'domingo', label: 'Domingo' }
+  ];
+  const dayTabsHtml = `
+    <div class="day-type-tabs" role="tablist">
+      ${dayTabs
+        .map(
+          (d) =>
+            `<button class="day-tab-btn ${state.horariosTipoDia === d.key ? 'active' : ''}" data-hor-day="${d.key}">${d.label}</button>`
+        )
+        .join('')}
+    </div>
+  `;
+
   el.horariosPanel.innerHTML = `
     <div class="horarios-head">
-      <h3>Horarios programados 24h</h3>
+      <h3>Horarios programados</h3>
       <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
     </div>
     <div class="horarios-line-tabs">${tabsHtml}</div>
+    ${dayTabsHtml}
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
   `;
   bindHorariosControls();
 
   try {
-    const res = await api.horarios(state.activeStop.id, state.horariosLineCode);
+    const res = await api.horarios(state.activeStop.id, state.horariosLineCode, state.horariosTipoDia);
     const data = res.data || {};
     const horarios = Array.isArray(data.horarios) ? data.horarios : [];
 
-    const nowArt = new Date(Date.now() - 3 * 3600 * 1000);
+    const todayTipo = getArgentinaTodayTipo();
+    const isTodayScheme = state.horariosTipoDia === todayTipo;
+    const nowArt = getArgentinaNow();
     const nowMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes();
 
-    let nextIdx = horarios.findIndex((h) => h.minuteOfDay >= nowMin);
-    if (nextIdx === -1 && horarios.length > 0) nextIdx = 0;
+    // Cross-match live buses against scheduled slots when viewing today's day type!
+    let slotToBus = new Map();
+    if (isTodayScheme && horarios.length > 0) {
+      state.horariosByLineCache.set(`${state.activeStop.id}:${state.horariosLineCode}:${todayTipo}`, horarios);
+      const lineBuses = state.arribos.filter((b) => Number(b.codigoLinea) === state.horariosLineCode);
+      slotToBus = matchBusesWithHorarios(lineBuses, horarios);
+    }
+
+    let nextMinute = -1;
+    if (isTodayScheme && horarios.length > 0) {
+      const nextSlot = horarios.find((h) => h.minuteOfDay >= nowMin);
+      nextMinute = nextSlot ? nextSlot.minuteOfDay : -1;
+    }
 
     const groups = [
       { title: 'Madrugada y Mañana (00:00 – 11:59)', items: horarios.filter((h) => h.minuteOfDay < 720) },
@@ -1084,62 +1220,83 @@ async function loadAndRenderHorarios(codLinea) {
       { title: 'Noche (20:00 – 23:59)', items: horarios.filter((h) => h.minuteOfDay >= 1200) }
     ].filter((g) => g.items.length > 0);
 
-    const nextMinute = nextIdx >= 0 ? horarios[nextIdx].minuteOfDay : -1;
-    const cacheTag = res.cached ? 'Guardado en caché local (24h)' : 'Sincronizado 24h y guardado en caché';
     const freqText = data.frecuenciaMin ? `Cada ~${data.frecuenciaMin} min` : `${horarios.length} pasos`;
+    const statusTag = res.cached
+      ? 'Caché 24h local'
+      : data.partial
+        ? 'Restante de hoy (sin mezclar días)'
+        : `Día completo (${data.fechaConsultada || '24h'})`;
 
-    const bodyHtml =
-      horarios.length === 0
-        ? `<div class="empty-state"><h3>Sin horarios programados</h3><p>No se encontraron salidas programadas para la línea ${escapeHtml(
-            lineObj.descripcion
-          )} en ${escapeHtml(state.activeStop.id)}.</p></div>`
-        : `
-          <div class="horarios-meta-bar">
-            <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong> · ${escapeHtml(freqText)}</span>
-            <span class="mono-meta">${escapeHtml(cacheTag)}</span>
-          </div>
-          ${groups
-            .map(
-              (g) => `
-              <div class="horarios-group">
-                <span class="micro-heading">${escapeHtml(g.title)}</span>
-                <div class="horarios-grid">
-                  ${g.items
-                    .map((h) => {
-                      const cls =
-                        h.minuteOfDay === nextMinute
-                          ? 'is-next'
-                          : h.minuteOfDay < nowMin
-                            ? 'is-past'
-                            : '';
-                      return `<span class="hora-pill ${cls}" title="${escapeHtml(h.bandera)} · ${escapeHtml(
-                        h.horaPaso
-                      )}">${escapeHtml(h.hora)}</span>`;
-                    })
-                    .join('')}
-                </div>
+    let bodyHtml;
+    if (!data.available || horarios.length === 0) {
+      bodyHtml = `
+        <div class="empty-state">
+          <h3>Programación aún no publicada</h3>
+          <p>${escapeHtml(
+            data.mensaje ||
+              `No hay salidas disponibles para ${lineObj.descripcion} en este tipo de día todavía.`
+          )}</p>
+        </div>
+      `;
+    } else {
+      bodyHtml = `
+        <div class="horarios-meta-bar">
+          <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong> · ${escapeHtml(freqText)}</span>
+          <span class="mono-meta">${escapeHtml(statusTag)}</span>
+        </div>
+        ${groups
+          .map(
+            (g) => `
+            <div class="horarios-group">
+              <span class="micro-heading">${escapeHtml(g.title)}</span>
+              <div class="horarios-grid">
+                ${g.items
+                  .map((h) => {
+                    const matchedBus = slotToBus.get(h.hora);
+                    const cls = matchedBus
+                      ? 'has-bus'
+                      : isTodayScheme && h.minuteOfDay === nextMinute
+                        ? 'is-next'
+                        : isTodayScheme && h.minuteOfDay < nowMin
+                          ? 'is-past'
+                          : '';
+                    const busTag = matchedBus?.identificadorCoche
+                      ? `<span class="hora-bus-tag">#${escapeHtml(matchedBus.identificadorCoche)}</span>`
+                      : '';
+                    const tooltip = matchedBus
+                      ? `${h.hora} · Coche #${matchedBus.identificadorCoche} (${matchedBus.choferNombre || 'En servicio'}, ${matchedBus.desvio?.label || ''})`
+                      : `${h.bandera} · ${h.horaPaso}`;
+                    return `<span class="hora-pill ${cls}" title="${escapeHtml(tooltip)}"><span>${escapeHtml(
+                      h.hora
+                    )}</span>${busTag}</span>`;
+                  })
+                  .join('')}
               </div>
-            `
-            )
-            .join('')}
-        `;
+            </div>
+          `
+          )
+          .join('')}
+      `;
+    }
 
     el.horariosPanel.innerHTML = `
       <div class="horarios-head">
-        <h3>Horarios programados 24h</h3>
+        <h3>Horarios programados</h3>
         <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
       </div>
       <div class="horarios-line-tabs">${tabsHtml}</div>
+      ${dayTabsHtml}
       ${bodyHtml}
     `;
     bindHorariosControls();
   } catch (err) {
     el.horariosPanel.innerHTML = `
       <div class="horarios-head">
-        <h3>Horarios programados 24h</h3>
+        <h3>Horarios programados</h3>
         <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
       </div>
       <div class="horarios-line-tabs">${tabsHtml}</div>
+      ${dayTabsHtml}
       <div class="empty-state"><h3>Error al cargar horarios</h3><p>${escapeHtml(err.message)}</p></div>
     `;
     bindHorariosControls();
@@ -1151,7 +1308,10 @@ function bindHorariosControls() {
     if (state.horariosOpen) toggleHorariosView();
   });
   el.horariosPanel.querySelectorAll('[data-hor-line]').forEach((btn) => {
-    btn.addEventListener('click', () => loadAndRenderHorarios(Number(btn.dataset.horLine)));
+    btn.addEventListener('click', () => loadAndRenderHorarios(Number(btn.dataset.horLine), state.horariosTipoDia));
+  });
+  el.horariosPanel.querySelectorAll('[data-hor-day]').forEach((btn) => {
+    btn.addEventListener('click', () => loadAndRenderHorarios(state.horariosLineCode, btn.dataset.horDay));
   });
 }
 
