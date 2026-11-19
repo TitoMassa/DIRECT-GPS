@@ -31,6 +31,7 @@ const busSimulator = new BusSimulator();
 let simRafId = null;
 let simLastFrameMs = 0;
 let simLastDomMs = 0;
+let fetchSeq = 0;
 
 const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
@@ -60,9 +61,11 @@ const state = {
   horariosArchiveCache: new Map(), // codLinea -> full horarios/<codLinea>.json
   horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
   lastRealGpsByUnit: new Map(), // busKey -> { lat, lng, ts }
-  fleetMemory: { dayKey: '', trips: [], units: [] },
+  fleetMemory: { dayKey: '', stopSnapshot: null, trips: [], units: [] },
   fleetMemoryLastFetchMs: 0,
   sessionObservedTrips: new Map(), // `${codLinea}:${tripKey}` -> latest online observation
+  stickyLiveTripByCoche: new Map(), // `${codLinea}:${coche}` -> { tripKey, dayKey, updatedAt }
+  completedTripsByStop: new Map(), // `${dayKey}:${stopId}` -> Set<`${codLinea}:${tripKey}`>
 
   // Catalog & Drilldown
   lineas: [],
@@ -580,13 +583,14 @@ async function ensureScheduleAssetsLoaded(lineCodes) {
   ]);
 }
 
-async function syncFleetMemory(lineCodes, { force = false } = {}) {
+async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
   const nowMs = Date.now();
-  if (!force && nowMs - state.fleetMemoryLastFetchMs < 45000 && state.fleetMemory.trips.length > 0) {
+  const sameStop = !stopId || state.fleetMemory?.stopSnapshot?.idParada === stopId;
+  if (!force && sameStop && nowMs - state.fleetMemoryLastFetchMs < 45000 && state.fleetMemory.trips.length > 0) {
     return state.fleetMemory;
   }
   state.fleetMemoryLastFetchMs = nowMs;
-  const mem = await api.getFleetMemory(lineCodes).catch(() => null);
+  const mem = await api.getFleetMemory(lineCodes, stopId).catch(() => null);
   if (mem) {
     state.fleetMemory = mem;
   }
@@ -1119,21 +1123,55 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
   const prevArribos = state.arribos || [];
   const prevByTripKey = new Map();
   const prevByCoche = new Map();
+  const activePredKeys = new Set();
   for (const b of prevArribos) {
     if (b.tripKey) prevByTripKey.set(`${b.codigoLinea}:${b.tripKey}`, b);
     if (b.identificadorCoche) prevByCoche.set(`${b.codigoLinea}:${b.identificadorCoche}`, b);
+    if (b.isPredicted) activePredKeys.add(b.key);
   }
 
   const nowSec = getArgentinaSecOfDay();
   const todayTipo = getArgentinaTodayTipo();
   const todayDayKey = getArgentinaDayKey();
   const nowMs = Date.now();
+  const completedStopKey = `${todayDayKey}:${stopId}`;
+  if (!state.completedTripsByStop.has(completedStopKey)) {
+    state.completedTripsByStop.set(completedStopKey, new Set());
+  }
+  const completedSet = state.completedTripsByStop.get(completedStopKey);
+
+  // Prune stale sticky entries from previous days
+  for (const [k, v] of state.stickyLiveTripByCoche.entries()) {
+    if (v.dayKey !== todayDayKey || nowMs - v.updatedAt > 2 * 3600 * 1000) {
+      state.stickyLiveTripByCoche.delete(k);
+    }
+  }
 
   const liveByLine = new Map();
+  const curLiveCoches = new Set();
   for (const b of liveBuses) {
     const cod = Number(b.codigoLinea);
     if (!liveByLine.has(cod)) liveByLine.set(cod, []);
     liveByLine.get(cod).push(b);
+    if (b.identificadorCoche) curLiveCoches.add(`${cod}:${b.identificadorCoche}`);
+  }
+
+  // If a live GPS bus was right about to pass this stop (<= 3 min or <= 950 m) on the previous online poll
+  // and is now gone from live arrivals, mark its trip completed at this stop so we NEVER spawn a phantom
+  // scheduled bus for a unit that already passed ahead of schedule!
+  if (!isOffline) {
+    for (const prev of prevArribos) {
+      if (prev.isPredicted || !prev.tripKey || !prev.identificadorCoche) continue;
+      const ck = `${prev.codigoLinea}:${prev.identificadorCoche}`;
+      if (!curLiveCoches.has(ck)) {
+        const wasPassing =
+          (prev.eta?.valid && prev.eta.minutes <= 3) ||
+          (typeof prev.routeMeters === 'number' && prev.routeMeters <= 950);
+        if (wasPassing) {
+          completedSet.add(`${prev.codigoLinea}:${prev.tripKey}`);
+        }
+      }
+    }
   }
 
   const liveMatchedTripKeysByLine = new Map();
@@ -1155,11 +1193,22 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
     }
 
     if (model && stopCoords) {
-      const matches = matchLiveBusesToTrips(model, stopId, stopCoords, buses, nowSec);
+      const matches = matchLiveBusesToTrips(model, stopId, stopCoords, buses, nowSec, {
+        stickyTripByCoche: state.stickyLiveTripByCoche
+      });
       for (const b of buses) {
         const m = matches.get(b.key);
         if (!m) continue;
         matchedTrips.add(m.tripKey);
+        completedSet.delete(`${cod}:${m.tripKey}`); // bus is actively approaching, definitely not completed
+
+        if (b.identificadorCoche) {
+          state.stickyLiveTripByCoche.set(`${cod}:${b.identificadorCoche}`, {
+            tripKey: m.tripKey,
+            dayKey: todayDayKey,
+            updatedAt: nowMs
+          });
+        }
 
         // Seamless GPS recovery handoff: transfer simulator state from prior predicted marker!
         const predKey = `pred:${cod}:${m.tripKey}`;
@@ -1213,9 +1262,11 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
     state.lineas.find((l) => Number(l.codigo) === Number(cod))?.descripcion ||
     `L${cod}`;
 
+  // UNIFIED caps across online & offline so brief network hiccups NEVER make scheduled arrivals blink in/out!
+  // Single-line mode uses 130 min horizon to cover low-frequency 2h headway lines (109B, 105C Perichón, Riachuelo).
   const isSingleLine = Boolean(state.focusedLineCode);
-  const maxUpcoming = isSingleLine ? 6 : isOffline ? 3 : 2;
-  const maxAheadMin = isSingleLine ? 95 : isOffline ? 55 : 40;
+  const maxUpcoming = isSingleLine ? 6 : 3;
+  const maxAheadMin = isSingleLine ? 130 : 60;
 
   for (const cod of targetLineCodes) {
     const branches = state.routeBranchesCache.get(cod) || [];
@@ -1237,6 +1288,8 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
       nowSec,
       liveMatchedTripKeys: matchedTrips,
       liveMatchedCoches: matchedCoches,
+      completedTripKeys: completedSet,
+      activePredKeys,
       fleetMemory: fleetMem,
       maxUpcoming,
       maxAheadMin
@@ -1244,13 +1297,13 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
 
     for (const p of preds) {
       // Spatial de-duplication: if an unmatched live GPS bus of the same line & branch is right next to
-      // this predicted slot (e.g., running >15 min late), bind the live bus instead of spawning a ghost!
+      // this predicted slot (e.g., running >16 min late), bind the live bus instead of spawning a ghost!
       const nearbyUnmatchedLive = lineLive.find(
         (lb) =>
           !lb.tripKey &&
           typeof lb.lat === 'number' &&
           typeof lb.lng === 'number' &&
-          (distanceMeters(lb.lat, lb.lng, p.lat, p.lng) ?? Infinity) <= 380 &&
+          (distanceMeters(lb.lat, lb.lng, p.lat, p.lng) ?? Infinity) <= 450 &&
           lb.realBandera === p.realBandera
       );
       if (nearbyUnmatchedLive) {
@@ -1259,6 +1312,13 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
         nearbyUnmatchedLive.scheduledTrip = p.scheduledTrip;
         nearbyUnmatchedLive.stopProj = p.stopProj;
         matchedTrips.add(p.tripKey);
+        if (nearbyUnmatchedLive.identificadorCoche) {
+          state.stickyLiveTripByCoche.set(`${cod}:${nearbyUnmatchedLive.identificadorCoche}`, {
+            tripKey: p.tripKey,
+            dayKey: todayDayKey,
+            updatedAt: nowMs
+          });
+        }
         const predKey = p.key;
         if (busSimulator.transferState(predKey, nearbyUnmatchedLive.key)) {
           if (state.selectedBusKey === predKey) state.selectedBusKey = nearbyUnmatchedLive.key;
@@ -1270,7 +1330,12 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
       // transfer its exact visual position & speed to the predicted unit!
       const prevSameTrip = prevByTripKey.get(`${cod}:${p.tripKey}`);
       const prevSameCoche = p.identificadorCoche ? prevByCoche.get(`${cod}:${p.identificadorCoche}`) : null;
-      const prevSource = prevSameTrip && !prevSameTrip.isPredicted ? prevSameTrip : prevSameCoche && !prevSameCoche.isPredicted ? prevSameCoche : null;
+      const prevSource =
+        prevSameTrip && !prevSameTrip.isPredicted
+          ? prevSameTrip
+          : prevSameCoche && !prevSameCoche.isPredicted
+            ? prevSameCoche
+            : null;
       if (prevSource) {
         if (busSimulator.transferState(prevSource.key, p.key)) {
           if (state.selectedBusKey === prevSource.key) state.selectedBusKey = p.key;
@@ -1287,13 +1352,15 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
   );
 }
 
-async function renderOfflineOrFallback(showSkeleton = false) {
+async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
   if (!state.activeStop) return;
   const stopId = state.activeStop.id;
 
   if (!state.catalogo) {
     state.catalogo = await api.catalogo().catch(() => null);
   }
+  if (mySeq !== null && mySeq !== fetchSeq) return;
+
   const catStop = state.catalogo?.stopById?.get(stopId) || null;
   if (catStop) {
     if (state.activeStop.nombre === `Parada ${stopId}` && catStop.nombre) {
@@ -1307,7 +1374,9 @@ async function renderOfflineOrFallback(showSkeleton = false) {
     if (state.stopLinesList.length === 0 && catStop.lineas?.length) {
       state.stopLinesList = catStop.lineas
         .map((cod) => {
-          const l = state.catalogo.lineByCode.get(Number(cod)) || state.lineas.find((x) => Number(x.codigo) === Number(cod));
+          const l =
+            state.catalogo.lineByCode.get(Number(cod)) ||
+            state.lineas.find((x) => Number(x.codigo) === Number(cod));
           return l ? { codigo: Number(l.codigo), descripcion: l.descripcion } : null;
         })
         .filter(Boolean);
@@ -1323,12 +1392,13 @@ async function renderOfflineOrFallback(showSkeleton = false) {
     : state.stopLinesList.map((l) => Number(l.codigo)).filter(Boolean);
 
   await ensureScheduleAssetsLoaded(targetLineCodes);
-  await syncFleetMemory(targetLineCodes, { force: false });
+  await syncFleetMemory(targetLineCodes, { force: false, stopId });
+  if (mySeq !== null && mySeq !== fetchSeq) return;
 
   const stopCoords =
     typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
       ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
-      : null;
+      : state.fleetMemory?.stopSnapshot?.stopCoords || null;
 
   if (state.simulateMode) {
     state.dataSource = 'offline-schedule';
@@ -1336,6 +1406,15 @@ async function renderOfflineOrFallback(showSkeleton = false) {
     busSimulator.reconcile(state.arribos, { applyPositions: true, stopId });
     el.lastSyncLabel.textContent = 'Sin conexión · Por horarios';
   } else {
+    // ULT. GPS offline: restore last consulted arrivals snapshot from system mirror if none in memory
+    if (state.arribos.length === 0 && state.fleetMemory?.stopSnapshot?.arribos?.length > 0) {
+      const snap = state.fleetMemory.stopSnapshot;
+      const snapCodes = Array.from(new Set(snap.arribos.map((a) => Number(a.codigoLinea)).filter(Boolean)));
+      await ensureBranchesLoaded(snapCodes);
+      if (mySeq !== null && mySeq !== fetchSeq) return;
+      state.arribos = normalizeArrivals(snap.arribos, stopId, stopCoords);
+      if (snap.savedAt) state.lastSyncAt = new Date(snap.savedAt);
+    }
     el.lastSyncLabel.textContent = state.lastSyncAt
       ? `Sin conexión · Últ. GPS ${state.lastSyncAt.toLocaleTimeString('es-AR', {
           hour: '2-digit',
@@ -1380,6 +1459,8 @@ async function renderOfflineOrFallback(showSkeleton = false) {
 
 async function fetchArribos(showSkeleton = false) {
   if (!state.activeStop) return;
+  const mySeq = ++fetchSeq;
+  const stopId = state.activeStop.id;
 
   if (showSkeleton && !state.horariosOpen) {
     el.arribosList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
@@ -1388,8 +1469,10 @@ async function fetchArribos(showSkeleton = false) {
   try {
     // When focused on a single line, query /api/arribos-linea to discover ALL active cars (> 3) in parallel!
     const res = state.focusedLineCode
-      ? await api.arribosLineaCompleto(state.activeStop.id, state.focusedLineCode)
-      : await api.arribos(state.activeStop.id, '000');
+      ? await api.arribosLineaCompleto(stopId, state.focusedLineCode)
+      : await api.arribos(stopId, '000');
+
+    if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
 
     const wasOffline = state.isOffline;
     state.isOffline = false;
@@ -1440,25 +1523,27 @@ async function fetchArribos(showSkeleton = false) {
 
     await Promise.all([
       ensureScheduleAssetsLoaded(targetLineCodes),
-      syncFleetMemory(targetLineCodes, { force: showSkeleton || wasOffline })
+      syncFleetMemory(targetLineCodes, { force: showSkeleton || wasOffline, stopId })
     ]);
+
+    if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
 
     const stopCoords =
       typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
         ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
         : payload.stopCoords || null;
 
-    const liveBuses = normalizeArrivals(rawArribos, state.activeStop.id, stopCoords);
+    const liveBuses = normalizeArrivals(rawArribos, stopId, stopCoords);
     state.arribos = reconcileWithSchedulePrediction(
       liveBuses,
-      state.activeStop.id,
+      stopId,
       stopCoords,
       targetLineCodes,
       { isOffline: false }
     );
 
     // Always learn real speeds & stopped states from fresh GPS fixes; apply smooth non-backjumping motion in EN VIVO
-    busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode, stopId: state.activeStop.id });
+    busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode, stopId });
 
     const extLabel = payload.extendedCount > 0 ? ` · +${payload.extendedCount} flota` : '';
     el.lastSyncLabel.textContent = `Act. ${state.lastSyncAt.toLocaleTimeString('es-AR', {
@@ -1502,6 +1587,7 @@ async function fetchArribos(showSkeleton = false) {
 
     checkProximityAlerts();
   } catch (err) {
+    if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
     const enteringOffline = !state.isOffline;
     state.isOffline = true;
     if (enteringOffline) {
@@ -1513,9 +1599,11 @@ async function fetchArribos(showSkeleton = false) {
         3200
       );
     }
-    await renderOfflineOrFallback(showSkeleton);
+    await renderOfflineOrFallback(showSkeleton, mySeq);
   } finally {
-    state.countdownSec = REFRESH_INTERVAL_SEC;
+    if (mySeq === fetchSeq) {
+      state.countdownSec = REFRESH_INTERVAL_SEC;
+    }
   }
 }
 

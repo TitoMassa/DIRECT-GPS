@@ -230,6 +230,12 @@ export class FleetMemory {
         PRIMARY KEY (codigo_linea, coche)
       );
       CREATE INDEX IF NOT EXISTS idx_unit_line ON unit_last_seen (codigo_linea);
+
+      CREATE TABLE IF NOT EXISTS stop_last_arribos (
+        stop_id TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
     this._ready = true;
   }
@@ -238,6 +244,7 @@ export class FleetMemory {
     const cutoff = nowMs - 4 * 86400 * 1000;
     this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', cutoff);
     this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
+    this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
   }
 
   async fetch(request) {
@@ -292,6 +299,19 @@ export class FleetMemory {
           nowMs
         );
         count++;
+      }
+      if (body.stopSnapshot && body.stopSnapshot.idParada) {
+        const sid = String(body.stopSnapshot.idParada).trim().toUpperCase();
+        this.sql.exec(
+          `INSERT INTO stop_last_arribos (stop_id, payload_json, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(stop_id) DO UPDATE SET
+             payload_json = excluded.payload_json,
+             updated_at = excluded.updated_at`,
+          sid,
+          JSON.stringify(body.stopSnapshot),
+          nowMs
+        );
       }
       return Response.json({ ok: true, count });
     }
@@ -450,8 +470,24 @@ export class FleetMemory {
           .toArray();
       }
 
+      const stopIdParam = String(url.searchParams.get('idParada') || '').trim().toUpperCase();
+      let stopSnapshot = null;
+      if (stopIdParam) {
+        const sRows = this.sql
+          .exec('SELECT payload_json, updated_at FROM stop_last_arribos WHERE stop_id = ?', stopIdParam)
+          .toArray();
+        if (sRows.length > 0) {
+          try {
+            stopSnapshot = { ...JSON.parse(sRows[0].payload_json), savedAt: sRows[0].updated_at };
+          } catch {
+            stopSnapshot = null;
+          }
+        }
+      }
+
       return Response.json({
         dayKey,
+        stopSnapshot,
         trips: tripRows.map((r) => ({
           codigoLinea: r.codigo_linea,
           tripKey: r.trip_key,
@@ -496,15 +532,17 @@ export class FleetMemory {
 
 // Isolate-level throttle & fallback store when Durable Object isn't bound
 const isolateWriteThrottle = new Map(); // `${cod}:${coche}` -> { ts, sig }
+const stopSnapThrottle = new Map(); // stopId -> ts
 const fallbackTrips = new Map();
 const fallbackUnits = new Map();
+const fallbackStops = new Map();
 
 function getFleetStub(env) {
   if (!env?.FLEET_MEMORY) return null;
   return env.FLEET_MEMORY.get(env.FLEET_MEMORY.idFromName('corrientes-v1'));
 }
 
-async function recordObservedUnits(env, arribos = [], stopId = '') {
+async function recordObservedUnits(env, arribos = [], stopId = '', stopCoords = null) {
   if (!Array.isArray(arribos) || arribos.length === 0) return;
   const nowMs = Date.now();
   const batch = [];
@@ -538,14 +576,31 @@ async function recordObservedUnits(env, arribos = [], stopId = '') {
     batch.push(item);
     fallbackUnits.set(k, { ...item, dayKey: getArgentinaDayKey(nowMs), tripKey: '' });
   }
-  if (batch.length === 0) return;
+
+  let stopSnapshot = null;
+  const cleanStop = String(stopId || '').trim().toUpperCase();
+  if (cleanStop) {
+    const lastSnapTs = stopSnapThrottle.get(cleanStop) || 0;
+    if (nowMs - lastSnapTs >= 45000) {
+      stopSnapThrottle.set(cleanStop, nowMs);
+      stopSnapshot = {
+        idParada: cleanStop,
+        stopCoords: stopCoords || null,
+        arribos: arribos.slice(0, 30),
+        savedAt: nowMs
+      };
+      fallbackStops.set(cleanStop, stopSnapshot);
+    }
+  }
+
+  if (batch.length === 0 && !stopSnapshot) return;
   const stub = getFleetStub(env);
   if (!stub) return;
   try {
     await stub.fetch('https://fleet-memory/record-units', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ units: batch })
+      body: JSON.stringify({ units: batch, stopSnapshot })
     });
   } catch {
     // Non-fatal: never block live arrivals
@@ -597,8 +652,10 @@ export default {
         const units = Array.from(fallbackUnits.values()).filter(
           (u) => filterSet.size === 0 || filterSet.has(u.codigoLinea)
         );
+        const stopIdParam = String(searchParams.get('idParada') || '').trim().toUpperCase();
+        const stopSnapshot = stopIdParam ? fallbackStops.get(stopIdParam) || null : null;
         return jsonResponse({
-          data: { dayKey, trips, units },
+          data: { dayKey, stopSnapshot, trips, units },
           source: 'fleet-memory-mem',
           savedAt: Date.now()
         });
@@ -1138,7 +1195,7 @@ export default {
             .sort((a, b) => (a.etaMin ?? 999) - (b.etaMin ?? 999))
             .map((x) => x.arribo);
 
-          if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, merged, stopId));
+          if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, merged, stopId, basePayload.stopCoords));
           return jsonResponse({
             data: {
               ...basePayload,
@@ -1151,7 +1208,7 @@ export default {
           });
         }
 
-        if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, basePayload.arribos, stopId));
+        if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, basePayload.arribos, stopId, basePayload.stopCoords));
         return jsonResponse({ data: basePayload, source: 'smartmovepro-soap', savedAt: Date.now() });
       }
 

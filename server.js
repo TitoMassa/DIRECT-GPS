@@ -37,9 +37,9 @@ function parseDesvioSeconds(raw = '') {
 function loadFleetStore() {
   try {
     const parsed = JSON.parse(fs.readFileSync(FLEET_STORE_FILE, 'utf8'));
-    return { trips: parsed.trips || {}, units: parsed.units || {} };
+    return { trips: parsed.trips || {}, units: parsed.units || {}, stops: parsed.stops || {} };
   } catch {
-    return { trips: {}, units: {} };
+    return { trips: {}, units: {}, stops: {} };
   }
 }
 
@@ -59,6 +59,9 @@ function scheduleFleetStoreSave() {
       for (const [k, v] of Object.entries(fleetStore.units)) {
         if ((v.updatedAt || 0) < cutoffUnits) delete fleetStore.units[k];
       }
+      for (const [k, v] of Object.entries(fleetStore.stops || {})) {
+        if ((v.savedAt || 0) < cutoffUnits) delete fleetStore.stops[k];
+      }
       fs.mkdirSync(path.dirname(FLEET_STORE_FILE), { recursive: true });
       fs.writeFileSync(FLEET_STORE_FILE, JSON.stringify(fleetStore));
     } catch {
@@ -67,7 +70,7 @@ function scheduleFleetStoreSave() {
   }, 1500);
 }
 
-function recordFleetUnitsLocal(arribos = [], stopId = '') {
+function recordFleetUnitsLocal(arribos = [], stopId = '', stopCoords = null) {
   if (!Array.isArray(arribos) || arribos.length === 0) return;
   const nowMs = Date.now();
   const dayKey = getArgentinaDayKey(nowMs);
@@ -97,6 +100,17 @@ function recordFleetUnitsLocal(arribos = [], stopId = '') {
       lng: !Number.isNaN(lng) && lng !== 0 ? lng : prev.lng ?? null,
       stopId: String(stopId || prev.stopId || '').toUpperCase(),
       updatedAt: nowMs
+    };
+    dirty = true;
+  }
+  const cleanStop = String(stopId || '').trim().toUpperCase();
+  if (cleanStop) {
+    fleetStore.stops ||= {};
+    fleetStore.stops[cleanStop] = {
+      idParada: cleanStop,
+      stopCoords: stopCoords || null,
+      arribos: arribos.slice(0, 30),
+      savedAt: nowMs
     };
     dirty = true;
   }
@@ -234,7 +248,13 @@ async function handleApi(req, res, urlObj) {
       const units = Object.values(fleetStore.units).filter(
         (u) => nowMs - (u.updatedAt || 0) < 24 * 3600 * 1000 && (filterSet.size === 0 || filterSet.has(u.codigoLinea))
       );
-      return sendJson(res, 200, { data: { dayKey, trips, units }, source: 'fleet-memory-disk', savedAt: nowMs });
+      const stopIdParam = String(searchParams.get('idParada') || '').trim().toUpperCase();
+      const stopSnapshot = stopIdParam && fleetStore.stops ? fleetStore.stops[stopIdParam] || null : null;
+      return sendJson(res, 200, {
+        data: { dayKey, stopSnapshot, trips, units },
+        source: 'fleet-memory-disk',
+        savedAt: nowMs
+      });
     }
 
     if (pathname === '/api/fleet-seen' && req.method === 'POST') {
@@ -330,7 +350,7 @@ async function handleApi(req, res, urlObj) {
         return sendJson(res, 400, { error: 'Faltan parámetros idParada o codLinea' });
       }
       const result = await smartmove.getArribosLineaCompleto(idParada, codLinea);
-      recordFleetUnitsLocal(result?.data?.arribos, idParada);
+      recordFleetUnitsLocal(result?.data?.arribos, idParada, result?.data?.stopCoords);
       return sendJson(res, 200, result);
     }
 
@@ -339,7 +359,7 @@ async function handleApi(req, res, urlObj) {
       const codLinea = searchParams.get('codLinea') || '000';
       const simulate = searchParams.get('simulate') === '1';
       const result = await smartmove.getArribos(idParada, codLinea, simulate);
-      recordFleetUnitsLocal(result?.data?.arribos, idParada);
+      recordFleetUnitsLocal(result?.data?.arribos, idParada, result?.data?.stopCoords);
       return sendJson(res, 200, result);
     }
 

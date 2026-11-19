@@ -1,6 +1,6 @@
 import {
-  pickStopBranch,
-  pickPairedReturnBranch,
+  pickStopBranches,
+  pickIncomingBranches,
   projectOnPolyline,
   sampleBranchAtAlong,
   buildTrajectoryFromBranchAlong
@@ -12,7 +12,11 @@ import {
 } from './api.js';
 import { getLineColor } from './config.js';
 
-const modelCache = new Map(); // `${codLinea}:${tipoDia}` -> LineScheduleModel
+const modelCacheByBranches = new WeakMap(); // branches[] -> Map<`${codLinea}:${tipoDia}`, LineScheduleModel>
+
+function getBranchKey(b) {
+  return `${b?.index ?? 0}:${b?.git || normalizeBandera(b?.bandera || '')}`;
+}
 
 export function normalizeBandera(str = '') {
   return String(str || '')
@@ -139,14 +143,12 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
         if (last.sIdx >= sIdx) continue;
 
         let sec = rawSec;
-        // Handle late-night trips crossing midnight (e.g. 23:45 -> 00:08)
         if (last.sec >= 21 * 3600 && sec < 3 * 3600) {
           sec += 86400;
         }
 
         const dt = sec - last.sec;
         const dist = Math.max(0, st.along - last.along);
-        // Expected urban bus travel time between stops (~5.3 m/s = ~19 km/h)
         const expectedDt = dist / 5.3;
         const maxDt = Math.max(270, dist / 1.15 + 210);
         if (dt < -25 || dt > maxDt) continue;
@@ -172,14 +174,12 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     }
   }
 
-  // Finalize trips: filter single-stop noise (when multi-stop trips exist), build O(1) stop maps & canonical tripKeys
   const validTrips = trips.filter((tr) => tr.points.length >= 2 || stopSchedules.length === 1);
   const finalized = [];
   const usedKeys = new Set();
 
   for (const tr of validTrips) {
     const pts = tr.points;
-    // Extrapolate smoothly to branch start (along=0) and branch end (along=totalLen)
     const first = pts[0];
     const last = pts[pts.length - 1];
     const avgSpeed =
@@ -228,7 +228,7 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
 
 /**
  * Builds and caches the complete space-time schedule model for one line and day type,
- * including paired return-branch chaining across cabeceras.
+ * chaining incoming feeder/return branches across cabeceras (supporting 2-, 3- and 4-branch lines).
  */
 export function buildLineScheduleModel(codLinea, branches = [], horariosFile = null, requestedTipo = 'habil') {
   if (!codLinea || !Array.isArray(branches) || branches.length === 0 || !horariosFile) return null;
@@ -236,33 +236,39 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
   const resolved = resolveAvailableTipoDia(horariosFile, requestedTipo);
   if (!resolved) return null;
 
-  const cacheKey = `${codLinea}:${resolved.tipo}:${branches.length}`;
-  if (modelCache.has(cacheKey)) {
-    return modelCache.get(cacheKey);
+  let byTipo = modelCacheByBranches.get(branches);
+  if (!byTipo) {
+    byTipo = new Map();
+    modelCacheByBranches.set(branches, byTipo);
+  }
+  const cacheKey = `${codLinea}:${resolved.tipo}`;
+  if (byTipo.has(cacheKey)) {
+    return byTipo.get(cacheKey);
   }
 
-  const branchTrips = new Map(); // branch -> Trip[]
+  const branchTrips = new Map(); // branchKey -> Trip[]
   for (const b of branches) {
     const trips = reconstructBranchTrips(b, horariosFile, resolved.tipo);
-    branchTrips.set(b, trips);
+    branchTrips.set(getBranchKey(b), trips);
   }
 
-  // Chain paired return trips across cabeceras (turnaround layover 15 s .. 30 min)
+  // Chain incoming feeder/return trips across cabeceras (layover 10 s .. 45 min)
+  const claimedReturn = new Set();
   for (const b of branches) {
-    const paired = pickPairedReturnBranch(branches, b);
-    if (!paired) continue;
-    const tripsB = branchTrips.get(b) || [];
-    const tripsR = branchTrips.get(paired) || [];
-    if (!tripsB.length || !tripsR.length) continue;
+    const feeders = pickIncomingBranches(branches, b);
+    const tripsB = branchTrips.get(getBranchKey(b)) || [];
+    if (!tripsB.length || !feeders.length) continue;
 
-    const claimedReturn = new Set();
+    const feederTrips = feeders.flatMap((fb) => branchTrips.get(getBranchKey(fb)) || []);
+    if (!feederTrips.length) continue;
+
     for (const t of tripsB) {
       let bestPrev = null;
       let bestLayover = Infinity;
-      for (const r of tripsR) {
+      for (const r of feederTrips) {
         if (claimedReturn.has(r)) continue;
         const layover = t.startSec - r.endSec;
-        if (layover >= 15 && layover <= 30 * 60 && layover < bestLayover) {
+        if (layover >= 10 && layover <= 45 * 60 && layover < bestLayover) {
           bestLayover = layover;
           bestPrev = r;
         }
@@ -280,9 +286,10 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     tipoDia: resolved.tipo,
     exactTipo: resolved.exact,
     branches,
-    branchTrips
+    branchTrips,
+    getTripsForBranch: (b) => branchTrips.get(getBranchKey(b)) || []
   };
-  modelCache.set(cacheKey, model);
+  byTipo.set(cacheKey, model);
   return model;
 }
 
@@ -311,7 +318,6 @@ export function getTripStopSec(trip, stopId, stopAlong) {
 
 /**
  * Evaluates a single branch trip's exact position `along(t)` and speed at effective clock `tEff` (seconds of day).
- * Uses gentle S-curve micro-easing near intermediate stops so motion looks organic and stops cleanly.
  */
 function evalPointsAtSec(points, tEff) {
   if (!points || points.length === 0) return null;
@@ -322,7 +328,6 @@ function evalPointsAtSec(points, tEff) {
   if (tEff >= last.sec) {
     return { along: last.along, speedMps: 0 };
   }
-  // Binary search bracketing segment
   let lo = 0;
   let hi = points.length - 2;
   while (lo < hi) {
@@ -335,7 +340,6 @@ function evalPointsAtSec(points, tEff) {
   const dt = Math.max(0.5, b.sec - a.sec);
   const dist = Math.max(0, b.along - a.along);
   const u = Math.max(0, Math.min(1, (tEff - a.sec) / dt));
-  // Subtle stop micro-deceleration while preserving exact arrival times at every stop
   const uSmooth = 0.84 * u + 0.16 * (0.5 - 0.5 * Math.cos(Math.PI * u));
   const duDt = (0.84 + 0.16 * 0.5 * Math.PI * Math.sin(Math.PI * u)) / dt;
   return {
@@ -345,18 +349,15 @@ function evalPointsAtSec(points, tEff) {
 }
 
 /**
- * Evaluates the exact real-time state of a scheduled trip approaching `stopProj` on `trip.branch`,
- * including:
- *   - Moving along the paired return branch (`trip.prevTrip`) toward cabecera
- *   - Resting at the cabecera (`speed = 0 m/s`, `isAtTerminal = true`) during layover
- *   - Moving along `trip.branch` directly toward the target stop
+ * Evaluates the exact real-time state of a scheduled trip approaching `stopProj` on `trip.branch`.
+ * Strictly monotonic: any upcoming trip within `maxAheadSec` is ALWAYS represented (never hidden
+ * behind an arbitrary departure-time gap that would later pop in and evict subsequent trips!).
  */
-export function evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec = 0) {
+export function evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec = 0, { maxAheadSec = 120 * 60 } = {}) {
   if (!trip || !stopProj) return null;
   const targetStopSec = getTripStopSec(trip, stopId, stopProj.along);
   if (targetStopSec === null) return null;
 
-  // Handle early-morning wrap for midnight-crossing trips
   let effNow = nowSec;
   if (targetStopSec > 86400 && effNow < 6 * 3600) {
     effNow += 86400;
@@ -364,12 +365,12 @@ export function evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec = 0)
   const tEff = effNow + (desvioSec || 0);
   const etaSec = targetStopSec - tEff;
 
-  // Already passed the stop by more than 45 s
-  if (etaSec < -45) return null;
+  // Already passed the stop by more than 45 s, or beyond horizon
+  if (etaSec < -45 || etaSec > maxAheadSec) return null;
 
   const stopBranch = trip.branch;
 
-  // 1) Directly on stopBranch (or arriving)
+  // 1) Directly on stopBranch (or arriving at stop)
   if (tEff >= trip.startSec) {
     const ev = evalPointsAtSec(trip.points, Math.min(tEff, targetStopSec));
     const along = Math.min(stopProj.along, ev.along);
@@ -392,11 +393,11 @@ export function evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec = 0)
     };
   }
 
-  // 2) Before departure from cabecera: check paired return trip (`trip.prevTrip`)
+  // 2) Before departure from cabecera: if chained return leg (`trip.prevTrip`) is currently active,
+  // place bus moving realistically along the return branch toward cabecera!
   if (trip.prevTrip) {
     const prev = trip.prevTrip;
     if (tEff >= prev.startSec && tEff < prev.endSec) {
-      // Currently moving along the opposite/return branch toward the turnaround cabecera!
       const ev = evalPointsAtSec(prev.points, tEff);
       const sample = sampleBranchAtAlong(prev.branch, ev.along);
       if (!sample) return null;
@@ -417,65 +418,58 @@ export function evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec = 0)
         targetStopSec
       };
     }
-
-    if (tEff >= prev.endSec && tEff < trip.startSec) {
-      // Resting at cabecera between return arrival and outbound departure!
-      const sample = sampleBranchAtAlong(stopBranch, 0);
-      if (!sample) return null;
-      return {
-        activeBranch: stopBranch,
-        activeAlong: 0,
-        lat: sample.lat,
-        lng: sample.lng,
-        remainingMeters: stopProj.along,
-        etaSec: Math.max(0, etaSec),
-        speedMps: 0,
-        isAtTerminal: true,
-        inOppositeLeg: false,
-        realBandera: stopBranch.bandera,
-        realBanderaColor: stopBranch.color,
-        targetStopSec
-      };
-    }
   }
 
-  // 3) No active return leg yet: if within 18 minutes of cabecera departure, show parked at cabecera waiting to depart
-  if (trip.startSec - tEff <= 18 * 60) {
-    const sample = sampleBranchAtAlong(stopBranch, 0);
-    if (!sample) return null;
-    return {
-      activeBranch: stopBranch,
-      activeAlong: 0,
-      lat: sample.lat,
-      lng: sample.lng,
-      remainingMeters: stopProj.along,
-      etaSec: Math.max(0, etaSec),
-      speedMps: 0,
-      isAtTerminal: true,
-      inOppositeLeg: false,
-      realBandera: stopBranch.bandera,
-      realBanderaColor: stopBranch.color,
-      targetStopSec
-    };
-  }
-
-  return null;
+  // 3) Waiting / staging at origin cabecera until scheduled departure (`trip.startSec`)
+  const sample = sampleBranchAtAlong(stopBranch, 0);
+  if (!sample) return null;
+  return {
+    activeBranch: stopBranch,
+    activeAlong: 0,
+    lat: sample.lat,
+    lng: sample.lng,
+    remainingMeters: stopProj.along,
+    etaSec: Math.max(0, etaSec),
+    speedMps: 0,
+    isAtTerminal: true,
+    inOppositeLeg: false,
+    realBandera: stopBranch.bandera,
+    realBanderaColor: stopBranch.color,
+    targetStopSec
+  };
 }
 
 /**
  * Matches live GPS buses of one line to their exact canonical scheduled `trip` & `turnoProgramado`
- * at `stopId`. Returns a Map<busKey, { trip, tripKey, prevTripKey, turnoHora, targetStopSec }>.
+ * across ALL branches serving `stopId`, with sticky-coche stability so 1–3 min SmartMovePro ETA
+ * wobbles never drop/swap a bus's match and cause predicted arrivals to flicker!
  */
-export function matchLiveBusesToTrips(model, stopId, stopCoords, buses = [], nowSec = getArgentinaSecOfDay()) {
+export function matchLiveBusesToTrips(
+  model,
+  stopId,
+  stopCoords,
+  buses = [],
+  nowSec = getArgentinaSecOfDay(),
+  { stickyTripByCoche = null } = {}
+) {
   const matches = new Map();
   if (!model || !Array.isArray(buses) || buses.length === 0) return matches;
 
-  const stopBranch = pickStopBranch(model.branches, stopId, stopCoords, buses[0]?.descripcionBandera || '');
-  if (!stopBranch) return matches;
+  const stopBranches = pickStopBranches(model.branches, stopId, stopCoords, buses[0]?.descripcionBandera || '');
+  if (stopBranches.length === 0) return matches;
 
-  const stopProj = stopCoords ? projectOnPolyline(stopBranch.pts, stopBranch.cum, stopCoords.lat, stopCoords.lng) : null;
-  const trips = model.branchTrips.get(stopBranch) || [];
-  if (trips.length === 0) return matches;
+  // Build candidate (trip, branch, stopProj) pool across all branches serving this stop
+  const pool = [];
+  for (const sb of stopBranches) {
+    const sp = stopCoords ? projectOnPolyline(sb.pts, sb.cum, stopCoords.lat, stopCoords.lng) : null;
+    for (const tr of model.getTripsForBranch(sb)) {
+      const stSec = getTripStopSec(tr, stopId, sp?.along ?? 0);
+      if (stSec !== null) {
+        pool.push({ trip: tr, branch: sb, stopProj: sp, stSec, normBandera: normalizeBandera(sb.bandera) });
+      }
+    }
+  }
+  if (pool.length === 0) return matches;
 
   const usedTrips = new Set();
   const ordered = [...buses].sort((a, b) => (a.eta?.minutes ?? 999) - (b.eta?.minutes ?? 999));
@@ -486,38 +480,54 @@ export function matchLiveBusesToTrips(model, stopId, stopCoords, buses = [], now
     }
     const desvioSec = bus.desvio?.seconds || 0;
     const expectedSec = (nowSec + bus.eta.minutes * 60 + desvioSec) % 86400;
+    const stickyKey = bus.identificadorCoche ? `${model.codLinea}:${bus.identificadorCoche}` : null;
+    const stickyRec = stickyKey && stickyTripByCoche ? stickyTripByCoche.get(stickyKey) : null;
+    const stickyTripKey = stickyRec?.tripKey || null;
+    const busNormBandera = normalizeBandera(bus.descripcionBandera || '');
 
-    let bestTrip = null;
-    let bestStopSec = null;
-    let bestDiffSec = (bus.esExtendido ? 14 : 10) * 60;
+    // Longer ETAs & opposite-leg buses carry higher SmartMovePro propagation variance (delay recovery at cabecera)
+    let baseTolMin = bus.eta.minutes >= 35 ? 16 : 12;
+    if (bus.esExtendido || bus.isOppositeLeg) baseTolMin += 4;
+    const baseTolSec = baseTolMin * 60;
 
-    for (const tr of trips) {
-      if (usedTrips.has(tr)) continue;
-      const stSec = getTripStopSec(tr, stopId, stopProj?.along ?? 0);
-      if (stSec === null) continue;
-      const normSt = stSec % 86400;
+    let bestItem = null;
+    let bestScore = Infinity;
+
+    for (const item of pool) {
+      if (usedTrips.has(item.trip)) continue;
+      const normSt = item.stSec % 86400;
       let diff = Math.abs(normSt - expectedSec);
       if (diff > 43200) diff = 86400 - diff;
-      if (diff < bestDiffSec) {
-        bestDiffSec = diff;
-        bestTrip = tr;
-        bestStopSec = stSec;
+
+      const isSticky = stickyTripKey && item.trip.tripKey === stickyTripKey;
+      const maxAllowed = isSticky ? Math.max(baseTolSec, 22 * 60) : baseTolSec;
+      if (diff > maxAllowed) continue;
+
+      let score = diff;
+      if (isSticky) score -= 5 * 60; // strong stickiness bonus prevents oscillation between adjacent slots
+      if (busNormBandera && item.normBandera && item.normBandera !== busNormBandera) {
+        score += 3 * 60; // gently prefer the branch matching the stop's reported bandera when multiple branches exist
+      }
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestItem = item;
       }
     }
 
-    if (bestTrip) {
-      usedTrips.add(bestTrip);
-      const turnoHora = formatSecHHMM(bestStopSec);
+    if (bestItem) {
+      usedTrips.add(bestItem.trip);
+      const turnoHora = formatSecHHMM(bestItem.stSec);
       bus.turnoProgramado = turnoHora;
-      bus.tripKey = bestTrip.tripKey;
-      bus.scheduledTrip = bestTrip;
-      bus.stopProj = stopProj;
+      bus.tripKey = bestItem.trip.tripKey;
+      bus.scheduledTrip = bestItem.trip;
+      bus.stopProj = bestItem.stopProj;
       matches.set(bus.key, {
-        trip: bestTrip,
-        tripKey: bestTrip.tripKey,
-        prevTripKey: bestTrip.prevTrip?.tripKey || null,
+        trip: bestItem.trip,
+        tripKey: bestItem.trip.tripKey,
+        prevTripKey: bestItem.trip.prevTrip?.tripKey || null,
         turnoHora,
-        targetStopSec: bestStopSec
+        targetStopSec: bestItem.stSec
       });
     }
   }
@@ -526,12 +536,14 @@ export function matchLiveBusesToTrips(model, stopId, stopCoords, buses = [], now
 }
 
 /**
- * Synthesizes realistic, street-following predicted bus objects for a line's active/imminent
- * scheduled turns that currently have NO live GPS unit (because the phone is offline, a bus lost
- * GPS signal, or a bus is running without GPS).
+ * Synthesizes realistic, street-following predicted bus objects across ALL branches serving `stopId`
+ * for active/upcoming scheduled turns that currently have NO live GPS unit.
  *
- * Automatically enriches predicted units with the last-seen online vehicle & driver info stored
- * in the central system `fleetMemory` (matching by canonical `tripKey`, then chained `prevTripKey`).
+ * Guarantees stability across consecutive 10s polls:
+ *  - Evaluates all serving branches, sorts strictly by ETA ascending BEFORE slicing `maxUpcoming`
+ *  - Applies +6 min upper-horizon hysteresis for already-displayed predicted keys (`activePredKeys`)
+ *  - Suppresses trips already completed early at this stop (`completedTripKeys`)
+ *  - Enriches with central system `fleetMemory` (coche, chofer, legajo, adaptado, last GPS time)
  */
 export function predictLineBusesForStop({
   codLinea,
@@ -544,20 +556,17 @@ export function predictLineBusesForStop({
   nowSec = getArgentinaSecOfDay(),
   liveMatchedTripKeys = new Set(),
   liveMatchedCoches = new Set(),
+  completedTripKeys = new Set(),
+  activePredKeys = new Set(),
   fleetMemory = null,
   maxUpcoming = 4,
   maxAheadMin = 65
 }) {
   const model = buildLineScheduleModel(codLinea, branches, horariosFile, tipoDia);
-  if (!model) return [];
+  if (!model || !stopCoords) return [];
 
-  const stopBranch = pickStopBranch(branches, stopId, stopCoords);
-  if (!stopBranch) return [];
-  const stopProj = stopCoords ? projectOnPolyline(stopBranch.pts, stopBranch.cum, stopCoords.lat, stopCoords.lng) : null;
-  if (!stopProj) return [];
-
-  const trips = model.branchTrips.get(stopBranch) || [];
-  if (trips.length === 0) return [];
+  const stopBranches = pickStopBranches(branches, stopId, stopCoords);
+  if (stopBranches.length === 0) return [];
 
   // Index system FleetMemory trips for this line
   const memByTrip = new Map();
@@ -570,41 +579,72 @@ export function predictLineBusesForStop({
   }
 
   const nowMs = Date.now();
+  const candidates = [];
+  const seenTripKeys = new Set();
+
+  for (const stopBranch of stopBranches) {
+    const stopProj = projectOnPolyline(stopBranch.pts, stopBranch.cum, stopCoords.lat, stopCoords.lng);
+    if (!stopProj) continue;
+
+    const trips = model.getTripsForBranch(stopBranch);
+    for (const trip of trips) {
+      if (seenTripKeys.has(trip.tripKey)) continue;
+      if (liveMatchedTripKeys.has(trip.tripKey)) continue;
+      if (completedTripKeys.has(trip.tripKey) || completedTripKeys.has(`${codLinea}:${trip.tripKey}`)) continue;
+
+      const predKey = `pred:${codLinea}:${trip.tripKey}`;
+      const isAlreadyVisible = activePredKeys.has(predKey);
+      const effectiveMaxAheadSec = (isAlreadyVisible ? maxAheadMin + 6 : maxAheadMin) * 60;
+
+      // Look up system memory for this trip (or its preceding return leg!)
+      let mem = memByTrip.get(trip.tripKey) || null;
+      let memFromPrev = false;
+      if (!mem && trip.prevTrip) {
+        mem = memByTrip.get(trip.prevTrip.tripKey) || null;
+        memFromPrev = Boolean(mem);
+      }
+      if (mem && mem.coche && liveMatchedCoches.has(mem.coche)) {
+        mem = null;
+      }
+
+      // Carry forward recent schedule deviation from last online observation on this exact trip
+      let desvioSec = 0;
+      let desvioRaw = '';
+      if (mem && Number.isFinite(mem.desvioSec)) {
+        const ageMin = mem.updatedAt ? (nowMs - mem.updatedAt) / 60000 : 999;
+        if (!memFromPrev && ageMin <= 75) {
+          desvioSec = Math.max(-1800, Math.min(1200, mem.desvioSec));
+          desvioRaw = mem.desvioRaw || formatDesvioFromSec(desvioSec);
+        } else if (memFromPrev && ageMin <= 35) {
+          desvioSec = Math.round(Math.max(-900, Math.min(600, mem.desvioSec * 0.5)));
+          desvioRaw = formatDesvioFromSec(desvioSec);
+        }
+      }
+
+      const ev = evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec, {
+        maxAheadSec: effectiveMaxAheadSec
+      });
+      if (!ev) continue;
+
+      seenTripKeys.add(trip.tripKey);
+      candidates.push({ trip, stopBranch, stopProj, ev, mem, desvioSec, desvioRaw, predKey });
+    }
+  }
+
+  // Sort strictly by ETA ascending across ALL serving branches BEFORE slicing to maxUpcoming!
+  candidates.sort((a, b) => a.ev.etaSec - b.ev.etaSec);
+
   const usedCoches = new Set(liveMatchedCoches);
   const predicted = [];
 
-  for (const trip of trips) {
-    if (liveMatchedTripKeys.has(trip.tripKey)) continue;
+  for (const item of candidates) {
+    if (predicted.length >= maxUpcoming) break;
 
-    // Look up system memory for this trip (or its preceding return leg!)
-    let mem = memByTrip.get(trip.tripKey) || null;
-    let memFromPrev = false;
-    if (!mem && trip.prevTrip) {
-      mem = memByTrip.get(trip.prevTrip.tripKey) || null;
-      memFromPrev = Boolean(mem);
-    }
-    if (mem && mem.coche && usedCoches.has(mem.coche)) {
+    const { trip, stopBranch, stopProj, ev, desvioSec, desvioRaw, predKey } = item;
+    let mem = item.mem;
+    if (mem?.coche && usedCoches.has(mem.coche)) {
       mem = null;
     }
-
-    // Carry forward recent schedule deviation (desvio) from last online observation on this exact trip
-    let desvioSec = 0;
-    let desvioRaw = '';
-    if (mem && Number.isFinite(mem.desvioSec)) {
-      const ageMin = mem.updatedAt ? (nowMs - mem.updatedAt) / 60000 : 999;
-      if (!memFromPrev && ageMin <= 75) {
-        desvioSec = Math.max(-1800, Math.min(1200, mem.desvioSec));
-        desvioRaw = mem.desvioRaw || formatDesvioFromSec(desvioSec);
-      } else if (memFromPrev && ageMin <= 35) {
-        // After a terminal turnaround, buses partially absorb prior delay/advance
-        desvioSec = Math.round(Math.max(-900, Math.min(600, mem.desvioSec * 0.5)));
-        desvioRaw = formatDesvioFromSec(desvioSec);
-      }
-    }
-
-    const ev = evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec);
-    if (!ev) continue;
-    if (ev.etaSec > maxAheadMin * 60) continue;
 
     const traj = buildTrajectoryFromBranchAlong(ev.activeBranch, ev.activeAlong, stopBranch, stopProj, {
       isAtTerminal: ev.isAtTerminal,
@@ -627,12 +667,14 @@ export function predictLineBusesForStop({
           };
 
     const turnoHora = formatSecHHMM(ev.targetStopSec);
-    const desvio = desvioRaw ? parseDesvioHorario(desvioRaw) : { raw: '', status: 'none', label: '', shortLabel: '', sign: '', minutes: 0, seconds: 0 };
+    const desvio = desvioRaw
+      ? parseDesvioHorario(desvioRaw)
+      : { raw: '', status: 'none', label: '', shortLabel: '', sign: '', minutes: 0, seconds: 0 };
     const lastGpsTime = mem?.ultimaGps ? formatGpsTimeOnly(mem.ultimaGps) : '';
     const coche = mem?.coche || '';
 
     predicted.push({
-      key: `pred:${codLinea}:${trip.tripKey}`,
+      key: predKey,
       codigoLinea: Number(codLinea),
       descripcionLinea: lineName || `L${codLinea}`,
       descripcionBandera: stopBranch.bandera,
@@ -669,8 +711,6 @@ export function predictLineBusesForStop({
       realBandera: ev.realBandera || stopBranch.bandera,
       realBanderaColor: ev.realBanderaColor || getLineColor(lineName)
     });
-
-    if (predicted.length >= maxUpcoming) break;
   }
 
   return predicted;

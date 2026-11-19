@@ -184,6 +184,19 @@ export function pickStopBranch(branches, stopId, stopCoords, stopBandera = '') {
   return stopBranch;
 }
 
+/**
+ * Returns ALL branches of a line that serve `stopId` (critical for the 207+ shared stops on
+ * multi-branch lines like 103C, 104A, 104D, 105C, 109B). Falls back to closest single branch.
+ */
+export function pickStopBranches(branches, stopId, stopCoords, stopBandera = '') {
+  if (!branches || branches.length === 0) return [];
+  const cleanId = String(stopId || '').trim().toUpperCase();
+  const matched = branches.filter((b) => b.stopIds.has(cleanId));
+  if (matched.length > 0) return matched;
+  const single = pickStopBranch(branches, stopId, stopCoords, stopBandera);
+  return single ? [single] : [];
+}
+
 function pickBestOppositeBranch(branches, stopBranch, busLat, busLng) {
   const candidates = branches.filter((b) => b !== stopBranch && b.pts.length >= 6);
   if (candidates.length === 0) return { oppositeBranch: null, busOnOpp: null };
@@ -225,6 +238,27 @@ export function pickPairedReturnBranch(branches, stopBranch) {
     }
   }
   return best;
+}
+
+/**
+ * Picks ALL feeder/return branches whose endpoint terminates near `targetBranch`'s origin cabecera
+ * (within 650 m). Handles multi-branch hubs (e.g. Puerto on 105C, Bº Esperanza on 103C).
+ */
+export function pickIncomingBranches(branches, targetBranch) {
+  if (!branches || !targetBranch?.pts?.length) return [];
+  const targetStart = targetBranch.pts[0];
+  const near = branches
+    .filter((b) => b !== targetBranch && b.pts.length >= 2)
+    .map((b) => {
+      const bEnd = b.pts[b.pts.length - 1];
+      return { b, gap: distanceMeters(bEnd[0], bEnd[1], targetStart[0], targetStart[1]) ?? Infinity };
+    })
+    .filter((x) => x.gap <= 650)
+    .sort((a, c) => a.gap - c.gap)
+    .map((x) => x.b);
+  if (near.length > 0) return near;
+  const fallback = pickPairedReturnBranch(branches, targetBranch);
+  return fallback ? [fallback] : [];
 }
 
 /**

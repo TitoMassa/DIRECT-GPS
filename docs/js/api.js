@@ -474,18 +474,20 @@ export const api = {
     apiGet(`/api/arribos-linea?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(codLinea)}`, null, 11000),
 
   // ── Central System FleetMemory (Cloudflare Durable Object SQLite + offline read mirror) ──
-  getFleetMemory: async (lineCodes = []) => {
-    const qs =
-      Array.isArray(lineCodes) && lineCodes.length > 0
-        ? `?lineas=${encodeURIComponent(lineCodes.join(','))}`
-        : '';
+  getFleetMemory: async (lineCodes = [], stopId = '') => {
+    const cleanStop = String(stopId || '').trim().toUpperCase();
+    const params = new URLSearchParams();
+    if (Array.isArray(lineCodes) && lineCodes.length > 0) params.set('lineas', lineCodes.join(','));
+    if (cleanStop) params.set('idParada', cleanStop);
+    const qs = params.toString() ? `?${params.toString()}` : '';
     try {
       const res = await apiGet(`/api/fleet-memory${qs}`, null, 5500);
       if (res?.data) {
-        // Merge into read-only offline mirror so airplane mode retains latest system assignments
+        // Merge into read-only offline mirror so airplane mode retains latest system assignments & stop arrivals
         readFleetMirror().then((existing) => {
           const mergedTrips = new Map();
           const mergedUnits = new Map();
+          const mergedStops = { ...(existing?.stops || {}) };
           for (const t of existing?.trips || []) {
             mergedTrips.set(`${t.codigoLinea}:${t.tripKey}`, t);
           }
@@ -498,10 +500,14 @@ export const api = {
           for (const u of res.data.units || []) {
             mergedUnits.set(`${u.codigoLinea}:${u.coche}`, u);
           }
+          if (res.data.stopSnapshot?.idParada) {
+            mergedStops[res.data.stopSnapshot.idParada] = res.data.stopSnapshot;
+          }
           saveFleetMirror({
             dayKey: res.data.dayKey,
             trips: [...mergedTrips.values()],
             units: [...mergedUnits.values()],
+            stops: mergedStops,
             syncedAt: Date.now()
           });
         });
@@ -511,7 +517,11 @@ export const api = {
       // Offline: return last synced snapshot from central system mirror
     }
     const mirrored = await readFleetMirror();
-    return mirrored || { dayKey: '', trips: [], units: [] };
+    if (!mirrored) return { dayKey: '', stopSnapshot: null, trips: [], units: [] };
+    return {
+      ...mirrored,
+      stopSnapshot: cleanStop && mirrored.stops ? mirrored.stops[cleanStop] || null : null
+    };
   },
 
   reportFleetSeen: async (entries = [], dayKey = '') => {

@@ -338,7 +338,9 @@ export class BusSimulator {
 
       // ── Mode A: Timetable-driven smooth 30fps tracking (offline / no-GPS / lost-GPS) ──
       if (st.mode === 'schedule' && st.scheduledTrip && st.stopProj) {
-        const ev = evaluateTripState(st.scheduledTrip, st.stopId, st.stopProj, nowSec, st.predDesvioSec || 0);
+        const ev = evaluateTripState(st.scheduledTrip, st.stopId, st.stopProj, nowSec, st.predDesvioSec || 0, {
+          maxAheadSec: 160 * 60
+        });
         let targetSpeed = 0;
 
         if (!ev) {
