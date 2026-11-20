@@ -34,7 +34,7 @@ export function parseTimeToSec(hhmmss = '') {
 }
 
 export function parseGpsStampSecOfDay(raw = '') {
-  const m = String(raw || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  const m = String(raw || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
   if (!m) return null;
   return parseInt(m[4], 10) * 3600 + parseInt(m[5], 10) * 60 + parseInt(m[6], 10);
 }
@@ -54,6 +54,13 @@ export function formatDesvioFromSec(sec = 0) {
   const mm = Math.floor(abs / 60);
   const ss = abs % 60;
   return `${sign}${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
+export const SERVICE_DAY_CUTOFF_SEC = 3 * 3600; // 03:00 AM (0 buses operate between 02:00 and 04:25 AM across Corrientes)
+
+export function toServiceSec(sec) {
+  if (!Number.isFinite(sec)) return sec;
+  return sec >= 0 && sec < SERVICE_DAY_CUTOFF_SEC ? sec + 86400 : sec;
 }
 
 export function getArgentinaSecOfDay(date = new Date()) {
@@ -139,8 +146,8 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       const [timeStr, idxStr = '0'] = String(raw).split('|');
       const bIdx = Number(idxStr);
       if (matchingBanderaIdx.size > 0 && !matchingBanderaIdx.has(bIdx)) continue;
-      const sec = parseTimeToSec(timeStr);
-      if (sec !== null) times.push(sec);
+      const rawSec = parseTimeToSec(timeStr);
+      if (rawSec !== null) times.push(toServiceSec(rawSec));
     }
     if (times.length === 0) continue;
     times.sort((a, b) => a - b);
@@ -476,21 +483,46 @@ function isAtBranchEndTerminal(branch, projAlong, lat, lng, outgoingBranch = nul
   return false;
 }
 
+function unitVector(lat1, lng1, lat2, lng2) {
+  const cosLat = Math.cos(((lat1 + lat2) * 0.5 * Math.PI) / 180);
+  const dx = (lng2 - lng1) * cosLat;
+  const dy = lat2 - lat1;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return null;
+  return [dx / len, dy / len];
+}
+
 /**
  * Builds a spatial-temporal GPS anchor for `trip` from a last-known GPS fix `(lat, lng, clockSec)`.
  * Evaluates up to 3 legs along the vehicle block (`trip`, `prevTrip`, and `prevTrip.prevTrip` / full_cycle)
  * choosing the leg whose scheduled time at the GPS projection best matches `clockSec + fallbackDesvioSec`.
  *
- * Enforces the physical punta de línea (cabecera) departure rule:
- *  - If a bus is at a cabecera ahead of schedule (before `trip.startSec` / `prevTrip.startSec`, or with positive
- *    advance at the terminal), it is marked `atOriginTerminal` / `atPrevOriginTerminal` with `initialOffsetSec = 0`
- *    so it waits quietly at the cabecera until its scheduled departure time and departs punctually on time!
+ * Enforces:
+ *  1) Punta de línea (cabecera) departure rule: an early bus at a cabecera waits until `trip.startSec` and
+ *     departs punctually on time (`initialOffsetSec = 0`).
+ *  2) Two-way street & pre-departure anti-U-turn protection: uses GPS heading vector (`prevFix -> (lat, lng)`
+ *     vs `proj.tangent`), pre-departure mid-route guards, and `preferredLeg` continuity so a bus driving toward
+ *     a cabecera on a two-way street (like Av. Sarmiento / Plaza 25 de Mayo) NEVER flips direction onto the
+ *     return leg before reaching the cabecera!
  */
-export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSec = 0) {
+export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSec = 0, options = {}) {
   if (!trip || typeof lat !== 'number' || typeof lng !== 'number' || Number.isNaN(lat) || Number.isNaN(lng)) {
     return null;
   }
   if (!Number.isFinite(clockSec)) return null;
+
+  const effClock = toServiceSec(clockSec);
+  const prevFix = options?.prevFix || null;
+  const preferredLeg = options?.preferredLeg || null;
+  let gpsDir = null;
+  if (
+    prevFix &&
+    typeof prevFix.lat === 'number' &&
+    typeof prevFix.lng === 'number' &&
+    (distanceMeters(prevFix.lat, prevFix.lng, lat, lng) ?? 0) >= 20
+  ) {
+    gpsDir = unitVector(prevFix.lat, prevFix.lng, lat, lng);
+  }
 
   const candidates = [{ t: trip, depth: 0 }];
   if (trip.prevTrip) {
@@ -510,9 +542,7 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
     const schedSecAtAnchor = getTripSecAtAlong(cand.t, proj.along);
     if (schedSecAtAnchor === null) continue;
 
-    let adjClock = clockSec;
-    if (schedSecAtAnchor > 86400 && adjClock < 6 * 3600) adjClock += 86400;
-    let rawOffset = schedSecAtAnchor - adjClock;
+    let rawOffset = schedSecAtAnchor - effClock;
     if (rawOffset > 43200) rawOffset -= 86400;
     if (rawOffset < -43200) rawOffset += 86400;
 
@@ -524,14 +554,12 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
       (cand.depth === 0 && isAtBranchStartTerminal(trip.branch, proj.along, lat, lng, trip.prevTrip?.branch)) ||
       (cand.depth === 1 && isAtBranchEndTerminal(cand.t.branch, proj.along, lat, lng, trip.branch));
 
-    let adjClockTrip = clockSec;
-    if (trip.startSec > 86400 && adjClockTrip < 6 * 3600) adjClockTrip += 86400;
     const tripDepRefSec = cand.depth === 0 ? Math.max(trip.startSec, schedSecAtAnchor) : trip.startSec;
     const waitingAtTripOrigin =
       atTripOriginCabecera &&
-      (adjClockTrip <= tripDepRefSec + 20 ||
+      (effClock <= tripDepRefSec + 20 ||
         (cand.depth === 0 && rawOffset > 0) ||
-        (fallbackDesvioSec > 0 && adjClockTrip <= tripDepRefSec + 240));
+        (fallbackDesvioSec > 0 && effClock <= tripDepRefSec + 240));
 
     // Check if the bus is parked/staging at `prevTrip`'s origin cabecera (start of `prevTrip` or arrival end of `prev.prevTrip`)
     const prevTrip = trip.prevTrip;
@@ -543,13 +571,11 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
 
     let waitingAtPrevOrigin = false;
     if (atPrevOriginCabecera && prevTrip) {
-      let adjClockPrev = clockSec;
-      if (prevTrip.startSec > 86400 && adjClockPrev < 6 * 3600) adjClockPrev += 86400;
       const prevDepRefSec = cand.depth === 1 ? Math.max(prevTrip.startSec, schedSecAtAnchor) : prevTrip.startSec;
       waitingAtPrevOrigin =
-        adjClockPrev <= prevDepRefSec + 20 ||
+        effClock <= prevDepRefSec + 20 ||
         (cand.depth === 1 && rawOffset > 0) ||
-        (fallbackDesvioSec > 0 && adjClockPrev <= prevDepRefSec + 240);
+        (fallbackDesvioSec > 0 && effClock <= prevDepRefSec + 240);
     }
 
     let score;
@@ -566,6 +592,49 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
       let desvioErr = Math.abs(rawOffset - (fallbackDesvioSec || 0));
       if (desvioErr > 43200) desvioErr = 86400 - desvioErr;
       score = desvioErr + cand.depth * 25;
+
+      // 1) Pre-departure mid-route guard on two-way streets:
+      //    A bus cannot already be mid-route (`!atTripOriginCabecera`) on `trip` (`depth === 0`) when the real clock
+      //    is still minutes before `trip.startSec` while `prevTrip` (`depth === 1`) is actively running toward the cabecera!
+      if (
+        cand.depth === 0 &&
+        !atTripOriginCabecera &&
+        prevTrip &&
+        effClock < trip.startSec - 150 &&
+        effClock <= prevTrip.endSec + 600
+      ) {
+        score += 2200;
+      }
+      if (
+        cand.depth === 1 &&
+        !atPrevOriginCabecera &&
+        prevTrip?.prevTrip &&
+        effClock < prevTrip.startSec - 150 &&
+        effClock <= prevTrip.prevTrip.endSec + 600
+      ) {
+        score += 2200;
+      }
+
+      // 2) Real GPS heading vector alignment against polyline tangent (prevents U-turns on shared two-way avenues!)
+      if (gpsDir && proj.tangent) {
+        const dot = gpsDir[0] * proj.tangent[0] + gpsDir[1] * proj.tangent[1];
+        if (dot < -0.25) {
+          score += 2400; // moving in the opposite direction of this branch!
+        } else if (dot > 0.35) {
+          score -= 180; // moving in the exact direction of this branch!
+        }
+      }
+
+      // 3) Continuity with already-resolved live leg (`preferredLeg`)
+      if (preferredLeg === 'previous_leg') {
+        if (cand.depth === 1) score -= 160;
+        else if (cand.depth === 0 && effClock < trip.startSec) score += 700;
+      } else if (preferredLeg === 'full_cycle') {
+        if (cand.depth === 2) score -= 160;
+        else if (cand.depth === 0 && effClock < trip.startSec) score += 700;
+      } else if (preferredLeg === 'direct' && cand.depth === 0 && effClock >= trip.startSec - 120) {
+        score -= 120;
+      }
     }
 
     if (score < bestScore) {
@@ -575,7 +644,7 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
         isStopBranch: cand.depth === 0,
         legDepth: cand.depth,
         along: proj.along,
-        clockSec: adjClock,
+        clockSec: effClock,
         initialOffsetSec,
         atOriginTerminal: waitingAtTripOrigin,
         atPrevOriginTerminal: waitingAtPrevOrigin,
@@ -614,10 +683,7 @@ export function evaluateTripState(
   const targetStopSec = getTripStopSec(trip, stopId, stopProj.along);
   if (targetStopSec === null) return null;
 
-  let effNow = nowSec;
-  if (targetStopSec > 86400 && effNow < 6 * 3600) {
-    effNow += 86400;
-  }
+  const effNow = toServiceSec(nowSec);
 
   // Only reject as already-passed if anchored directly on THIS trip (`legDepth === 0`) past `stopProj.along`!
   // Never reject a `legDepth === 2` (`full_cycle`) bus finishing the previous lap!
@@ -1005,13 +1071,13 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
   const desvioSec = bus.desvio?.seconds || 0;
   const hasDesvio = bus.desvio && bus.desvio.status !== 'none';
   const isSticky = Boolean(stickyTripKey && item.trip.tripKey === stickyTripKey);
+  const effNow = toServiceSec(nowSec);
 
   // ── Signal A: Exact spatial-temporal match using GPS coordinate + SmartMovePro desvio ──
   // Independent of SmartMovePro's noisy ETA and works even if the bus is 30 min late or 15 min early!
   let spatialDiffSec = Infinity;
   if (typeof bus.lat === 'number' && typeof bus.lng === 'number' && hasDesvio) {
-    const tEff = nowSec + desvioSec;
-    const normEff = ((tEff % 86400) + 86400) % 86400;
+    const tEff = effNow + desvioSec;
     const leg = bus.trajectory?.leg;
     const isOpp = leg === 'previous_leg' || bus.isOppositeLeg;
     const isFullCycle = leg === 'full_cycle' || bus.isNextCycle || bus.isNextLap;
@@ -1022,8 +1088,8 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
       if (!proj || proj.perp > 160) return Infinity;
       const schedAtBus = getTripSecAtAlong(tr, proj.along);
       if (schedAtBus === null) return Infinity;
-      let d = Math.abs((schedAtBus % 86400) - normEff);
-      if (d > 43200) d = 86400 - d;
+      let d = Math.abs(schedAtBus - tEff);
+      if (d > 43200) d = Math.abs(d - 86400);
       return d;
     };
 
@@ -1045,17 +1111,20 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
         testTripSpatial(item.trip.prevTrip)
       );
     } else {
-      spatialDiffSec = testTripSpatial(item.trip);
+      // Also check `prevTrip` when the bus is on a shared two-way street before `item.trip.startSec`
+      spatialDiffSec =
+        effNow < item.trip.startSec - 120 && item.trip.prevTrip
+          ? Math.min(testTripSpatial(item.trip), testTripSpatial(item.trip.prevTrip))
+          : testTripSpatial(item.trip);
     }
   }
 
   // ── Signal B: ETA + Desvio match (`Now + ETA + Desvio` vs `targetStopSec`) ──
   let etaDiffSec = Infinity;
   if (bus.eta && bus.eta.valid !== false && typeof bus.eta.minutes === 'number' && bus.eta.minutes <= 240) {
-    const expectedSec = ((nowSec + bus.eta.minutes * 60 + desvioSec) % 86400 + 86400) % 86400;
-    const normSt = item.stSec % 86400;
-    let d = Math.abs(normSt - expectedSec);
-    if (d > 43200) d = 86400 - d;
+    const expectedSec = effNow + bus.eta.minutes * 60 + desvioSec;
+    let d = Math.abs(item.stSec - expectedSec);
+    if (d > 43200) d = Math.abs(d - 86400);
     etaDiffSec = d;
   }
 
@@ -1189,6 +1258,7 @@ export function detectAlreadyPassedTrips({
   if (stopBranches.length === 0) return passed;
 
   const nowMs = Date.now();
+  const effNow = toServiceSec(nowSec);
 
   // Build lookup of known active tripKeys and coche -> tripKeys from FleetMemory
   const activeMemTripKeys = new Set();
@@ -1229,8 +1299,24 @@ export function detectAlreadyPassedTrips({
     // Must be genuinely PAST this stop along stopBranch!
     if (proj.along <= stopProj.along + 65) return;
 
-    const tEff = clockSec + (desvioSec || 0);
-    const normEff = ((tEff % 86400) + 86400) % 86400;
+    const effClock = toServiceSec(clockSec);
+    const tEff = effClock + (desvioSec || 0);
+
+    // Guard on shared two-way streets: if the bus is actually on an opposite branch whose scheduled trip
+    // matches `tEff` much better than any trip on `stopBranch`, do NOT falsely mark a `stopBranch` trip passed!
+    let bestOppDiff = Infinity;
+    for (const ob of branches) {
+      if (ob === stopBranch) continue;
+      const oProj = projectOnPolyline(ob.pts, ob.cum, lat, lng);
+      if (!oProj || oProj.perp > 130) continue;
+      for (const otr of model.getTripsForBranch(ob)) {
+        const oSched = getTripSecAtAlong(otr, oProj.along);
+        if (oSched === null) continue;
+        let od = Math.abs(oSched - tEff);
+        if (od > 43200) od = Math.abs(od - 86400);
+        if (od < bestOppDiff) bestOppDiff = od;
+      }
+    }
 
     // If FleetMemory already knows which trip on this branch this exact coche is running AND that trip
     // is time-consistent at `proj.along` (so a full_cycle bus never marks its NEXT lap!), mark it passed!
@@ -1241,9 +1327,9 @@ export function detectAlreadyPassedTrips({
         if (!tr) continue;
         const schedAtBus = getTripSecAtAlong(tr, proj.along);
         if (schedAtBus === null) continue;
-        let d = Math.abs((schedAtBus % 86400) - normEff);
-        if (d > 43200) d = 86400 - d;
-        if (d <= 28 * 60) {
+        let d = Math.abs(schedAtBus - tEff);
+        if (d > 43200) d = Math.abs(d - 86400);
+        if (d <= 28 * 60 && d <= bestOppDiff + 90) {
           passed.add(tk);
         }
       }
@@ -1255,14 +1341,14 @@ export function detectAlreadyPassedTrips({
     for (const tr of trips) {
       const schedAtBus = getTripSecAtAlong(tr, proj.along);
       if (schedAtBus === null) continue;
-      let d = Math.abs((schedAtBus % 86400) - normEff);
-      if (d > 43200) d = 86400 - d;
+      let d = Math.abs(schedAtBus - tEff);
+      if (d > 43200) d = Math.abs(d - 86400);
       if (d < bestDiff) {
         bestDiff = d;
         bestTrip = tr;
       }
     }
-    if (bestTrip) {
+    if (bestTrip && bestDiff <= bestOppDiff + 90) {
       passed.add(bestTrip.tripKey);
     }
   };
@@ -1293,7 +1379,7 @@ export function detectAlreadyPassedTrips({
       if (isLiveFullCycle || isDownstream) {
         const hint = b.realBandera || b.descripcionBandera || '';
         const cocheId = b.identificadorCoche || b.coche || '';
-        const bClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS || b.ultimaGps || '') ?? nowSec;
+        const bClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS || b.ultimaGps || '') ?? effNow;
         markPassedBySpatialFix(stopBranch, stopProj, trips, lat, lng, desvioSec, bClock, hint, cocheId);
       }
     }
@@ -1305,11 +1391,17 @@ export function detectAlreadyPassedTrips({
       const lat = Number(rec.lat);
       const lng = Number(rec.lng);
       if (Number.isFinite(lat) && Number.isFinite(lng)) {
-        const proj = projectOnPolyline(stopBranch.pts, stopBranch.cum, lat, lng);
-        if (proj && proj.perp <= 140 && proj.along > stopProj.along + 65) {
-          if (trips.some((t) => t.tripKey === rec.tripKey)) {
-            passed.add(rec.tripKey);
-          }
+        const tr = trips.find((t) => t.tripKey === rec.tripKey);
+        if (!tr) continue;
+        const recClock =
+          parseGpsStampSecOfDay(rec.ultimaGps) ??
+          (rec.updatedAt ? getArgentinaSecOfDay(new Date(rec.updatedAt)) : effNow);
+        const anchor = buildGpsAnchorForTrip(tr, lat, lng, recClock, rec.desvioSec || 0, {
+          prevFix: rec.prevFix || null,
+          preferredLeg: rec.realLeg || null
+        });
+        if (anchor && anchor.legDepth === 0 && !anchor.atOriginTerminal && anchor.along > stopProj.along + 65) {
+          passed.add(rec.tripKey);
         }
       }
     }
@@ -1322,7 +1414,7 @@ export function detectAlreadyPassedTrips({
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
       const uClock =
         parseGpsStampSecOfDay(u.ultimaGps) ??
-        (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : nowSec);
+        (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : effNow);
       markPassedBySpatialFix(stopBranch, stopProj, trips, lat, lng, u.desvioSec || 0, uClock, u.bandera || '', u.coche || '');
     }
   }
@@ -1408,6 +1500,7 @@ export function predictLineBusesForStop({
   completedTripKeys = new Set(),
   activePredKeys = new Set(),
   fleetMemory = null,
+  gpsHistoryByUnit = null,
   maxUpcoming = 4,
   maxAheadMin = 65
 }) {
@@ -1418,6 +1511,7 @@ export function predictLineBusesForStop({
   if (stopBranches.length === 0) return [];
 
   const nowMs = Date.now();
+  const effNow = toServiceSec(nowSec);
 
   // Index system FleetMemory trips for this line
   const memByTrip = new Map();
@@ -1449,29 +1543,45 @@ export function predictLineBusesForStop({
       typeof u.desvioSec === 'number'
         ? u.desvioSec
         : parseDesvioHorario(u.desvioHorario || '').seconds;
-    const uClock =
+    const uClock = toServiceSec(
       parseGpsStampSecOfDay(ultimaGps) ??
-      (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : nowSec);
+        (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : effNow)
+    );
     const tEff = uClock + (desvioSec || 0);
-    const normEff = ((tEff % 86400) + 86400) % 86400;
     const uNormBandera = normalizeBandera(u.descripcionBandera || u.bandera || '');
 
+    const unitHist = gpsHistoryByUnit ? gpsHistoryByUnit.get(`${codLinea}-c${cleanCoche}`) : null;
+    const prevFix = unitHist?.prevMoving || unitHist?.prev || null;
+    const gpsDir =
+      prevFix && (distanceMeters(prevFix.lat, prevFix.lng, uLat, uLng) ?? 0) >= 20
+        ? unitVector(prevFix.lat, prevFix.lng, uLat, uLng)
+        : null;
+
     let bestTr = null;
-    let bestDiff = 14 * 60;
+    let bestScore = 14 * 60;
     for (const b of branches) {
-      if (uNormBandera) {
-        const nb = normalizeBandera(b.bandera);
-        if (nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) continue;
-      }
       const proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
       if (!proj || proj.perp > 140) continue;
+
+      let dirPenalty = 0;
+      if (gpsDir && proj.tangent) {
+        const dot = gpsDir[0] * proj.tangent[0] + gpsDir[1] * proj.tangent[1];
+        if (dot < -0.25) dirPenalty = 2400;
+        else if (dot > 0.35) dirPenalty = -90;
+      }
+
+      const nb = normalizeBandera(b.bandera);
+      const banderaPenalty =
+        uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera) ? 35 : 0;
+
       for (const tr of model.getTripsForBranch(b)) {
         const sched = getTripSecAtAlong(tr, proj.along);
         if (sched === null) continue;
-        let d = Math.abs((sched % 86400) - normEff);
-        if (d > 43200) d = 86400 - d;
-        if (d < bestDiff) {
-          bestDiff = d;
+        let d = Math.abs(sched - tEff);
+        if (d > 43200) d = Math.abs(d - 86400);
+        const score = d + dirPenalty + banderaPenalty;
+        if (score < bestScore) {
+          bestScore = score;
           bestTr = tr;
         }
       }
@@ -1555,8 +1665,6 @@ export function predictLineBusesForStop({
       if (liveBlockSrc) {
         const targetStopSec = getTripStopSec(trip, stopId, stopProj.along);
         if (targetStopSec === null) continue;
-        let effNow = nowSec;
-        if (targetStopSec > 86400 && effNow < 6 * 3600) effNow += 86400;
 
         const srcBus = liveBlockSrc.bus;
         const propagatedDesvio = propagateBlockDesvioSec(
@@ -1643,9 +1751,12 @@ export function predictLineBusesForStop({
             continue;
           }
           // 2) Still physically approaching `stopId` on this trip (or its prevTrip) -> bind directly to live bus!
-          const liveAnchor = buildGpsAnchorForTrip(trip, fLat, fLng, nowSec, srcBus.desvio?.seconds || 0);
+          const liveAnchor = buildGpsAnchorForTrip(trip, fLat, fLng, effNow, srcBus.desvio?.seconds || 0, {
+            prevFix: srcBus.prevGpsFix || null,
+            preferredLeg: srcBus.trajectory?.leg || null
+          });
           if (liveAnchor) {
-            const ev = evaluateTripState(trip, stopId, stopProj, nowSec, srcBus.desvio?.seconds || 0, {
+            const ev = evaluateTripState(trip, stopId, stopProj, effNow, srcBus.desvio?.seconds || 0, {
               maxAheadSec: effectiveMaxAheadSec,
               anchor: liveAnchor
             });
@@ -1700,16 +1811,26 @@ export function predictLineBusesForStop({
       let desvioSec = 0;
       if (mem) {
         const ageMin = mem.updatedAt ? (nowMs - mem.updatedAt) / 60000 : 999;
-        const memClockSec =
+        const memClockSec = toServiceSec(
           parseGpsStampSecOfDay(mem.ultimaGps) ??
-          (mem.updatedAt ? getArgentinaSecOfDay(new Date(mem.updatedAt)) : nowSec);
-        const elapsedSec = Math.max(0, nowSec - memClockSec);
+            (mem.updatedAt ? getArgentinaSecOfDay(new Date(mem.updatedAt)) : effNow)
+        );
+        const elapsedSec = Math.max(0, effNow - memClockSec);
 
         if (memDepth <= 2 && ageMin <= 90) {
           const mLat = Number(mem.lat);
           const mLng = Number(mem.lng);
           if (Number.isFinite(mLat) && Number.isFinite(mLng) && mLat !== 0 && mLng !== 0) {
-            anchor = buildGpsAnchorForTrip(trip, mLat, mLng, memClockSec, mem.desvioSec || 0);
+            const cleanMemCoche = String(mem.coche || '').trim();
+            const unitHist =
+              cleanMemCoche && gpsHistoryByUnit ? gpsHistoryByUnit.get(`${codLinea}-c${cleanMemCoche}`) : null;
+            const prevFix = mem.prevFix || unitHist?.prevMoving || unitHist?.prev || null;
+            const preferredLeg =
+              memDepth === 0 ? mem.realLeg || null : memDepth === 1 ? 'previous_leg' : 'full_cycle';
+            anchor = buildGpsAnchorForTrip(trip, mLat, mLng, memClockSec, mem.desvioSec || 0, {
+              prevFix,
+              preferredLeg
+            });
           }
         }
         if (!anchor && Number.isFinite(mem.desvioSec)) {
@@ -1717,8 +1838,9 @@ export function predictLineBusesForStop({
         }
       }
 
-      const ev = evaluateTripState(trip, stopId, stopProj, nowSec, desvioSec, {
-        maxAheadSec: effectiveMaxAheadSec,
+      const tripMaxAheadSec = mem ? Math.max(effectiveMaxAheadSec, 110 * 60) : effectiveMaxAheadSec;
+      const ev = evaluateTripState(trip, stopId, stopProj, effNow, desvioSec, {
+        maxAheadSec: tripMaxAheadSec,
         anchor
       });
       if (!ev) continue;

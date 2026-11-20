@@ -3,6 +3,7 @@ import { computeProximityPercent, distanceMeters, parseDesvioHorario } from './a
 import {
   evaluateTripState,
   getArgentinaSecOfDay,
+  toServiceSec,
   buildGpsAnchorForTrip,
   formatDesvioFromSec
 } from './predictor.js';
@@ -223,12 +224,19 @@ export class BusSimulator {
           const curSample = sampleTrajectory(prev.activeTraj, prev.walkedMeters);
           const aLat = curSample?.lat ?? prev.anchorLat ?? bus.lat;
           const aLng = curSample?.lng ?? prev.anchorLng ?? bus.lng;
+          const prevFix =
+            typeof prev.lastRealLat === 'number' && typeof prev.lastRealLng === 'number'
+              ? { lat: prev.lastRealLat, lng: prev.lastRealLng }
+              : null;
           prev.scheduleAnchor =
-            buildGpsAnchorForTrip(bus.scheduledTrip, aLat, aLng, nowSec, desvioSec) || incomingAnchor;
+            buildGpsAnchorForTrip(bus.scheduledTrip, aLat, aLng, nowSec, desvioSec, {
+              prevFix,
+              preferredLeg: prev.lastRealLeg || prev.activeTraj?.leg || null
+            }) || incomingAnchor;
         } else if (incomingAnchor && !prev.scheduleAnchor) {
           prev.scheduleAnchor = incomingAnchor;
         }
-        if (prev.scheduleAnchor?.atOriginTerminal && nowSec < (bus.scheduledTrip.startSec || 0)) {
+        if (prev.scheduleAnchor?.atOriginTerminal && toServiceSec(nowSec) < (bus.scheduledTrip.startSec || 0)) {
           prev.isAtTerminal = true;
           prev.isStopped = true;
           prev.currentSpeedMps = 0;
@@ -294,7 +302,10 @@ export class BusSimulator {
           Boolean(bus.scheduledTrip && bus.stopProj);
 
         const initAnchor = alreadyFrozen3Min
-          ? buildGpsAnchorForTrip(bus.scheduledTrip, bus.lat, bus.lng, nowSec, aheadSec)
+          ? buildGpsAnchorForTrip(bus.scheduledTrip, bus.lat, bus.lng, nowSec, aheadSec, {
+              prevFix: bus.prevGpsFix || null,
+              preferredLeg: newTraj.leg || null
+            })
           : null;
 
         const entry = {
@@ -390,12 +401,20 @@ export class BusSimulator {
             prev.walkedMeters = 0;
           }
           prev.currentSpeedMps = 0;
+          const prevFix =
+            typeof prev.lastRealLat === 'number' && typeof prev.lastRealLng === 'number'
+              ? { lat: prev.lastRealLat, lng: prev.lastRealLng }
+              : bus.prevGpsFix || null;
           prev.scheduleAnchor = buildGpsAnchorForTrip(
             bus.scheduledTrip,
             aLat,
             aLng,
             nowSec,
-            aheadSec
+            aheadSec,
+            {
+              prevFix,
+              preferredLeg: prev.lastRealLeg || newTraj.leg || null
+            }
           );
         }
         prev.mode = 'schedule';

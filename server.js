@@ -243,7 +243,9 @@ async function handleApi(req, res, urlObj) {
       const dayKey = String(searchParams.get('dayKey') || getArgentinaDayKey()).slice(0, 10);
       const nowMs = Date.now();
       const trips = Object.values(fleetStore.trips).filter(
-        (t) => t.dayKey === dayKey && (filterSet.size === 0 || filterSet.has(t.codigoLinea))
+        (t) =>
+          (t.dayKey === dayKey || nowMs - (t.updatedAt || 0) < 4 * 3600 * 1000) &&
+          (filterSet.size === 0 || filterSet.has(t.codigoLinea))
       );
       const units = Object.values(fleetStore.units).filter(
         (u) => nowMs - (u.updatedAt || 0) < 24 * 3600 * 1000 && (filterSet.size === 0 || filterSet.has(u.codigoLinea))

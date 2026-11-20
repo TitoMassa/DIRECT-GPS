@@ -573,9 +573,10 @@ export class FleetMemory {
             `SELECT codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, chofer_raw,
                     es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
              FROM trip_assignments
-             WHERE day_key = ? AND codigo_linea IN (${ph})
+             WHERE (day_key = ? OR updated_at > ?) AND codigo_linea IN (${ph})
              ORDER BY updated_at DESC`,
             dayKey,
+            nowMs - 4 * 3600 * 1000,
             ...lineCodes
           )
           .toArray();
@@ -596,9 +597,10 @@ export class FleetMemory {
             `SELECT codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, chofer_raw,
                     es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
              FROM trip_assignments
-             WHERE day_key = ?
+             WHERE day_key = ? OR updated_at > ?
              ORDER BY updated_at DESC LIMIT 600`,
-            dayKey
+            dayKey,
+            nowMs - 4 * 3600 * 1000
           )
           .toArray();
         unitRows = this.sql

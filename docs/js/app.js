@@ -15,10 +15,18 @@ import {
   getArgentinaTodayTipo,
   matchBusesWithHorarios
 } from './api.js';
-import { parseRouteBranches, resolveBusTrajectory, pickStopBranches, projectOnPolyline } from './trajectory.js';
+import {
+  parseRouteBranches,
+  resolveBusTrajectory,
+  buildTrajectoryFromBranchAlong,
+  pickStopBranches,
+  projectOnPolyline
+} from './trajectory.js';
 import {
   buildLineScheduleModel,
   matchLiveBusesToTrips,
+  buildGpsAnchorForTrip,
+  parseGpsStampSecOfDay,
   detectAlreadyPassedTrips,
   predictLineBusesForStop,
   getArgentinaSecOfDay,
@@ -1210,8 +1218,9 @@ function getMergedFleetMemory() {
     merged.set(`${t.codigoLinea}:${t.tripKey}`, t);
   }
   const todayKey = getArgentinaDayKey();
+  const nowMs = Date.now();
   for (const [k, rec] of state.sessionObservedTrips.entries()) {
-    if (rec.dayKey === todayKey) {
+    if (rec.dayKey === todayKey || (rec.updatedAt && nowMs - rec.updatedAt < 4 * 3600 * 1000)) {
       merged.set(k, rec);
     }
   }
@@ -1256,9 +1265,9 @@ function reconcileWithSchedulePrediction(
   }
   const completedSet = state.completedTripsByStop.get(completedStopKey);
 
-  // Prune stale sticky entries from previous days
+  // Prune stale sticky entries (> 2 hours old; survives 00:00 midnight rollover)
   for (const [k, v] of state.stickyLiveTripByCoche.entries()) {
-    if (v.dayKey !== todayDayKey || nowMs - v.updatedAt > 2 * 3600 * 1000) {
+    if (nowMs - v.updatedAt > 2 * 3600 * 1000) {
       state.stickyLiveTripByCoche.delete(k);
     }
   }
@@ -1330,6 +1339,41 @@ function reconcileWithSchedulePrediction(
           });
         }
 
+        // If this is a cold-start Poll 1 on a shared two-way street (no `prevGpsFix` heading vector yet)
+        // and the spatial-temporal schedule anchor proves the bus is actually on `prevTrip` (`legDepth === 1`)
+        // heading toward the turnaround cabecera, refine its trajectory to `previous_leg` immediately!
+        if (
+          !b.isNextLap &&
+          !b.prevGpsFix &&
+          b.trajectory?.leg === 'direct' &&
+          m.trip?.prevTrip &&
+          b.stopProj &&
+          typeof b.lat === 'number' &&
+          typeof b.lng === 'number'
+        ) {
+          const gpsClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec;
+          const liveAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, b.desvio?.seconds || 0);
+          if (liveAnchor && liveAnchor.legDepth === 1 && !liveAnchor.atOriginTerminal) {
+            const refinedTraj = buildTrajectoryFromBranchAlong(
+              liveAnchor.branch,
+              liveAnchor.along,
+              m.trip.branch,
+              b.stopProj,
+              {
+                isAtTerminal: Boolean(b.trajectory.isAtTerminal),
+                etaSec: b.etaSecondsRemaining || 600
+              }
+            );
+            if (refinedTraj) {
+              b.trajectory = refinedTraj;
+              b.routeMeters = refinedTraj.totalMeters;
+              b.isOppositeLeg = Boolean(refinedTraj.isOppositeLeg);
+              b.realBandera = refinedTraj.realBandera || b.realBandera;
+              b.realBanderaColor = refinedTraj.realBanderaColor || b.realBanderaColor;
+            }
+          }
+        }
+
         // Seamless GPS recovery handoff: transfer simulator state from prior predicted marker!
         if (!b.isNextLap) {
           const predKey = `pred:${cod}:${m.tripKey}`;
@@ -1353,6 +1397,8 @@ function reconcileWithSchedulePrediction(
             desvioSec: b.desvio?.seconds || 0,
             desvioRaw: b.desvio?.raw || '',
             bandera: b.realBandera || b.descripcionBandera || '',
+            realLeg: b.trajectory?.leg || null,
+            prevFix: b.prevGpsFix || null,
             ultimaGps: b.ultimaFechaHoraGPS || '',
             lat: b.lat,
             lng: b.lng,
@@ -1388,7 +1434,7 @@ function reconcileWithSchedulePrediction(
   // Single-line mode uses 130 min horizon to cover low-frequency 2h headway lines (109B, 105C Perichón, Riachuelo).
   const isSingleLine = Boolean(state.focusedLineCode);
   const maxUpcoming = isSingleLine ? 6 : 3;
-  const maxAheadMin = isSingleLine ? 130 : 60;
+  const maxAheadMin = isSingleLine ? 130 : 75;
 
   for (const cod of targetLineCodes) {
     const branches = state.routeBranchesCache.get(cod) || [];
@@ -1445,6 +1491,7 @@ function reconcileWithSchedulePrediction(
       completedTripKeys: completedSet,
       activePredKeys,
       fleetMemory: fleetMem,
+      gpsHistoryByUnit: state.lastRealGpsByUnit,
       maxUpcoming,
       maxAheadMin
     });
