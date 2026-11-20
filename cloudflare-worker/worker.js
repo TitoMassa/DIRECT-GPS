@@ -658,6 +658,21 @@ export class FleetMemory {
       );
       CREATE INDEX IF NOT EXISTS idx_cap_line_tipo ON fleet_capacity_daily (codigo_linea, tipo_dia, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS learned_shift_transitions (
+        codigo_linea INTEGER NOT NULL,
+        tipo_dia TEXT NOT NULL,
+        from_trip_key TEXT NOT NULL,
+        to_trip_key TEXT NOT NULL,
+        same_shift_count INTEGER DEFAULT 0,
+        relevo_count INTEGER DEFAULT 0,
+        last_coche TEXT DEFAULT '',
+        last_chofer TEXT DEFAULT '',
+        last_day_key TEXT DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (codigo_linea, tipo_dia, from_trip_key, to_trip_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_learned_shift_line ON learned_shift_transitions (codigo_linea, tipo_dia);
+
       CREATE TABLE IF NOT EXISTS roster_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -1158,6 +1173,105 @@ export class FleetMemory {
     return result;
   }
 
+  _parseTripKeyStartSec(tripKey) {
+    const idx = String(tripKey || '').lastIndexOf('@');
+    if (idx < 0) return null;
+    const m = String(tripKey)
+      .slice(idx + 1)
+      .trim()
+      .match(/^(\d{1,2}):(\d{2})/);
+    if (!m) return null;
+    return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
+  }
+
+  _recordShiftTransition(cod, dayKey, fromTripKey, toTripKey, prevChofer, curChofer, coche, nowMs) {
+    if (!cod || !fromTripKey || !toTripKey || fromTripKey === toTripKey) return;
+    const fromSec = this._parseTripKeyStartSec(fromTripKey);
+    let toSec = this._parseTripKeyStartSec(toTripKey);
+    if (fromSec === null || toSec === null) return;
+    if (fromSec >= 20 * 3600 && toSec < 4 * 3600) toSec += 86400;
+    const dt = toSec - fromSec;
+    if (dt < 20 * 60 || dt > 140 * 60) return;
+
+    const tipoDia = getArgentinaServiceTipo(nowMs);
+    const existing = this.sql
+      .exec(
+        `SELECT last_day_key, last_coche FROM learned_shift_transitions
+         WHERE codigo_linea = ? AND tipo_dia = ? AND from_trip_key = ? AND to_trip_key = ?`,
+        cod,
+        tipoDia,
+        fromTripKey,
+        toTripKey
+      )
+      .toArray();
+    if (existing.length > 0 && existing[0].last_day_key === dayKey && existing[0].last_coche === coche) {
+      return;
+    }
+
+    const isRelevo = Boolean(prevChofer && curChofer && prevChofer !== curChofer);
+    const sameDelta = isRelevo ? 0 : 1;
+    const relevoDelta = isRelevo ? 1 : 0;
+
+    this.sql.exec(
+      `INSERT INTO learned_shift_transitions (
+        codigo_linea, tipo_dia, from_trip_key, to_trip_key,
+        same_shift_count, relevo_count, last_coche, last_chofer, last_day_key, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(codigo_linea, tipo_dia, from_trip_key, to_trip_key) DO UPDATE SET
+        same_shift_count = learned_shift_transitions.same_shift_count + excluded.same_shift_count,
+        relevo_count = learned_shift_transitions.relevo_count + excluded.relevo_count,
+        last_coche = excluded.last_coche,
+        last_chofer = CASE WHEN excluded.last_chofer != '' THEN excluded.last_chofer ELSE learned_shift_transitions.last_chofer END,
+        last_day_key = excluded.last_day_key,
+        updated_at = excluded.updated_at`,
+      cod,
+      tipoDia,
+      fromTripKey,
+      toTripKey,
+      sameDelta,
+      relevoDelta,
+      coche,
+      curChofer || prevChofer || '',
+      dayKey,
+      nowMs
+    );
+  }
+
+  _getLearnedTransitions(lineCodes = []) {
+    const codes = Array.isArray(lineCodes) ? lineCodes.map(Number).filter(Boolean) : [];
+    const rows =
+      codes.length > 0
+        ? this.sql
+            .exec(
+              `SELECT codigo_linea, tipo_dia, from_trip_key, to_trip_key,
+                      same_shift_count, relevo_count, last_coche, last_chofer, updated_at
+               FROM learned_shift_transitions
+               WHERE codigo_linea IN (${codes.map(() => '?').join(',')})
+               ORDER BY updated_at DESC LIMIT 400`,
+              ...codes
+            )
+            .toArray()
+        : this.sql
+            .exec(
+              `SELECT codigo_linea, tipo_dia, from_trip_key, to_trip_key,
+                      same_shift_count, relevo_count, last_coche, last_chofer, updated_at
+               FROM learned_shift_transitions
+               ORDER BY updated_at DESC LIMIT 400`
+            )
+            .toArray();
+    return rows.map((r) => ({
+      codigoLinea: r.codigo_linea,
+      dayType: r.tipo_dia,
+      fromTripKey: r.from_trip_key,
+      toTripKey: r.to_trip_key,
+      sameShiftCount: r.same_shift_count,
+      relevoCount: r.relevo_count,
+      lastCoche: r.last_coche,
+      lastChofer: r.last_chofer,
+      updatedAt: r.updated_at
+    }));
+  }
+
   _pruneOld(nowMs) {
     const cutoff = nowMs - 4 * 86400 * 1000;
     const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
@@ -1167,6 +1281,7 @@ export class FleetMemory {
     this.sql.exec('DELETE FROM fleet_cars WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_drivers WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_capacity_daily WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
+    this.sql.exec('DELETE FROM learned_shift_transitions WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
   }
 
   async fetch(request) {
@@ -1433,6 +1548,7 @@ export class FleetMemory {
         LINE_NAMES_BY_CODE[codLinea] ||
         `L${codLinea}`;
       const capacity = this._getCapacityByLine(nowMs, todayKey, codLinea).get(codLinea) || null;
+      const learnedTransitions = this._getLearnedTransitions([codLinea]);
 
       return Response.json({
         codigoLinea: codLinea,
@@ -1441,6 +1557,7 @@ export class FleetMemory {
         retentionDays: ROSTER_RETENTION_DAYS,
         meta: this._getRosterMetaSummary(),
         capacity,
+        learnedTransitions,
         coches,
         choferes
       });
@@ -1552,6 +1669,30 @@ export class FleetMemory {
             supersededTripKey,
             coche
           );
+        }
+
+        // Permanent shift & vuelta learning: if this physical car previously completed another trip today
+        // (and it wasn't a superseded misassignment), record whether the same driver continued or a relevo occurred!
+        const prevUnitRows = this.sql
+          .exec(
+            'SELECT day_key, trip_key, chofer_nombre, chofer_legajo FROM unit_last_seen WHERE codigo_linea = ? AND coche = ?',
+            cod,
+            coche
+          )
+          .toArray();
+        if (prevUnitRows.length > 0) {
+          const pu = prevUnitRows[0];
+          const prevTripKey = String(pu.trip_key || '').trim();
+          if (
+            pu.day_key === dayKey &&
+            prevTripKey &&
+            prevTripKey !== tripKey &&
+            prevTripKey !== supersededTripKey
+          ) {
+            const prevDrv = String(pu.chofer_legajo || pu.chofer_nombre || '').trim().toUpperCase();
+            const curDrv = String(e.choferLegajo || e.choferNombre || '').trim().toUpperCase();
+            this._recordShiftTransition(cod, dayKey, prevTripKey, tripKey, prevDrv, curDrv, coche, nowMs);
+          }
         }
 
         this.sql.exec(
@@ -1718,9 +1859,12 @@ export class FleetMemory {
         }
       }
 
+      const learnedTransitions = this._getLearnedTransitions(lineCodes);
+
       return Response.json({
         dayKey,
         stopSnapshot,
+        learnedTransitions,
         trips: tripRows.map((r) => ({
           codigoLinea: r.codigo_linea,
           tripKey: r.trip_key,

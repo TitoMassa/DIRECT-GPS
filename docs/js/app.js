@@ -37,7 +37,8 @@ import {
   formatLapNumber,
   formatLapSpoken,
   formatShiftLaps,
-  formatShiftLapsSpoken
+  formatShiftLapsSpoken,
+  ingestLearnedShiftTransitions
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -895,6 +896,18 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
   const mem = await api.getFleetMemory(lineCodes, stopId).catch(() => null);
   if (mem) {
     state.fleetMemory = mem;
+    if (Array.isArray(mem.learnedTransitions) && mem.learnedTransitions.length > 0) {
+      const byLine = new Map();
+      for (const tr of mem.learnedTransitions) {
+        const cod = Number(tr.codigoLinea);
+        if (!cod) continue;
+        if (!byLine.has(cod)) byLine.set(cod, []);
+        byLine.get(cod).push(tr);
+      }
+      for (const [cod, list] of byLine.entries()) {
+        ingestLearnedShiftTransitions(cod, list);
+      }
+    }
   }
   return state.fleetMemory;
 }
@@ -3969,11 +3982,17 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
   renderLineFlotaView();
 
   try {
-    const [res, schedSummary] = await Promise.all([
+    const [res, initialSchedSummary] = await Promise.all([
       api.flotaLinea(linea.codigo),
       computeLineScheduledFleetSummary(linea.codigo)
     ]);
     const data = res?.data;
+    let schedSummary = initialSchedSummary;
+    if (Array.isArray(data?.learnedTransitions) && data.learnedTransitions.length > 0) {
+      if (ingestLearnedShiftTransitions(linea.codigo, data.learnedTransitions)) {
+        schedSummary = (await computeLineScheduledFleetSummary(linea.codigo)) || schedSummary;
+      }
+    }
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     state.flotaView.data = data || { coches: [], choferes: [], retentionDays: 7, meta: {} };
     state.flotaView.schedSummary = schedSummary;

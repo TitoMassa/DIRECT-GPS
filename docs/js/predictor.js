@@ -16,6 +16,44 @@ import {
 import { getLineColor } from './config.js';
 
 const modelCacheByBranches = new WeakMap(); // branches[] -> Map<`${codLinea}:${tipoDia}`, LineScheduleModel>
+const learnedTransitionsByLine = new Map(); // `${codLinea}:${tipoDia}` -> Map<fromTripKey, { toTripKey, sameShiftCount, relevoCount }>
+let learnedTransitionsEpoch = 0;
+
+/**
+ * Ingests persistent server-learned trip-to-trip shift continuations and relevo boundaries
+ * from FleetMemory (/flota) so the schedule & turno model permanently self-corrects.
+ */
+export function ingestLearnedShiftTransitions(codLinea, transitions = []) {
+  const numCode = Number(codLinea);
+  if (!numCode || !Array.isArray(transitions) || !transitions.length) return false;
+  let changed = false;
+  for (const tr of transitions) {
+    const dayType = String(tr.dayType || tr.day_type || 'habil').trim();
+    const fromKey = String(tr.fromTripKey || tr.from_trip_key || '').trim();
+    const toKey = String(tr.toTripKey || tr.to_trip_key || '').trim();
+    const sameShiftCount = Number(tr.sameShiftCount ?? tr.same_shift_count ?? 0) || 0;
+    const relevoCount = Number(tr.relevoCount ?? tr.relevo_count ?? 0) || 0;
+    if (!fromKey || !toKey || sameShiftCount + relevoCount <= 0) continue;
+    const mapKey = `${numCode}:${dayType}`;
+    let byFrom = learnedTransitionsByLine.get(mapKey);
+    if (!byFrom) {
+      byFrom = new Map();
+      learnedTransitionsByLine.set(mapKey, byFrom);
+    }
+    const prev = byFrom.get(fromKey);
+    if (
+      !prev ||
+      prev.toTripKey !== toKey ||
+      prev.sameShiftCount !== sameShiftCount ||
+      prev.relevoCount !== relevoCount
+    ) {
+      byFrom.set(fromKey, { toTripKey: toKey, sameShiftCount, relevoCount });
+      changed = true;
+    }
+  }
+  if (changed) learnedTransitionsEpoch += 1;
+  return changed;
+}
 
 // Interprovincial 904 lines (Corrientes-Chaco) operate continuous shifts with NO horarios cortados.
 // Urban lines (102-109) regularly have horarios cortados (peak cars pulling in mid-morning / returning midday).
@@ -495,7 +533,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     byTipo = new Map();
     modelCacheByBranches.set(branches, byTipo);
   }
-  const cacheKey = `${codLinea}:${resolved.tipo}`;
+  const cacheKey = `${codLinea}:${resolved.tipo}:e${learnedTransitionsEpoch}`;
   if (byTipo.has(cacheKey)) {
     return byTipo.get(cacheKey);
   }
@@ -615,6 +653,184 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     .sort((a, c) => a.startSec - c.startSec);
 
   const tripByKey = new Map();
+  for (const trip of allTrips) {
+    tripByKey.set(trip.tripKey, trip);
+  }
+
+  const sameTerminalPair = (inBr, outBr) =>
+    terminals.some((term) => term.inBranches.includes(inBr) && term.outBranches.includes(outBr));
+
+  // 2b) Apply persistent server-learned trip-to-trip shift continuations & relevo boundaries
+  const learnedMap = learnedTransitionsByLine.get(`${numCode}:${resolved.tipo}`);
+  if (learnedMap && learnedMap.size > 0) {
+    for (const [fromKey, meta] of learnedMap.entries()) {
+      const fromTrip = tripByKey.get(fromKey);
+      const toTrip = tripByKey.get(meta.toTripKey);
+      if (!fromTrip || !toTrip || fromTrip === toTrip) continue;
+      const lay = toTrip.startSec - fromTrip.endSec;
+      if (lay < -300 || lay > 55 * 60 || !sameTerminalPair(fromTrip.branch, toTrip.branch)) continue;
+      if (fromTrip.nextTrip !== toTrip) {
+        if (fromTrip.nextTrip) fromTrip.nextTrip.prevTrip = null;
+        if (toTrip.prevTrip) toTrip.prevTrip.nextTrip = null;
+        fromTrip.nextTrip = toTrip;
+        toTrip.prevTrip = fromTrip;
+        toTrip.layoverFromPrevSec = lay;
+      }
+      toTrip.linkConfidence = 'learned';
+      if (meta.relevoCount > meta.sameShiftCount) {
+        toTrip.learnedRelevoHere = true;
+        toTrip.learnedSameShiftHere = false;
+      } else if (meta.sameShiftCount > 0) {
+        toTrip.learnedSameShiftHere = true;
+        toTrip.learnedRelevoHere = false;
+      }
+    }
+  }
+
+  // 2c) Shift-Completion Handoff & Stub Rebalancer:
+  // In the evening (18:00-23:00), vehicles that started at ~05:00/12:00 complete their ~8h (or 2x8h) shift
+  // and pull into the garage ("mete coche"), while afternoon services (entering ~15:15-17:40) that have only
+  // completed 1-3 vueltas continue onto the remaining evening departures to complete their ~8h (4-vuelta) shift.
+  if (!isInterurban && allTrips.length >= 8) {
+    const extractChains = () => {
+      const list = [];
+      for (const t of allTrips) {
+        if (t.prevTrip) continue;
+        const c = [];
+        let cur = t;
+        const v = new Set();
+        while (cur && !v.has(cur)) {
+          v.add(cur);
+          c.push(cur);
+          cur = cur.nextTrip;
+        }
+        list.push(c);
+      }
+      return list;
+    };
+
+    const initChains = extractChains();
+    const legSamples = [];
+    for (const c of initChains) {
+      const dur = c[c.length - 1].endSec - c[0].startSec;
+      if (dur >= 6.0 * 3600 && dur <= 9.4 * 3600) {
+        legSamples.push(c.length);
+      } else if (dur >= 13.5 * 3600 && dur <= 17.5 * 3600) {
+        const half = Math.round(c.length / 2);
+        legSamples.push(half, half);
+      }
+    }
+    legSamples.sort((a, b) => a - b);
+    const typicalLegs = legSamples.length ? legSamples[Math.floor(legSamples.length / 2)] : 8;
+
+    // Pass A: Reconnect afternoon stubs broken by slightly wider evening layovers (e.g. 109A 19:17 -> 19:33)
+    for (let iter = 0; iter < 4; iter++) {
+      const chains = extractChains();
+      let bestPair = null;
+      for (const c1 of chains) {
+        const s1 = c1[0].startSec;
+        const arr = c1[c1.length - 1];
+        const dur1 = arr.endSec - s1;
+        if (s1 < 13.0 * 3600 || arr.endSec < 17.5 * 3600) continue;
+        if (c1.length > typicalLegs - 2 || dur1 >= 5.5 * 3600) continue;
+        for (const c2 of chains) {
+          if (c1 === c2) continue;
+          const dep = c2[0];
+          const dur2 = c2[c2.length - 1].endSec - dep.startSec;
+          if (dep.startSec < 18.0 * 3600 || dur2 >= 6.0 * 3600) continue;
+          const lay = dep.startSec - arr.endSec;
+          if (lay < -120 || lay > 42 * 60) continue;
+          if (!sameTerminalPair(arr.branch, dep.branch)) continue;
+          const mergedLegs = c1.length + c2.length;
+          const mergedDur = c2[c2.length - 1].endSec - s1;
+          if (mergedLegs > typicalLegs + 1 || mergedDur > 9.1 * 3600) continue;
+          const score = Math.abs(mergedLegs - typicalLegs) * 600 + Math.abs(lay);
+          if (!bestPair || score < bestPair.score) {
+            bestPair = { arr, dep, lay, score };
+          }
+        }
+      }
+      if (!bestPair) break;
+      bestPair.arr.nextTrip = bestPair.dep;
+      bestPair.dep.prevTrip = bestPair.arr;
+      bestPair.dep.layoverFromPrevSec = bestPair.lay;
+      bestPair.dep.linkConfidence = 'rebalanced';
+    }
+
+    // Pass B: Transfer evening post-shift tails from already-finished ~8h/16h blocks to mid-shift afternoon blocks
+    for (let iter = 0; iter < 6; iter++) {
+      const chains = extractChains();
+      let bestSwap = null;
+      for (const B of chains) {
+        const sB = B[0].startSec;
+        const arrB = B[B.length - 1];
+        const durB = arrB.endSec - sB;
+        if (arrB.endSec < 17.5 * 3600 || arrB.endSec > 23.0 * 3600) continue;
+
+        let targetLegsB = 0;
+        let maxDurB = 0;
+        if (sB >= 13.0 * 3600 && B.length <= typicalLegs - 2 && durB < 6.2 * 3600) {
+          targetLegsB = typicalLegs;
+          maxDurB = 9.1 * 3600;
+        } else if (
+          sB < 9.5 * 3600 &&
+          B.length >= typicalLegs + 2 &&
+          B.length <= 2 * typicalLegs - 2 &&
+          durB < 15.2 * 3600
+        ) {
+          targetLegsB = 2 * typicalLegs;
+          maxDurB = 17.2 * 3600;
+        } else {
+          continue;
+        }
+
+        for (const A of chains) {
+          if (A === B) continue;
+          const sA = A[0].startSec;
+          const durA = A[A.length - 1].endSec - sA;
+          const isSingleShiftA = sA >= 10.0 * 3600;
+          const targetLegsA = isSingleShiftA ? typicalLegs : 2 * typicalLegs;
+          const minHeadDurA = isSingleShiftA ? 6.5 * 3600 : 14.0 * 3600;
+          const maxHeadDurA = isSingleShiftA ? 9.6 * 3600 : 17.2 * 3600;
+          if (A.length <= targetLegsA && durA <= maxHeadDurA) continue;
+
+          for (let k = 2; k < A.length; k++) {
+            const arrA = A[k - 1];
+            const depNext = A[k];
+            if (depNext.linkConfidence === 'learned') continue;
+            if (depNext.startSec < 18.0 * 3600) continue;
+            const layB = depNext.startSec - arrB.endSec;
+            if (layB < -240 || layB > 42 * 60) continue;
+            if (!sameTerminalPair(arrB.branch, depNext.branch)) continue;
+
+            const headDurA = arrA.endSec - sA;
+            if (Math.abs(k - targetLegsA) > 1 || headDurA < minHeadDurA || headDurA > maxHeadDurA) continue;
+
+            const tailLegs = A.length - k;
+            const newLegsB = B.length + tailLegs;
+            const newDurB = A[A.length - 1].endSec - sB;
+            if (newLegsB > targetLegsB + 1 || newDurB > maxDurB) continue;
+
+            const beforeErr = Math.abs(A.length - targetLegsA) + Math.abs(B.length - targetLegsB);
+            const afterErr = Math.abs(k - targetLegsA) + Math.abs(newLegsB - targetLegsB);
+            if (afterErr >= beforeErr) continue;
+
+            const gain = (beforeErr - afterErr) * 1200 - Math.abs(layB);
+            if (!bestSwap || gain > bestSwap.gain) {
+              bestSwap = { arrA, arrB, depNext, layB, gain };
+            }
+          }
+        }
+      }
+      if (!bestSwap) break;
+      bestSwap.arrA.nextTrip = null;
+      bestSwap.arrB.nextTrip = bestSwap.depNext;
+      bestSwap.depNext.prevTrip = bestSwap.arrB;
+      bestSwap.depNext.layoverFromPrevSec = bestSwap.layB;
+      bestSwap.depNext.linkConfidence = 'rebalanced';
+    }
+  }
+
   const rawBlocks = [];
   for (const trip of allTrips) {
     tripByKey.set(trip.tripKey, trip);
@@ -900,51 +1116,64 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     }
   }
 
-  // 3d) Split continuous multi-driver "relevo en línea" runs (> 10.2h) into ~8h driver shifts
+  // 3d) Split continuous multi-driver "relevo en línea" runs (> 10.6h) into ~8h driver shifts
   // so lap numbering ALWAYS resets to Vuelta 1 at every shift change (preserving trip.prevTrip/nextTrip
   // for seamless physical bus tracking across the relevo).
-  const singleShiftDurs = blockMeta
-    .filter((b) => b.durSec >= 6.0 * 3600 && b.durSec <= 9.8 * 3600)
-    .map((b) => b.durSec)
-    .sort((a, b) => a - b);
-  const singleShiftLegsList = blockMeta
-    .filter((b) => b.durSec >= 6.0 * 3600 && b.durSec <= 9.8 * 3600)
-    .map((b) => b.trips.length)
-    .sort((a, b) => a - b);
+  const singleShiftDurs = [];
+  const singleShiftLegsList = [];
+  for (const b of blockMeta) {
+    if (b.durSec >= 6.0 * 3600 && b.durSec <= 9.8 * 3600) {
+      singleShiftDurs.push(b.durSec);
+      singleShiftLegsList.push(b.trips.length);
+    } else if (b.durSec >= 13.5 * 3600 && b.durSec <= 17.5 * 3600) {
+      singleShiftDurs.push(b.durSec * 0.5, b.durSec * 0.5);
+      const halfLegs = Math.round(b.trips.length / 2);
+      singleShiftLegsList.push(halfLegs, halfLegs);
+    }
+  }
+  singleShiftDurs.sort((a, b) => a - b);
+  singleShiftLegsList.sort((a, b) => a - b);
   const typicalShiftSec = singleShiftDurs.length
     ? Math.max(7.0 * 3600, Math.min(8.4 * 3600, singleShiftDurs[Math.floor(singleShiftDurs.length / 2)]))
     : 8.0 * 3600;
   const typicalShiftLegs = singleShiftLegsList.length
     ? singleShiftLegsList[Math.floor(singleShiftLegsList.length / 2)]
     : null;
+  const isWholeLapLine = !typicalShiftLegs || typicalShiftLegs % 2 === 0;
 
   const splitContinuousShift = (p) => {
     const out = [];
     let curTrips = p.trips;
     const isPeak = peakServiceBms.has(p);
 
-    while (curTrips.length >= 4) {
+    while (curTrips.length >= 6) {
       const s0 = curTrips[0].startSec;
       const eLast = curTrips[curTrips.length - 1].endSec;
       const remDur = eLast - s0;
-      if (remDur <= 10.2 * 3600) break;
+      const hasLearnedRelevo = curTrips.slice(2, curTrips.length - 1).some((t) => t.learnedRelevoHere);
+      if (!hasLearnedRelevo && remDur <= 10.6 * 3600) break;
 
-      const targetDur =
-        remDur <= 17.2 * 3600
-          ? Math.min(typicalShiftSec, Math.max(7.2 * 3600, remDur * 0.5))
-          : typicalShiftSec;
-      const minRightLegs = curTrips.length >= 4 ? 2 : 1;
+      const targetDur = typicalShiftSec;
+      const minRightLegs = curTrips.length >= 8 ? 4 : 2;
       let bestIdx = -1;
       let bestScore = Infinity;
 
       for (let i = 2; i <= curTrips.length - minRightLegs; i++) {
+        const nextTrip = curTrips[i];
+        if (nextTrip.learnedSameShiftHere) continue;
         const t1End = curTrips[i - 1].endSec;
-        const t2Start = curTrips[i].startSec;
+        const t2Start = nextTrip.startSec;
         const t1Dur = t1End - s0;
-        if (t1Dur < 5.0 * 3600 || t1Dur > 10.0 * 3600) continue;
+        const t2Dur = eLast - t2Start;
+        if (!nextTrip.learnedRelevoHere) {
+          if (t1Dur < 5.0 * 3600 || t1Dur > 10.0 * 3600) continue;
+          if (t2Dur < 4.4 * 3600) continue;
+        }
         const midElapsed = (t1End + t2Start) * 0.5 - s0;
         let score = Math.abs(midElapsed - targetDur);
-        if (typicalShiftLegs && i === typicalShiftLegs) score -= 900;
+        if (nextTrip.learnedRelevoHere) score -= 50000;
+        if (typicalShiftLegs && i === typicalShiftLegs) score -= 2200;
+        if (isWholeLapLine && nextTrip.branch === curTrips[0].branch) score -= 1400;
         if (remDur <= 17.2 * 3600 && i === Math.floor(curTrips.length / 2)) score -= 300;
         if (score < bestScore) {
           bestScore = score;
