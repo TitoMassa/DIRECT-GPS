@@ -564,7 +564,11 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     }
   }
 
-  // Step 3: Materialize continuous vehicle blocks & order morning services by first full active rotation!
+  // Step 3: Materialize continuous duty blocks & assign canonical physical service numbers (1..N).
+  // A service (e.g. Servicio 1 on 106B) keeps its SAME number all day across:
+  //  - ~8h full shifts + "relevo en línea" (~14-19h continuous duty),
+  //  - "horarios cortados" (morning peak block pulling in + midday/afternoon return),
+  //  - "mete coche" breaks (morning 8h shift + afternoon/evening 2nd shift).
   const allTrips = branches
     .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
     .sort((a, c) => a.startSec - c.startSec);
@@ -587,75 +591,358 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     rawBlocks.push(block);
   }
 
-  // Real-world Corrientes service numbering: once all active morning services are running,
-  // departures starting from the first car's 2nd lap follow exact numeric order (Servicio 1, 2, 3, ...).
   const firstTrip = allTrips[0] || null;
   const primaryBranch = firstTrip?.branch || branches[0] || null;
   const primaryTrips = primaryBranch ? branchTrips.get(getBranchKey(primaryBranch)) || [] : [];
-  const firstBlock = firstTrip?.block || null;
-  const firstBlockLap2 = firstBlock ? firstBlock.filter((t) => t.branch === primaryBranch)[1] || null : null;
 
-  const orderedBlocks = [];
-  const peakServiceBlocks = new Set();
-  const seenBlocks = new Set();
-  if (firstBlockLap2) {
-    const lap2Idx = primaryTrips.indexOf(firstBlockLap2);
-    for (let k = lap2Idx; k < primaryTrips.length; k++) {
-      const blk = primaryTrips[k].block;
-      if (!blk || seenBlocks.has(blk)) break;
-      seenBlocks.add(blk);
-      peakServiceBlocks.add(blk);
-      orderedBlocks.push(blk);
-    }
-  }
-  for (const blk of rawBlocks) {
-    if (!seenBlocks.has(blk)) {
-      seenBlocks.add(blk);
-      orderedBlocks.push(blk);
-    }
-  }
+  const cyclicDist = (a, b, n) => (((b - a) % n) + n) % n;
+  const isStrictlyBetweenCyc = (prevS, cand, nextS, n) => {
+    if (prevS === nextS) return cand !== prevS;
+    const dPN = cyclicDist(prevS, nextS, n);
+    const dPC = cyclicDist(prevS, cand, n);
+    return dPC > 0 && dPC < dPN;
+  };
 
-  const blockInfos = [];
-  const blockInfoById = new Map();
-
-  orderedBlocks.forEach((blk, idx) => {
-    const serviceNumber = idx + 1;
-    const blockId = `blk:${numCode}:${resolved.tipo}:${serviceNumber}`;
-    const startSec = blk[0]?.startSec ?? 0;
-    const endSec = blk[blk.length - 1]?.endSec ?? 0;
-    const isPeakService = peakServiceBlocks.has(blk);
-    const durationSec = Math.max(0, endSec - startSec);
-    // Urban horarios cortados: short split/refuerzo blocks (< 5.5h, e.g. 05:00-08:30 peak)
-    // vs full ~8h shift or ~16h all-day continuous rotations. Interprovincial 904 NEVER has cortados.
-    const isCortado = !isInterprovincial && durationSec < 5.5 * 3600;
-
-    const branchLapCounts = new Map();
-    const info = {
-      blockId,
-      serviceNumber,
-      isPeakService,
-      isCortado,
-      isInterprovincial,
+  const blockMeta = rawBlocks.map((trips, idx) => {
+    const startSec = trips[0]?.startSec ?? 0;
+    const endSec = trips[trips.length - 1]?.endSec ?? 0;
+    const durSec = Math.max(0, endSec - startSec);
+    const primTrips = primaryBranch ? trips.filter((t) => t.branch === primaryBranch) : [];
+    const branchSet = new Set(trips.map((t) => t.branch));
+    return {
+      idx,
+      trips,
       startSec,
       endSec,
-      legCount: blk.length,
-      trips: blk
+      durSec,
+      isCortado: !isInterprovincial && durSec < 5.5 * 3600,
+      isRelevoEnLinea: durSec >= 11 * 3600,
+      primTrips,
+      branchSet,
+      firstPrimStart: primTrips.length ? primTrips[0].startSec : startSec
     };
+  });
 
-    for (const t of blk) {
-      const bk = getBranchKey(t.branch);
-      const lap = (branchLapCounts.get(bk) || 0) + 1;
-      branchLapCounts.set(bk, lap);
-      t.blockId = blockId;
-      t.serviceNumber = serviceNumber;
-      t.lapNumber = lap;
-      t.isCortadoBlock = isCortado;
-      t.blockInfo = info;
+  // 3a) Compute exact peak simultaneous active vehicles across the day (3-min edge trim avoids double-counting handoffs)
+  const sweepEvents = [];
+  for (const bm of blockMeta) {
+    const s = bm.startSec;
+    const e = Math.max(s + 60, bm.endSec - 180);
+    sweepEvents.push([s, 1, bm]);
+    sweepEvents.push([e, -1, bm]);
+  }
+  sweepEvents.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const curActive = new Set();
+  let peakCount = 0;
+  let peakTime = 0;
+  let peakSnapshot = [];
+  for (const [t, delta, bm] of sweepEvents) {
+    if (delta === 1) curActive.add(bm);
+    else curActive.delete(bm);
+    if (curActive.size > peakCount) {
+      peakCount = curActive.size;
+      peakTime = t;
+      peakSnapshot = [...curActive];
+    }
+  }
+
+  // Compute midday valley floor (09:30–11:30, when urban horarios cortados are off the road)
+  let middayValleyCount = peakCount;
+  for (let t = 9.5 * 3600; t <= 11.5 * 3600; t += 300) {
+    let active = 0;
+    for (const bm of blockMeta) {
+      if (bm.startSec <= t && bm.endSec >= t) active++;
+    }
+    if (active > 0 && active < middayValleyCount) middayValleyCount = active;
+  }
+
+  // 3b) Canonical morning service numbering (1..N):
+  // Once all active morning services are running, departures starting from Service 1's 2nd lap
+  // follow exact numeric order (Servicio 1, 2, 3, ..., N).
+  const tripToBm = new Map();
+  for (const bm of blockMeta) {
+    for (const t of bm.trips) tripToBm.set(t, bm);
+  }
+  const firstPrimTrip = primaryTrips[0] || null;
+  const firstBm = firstPrimTrip ? tripToBm.get(firstPrimTrip) : null;
+  const firstLap2 = firstBm && firstBm.primTrips.length >= 2 ? firstBm.primTrips[1] : null;
+  const peakSet = new Set(peakSnapshot);
+
+  const morningOrdered = [];
+  const usedMorning = new Set();
+  if (firstLap2) {
+    const lap2Idx = primaryTrips.indexOf(firstLap2);
+    for (let k = lap2Idx; k < primaryTrips.length; k++) {
+      const bm = tripToBm.get(primaryTrips[k]);
+      if (!bm || usedMorning.has(bm)) break;
+      if (!peakSet.has(bm) && bm.endSec <= peakTime - 180) continue;
+      usedMorning.add(bm);
+      morningOrdered.push(bm);
+    }
+  }
+
+  const missingPeak = peakSnapshot
+    .filter((bm) => !usedMorning.has(bm))
+    .sort((a, b) => a.firstPrimStart - b.firstPrimStart);
+  for (const mp of missingPeak) {
+    if (mp.primTrips.length > 0 && morningOrdered.length > 0) {
+      const refTrip = mp.primTrips.reduce((best, t) =>
+        Math.abs(t.startSec - peakTime) < Math.abs(best.startSec - peakTime) ? t : best
+      );
+      const rIdx = primaryTrips.indexOf(refTrip);
+      let prevKnown = null;
+      for (let k = rIdx - 1; k >= 0; k--) {
+        const b = tripToBm.get(primaryTrips[k]);
+        if (b && usedMorning.has(b)) {
+          prevKnown = b;
+          break;
+        }
+      }
+      if (prevKnown) {
+        morningOrdered.splice(morningOrdered.indexOf(prevKnown) + 1, 0, mp);
+      } else {
+        morningOrdered.push(mp);
+      }
+    } else {
+      morningOrdered.push(mp);
+    }
+    usedMorning.add(mp);
+  }
+
+  if (morningOrdered.length === 0 && blockMeta.length > 0) {
+    morningOrdered.push(...peakSnapshot.sort((a, b) => a.startSec - b.startSec));
+  }
+
+  let totalServices = Math.max(1, morningOrdered.length);
+  const assignedServiceByBm = new Map();
+  const serviceBlocksMap = new Map(); // serviceNumber -> bm[]
+  const peakServiceBms = new Set(morningOrdered);
+  morningOrdered.forEach((bm, i) => {
+    const s = i + 1;
+    assignedServiceByBm.set(bm, s);
+    serviceBlocksMap.set(s, [bm]);
+  });
+
+  // 3c) Assign every subsequent block (cortado returns, 2nd 8h shifts, evening turns) back to its
+  // TRUE canonical service number (1..N) via Most-Constrained-First cyclic neighbor alignment!
+  const overlapsService = (bm, s) =>
+    (serviceBlocksMap.get(s) || []).some(
+      (ex) => bm.startSec < ex.endSec - 180 && ex.startSec < bm.endSec - 180
+    );
+
+  const getAdjacentBlocks = (bm, s) => {
+    const list = serviceBlocksMap.get(s) || [];
+    let prev = null;
+    let next = null;
+    for (const ex of list) {
+      if (ex.endSec <= bm.startSec + 180 && (!prev || ex.endSec > prev.endSec)) prev = ex;
+      if (ex.startSec >= bm.endSec - 180 && (!next || ex.startSec < next.startSec)) next = ex;
+    }
+    return { prev, next };
+  };
+
+  const scoreServiceCandidate = (bm, s) => {
+    let matches = 0;
+    let violations = 0;
+    let observations = 0;
+    let arcFracSum = 0;
+
+    for (const t of bm.trips) {
+      const list = branchTrips.get(getBranchKey(t.branch)) || [];
+      const pos = list.indexOf(t);
+      if (pos < 0) continue;
+
+      let prevS = null;
+      let nextS = null;
+      let prevDt = Infinity;
+      let nextDt = Infinity;
+      for (let k = pos - 1; k >= 0; k--) {
+        const dt = t.startSec - list[k].startSec;
+        if (dt > 110 * 60) break;
+        const b = tripToBm.get(list[k]);
+        if (b && assignedServiceByBm.has(b)) {
+          prevS = assignedServiceByBm.get(b);
+          prevDt = dt;
+          break;
+        }
+      }
+      for (let k = pos + 1; k < list.length; k++) {
+        const dt = list[k].startSec - t.startSec;
+        if (dt > 110 * 60) break;
+        const b = tripToBm.get(list[k]);
+        if (b && assignedServiceByBm.has(b)) {
+          nextS = assignedServiceByBm.get(b);
+          nextDt = dt;
+          break;
+        }
+      }
+
+      if (prevS !== null && nextS !== null) {
+        const w = t.branch === primaryBranch ? 2 : 1;
+        observations += w;
+        if (isStrictlyBetweenCyc(prevS, s, nextS, totalServices)) {
+          matches += w;
+          const dPN = cyclicDist(prevS, nextS, totalServices) || totalServices;
+          const dPC = cyclicDist(prevS, s, totalServices);
+          const slotFrac = dPC / dPN;
+          const timeFrac = prevDt / Math.max(1, prevDt + nextDt);
+          arcFracSum += w * Math.abs(slotFrac - timeFrac);
+        } else {
+          violations += w;
+        }
+      }
     }
 
-    blockInfos.push(info);
-    blockInfoById.set(blockId, info);
-  });
+    const avgArcFrac = matches > 0 ? arcFracSum / matches : 0.5;
+    const { prev: prevBlk, next: nextBlk } = getAdjacentBlocks(bm, s);
+    let contBonus = 0;
+    const refBlk = prevBlk || nextBlk;
+    if (refBlk) {
+      const sharesBranch = [...bm.branchSet].some((br) => refBlk.branchSet.has(br));
+      if (sharesBranch) contBonus += 4.0;
+    }
+    if (prevBlk) {
+      const gapH = (bm.startSec - prevBlk.endSec) / 3600;
+      if (gapH >= 0.3 && gapH <= 5.5) contBonus += 2.0;
+      const startH = bm.startSec / 3600;
+      if (startH >= 10.5 && startH <= 14.2 && prevBlk.isCortado) contBonus += 2.5;
+      if (startH >= 14.5 && startH <= 18.5 && !prevBlk.isCortado) contBonus += 2.0;
+      contBonus -= Math.abs(gapH - 3.0) * 0.15;
+    }
+
+    return {
+      s,
+      matches,
+      violations,
+      observations,
+      score: matches * 10 - violations * 40 - avgArcFrac * 3 + contBonus
+    };
+  };
+
+  const remainingBms = blockMeta
+    .filter((bm) => !assignedServiceByBm.has(bm))
+    .sort((a, b) => a.startSec - b.startSec);
+
+  while (remainingBms.length > 0) {
+    let bestPick = null;
+    for (let i = 0; i < remainingBms.length; i++) {
+      const bm = remainingBms[i];
+      const free = [];
+      for (let s = 1; s <= totalServices; s++) {
+        if (!overlapsService(bm, s)) free.push(s);
+      }
+      if (!free.length) continue;
+
+      const evals = free.map((s) => scoreServiceCandidate(bm, s)).sort((a, b) => b.score - a.score);
+      const perfect = evals.filter((e) => e.observations > 0 && e.violations === 0 && e.matches > 0);
+      const priority =
+        perfect.length === 1
+          ? 10000 + perfect[0].matches * 100 - bm.startSec / 1000
+          : perfect.length > 1
+            ? 5000 + (evals[0].score - evals[1].score) * 10 - bm.startSec / 1000
+            : 1000 + evals[0].score - bm.startSec / 1000;
+
+      if (!bestPick || priority > bestPick.priority) {
+        bestPick = { idx: i, bm, chosen: evals[0], priority };
+      }
+    }
+
+    if (!bestPick) {
+      const bm = remainingBms.shift();
+      totalServices += 1;
+      assignedServiceByBm.set(bm, totalServices);
+      serviceBlocksMap.set(totalServices, [bm]);
+    } else {
+      remainingBms.splice(bestPick.idx, 1);
+      assignedServiceByBm.set(bestPick.bm, bestPick.chosen.s);
+      serviceBlocksMap.get(bestPick.chosen.s).push(bestPick.bm);
+    }
+  }
+
+  // 3d) Finalize blockInfo objects with true serviceNumber (1..N), turnoIndex, and sibling turnos
+  const blockInfos = [];
+  const blockInfoById = new Map();
+  const fleetServices = [];
+  let corridosCount = 0;
+  let cortadosCount = 0;
+  let relevoEnLineaCount = 0;
+
+  for (let s = 1; s <= totalServices; s++) {
+    const parts = (serviceBlocksMap.get(s) || []).sort((a, b) => a.startSec - b.startSec);
+    if (!parts.length) continue;
+
+    const firstPart = parts[0];
+    const hasRelevo = parts.some((p) => p.isRelevoEnLinea);
+    if (firstPart.isCortado) cortadosCount++;
+    else corridosCount++;
+    if (hasRelevo) relevoEnLineaCount++;
+
+    const serviceTurnos = parts.map((p, idx) => ({
+      blockId: `blk:${numCode}:${resolved.tipo}:${s}:t${idx + 1}`,
+      turnoIndex: idx + 1,
+      startSec: p.startSec,
+      endSec: p.endSec,
+      durationSec: p.durSec,
+      isCortado: p.isCortado,
+      isRelevoEnLinea: p.isRelevoEnLinea,
+      legCount: p.trips.length
+    }));
+
+    fleetServices.push({
+      serviceNumber: s,
+      isCortadoMorning: firstPart.isCortado,
+      isRelevoEnLinea: hasRelevo,
+      turnos: serviceTurnos
+    });
+
+    parts.forEach((p, idx) => {
+      const turnoIndex = idx + 1;
+      const blockId = serviceTurnos[idx].blockId;
+      const branchLapCounts = new Map();
+      const info = {
+        blockId,
+        serviceNumber: s,
+        turnoIndex,
+        serviceTurnosCount: parts.length,
+        serviceTurnos,
+        isPeakService: peakServiceBms.has(p),
+        isCortado: p.isCortado,
+        isRelevoEnLinea: p.isRelevoEnLinea,
+        isInterprovincial,
+        startSec: p.startSec,
+        endSec: p.endSec,
+        durationSec: p.durSec,
+        legCount: p.trips.length,
+        trips: p.trips
+      };
+
+      for (const t of p.trips) {
+        const bk = getBranchKey(t.branch);
+        const lap = (branchLapCounts.get(bk) || 0) + 1;
+        branchLapCounts.set(bk, lap);
+        t.blockId = blockId;
+        t.serviceNumber = s;
+        t.turnoIndex = turnoIndex;
+        t.serviceTurnosCount = parts.length;
+        t.lapNumber = lap;
+        t.isCortadoBlock = p.isCortado;
+        t.isRelevoEnLinea = p.isRelevoEnLinea;
+        t.blockInfo = info;
+      }
+
+      blockInfos.push(info);
+      blockInfoById.set(blockId, info);
+    });
+  }
+
+  const fleetSummary = {
+    totalServices: fleetServices.length,
+    corridosCount,
+    cortadosCount,
+    middayValleyCount: Math.min(fleetServices.length, middayValleyCount),
+    relevoEnLineaCount,
+    services: fleetServices
+  };
 
   const model = {
     codLinea: numCode,
@@ -668,6 +955,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     tripByKey,
     blocks: blockInfos,
     blockInfoById,
+    fleetSummary,
     getTripsForBranch: (b) => branchTrips.get(getBranchKey(b)) || []
   };
   byTipo.set(cacheKey, model);
@@ -1575,8 +1863,11 @@ export function matchLiveBusesToTrips(
       bus.scheduledTrip = bestItem.trip;
       bus.stopProj = bestItem.stopProj;
       bus.serviceNumber = bestItem.trip.serviceNumber || null;
+      bus.turnoIndex = bestItem.trip.turnoIndex || 1;
+      bus.serviceTurnosCount = bestItem.trip.serviceTurnosCount || 1;
       bus.lapNumber = bestItem.trip.lapNumber || null;
       bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
+      bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
       bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
       matches.set(bus.key, {
         trip: bestItem.trip,
@@ -2400,8 +2691,11 @@ export function predictLineBusesForStop({
       tripKey: trip.tripKey,
       scheduledTrip: trip,
       serviceNumber: trip.serviceNumber || null,
+      turnoIndex: trip.turnoIndex || 1,
+      serviceTurnosCount: trip.serviceTurnosCount || 1,
       lapNumber: trip.lapNumber || null,
       isCortadoBlock: Boolean(trip.isCortadoBlock),
+      isRelevoEnLinea: Boolean(trip.isRelevoEnLinea),
       nextLapStopTime: findNextSameBranchPassTime(trip, stopId, stopProj?.along ?? 0),
       stopProj,
       predAnchor: anchor,

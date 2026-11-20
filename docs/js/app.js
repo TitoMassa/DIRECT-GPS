@@ -31,7 +31,8 @@ import {
   detectAlreadyPassedTrips,
   predictLineBusesForStop,
   getArgentinaSecOfDay,
-  getArgentinaDayKey
+  getArgentinaDayKey,
+  formatSecHHMM
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -109,6 +110,7 @@ const state = {
     tab: 'coches', // 'coches' | 'choferes'
     scope: 'semana', // 'semana' | 'hoy'
     data: null,
+    schedSummary: null, // Cross-referenced from official timetable model for today
     loading: false,
     error: null
   },
@@ -1296,8 +1298,13 @@ function buildArrivalAriaLabel(bus) {
   if (bus.serviceNumber) {
     const srvDesc = [
       `Servicio ${bus.serviceNumber}`,
+      bus.serviceTurnosCount > 1 ? `turno ${bus.turnoIndex || 1}` : null,
       bus.lapNumber ? `vuelta ${bus.lapNumber}` : null,
-      bus.isCortadoBlock ? 'horario cortado' : null
+      bus.isCortadoBlock
+        ? 'horario cortado'
+        : bus.isRelevoEnLinea
+          ? 'servicio continuo con relevo en línea'
+          : null
     ]
       .filter(Boolean)
       .join(', ');
@@ -1343,9 +1350,15 @@ function buildArrivalTagsHtml(bus) {
   }
   if (bus.serviceNumber) {
     const srvLabel = bus.lapNumber ? `S${bus.serviceNumber}·V${bus.lapNumber}` : `S${bus.serviceNumber}`;
+    const turnoTag = bus.serviceTurnosCount > 1 ? ` · Turno ${bus.turnoIndex || 1}/${bus.serviceTurnosCount}` : '';
+    const regimeTag = bus.isCortadoBlock
+      ? 'Horario cortado'
+      : bus.isRelevoEnLinea
+        ? 'Continuo (relevo en línea)'
+        : 'Turno corrido';
     const srvTip = [
-      `Servicio ${bus.serviceNumber}${bus.lapNumber ? ` · Vuelta ${bus.lapNumber}` : ''}`,
-      bus.isCortadoBlock ? 'Horario cortado' : 'Servicio continuo',
+      `Servicio ${bus.serviceNumber}${turnoTag}${bus.lapNumber ? ` · Vuelta ${bus.lapNumber}` : ''}`,
+      regimeTag,
       bus.nextLapStopTime ? `Sig. vuelta: ${bus.nextLapStopTime}` : null
     ]
       .filter(Boolean)
@@ -1686,7 +1699,11 @@ function updateInspectorFields(bus) {
         : `Srv ${bus.serviceNumber}`;
       el.inspServicePill.title = bus.isCortadoBlock
         ? 'Rotación estimada · Horario cortado'
-        : 'Rotación estimada · Servicio continuo';
+        : bus.isRelevoEnLinea
+          ? 'Rotación estimada · Continuo (relevo en línea)'
+          : bus.serviceTurnosCount > 1
+            ? `Rotación estimada · Turno ${bus.turnoIndex || 1} de ${bus.serviceTurnosCount}`
+            : 'Rotación estimada · Turno corrido';
       el.inspServicePill.classList.remove('hidden');
     } else {
       el.inspServicePill.classList.add('hidden');
@@ -2106,8 +2123,11 @@ function reconcileWithSchedulePrediction(
         nearbyUnmatchedLive.scheduledTrip = p.scheduledTrip;
         nearbyUnmatchedLive.stopProj = p.stopProj;
         nearbyUnmatchedLive.serviceNumber = p.serviceNumber || null;
+        nearbyUnmatchedLive.turnoIndex = p.turnoIndex || 1;
+        nearbyUnmatchedLive.serviceTurnosCount = p.serviceTurnosCount || 1;
         nearbyUnmatchedLive.lapNumber = p.lapNumber || null;
         nearbyUnmatchedLive.isCortadoBlock = Boolean(p.isCortadoBlock);
+        nearbyUnmatchedLive.isRelevoEnLinea = Boolean(p.isRelevoEnLinea);
         nearbyUnmatchedLive.nextLapStopTime = p.nextLapStopTime || null;
         matchedTrips.add(p.tripKey);
         if (nearbyUnmatchedLive.identificadorCoche) {
@@ -2583,6 +2603,16 @@ function computeHorariosLiveMatch(ctx) {
   return { isTodayScheme, nowSvcMin, nextHora, slotToBus };
 }
 
+function formatFleetSummaryShort(fleetSummary) {
+  if (!fleetSummary || !fleetSummary.totalServices) return '';
+  const n = fleetSummary.totalServices;
+  const sWord = n === 1 ? 'servicio' : 'servicios';
+  if (fleetSummary.cortadosCount > 0) {
+    return `${n} ${sWord} (${fleetSummary.corridosCount} corridos · ${fleetSummary.cortadosCount} cortados)`;
+  }
+  return `${n} ${sWord} ${n === 1 ? 'continuo' : 'continuos'}`;
+}
+
 function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } = {}) {
   const banner = document.getElementById('horarios-rotation-banner');
   if (!banner) return;
@@ -2600,20 +2630,35 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
   const blockInfo = selBlockId ? model.blockInfoById?.get(selBlockId) : null;
 
   if (!selBlockId || !blockSlots || !blockInfo) {
+    const fs = model.fleetSummary;
     const regimeTag = model.isInterprovincial
       ? '<span class="rotation-tag is-continuo">Interprovincial · continuo</span>'
-      : '<span class="rotation-tag is-cortado">Urbana · horarios cortados</span>';
+      : fs && fs.cortadosCount > 0 && fs.middayValleyCount < fs.totalServices
+        ? `<span class="rotation-tag is-cortado">Valle: ${fs.middayValleyCount} en línea</span>`
+        : '<span class="rotation-tag is-continuo">Turno corrido</span>';
     banner.innerHTML = `
       <div class="rotation-banner-head">
-        <span class="rotation-hint">Tocá un horario para resaltar todas las vueltas del mismo servicio.</span>
+        <span class="rotation-hint">Tocá un horario para ver vueltas y turnos del mismo servicio.</span>
         ${regimeTag}
       </div>
     `;
     return;
   }
 
-  const tagCls = blockInfo.isCortado ? 'is-cortado' : 'is-continuo';
-  const tagText = blockInfo.isCortado ? 'Horario cortado' : 'Servicio continuo';
+  const tagCls = blockInfo.isCortado
+    ? 'is-cortado'
+    : blockInfo.isRelevoEnLinea
+      ? 'is-relevo'
+      : 'is-continuo';
+  const tagText = blockInfo.isCortado
+    ? 'Horario cortado'
+    : blockInfo.isRelevoEnLinea
+      ? 'Relevo en línea'
+      : 'Turno corrido';
+  const turnoLabel =
+    blockInfo.serviceTurnosCount > 1
+      ? `Servicio ${blockInfo.serviceNumber} · Turno ${blockInfo.turnoIndex}/${blockInfo.serviceTurnosCount}`
+      : `Servicio ${blockInfo.serviceNumber}`;
 
   const chainHtml = blockSlots
     .map((s, idx) => {
@@ -2625,6 +2670,35 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
       return `${delta}<span class="rotation-lap-chip ${isCur ? 'is-current' : ''}">${escapeHtml(s.hora)}</span>`;
     })
     .join('');
+
+  // Continuity line showing all turnos of this same service across the full service day
+  let continuityHtml = '';
+  let continuitySpoken = '';
+  const allTurnos = Array.isArray(blockInfo.serviceTurnos) ? blockInfo.serviceTurnos : [];
+  if (allTurnos.length > 1) {
+    const descParts = allTurnos.map((tr) => {
+      const span = `${formatSecHHMM(tr.startSec)}–${formatSecHHMM(tr.endSec)}`;
+      const kind = tr.isCortado ? ' cortado' : tr.isRelevoEnLinea ? ' relevo' : '';
+      const label = `T${tr.turnoIndex} ${span}${kind}`;
+      return tr.blockId === blockInfo.blockId ? `<strong>${escapeHtml(label)}</strong>` : escapeHtml(label);
+    });
+    continuityHtml = `<div class="rotation-continuity">Mismo Servicio ${blockInfo.serviceNumber}: ${descParts.join(' · ')}</div>`;
+    const otherTurnos = allTurnos.filter((tr) => tr.blockId !== blockInfo.blockId);
+    continuitySpoken =
+      ' ' +
+      otherTurnos
+        .map(
+          (tr) =>
+            `Mismo Servicio ${blockInfo.serviceNumber} ${
+              tr.turnoIndex > blockInfo.turnoIndex ? 'retoma' : 'salió antes'
+            } en turno ${tr.turnoIndex} de ${formatSecHHMM(tr.startSec)} a ${formatSecHHMM(tr.endSec)}.`
+        )
+        .join(' ');
+  } else if (blockInfo.isRelevoEnLinea) {
+    const span = `${formatSecHHMM(blockInfo.startSec)}–${formatSecHHMM(blockInfo.endSec)}`;
+    continuityHtml = `<div class="rotation-continuity">Jornada continua ${escapeHtml(span)} con relevo de chofer en línea (~8 h por turno)</div>`;
+    continuitySpoken = ` Jornada continua de ${formatSecHHMM(blockInfo.startSec)} a ${formatSecHHMM(blockInfo.endSec)} con relevo de chofer en línea.`;
+  }
 
   // Identify live bus currently serving this block TODAY (never across different days!)
   let liveBlockBus = null;
@@ -2650,17 +2724,18 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
     ? `Hoy en servicio: <strong>Coche #${escapeHtml(liveBlockBus.identificadorCoche)}</strong>${
         liveBlockBus.choferNombre ? ` · ${escapeHtml(liveBlockBus.choferNombre)}` : ''
       } (asignación diaria)`
-    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'} en esta parada · Coche y chofer varían cada día.`;
+    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'} en este turno · Coche y chofer rotan cada día.`;
 
   banner.innerHTML = `
     <div class="rotation-banner-head">
       <div class="rotation-banner-title">
-        <span>Servicio ${blockInfo.serviceNumber}</span>
+        <span>${escapeHtml(turnoLabel)}</span>
         <span class="rotation-tag ${tagCls}">${tagText}</span>
       </div>
       <button type="button" class="mini-close-btn" data-clear-rotation aria-label="Limpiar selección de servicio">✕</button>
     </div>
     <div class="rotation-laps-chain">${chainHtml}</div>
+    ${continuityHtml}
     <div class="rotation-hint">${liveNote}</div>
   `;
 
@@ -2672,9 +2747,9 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
       ? ` Hoy en servicio: coche ${liveBlockBus.identificadorCoche}.`
       : ' Coche y chofer rotan cada día.';
     announce(
-      `Servicio ${blockInfo.serviceNumber}, ${tagText}. ${blockSlots.length} ${
+      `${turnoLabel}, ${tagText}. ${blockSlots.length} ${
         blockSlots.length === 1 ? 'vuelta' : 'vueltas'
-      } en esta parada: ${spokenChain}.${spokenLive}`
+      } en esta parada: ${spokenChain}.${continuitySpoken}${spokenLive}`
     );
   }
 }
@@ -2686,10 +2761,11 @@ function buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext) {
     parts.push(`coche ${matchedBus.identificadorCoche} en servicio hoy`);
   }
   if (slotMeta?.blockInfo?.serviceNumber) {
+    const bi = slotMeta.blockInfo;
+    const turnoPart = bi.serviceTurnosCount > 1 ? `, turno ${bi.turnoIndex} de ${bi.serviceTurnosCount}` : '';
+    const kindPart = bi.isCortado ? ', horario cortado' : bi.isRelevoEnLinea ? ', relevo en línea' : '';
     parts.push(
-      `Servicio ${slotMeta.blockInfo.serviceNumber}, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}${
-        slotMeta.blockInfo.isCortado ? ', horario cortado' : ''
-      }`
+      `Servicio ${bi.serviceNumber}${turnoPart}, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}${kindPart}`
     );
   }
   return parts.join(', ');
@@ -2700,14 +2776,19 @@ function updateHorariosRotationHighlights({ speakSelection = false } = {}) {
   if (!ctx || !state.horariosOpen) return;
   const selBlockId = state.horariosSelectedBlockId;
   const selHora = state.horariosSelectedHora;
+  const selInfo = selBlockId ? ctx.model?.blockInfoById?.get(selBlockId) : null;
+  const selSrvStr = selInfo?.serviceNumber ? String(selInfo.serviceNumber) : '';
   const liveInfo = computeHorariosLiveMatch(ctx);
 
   el.horariosPanel.querySelectorAll('.hora-pill[data-hora]').forEach((pill) => {
     const bId = pill.dataset.blockId || '';
+    const srv = pill.dataset.srv || '';
     const hora = pill.dataset.hora || '';
     const inBlock = Boolean(selBlockId && bId && bId === selBlockId);
+    const inSiblingTurno = Boolean(!inBlock && selSrvStr && srv === selSrvStr);
     const isSel = inBlock && hora === selHora;
     pill.classList.toggle('is-block-active', inBlock);
+    pill.classList.toggle('is-service-sibling', inSiblingTurno);
     pill.classList.toggle('is-block-selected', isSel);
     pill.setAttribute('aria-pressed', String(isSel));
   });
@@ -2902,6 +2983,7 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
     ].filter((g) => g.items.length > 0);
 
     const freqText = data.frecuenciaMin ? `Cada ~${data.frecuenciaMin} min` : `${horarios.length} pasos`;
+    const fleetShort = formatFleetSummaryShort(model?.fleetSummary);
     const statusTag = res.archived
       ? 'Grilla completa'
       : res.cached
@@ -2924,7 +3006,7 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
     } else {
       bodyHtml = `
         <div class="horarios-meta-bar">
-          <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong> · ${escapeHtml(freqText)}</span>
+          <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong>${fleetShort ? ` · ${escapeHtml(fleetShort)}` : ''} · ${escapeHtml(freqText)}</span>
           <span class="mono-meta">${escapeHtml(statusTag)}</span>
         </div>
         <div id="horarios-rotation-banner" class="rotation-banner hidden"></div>
@@ -3456,6 +3538,43 @@ function renderLineFlotaView() {
     }
   }
 
+  const sched = fv.schedSummary;
+  let crossCardHtml = '';
+  if (sched && sched.totalServices > 0) {
+    const tipoLabel =
+      sched.tipoDia === 'domingo' ? 'Domingo' : sched.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    const schedSub =
+      sched.cortadosCount > 0
+        ? `${sched.corridosCount} corridos · ${sched.cortadosCount} cortados${
+            sched.middayValleyCount < sched.totalServices ? ` · valle ${sched.middayValleyCount}` : ''
+          }`
+        : `${sched.totalServices === 1 ? 'Turno continuo' : 'Todos corridos'}${
+            sched.relevoEnLineaCount > 0 ? ` · ${sched.relevoEnLineaCount} c/ relevo` : ''
+          }`;
+    const obsVal = `${hoyCochesCount} ${hoyCochesCount === 1 ? 'coche' : 'coches'} hoy`;
+    const obsSub = `${allCoches.length} en ${retentionDays}d · ${allChoferes.length} ${
+      allChoferes.length === 1 ? 'chofer' : 'choferes'
+    }`;
+    const srCross = `Programación ${tipoLabel}: ${sched.totalServices} ${
+      sched.totalServices === 1 ? 'servicio' : 'servicios'
+    }, ${schedSub.replace(/·/g, ',')}. Detectados en el sistema: ${obsVal}, ${allCoches.length} coches en ${retentionDays} días y ${allChoferes.length} choferes.`;
+    crossCardHtml = `
+      <div class="flota-cross-card" role="region" aria-label="Cruce de servicios programados y flota detectada">
+        <span class="sr-only">${escapeHtml(srCross)}</span>
+        <div class="flota-cross-cell" aria-hidden="true">
+          <span class="flota-cross-label">Programado · ${escapeHtml(tipoLabel)}</span>
+          <span class="flota-cross-val">${sched.totalServices} ${sched.totalServices === 1 ? 'servicio' : 'servicios'}</span>
+          <span class="flota-cross-sub">${escapeHtml(schedSub)}</span>
+        </div>
+        <div class="flota-cross-cell" aria-hidden="true">
+          <span class="flota-cross-label">Detectado · Sistema</span>
+          <span class="flota-cross-val">${escapeHtml(obsVal)}</span>
+          <span class="flota-cross-sub">${escapeHtml(obsSub)}</span>
+        </div>
+      </div>
+    `;
+  }
+
   el.lineasContent.innerHTML = `
     <div class="flota-view">
       <div class="flota-system-bar">
@@ -3473,6 +3592,8 @@ function renderLineFlotaView() {
           </svg>
         </button>
       </div>
+
+      ${crossCardHtml}
 
       <div class="flota-tabs-bar" role="tablist" aria-label="Ver coches o choferes">
         <button type="button" class="flota-tab-btn ${fv.tab === 'coches' ? 'active' : ''}" data-flota-tab="coches" role="tab" aria-selected="${fv.tab === 'coches'}" tabindex="${fv.tab === 'coches' ? '0' : '-1'}">Coches (${scopeCoches.length})</button>
@@ -3536,12 +3657,39 @@ function renderLineFlotaView() {
   });
 }
 
+async function computeLineScheduledFleetSummary(codLinea) {
+  const num = Number(codLinea);
+  if (!num) return null;
+  try {
+    let branches = state.routeBranchesCache.get(num);
+    if (!branches) {
+      const recRes = await api.recorridos(num).catch(() => null);
+      if (Array.isArray(recRes?.data) && recRes.data.length > 0) {
+        branches = parseRouteBranches(recRes.data);
+        state.routeBranchesCache.set(num, branches);
+      }
+    }
+    let horFile = state.horariosArchiveCache.get(num);
+    if (horFile === undefined) {
+      horFile = await api.horariosLineArchive(num).catch(() => null);
+      state.horariosArchiveCache.set(num, horFile || null);
+    }
+    if (!branches?.length || !horFile) return null;
+    const todayTipo = getArgentinaTodayTipo();
+    const model = buildLineScheduleModel(num, branches, horFile, todayTipo);
+    if (!model?.fleetSummary) return null;
+    return { ...model.fleetSummary, tipoDia: model.tipoDia };
+  } catch {
+    return null;
+  }
+}
+
 async function openLineFlota(linea, { force = true, announceLoad = true } = {}) {
   el.lineasFilterInput.value = '';
   const sameLine = state.drill.step === 'flota' && state.drill.linea?.codigo === linea.codigo;
   state.drill = { step: 'flota', linea, calle: null, interseccion: null, items: [] };
   if (!sameLine) {
-    state.flotaView = { tab: 'coches', scope: 'semana', data: null, loading: true, error: null };
+    state.flotaView = { tab: 'coches', scope: 'semana', data: null, schedSummary: null, loading: true, error: null };
   } else if (force) {
     state.flotaView.loading = true;
     state.flotaView.error = null;
@@ -3550,10 +3698,14 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
   renderLineFlotaView();
 
   try {
-    const res = await api.flotaLinea(linea.codigo);
+    const [res, schedSummary] = await Promise.all([
+      api.flotaLinea(linea.codigo),
+      computeLineScheduledFleetSummary(linea.codigo)
+    ]);
     const data = res?.data;
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     state.flotaView.data = data || { coches: [], choferes: [], retentionDays: 7, meta: {} };
+    state.flotaView.schedSummary = schedSummary;
     state.flotaView.loading = false;
     state.flotaView.error = null;
 
@@ -3575,8 +3727,13 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
       const cTotal = (data?.coches || []).length;
       const cHoy = (data?.coches || []).filter((c) => c.vistoHoy).length;
       const dTotal = (data?.choferes || []).length;
+      const schedHint = schedSummary?.totalServices
+        ? ` Programados hoy: ${formatFleetSummaryShort(schedSummary)}.`
+        : '';
       announce(
-        `Flota de línea ${linea.descripcion}: ${cTotal} ${cTotal === 1 ? 'coche' : 'coches'} (${cHoy} hoy) y ${dTotal} ${dTotal === 1 ? 'chofer' : 'choferes'} registrados en el sistema.`
+        `Flota de línea ${linea.descripcion}:${schedHint} En el sistema: ${cTotal} ${
+          cTotal === 1 ? 'coche' : 'coches'
+        } (${cHoy} hoy) y ${dTotal} ${dTotal === 1 ? 'chofer' : 'choferes'}.`
       );
     }
   } catch (err) {
