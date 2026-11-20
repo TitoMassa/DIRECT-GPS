@@ -680,15 +680,38 @@ export class FleetMemory {
     `);
 
     // Idempotent schema migrations for existing Durable Object instances
-    try {
-      this.sql.exec("ALTER TABLE unit_last_seen ADD COLUMN gps_trail TEXT DEFAULT ''");
-    } catch {
-      // Column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE unit_last_seen ADD COLUMN dir_bandera TEXT DEFAULT ''");
-    } catch {
-      // Column already exists
+    const migrations = [
+      "ALTER TABLE unit_last_seen ADD COLUMN gps_trail TEXT DEFAULT ''",
+      "ALTER TABLE unit_last_seen ADD COLUMN dir_bandera TEXT DEFAULT ''",
+      'ALTER TABLE fleet_cars ADD COLUMN last_lat REAL',
+      'ALTER TABLE fleet_cars ADD COLUMN last_lng REAL',
+      'ALTER TABLE fleet_cars ADD COLUMN last_desvio_sec INTEGER DEFAULT 0',
+      "ALTER TABLE fleet_cars ADD COLUMN last_desvio_raw TEXT DEFAULT ''",
+      "ALTER TABLE fleet_cars ADD COLUMN last_trip_key TEXT DEFAULT ''",
+      'ALTER TABLE fleet_cars ADD COLUMN last_service_num INTEGER DEFAULT 0',
+      'ALTER TABLE fleet_cars ADD COLUMN last_turno_idx INTEGER DEFAULT 0',
+      "ALTER TABLE fleet_cars ADD COLUMN last_turno_start TEXT DEFAULT ''",
+      "ALTER TABLE fleet_cars ADD COLUMN last_turno_end TEXT DEFAULT ''",
+      'ALTER TABLE fleet_cars ADD COLUMN last_lap_num REAL DEFAULT 0',
+      'ALTER TABLE fleet_cars ADD COLUMN last_shift_laps REAL DEFAULT 0',
+      'ALTER TABLE fleet_drivers ADD COLUMN last_lat REAL',
+      'ALTER TABLE fleet_drivers ADD COLUMN last_lng REAL',
+      'ALTER TABLE fleet_drivers ADD COLUMN last_desvio_sec INTEGER DEFAULT 0',
+      "ALTER TABLE fleet_drivers ADD COLUMN last_desvio_raw TEXT DEFAULT ''",
+      "ALTER TABLE fleet_drivers ADD COLUMN last_trip_key TEXT DEFAULT ''",
+      'ALTER TABLE fleet_drivers ADD COLUMN last_service_num INTEGER DEFAULT 0',
+      'ALTER TABLE fleet_drivers ADD COLUMN last_turno_idx INTEGER DEFAULT 0',
+      "ALTER TABLE fleet_drivers ADD COLUMN last_turno_start TEXT DEFAULT ''",
+      "ALTER TABLE fleet_drivers ADD COLUMN last_turno_end TEXT DEFAULT ''",
+      'ALTER TABLE fleet_drivers ADD COLUMN last_lap_num REAL DEFAULT 0',
+      'ALTER TABLE fleet_drivers ADD COLUMN last_shift_laps REAL DEFAULT 0'
+    ];
+    for (const stmt of migrations) {
+      try {
+        this.sql.exec(stmt);
+      } catch {
+        // Column already exists
+      }
     }
 
     // One-time backfill from existing unit_last_seen rows (last 7 days) so production rosters start populated
@@ -849,6 +872,19 @@ export class FleetMemory {
     const bandera = String(u.bandera || u.descripcionBandera || '').trim();
     const stopId = String(u.stopId || '').trim().toUpperCase();
     const esAdaptado = u.esAdaptado ? 1 : 0;
+    const rawLat = Number(u.lat ?? u.latitud);
+    const rawLng = Number(u.lng ?? u.longitud);
+    const lat = Number.isFinite(rawLat) && rawLat !== 0 ? rawLat : null;
+    const lng = Number.isFinite(rawLng) && rawLng !== 0 ? rawLng : null;
+    const desvioSec = Number.isFinite(Number(u.desvioSec)) ? Math.round(Number(u.desvioSec)) : 0;
+    const desvioRaw = String(u.desvioRaw || u.desvioHorario || '').trim();
+    const tripKey = String(u.tripKey || '').trim();
+    const serviceNum = Number(u.serviceNumber) > 0 ? Math.round(Number(u.serviceNumber)) : 0;
+    const turnoIdx = Number(u.turnoIndex) > 0 ? Math.round(Number(u.turnoIndex)) : 0;
+    const turnoStart = String(u.turnoStart || '').trim();
+    const turnoEnd = String(u.turnoEnd || '').trim();
+    const lapNum = Number(u.lapNumber) > 0 ? Number(u.lapNumber) : 0;
+    const shiftLaps = Number(u.shiftLaps) > 0 ? Number(u.shiftLaps) : 0;
 
     const driver = normalizeDriverRecord(
       u.choferNombre || '',
@@ -864,8 +900,10 @@ export class FleetMemory {
         codigo_linea, coche, descripcion_linea, es_adaptado,
         last_chofer_nombre, last_chofer_legajo, last_chofer_raw,
         last_bandera, last_gps, last_stop_id,
+        last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+        last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end, last_lap_num, last_shift_laps,
         first_seen_at, last_seen_at, last_day_key, seen_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
       ON CONFLICT(codigo_linea, coche) DO UPDATE SET
         descripcion_linea = CASE WHEN excluded.descripcion_linea != '' THEN excluded.descripcion_linea ELSE fleet_cars.descripcion_linea END,
         es_adaptado = MAX(fleet_cars.es_adaptado, excluded.es_adaptado),
@@ -875,6 +913,17 @@ export class FleetMemory {
         last_bandera = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_cars.last_bandera END,
         last_gps = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_cars.last_gps END,
         last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_cars.last_stop_id END,
+        last_lat = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_lat IS NOT NULL THEN excluded.last_lat ELSE COALESCE(fleet_cars.last_lat, excluded.last_lat) END,
+        last_lng = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_cars.last_lng, excluded.last_lng) END,
+        last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_cars.last_desvio_sec END,
+        last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_cars.last_desvio_raw END,
+        last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_cars.last_trip_key END,
+        last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_cars.last_service_num END,
+        last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_cars.last_turno_idx END,
+        last_turno_start = CASE WHEN excluded.last_turno_start != '' THEN excluded.last_turno_start ELSE fleet_cars.last_turno_start END,
+        last_turno_end = CASE WHEN excluded.last_turno_end != '' THEN excluded.last_turno_end ELSE fleet_cars.last_turno_end END,
+        last_lap_num = CASE WHEN excluded.last_lap_num > 0 THEN excluded.last_lap_num ELSE fleet_cars.last_lap_num END,
+        last_shift_laps = CASE WHEN excluded.last_shift_laps > 0 THEN excluded.last_shift_laps ELSE fleet_cars.last_shift_laps END,
         first_seen_at = MIN(fleet_cars.first_seen_at, excluded.first_seen_at),
         last_day_key = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at THEN excluded.last_day_key ELSE fleet_cars.last_day_key END,
         last_seen_at = MAX(fleet_cars.last_seen_at, excluded.last_seen_at),
@@ -889,6 +938,17 @@ export class FleetMemory {
       bandera,
       ultimaGps,
       stopId,
+      lat,
+      lng,
+      desvioSec,
+      desvioRaw,
+      tripKey,
+      serviceNum,
+      turnoIdx,
+      turnoStart,
+      turnoEnd,
+      lapNum,
+      shiftLaps,
       obsMs,
       obsMs,
       effectiveDayKey
@@ -921,8 +981,10 @@ export class FleetMemory {
         `INSERT INTO fleet_drivers (
           codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo, chofer_raw,
           last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+          last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+          last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end, last_lap_num, last_shift_laps,
           first_seen_at, last_seen_at, last_day_key, seen_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(codigo_linea, driver_key) DO UPDATE SET
           descripcion_linea = CASE WHEN excluded.descripcion_linea != '' THEN excluded.descripcion_linea ELSE fleet_drivers.descripcion_linea END,
           chofer_nombre = CASE WHEN excluded.chofer_nombre != '' AND excluded.chofer_nombre NOT LIKE 'Legajo %' THEN excluded.chofer_nombre ELSE fleet_drivers.chofer_nombre END,
@@ -933,6 +995,17 @@ export class FleetMemory {
           last_bandera = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_drivers.last_bandera END,
           last_gps = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_drivers.last_gps END,
           last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_drivers.last_stop_id END,
+          last_lat = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_lat IS NOT NULL THEN excluded.last_lat ELSE COALESCE(fleet_drivers.last_lat, excluded.last_lat) END,
+          last_lng = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_drivers.last_lng, excluded.last_lng) END,
+          last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_drivers.last_desvio_sec END,
+          last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_drivers.last_desvio_raw END,
+          last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_drivers.last_trip_key END,
+          last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_drivers.last_service_num END,
+          last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_drivers.last_turno_idx END,
+          last_turno_start = CASE WHEN excluded.last_turno_start != '' THEN excluded.last_turno_start ELSE fleet_drivers.last_turno_start END,
+          last_turno_end = CASE WHEN excluded.last_turno_end != '' THEN excluded.last_turno_end ELSE fleet_drivers.last_turno_end END,
+          last_lap_num = CASE WHEN excluded.last_lap_num > 0 THEN excluded.last_lap_num ELSE fleet_drivers.last_lap_num END,
+          last_shift_laps = CASE WHEN excluded.last_shift_laps > 0 THEN excluded.last_shift_laps ELSE fleet_drivers.last_shift_laps END,
           first_seen_at = MIN(fleet_drivers.first_seen_at, excluded.first_seen_at),
           last_day_key = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at THEN excluded.last_day_key ELSE fleet_drivers.last_day_key END,
           last_seen_at = MAX(fleet_drivers.last_seen_at, excluded.last_seen_at),
@@ -948,6 +1021,17 @@ export class FleetMemory {
         bandera,
         ultimaGps,
         stopId,
+        lat,
+        lng,
+        desvioSec,
+        desvioRaw,
+        tripKey,
+        serviceNum,
+        turnoIdx,
+        turnoStart,
+        turnoEnd,
+        lapNum,
+        shiftLaps,
         mergedFirst,
         obsMs,
         effectiveDayKey,
@@ -1475,6 +1559,9 @@ export class FleetMemory {
           `SELECT codigo_linea, coche, descripcion_linea, es_adaptado,
                   last_chofer_nombre, last_chofer_legajo, last_chofer_raw,
                   last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
                   first_seen_at, last_seen_at, last_day_key, seen_count
            FROM fleet_cars
            WHERE codigo_linea = ? AND last_seen_at >= ?
@@ -1488,6 +1575,9 @@ export class FleetMemory {
         .exec(
           `SELECT codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo, chofer_raw,
                   last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
                   first_seen_at, last_seen_at, last_day_key, seen_count
            FROM fleet_drivers
            WHERE codigo_linea = ? AND last_seen_at >= ?
@@ -1497,50 +1587,133 @@ export class FleetMemory {
         )
         .toArray();
 
+      // Join fresh unit_last_seen coordinates/tripKey/desvio so legacy rows without last_lat still map cleanly
+      const unitRows = this.sql
+        .exec(
+          `SELECT coche, day_key, trip_key, desvio_sec, desvio_raw, lat, lng, gps_trail, dir_bandera, updated_at
+           FROM unit_last_seen
+           WHERE codigo_linea = ?`,
+          codLinea
+        )
+        .toArray();
+      const unitByCoche = new Map();
+      for (const u of unitRows) unitByCoche.set(u.coche, u);
+
+      const todayTripRows = this.sql
+        .exec(
+          `SELECT trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, es_adaptado,
+                  desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+           FROM trip_assignments
+           WHERE day_key = ? AND codigo_linea = ?
+           ORDER BY updated_at DESC`,
+          todayKey,
+          codLinea
+        )
+        .toArray();
+
       const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
       const coches = carRows
-        .map((r) => ({
-          coche: r.coche,
-          esAdaptado: Boolean(r.es_adaptado),
-          vistoHoy: r.last_day_key === todayKey,
-          enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
-          lastChoferNombre: r.last_chofer_nombre || '',
-          lastChoferLegajo: r.last_chofer_legajo || '',
-          lastBandera: r.last_bandera || '',
-          lastGps: r.last_gps || '',
-          lastStopId: r.last_stop_id || '',
-          firstSeenAt: r.first_seen_at,
-          lastSeenAt: r.last_seen_at,
-          lastDayKey: r.last_day_key,
-          seenCount: r.seen_count || 1
-        }))
+        .map((r) => {
+          const u = unitByCoche.get(r.coche) || null;
+          const lat = r.last_lat ?? u?.lat ?? null;
+          const lng = r.last_lng ?? u?.lng ?? null;
+          const tripKey = r.last_trip_key || (u?.day_key === r.last_day_key ? u.trip_key : '') || '';
+          const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec || 0;
+          const desvioRaw = r.last_desvio_raw || u?.desvio_raw || '';
+          return {
+            coche: r.coche,
+            esAdaptado: Boolean(r.es_adaptado),
+            vistoHoy: r.last_day_key === todayKey,
+            enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
+            lastChoferNombre: r.last_chofer_nombre || '',
+            lastChoferLegajo: r.last_chofer_legajo || '',
+            lastBandera: r.last_bandera || '',
+            lastGps: r.last_gps || '',
+            lastStopId: r.last_stop_id || '',
+            lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+            lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+            lastDesvioSec: Number(desvioSec) || 0,
+            lastDesvioRaw: desvioRaw,
+            lastTripKey: tripKey,
+            lastServiceNum: Number(r.last_service_num) || 0,
+            lastTurnoIdx: Number(r.last_turno_idx) || 0,
+            lastTurnoStart: r.last_turno_start || '',
+            lastTurnoEnd: r.last_turno_end || '',
+            lastLapNum: Number(r.last_lap_num) || 0,
+            lastShiftLaps: Number(r.last_shift_laps) || 0,
+            dirBandera: u?.dir_bandera || '',
+            firstSeenAt: r.first_seen_at,
+            lastSeenAt: r.last_seen_at,
+            lastDayKey: r.last_day_key,
+            seenCount: r.seen_count || 1
+          };
+        })
         .sort((a, b) => {
+          if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
           if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
           if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
           return compareCocheIds(a.coche, b.coche);
         });
 
       const choferes = drvRows
-        .map((r) => ({
-          driverKey: r.driver_key,
-          choferNombre: r.chofer_nombre,
-          choferLegajo: r.chofer_legajo || '',
-          lastCoche: r.last_coche || '',
-          lastEsAdaptado: Boolean(r.last_es_adaptado),
-          vistoHoy: r.last_day_key === todayKey,
-          lastBandera: r.last_bandera || '',
-          lastGps: r.last_gps || '',
-          lastStopId: r.last_stop_id || '',
-          firstSeenAt: r.first_seen_at,
-          lastSeenAt: r.last_seen_at,
-          lastDayKey: r.last_day_key,
-          seenCount: r.seen_count || 1
-        }))
+        .map((r) => {
+          const u = r.last_coche ? unitByCoche.get(r.last_coche) : null;
+          const isSameCarFresh = Boolean(u && u.day_key === r.last_day_key && Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 45 * 60 * 1000);
+          const lat = r.last_lat ?? (isSameCarFresh ? u?.lat : null) ?? null;
+          const lng = r.last_lng ?? (isSameCarFresh ? u?.lng : null) ?? null;
+          const tripKey = r.last_trip_key || (isSameCarFresh ? u?.trip_key : '') || '';
+          const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : isSameCarFresh ? u?.desvio_sec || 0 : 0;
+          const desvioRaw = r.last_desvio_raw || (isSameCarFresh ? u?.desvio_raw : '') || '';
+          return {
+            driverKey: r.driver_key,
+            choferNombre: r.chofer_nombre,
+            choferLegajo: r.chofer_legajo || '',
+            lastCoche: r.last_coche || '',
+            lastEsAdaptado: Boolean(r.last_es_adaptado),
+            vistoHoy: r.last_day_key === todayKey,
+            enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
+            lastBandera: r.last_bandera || '',
+            lastGps: r.last_gps || '',
+            lastStopId: r.last_stop_id || '',
+            lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+            lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+            lastDesvioSec: Number(desvioSec) || 0,
+            lastDesvioRaw: desvioRaw,
+            lastTripKey: tripKey,
+            lastServiceNum: Number(r.last_service_num) || 0,
+            lastTurnoIdx: Number(r.last_turno_idx) || 0,
+            lastTurnoStart: r.last_turno_start || '',
+            lastTurnoEnd: r.last_turno_end || '',
+            lastLapNum: Number(r.last_lap_num) || 0,
+            lastShiftLaps: Number(r.last_shift_laps) || 0,
+            firstSeenAt: r.first_seen_at,
+            lastSeenAt: r.last_seen_at,
+            lastDayKey: r.last_day_key,
+            seenCount: r.seen_count || 1
+          };
+        })
         .sort((a, b) => {
+          if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
           if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
           if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
           return a.choferNombre.localeCompare(b.choferNombre, 'es');
         });
+
+      const todayTrips = todayTripRows.map((t) => ({
+        tripKey: t.trip_key,
+        turnoHora: t.turno_hora,
+        coche: t.coche,
+        choferNombre: t.chofer_nombre || '',
+        choferLegajo: t.chofer_legajo || '',
+        esAdaptado: Boolean(t.es_adaptado),
+        desvioSec: t.desvio_sec || 0,
+        desvioRaw: t.desvio_raw || '',
+        ultimaGps: t.ultima_gps || '',
+        lat: t.lat,
+        lng: t.lng,
+        stopId: t.stop_id || '',
+        updatedAt: t.updated_at
+      }));
 
       const descripcionLinea =
         carRows[0]?.descripcion_linea ||
@@ -1558,8 +1731,141 @@ export class FleetMemory {
         meta: this._getRosterMetaSummary(),
         capacity,
         learnedTransitions,
+        todayTrips,
         coches,
         choferes
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/flota-buscar') {
+      const rawQ = String(url.searchParams.get('q') || '').trim();
+      const normQ = normalizeDriverNameKey(rawQ);
+      if (normQ.length < 2) {
+        return Response.json({ dayKey: todayKey, results: [] });
+      }
+      const minTs = nowMs - ROSTER_RETENTION_MS;
+      const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+
+      const carRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, descripcion_linea, es_adaptado,
+                  last_chofer_nombre, last_chofer_legajo,
+                  last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
+                  last_seen_at, last_day_key
+           FROM fleet_cars
+           WHERE last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const drvRows = this.sql
+        .exec(
+          `SELECT codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo,
+                  last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
+                  last_seen_at, last_day_key
+           FROM fleet_drivers
+           WHERE last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const unitRows = this.sql
+        .exec('SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw FROM unit_last_seen')
+        .toArray();
+      const unitMap = new Map();
+      for (const u of unitRows) unitMap.set(`${u.codigo_linea}:${u.coche}`, u);
+
+      const matches = [];
+      for (const r of carRows) {
+        const hay = normalizeDriverNameKey(`${r.coche} ${r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || ''}`);
+        if (!hay.includes(normQ) && !String(r.coche || '').toUpperCase().includes(rawQ.toUpperCase())) continue;
+        const u = unitMap.get(`${r.codigo_linea}:${r.coche}`) || null;
+        const lat = r.last_lat ?? u?.lat ?? null;
+        const lng = r.last_lng ?? u?.lng ?? null;
+        const enLineaAhora = r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff;
+        matches.push({
+          type: 'coche',
+          codigoLinea: r.codigo_linea,
+          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          coche: r.coche,
+          choferNombre: r.last_chofer_nombre || '',
+          choferLegajo: r.last_chofer_legajo || '',
+          esAdaptado: Boolean(r.es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          enLineaAhora,
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+          lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+          lastDesvioSec: Number(r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec) || 0,
+          lastDesvioRaw: r.last_desvio_raw || u?.desvio_raw || '',
+          lastTripKey: r.last_trip_key || (u?.day_key === r.last_day_key ? u.trip_key : '') || '',
+          lastServiceNum: Number(r.last_service_num) || 0,
+          lastTurnoIdx: Number(r.last_turno_idx) || 0,
+          lastTurnoStart: r.last_turno_start || '',
+          lastTurnoEnd: r.last_turno_end || '',
+          lastLapNum: Number(r.last_lap_num) || 0,
+          lastShiftLaps: Number(r.last_shift_laps) || 0,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key
+        });
+      }
+
+      for (const r of drvRows) {
+        const hay = normalizeDriverNameKey(`${r.chofer_nombre} ${r.chofer_legajo || ''}`);
+        if (!hay.includes(normQ)) continue;
+        const u = r.last_coche ? unitMap.get(`${r.codigo_linea}:${r.last_coche}`) : null;
+        const lat = r.last_lat ?? u?.lat ?? null;
+        const lng = r.last_lng ?? u?.lng ?? null;
+        const enLineaAhora = r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff;
+        matches.push({
+          type: 'chofer',
+          driverKey: r.driver_key,
+          codigoLinea: r.codigo_linea,
+          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          coche: r.last_coche || '',
+          choferNombre: r.chofer_nombre,
+          choferLegajo: r.chofer_legajo || '',
+          esAdaptado: Boolean(r.last_es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          enLineaAhora,
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+          lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+          lastDesvioSec: Number(r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec) || 0,
+          lastDesvioRaw: r.last_desvio_raw || u?.desvio_raw || '',
+          lastTripKey: r.last_trip_key || (u?.day_key === r.last_day_key ? u.trip_key : '') || '',
+          lastServiceNum: Number(r.last_service_num) || 0,
+          lastTurnoIdx: Number(r.last_turno_idx) || 0,
+          lastTurnoStart: r.last_turno_start || '',
+          lastTurnoEnd: r.last_turno_end || '',
+          lastLapNum: Number(r.last_lap_num) || 0,
+          lastShiftLaps: Number(r.last_shift_laps) || 0,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key
+        });
+      }
+
+      matches.sort((a, b) => {
+        if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+        if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+        return (b.lastSeenAt || 0) - (a.lastSeenAt || 0);
+      });
+
+      return Response.json({
+        dayKey: todayKey,
+        results: matches.slice(0, 12)
       });
     }
 
@@ -2339,6 +2645,38 @@ export default {
           source: 'fleet-memory-mem',
           savedAt: nowMs
         });
+      }
+
+      if (pathname === '/api/flota-buscar' && request.method === 'GET') {
+        const q = String(searchParams.get('q') || '').trim();
+        if (q.length < 2) {
+          return jsonResponse({ data: { dayKey: getArgentinaDayKey(), results: [] }, source: 'fleet-memory-do', savedAt: Date.now() });
+        }
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch(`https://fleet-memory/flota-buscar?q=${encodeURIComponent(q)}`);
+            const data = await doRes.json();
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+          } catch {
+            // Fall through to in-memory fallback
+          }
+        }
+        const nowMs = Date.now();
+        const todayKey = getArgentinaDayKey(nowMs);
+        const normQ = normalizeDriverNameKey(q);
+        const results = [];
+        for (const c of fallbackRosterCars.values()) {
+          if (normalizeDriverNameKey(`${c.coche} ${c.descripcionLinea}`).includes(normQ)) {
+            results.push({ type: 'coche', ...c, choferNombre: c.lastChoferNombre, choferLegajo: c.lastChoferLegajo, vistoHoy: c.lastDayKey === todayKey, enLineaAhora: c.lastDayKey === todayKey && nowMs - c.lastSeenAt < SIMULTANEOUS_ACTIVE_WINDOW_MS });
+          }
+        }
+        for (const d of fallbackRosterDrivers.values()) {
+          if (normalizeDriverNameKey(`${d.choferNombre} ${d.choferLegajo}`).includes(normQ)) {
+            results.push({ type: 'chofer', ...d, coche: d.lastCoche, vistoHoy: d.lastDayKey === todayKey, enLineaAhora: d.lastDayKey === todayKey && nowMs - d.lastSeenAt < SIMULTANEOUS_ACTIVE_WINDOW_MS });
+          }
+        }
+        return jsonResponse({ data: { dayKey: todayKey, results: results.slice(0, 12) }, source: 'fleet-memory-mem', savedAt: nowMs });
       }
 
       if (pathname === '/api/fleet-memory' && request.method === 'GET') {

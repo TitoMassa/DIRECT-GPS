@@ -860,6 +860,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     return dPC > 0 && dPC < dPN;
   };
 
+  const isWeekend = resolved.tipo !== 'habil';
   const blockMeta = rawBlocks.map((trips, idx) => {
     const startSec = trips[0]?.startSec ?? 0;
     const endSec = trips[trips.length - 1]?.endSec ?? 0;
@@ -872,7 +873,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       startSec,
       endSec,
       durSec,
-      isCortado: !isInterprovincial && durSec < 5.5 * 3600,
+      isCortado: !isInterprovincial && !isWeekend && durSec < 5.5 * 3600,
       isRelevoEnLinea: durSec >= 11 * 3600,
       primTrips,
       branchSet,
@@ -1205,7 +1206,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       endSec: curTrips[curTrips.length - 1].endSec,
       durSec: tailDur,
       // A trailing night relief right after a relevo en línea is a continuation shift, NOT a morning cortado
-      isCortado: cameFromRelevo ? false : !isInterprovincial && tailDur < 5.5 * 3600,
+      isCortado: cameFromRelevo ? false : !isInterprovincial && !isWeekend && tailDur < 5.5 * 3600,
       isRelevoEnLinea: cameFromRelevo,
       relevoFromPrev: cameFromRelevo,
       relevoToNext: false,
@@ -3528,3 +3529,216 @@ export function predictLineBusesForStop({
 
   return predicted;
 }
+
+/**
+ * Resolves the scheduled Service, Turno (start–end time), and Vuelta for ANY fleet car or driver
+ * (live or historical) using:
+ *  1) Exact `tripKey` lookup in `model.tripByKey`,
+ *  2) Direct server-persisted service metadata (`lastServiceNum`, `lastTurnoStart`, `lastTurnoEnd`),
+ *  3) Spatial-temporal projection against `model` using `(lat, lng, bandera, ultimaGps, desvioSec)`.
+ */
+export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfDay()) {
+  if (!unit) return null;
+
+  const packTrip = (trip) => {
+    const bi = trip?.blockInfo || (trip?.blockId ? model?.blockInfoById?.get(trip.blockId) : null);
+    if (!trip || !bi) return null;
+    return {
+      trip,
+      blockInfo: bi,
+      tripKey: trip.tripKey,
+      serviceNumber: bi.serviceNumber,
+      turnoIndex: bi.turnoIndex,
+      serviceTurnosCount: bi.serviceTurnosCount,
+      lapNumber: trip.lapNumber || null,
+      shiftLaps: bi.shiftLaps || trip.shiftLaps || null,
+      isHalfLap: Boolean(trip.isHalfLap),
+      isCortado: Boolean(bi.isCortado),
+      isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+      startSec: bi.startSec,
+      endSec: bi.endSec,
+      startHHMM: formatSecHHMM(bi.startSec),
+      endHHMM: formatSecHHMM(bi.endSec)
+    };
+  };
+
+  // 1) Exact tripKey lookup
+  const tk = String(unit.tripKey || unit.lastTripKey || '').trim();
+  if (tk && model?.tripByKey?.has(tk)) {
+    const packed = packTrip(model.tripByKey.get(tk));
+    if (packed) return packed;
+  }
+
+  // 2) Spatial-temporal matching against all trips in model (works for BOTH live and historical timestamps!)
+  if (model && Array.isArray(model.branches) && model.branches.length > 0) {
+    const uLat = parseFloat(unit.lat ?? unit.lastLat ?? unit.latitud);
+    const uLng = parseFloat(unit.lng ?? unit.lastLng ?? unit.longitud);
+    const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || unit.lastGps || '').trim();
+    const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
+    const fallbackSec =
+      typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0
+        ? (() => {
+            const art = new Date(unit.lastSeenAt - 3 * 3600 * 1000);
+            return art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+          })()
+        : nowSec;
+    const uClock = toServiceSec(uClockRaw !== null ? uClockRaw : fallbackSec);
+    const parsedDesvio =
+      typeof unit.desvioSec === 'number'
+        ? { seconds: unit.desvioSec }
+        : typeof unit.lastDesvioSec === 'number'
+          ? { seconds: unit.lastDesvioSec }
+          : parseDesvioHorario(unit.desvioHorario || unit.lastDesvioRaw || '');
+    const tEff = uClock + (parsedDesvio?.seconds || 0);
+    const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
+    const hasCoords = !Number.isNaN(uLat) && !Number.isNaN(uLng) && (uLat !== 0 || uLng !== 0);
+
+    let bestTrip = null;
+    let bestScore = Infinity;
+
+    for (const b of model.branches) {
+      const trips = model.getTripsForBranch(b) || [];
+      if (!trips.length) continue;
+      let proj = null;
+      if (hasCoords) {
+        proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+        if (!proj || proj.perp > 450) continue;
+      }
+      const bNorm = normalizeBandera(b.bandera || '');
+      const banderaMatch =
+        uNormBandera && bNorm && (bNorm.includes(uNormBandera) || uNormBandera.includes(bNorm));
+      const banderaPenalty = uNormBandera && !banderaMatch ? 240 : 0;
+      const distPenalty = proj ? proj.perp * 0.45 : 0;
+
+      for (const tr of trips) {
+        if (tEff < tr.startSec - 20 * 60 || tEff > tr.endSec + 25 * 60) continue;
+        let schedSec;
+        if (proj) {
+          schedSec = getTripSecAtAlong(tr, proj.along);
+        } else {
+          schedSec = (tr.startSec + tr.endSec) * 0.5;
+        }
+        if (schedSec === null) continue;
+        const timeErr = Math.abs(tEff - schedSec);
+        if (timeErr > 28 * 60) continue;
+        const score = timeErr + banderaPenalty + distPenalty;
+        if (score < bestScore) {
+          bestScore = score;
+          bestTrip = tr;
+        }
+      }
+    }
+
+    if (bestTrip && bestScore <= 22 * 60) {
+      const packed = packTrip(bestTrip);
+      if (packed) return packed;
+    }
+  }
+
+  // 3) Fallback to server-persisted service metadata (e.g. historical driver from another dayType)
+  const sNum = Number(unit.lastServiceNum ?? unit.serviceNumber) || 0;
+  if (sNum > 0) {
+    return {
+      trip: null,
+      blockInfo: null,
+      tripKey: tk,
+      serviceNumber: sNum,
+      turnoIndex: Number(unit.lastTurnoIdx ?? unit.turnoIndex) || 1,
+      serviceTurnosCount: 0,
+      lapNumber: Number(unit.lastLapNum ?? unit.lapNumber) || null,
+      shiftLaps: Number(unit.lastShiftLaps ?? unit.shiftLaps) || null,
+      isHalfLap: false,
+      isCortado: false,
+      isRelevoEnLinea: false,
+      startSec: null,
+      endSec: null,
+      startHHMM: String(unit.lastTurnoStart || '').trim(),
+      endHHMM: String(unit.lastTurnoEnd || '').trim()
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Globally matches a set of live units of a line (no stop required!) to unique services/trips
+ * using Hungarian minimum-cost assignment so two cars never claim the same service.
+ */
+export function matchFreeFleetUnitsToModel(model, units = [], nowSec = getArgentinaSecOfDay(), gpsHistoryByUnit = null) {
+  const result = new Map(); // coche -> resolved meta
+  if (!model || !Array.isArray(units) || units.length === 0) return result;
+
+  const serviceNums = (model.fleetSummary?.services || []).map((s) => s.serviceNumber);
+  if (serviceNums.length === 0) return result;
+
+  const tripsByService = new Map();
+  for (const s of serviceNums) tripsByService.set(s, []);
+  for (const blk of model.blocks || []) {
+    const arr = tripsByService.get(blk.serviceNumber);
+    if (arr) arr.push(...blk.trips);
+  }
+
+  const validUnits = units.filter((u) => {
+    const c = String(u.coche || u.identificadorCoche || '').trim();
+    const la = parseFloat(u.lat ?? u.lastLat ?? u.latitud);
+    const ln = parseFloat(u.lng ?? u.lastLng ?? u.longitud);
+    return c && !Number.isNaN(la) && !Number.isNaN(ln) && (la !== 0 || ln !== 0);
+  });
+  if (validUnits.length === 0) return result;
+
+  const BIG = 1e6;
+  const costMatrix = [];
+  const bestTripMatrix = [];
+
+  for (const u of validUnits) {
+    const c = String(u.coche || u.identificadorCoche || '').trim();
+    const hist = gpsHistoryByUnit?.get(`${model.codLinea}:${c}`) || null;
+    const rowCosts = [];
+    const rowTrips = [];
+    for (const sNum of serviceNums) {
+      const scored = scoreCorridorPeerAgainstService(u, tripsByService.get(sNum) || [], model, nowSec, hist);
+      if (scored && scored.effScore <= 22 * 60) {
+        rowCosts.push(scored.effScore);
+        rowTrips.push(scored.trip);
+      } else {
+        rowCosts.push(BIG);
+        rowTrips.push(null);
+      }
+    }
+    costMatrix.push(rowCosts);
+    bestTripMatrix.push(rowTrips);
+  }
+
+  const assignment = solveMinCostAssignment(costMatrix);
+  for (let i = 0; i < validUnits.length; i++) {
+    const col = assignment[i];
+    const u = validUnits[i];
+    const c = String(u.coche || u.identificadorCoche || '').trim();
+    if (col >= 0 && costMatrix[i][col] < BIG && bestTripMatrix[i][col]) {
+      const trip = bestTripMatrix[i][col];
+      const bi = trip.blockInfo || model.blockInfoById?.get(trip.blockId);
+      if (bi) {
+        result.set(c, {
+          trip,
+          blockInfo: bi,
+          tripKey: trip.tripKey,
+          serviceNumber: bi.serviceNumber,
+          turnoIndex: bi.turnoIndex,
+          serviceTurnosCount: bi.serviceTurnosCount,
+          lapNumber: trip.lapNumber || null,
+          shiftLaps: bi.shiftLaps || trip.shiftLaps || null,
+          isHalfLap: Boolean(trip.isHalfLap),
+          isCortado: Boolean(bi.isCortado),
+          isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+          startSec: bi.startSec,
+          endSec: bi.endSec,
+          startHHMM: formatSecHHMM(bi.startSec),
+          endHHMM: formatSecHHMM(bi.endSec)
+        });
+      }
+    }
+  }
+
+  return result;
+}
+

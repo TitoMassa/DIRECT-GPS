@@ -1806,6 +1806,12 @@ input:focus-visible,
   flex-shrink: 0;
 }
 
+.flota-status-pill.is-live {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
 .flota-status-pill.is-today {
   background: var(--ok-soft);
   color: var(--ok);
@@ -1814,6 +1820,158 @@ input:focus-visible,
 .flota-status-pill.is-recent {
   background: var(--surface-2);
   color: var(--text-2);
+}
+
+.flota-tabs-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.flota-row-clickable {
+  padding: 0;
+  overflow: hidden;
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.flota-row-clickable:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.flota-row-btn {
+  display: block;
+  width: 100%;
+  padding: 9px 11px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.flota-row-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.flota-service-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.flota-srv-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.flota-srv-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.flota-map-cue {
+  color: var(--text-2);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.flota-srv-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.flota-srv-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.srv-turnos-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.srv-turno-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+
+.srv-turno-row.is-clickable {
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.srv-turno-row.is-clickable:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-3, var(--surface-2));
+}
+
+.srv-turno-row.is-live {
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+.srv-turno-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.srv-turno-time {
+  color: var(--text-1);
+}
+
+.srv-turno-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.srv-turno-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.srv-turno-assigned {
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.srv-turno-unassigned {
+  color: var(--text-3);
+  font-size: 11px;
 }
 
 .flota-row-sub {
