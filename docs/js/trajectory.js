@@ -581,9 +581,22 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   if (returnBranch && returnBranch !== oppositeBranch) {
     terminalPts.push(returnBranch.pts[0], returnBranch.pts[returnBranch.pts.length - 1]);
   }
-  const isAtTerminal = terminalPts.some(
-    (pt) => (distanceMeters(bus.lat, bus.lng, pt[0], pt[1]) ?? Infinity) <= 165
+  const nearTerminalPt = terminalPts.some(
+    (pt) => (distanceMeters(bus.lat, bus.lng, pt[0], pt[1]) ?? Infinity) <= 240
   );
+  const firstStopAlong = stopBranch.orderedStops?.[0]?.along ?? 0;
+  const nearStopBranchOrigin =
+    leg === 'direct' &&
+    busOnStop &&
+    busOnStop.perp <= 140 &&
+    busOnStop.along <= Math.min(340, Math.max(220, firstStopAlong + 130));
+  const nearOppBranchTerminal =
+    leg === 'previous_leg' &&
+    oppositeBranch &&
+    busOnOpp &&
+    busOnOpp.perp <= 140 &&
+    (oppositeBranch.totalLen - busOnOpp.along <= 360 || busOnOpp.along <= 220);
+  const isAtTerminal = nearTerminalPt || nearStopBranchOrigin || nearOppBranchTerminal;
 
   const mapStopsInRange = (branch, fromAlong, toAlong, offsetMeters) => {
     const out = [];

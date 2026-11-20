@@ -450,11 +450,41 @@ function evalPointsAtSec(points, tEff) {
   };
 }
 
+function isAtBranchStartTerminal(branch, projAlong, lat, lng, incomingBranch = null) {
+  if (!branch?.pts?.length) return false;
+  const firstStopAlong = branch.orderedStops?.[0]?.along ?? 0;
+  const maxStartAlong = Math.min(360, Math.max(240, firstStopAlong + 145));
+  if (projAlong <= maxStartAlong) return true;
+  const startPt = branch.pts[0];
+  if ((distanceMeters(lat, lng, startPt[0], startPt[1]) ?? Infinity) <= 250) return true;
+  const incPts = incomingBranch?.pts;
+  if (incPts?.length) {
+    const incEndPt = incPts[incPts.length - 1];
+    if ((distanceMeters(lat, lng, incEndPt[0], incEndPt[1]) ?? Infinity) <= 250) return true;
+  }
+  return false;
+}
+
+function isAtBranchEndTerminal(branch, projAlong, lat, lng, outgoingBranch = null) {
+  if (!branch?.pts?.length) return false;
+  const remToEnd = Math.max(0, (branch.totalLen ?? 0) - projAlong);
+  if (remToEnd <= 380) return true;
+  const endPt = branch.pts[branch.pts.length - 1];
+  if ((distanceMeters(lat, lng, endPt[0], endPt[1]) ?? Infinity) <= 250) return true;
+  const outStartPt = outgoingBranch?.pts?.[0];
+  if (outStartPt && (distanceMeters(lat, lng, outStartPt[0], outStartPt[1]) ?? Infinity) <= 250) return true;
+  return false;
+}
+
 /**
  * Builds a spatial-temporal GPS anchor for `trip` from a last-known GPS fix `(lat, lng, clockSec)`.
  * Evaluates up to 3 legs along the vehicle block (`trip`, `prevTrip`, and `prevTrip.prevTrip` / full_cycle)
  * choosing the leg whose scheduled time at the GPS projection best matches `clockSec + fallbackDesvioSec`.
- * Guarantees 0 m jump on GPS loss and preserves accumulated delay/advance with gradual recovery!
+ *
+ * Enforces the physical punta de línea (cabecera) departure rule:
+ *  - If a bus is at a cabecera ahead of schedule (before `trip.startSec` / `prevTrip.startSec`, or with positive
+ *    advance at the terminal), it is marked `atOriginTerminal` / `atPrevOriginTerminal` with `initialOffsetSec = 0`
+ *    so it waits quietly at the cabecera until its scheduled departure time and departs punctually on time!
  */
 export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSec = 0) {
   if (!trip || typeof lat !== 'number' || typeof lng !== 'number' || Number.isNaN(lat) || Number.isNaN(lng)) {
@@ -489,10 +519,54 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
     // Sanity guard: ignore anchor if > 60 min off schedule (stale/different cycle)
     if (Math.abs(rawOffset) > 60 * 60) continue;
 
-    // Score against known desvioSec so buses near turnarounds (shared streets) lock to the exact real leg!
-    let desvioErr = Math.abs(rawOffset - (fallbackDesvioSec || 0));
-    if (desvioErr > 43200) desvioErr = 86400 - desvioErr;
-    const score = desvioErr + cand.depth * 25;
+    // Check if the bus is parked/staging at `trip`'s origin cabecera (start of `trip` or arrival end of `prevTrip`)
+    const atTripOriginCabecera =
+      (cand.depth === 0 && isAtBranchStartTerminal(trip.branch, proj.along, lat, lng, trip.prevTrip?.branch)) ||
+      (cand.depth === 1 && isAtBranchEndTerminal(cand.t.branch, proj.along, lat, lng, trip.branch));
+
+    let adjClockTrip = clockSec;
+    if (trip.startSec > 86400 && adjClockTrip < 6 * 3600) adjClockTrip += 86400;
+    const tripDepRefSec = cand.depth === 0 ? Math.max(trip.startSec, schedSecAtAnchor) : trip.startSec;
+    const waitingAtTripOrigin =
+      atTripOriginCabecera &&
+      (adjClockTrip <= tripDepRefSec + 20 ||
+        (cand.depth === 0 && rawOffset > 0) ||
+        (fallbackDesvioSec > 0 && adjClockTrip <= tripDepRefSec + 240));
+
+    // Check if the bus is parked/staging at `prevTrip`'s origin cabecera (start of `prevTrip` or arrival end of `prev.prevTrip`)
+    const prevTrip = trip.prevTrip;
+    const atPrevOriginCabecera =
+      Boolean(prevTrip) &&
+      !waitingAtTripOrigin &&
+      ((cand.depth === 1 && isAtBranchStartTerminal(prevTrip.branch, proj.along, lat, lng, prevTrip.prevTrip?.branch)) ||
+        (cand.depth === 2 && isAtBranchEndTerminal(cand.t.branch, proj.along, lat, lng, prevTrip.branch)));
+
+    let waitingAtPrevOrigin = false;
+    if (atPrevOriginCabecera && prevTrip) {
+      let adjClockPrev = clockSec;
+      if (prevTrip.startSec > 86400 && adjClockPrev < 6 * 3600) adjClockPrev += 86400;
+      const prevDepRefSec = cand.depth === 1 ? Math.max(prevTrip.startSec, schedSecAtAnchor) : prevTrip.startSec;
+      waitingAtPrevOrigin =
+        adjClockPrev <= prevDepRefSec + 20 ||
+        (cand.depth === 1 && rawOffset > 0) ||
+        (fallbackDesvioSec > 0 && adjClockPrev <= prevDepRefSec + 240);
+    }
+
+    let score;
+    let initialOffsetSec = rawOffset;
+    if (waitingAtTripOrigin) {
+      // Waiting at `trip` origin punta de línea ahead of departure: lock to closest terminal polyline and reset offset to 0 (punctual departure!)
+      initialOffsetSec = 0;
+      score = proj.perp + cand.depth * 18;
+    } else if (waitingAtPrevOrigin) {
+      initialOffsetSec = 0;
+      score = proj.perp + (cand.depth - 1) * 18 + 30;
+    } else {
+      // Score against known desvioSec so buses near turnarounds (shared streets) lock to the exact real leg!
+      let desvioErr = Math.abs(rawOffset - (fallbackDesvioSec || 0));
+      if (desvioErr > 43200) desvioErr = 86400 - desvioErr;
+      score = desvioErr + cand.depth * 25;
+    }
 
     if (score < bestScore) {
       bestScore = score;
@@ -502,7 +576,14 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
         legDepth: cand.depth,
         along: proj.along,
         clockSec: adjClock,
-        initialOffsetSec: rawOffset
+        initialOffsetSec,
+        atOriginTerminal: waitingAtTripOrigin,
+        atPrevOriginTerminal: waitingAtPrevOrigin,
+        terminalWaitUntilSec: waitingAtTripOrigin
+          ? trip.startSec
+          : waitingAtPrevOrigin && prevTrip
+            ? prevTrip.startSec
+            : null
       };
     }
   }
@@ -513,8 +594,13 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
 /**
  * Evaluates the exact real-time state of a scheduled trip approaching `stopProj` on `trip.branch`
  * across up to 3 vehicle-block legs (`trip`, `prevTrip`, and `prevTrip.prevTrip` / `full_cycle`).
- * When `anchor` is supplied (from live GPS loss or FleetMemory), the bus starts RIGHT FROM its last
- * GPS position and gradually recovers its delay/advance instead of jumping magically to on-time!
+ *
+ * Enforces physical cabecera rules:
+ *  - When a bus is at a punta de línea ahead of schedule (`anchor.atOriginTerminal` or after arriving early
+ *    from `prevTrip`), it waits quietly at the cabecera (`speedMps = 0, isAtTerminal = true`) until the
+ *    scheduled departure time (`effNow >= trip.startSec`) and then departs punctually (`effectiveOffsetSec = 0`),
+ *    neither early nor late!
+ *  - When a bus is mid-route or late, it starts right from its last GPS position and gradually recovers delay.
  */
 export function evaluateTripState(
   trip,
@@ -536,28 +622,187 @@ export function evaluateTripState(
   // Only reject as already-passed if anchored directly on THIS trip (`legDepth === 0`) past `stopProj.along`!
   // Never reject a `legDepth === 2` (`full_cycle`) bus finishing the previous lap!
   const isAnchorOnThisLeg = anchor && (anchor.legDepth === 0 || (anchor.legDepth === undefined && anchor.isStopBranch));
-  if (isAnchorOnThisLeg && anchor.along > stopProj.along + 60) {
+  if (isAnchorOnThisLeg && !anchor.atOriginTerminal && anchor.along > stopProj.along + 60) {
     return null;
   }
 
-  let effectiveOffsetSec = desvioSec || 0;
-  if (anchor && Number.isFinite(anchor.clockSec) && Number.isFinite(anchor.initialOffsetSec)) {
-    const elapsedSec = Math.max(0, effNow - anchor.clockSec);
-    effectiveOffsetSec = computeGradualOffsetSec(anchor.initialOffsetSec, elapsedSec);
+  const stopBranch = trip.branch;
+
+  // ── Case 0: Bus was last seen parked/waiting at `trip`'s origin punta de línea ahead of `trip.startSec` ──
+  // Must stay completely stationary at its exact cabecera spot until `effNow >= trip.startSec`,
+  // and then depart punctually on time (`effectiveOffsetSec = 0`: neither early nor late)!
+  if (anchor?.atOriginTerminal) {
+    const etaSec = targetStopSec - effNow; // effectiveOffsetSec === 0 (punctual departure at trip.startSec)
+    if (etaSec < -45 || etaSec > maxAheadSec) return null;
+
+    const termBranch = anchor.branch || stopBranch;
+    const termAlong = Number.isFinite(anchor.along) ? anchor.along : 0;
+    const inOpp = termBranch !== stopBranch;
+    const oppRem = inOpp ? Math.max(0, termBranch.totalLen - termAlong) : 0;
+
+    if (effNow < trip.startSec) {
+      const sample = sampleBranchAtAlong(termBranch, termAlong) || sampleBranchAtAlong(stopBranch, 0);
+      if (!sample) return null;
+      const remainingMeters = inOpp ? oppRem + stopProj.along : Math.max(0, stopProj.along - termAlong);
+      return {
+        activeBranch: termBranch,
+        activeAlong: termAlong,
+        viaBranch: null,
+        legDepth: inOpp ? 1 : 0,
+        lat: sample.lat,
+        lng: sample.lng,
+        remainingMeters,
+        etaSec: Math.max(0, etaSec),
+        speedMps: 0,
+        isAtTerminal: true,
+        inOppositeLeg: inOpp,
+        inNextCycle: false,
+        realBandera: termBranch.bandera,
+        realBanderaColor: termBranch.color,
+        effectiveOffsetSec: 0,
+        targetStopSec
+      };
+    }
+
+    // `effNow >= trip.startSec`: depart punctually right at `trip.startSec` from the exact anchored cabecera spot (0.00 m jump!)
+    const ev = evalPointsAtSec(trip.points, Math.min(effNow, targetStopSec));
+    const u = stopProj.along > 1 ? Math.max(0, Math.min(1, ev.along / stopProj.along)) : 1;
+
+    if (inOpp && oppRem > 1) {
+      const totalDist = oppRem + stopProj.along;
+      const travelled = u * totalDist;
+      const scale = totalDist / Math.max(1, stopProj.along);
+      if (travelled < oppRem) {
+        const curAlong = Math.min(termBranch.totalLen, termAlong + travelled);
+        const sample = sampleBranchAtAlong(termBranch, curAlong);
+        if (!sample) return null;
+        const remainingMeters = Math.max(0, totalDist - travelled);
+        return {
+          activeBranch: termBranch,
+          activeAlong: curAlong,
+          viaBranch: null,
+          legDepth: 1,
+          lat: sample.lat,
+          lng: sample.lng,
+          remainingMeters,
+          etaSec: Math.max(0, etaSec),
+          speedMps: Math.min(25.0, ev.speedMps * scale),
+          isAtTerminal: travelled <= 25 && effNow <= trip.startSec + 10,
+          inOppositeLeg: true,
+          inNextCycle: false,
+          realBandera: termBranch.bandera,
+          realBanderaColor: termBranch.color,
+          effectiveOffsetSec: 0,
+          targetStopSec
+        };
+      }
+      const along = Math.min(stopProj.along, Math.max(0, travelled - oppRem));
+      const sample = sampleBranchAtAlong(stopBranch, along);
+      if (!sample) return null;
+      const remainingMeters = Math.max(0, stopProj.along - along);
+      return {
+        activeBranch: stopBranch,
+        activeAlong: along,
+        viaBranch: null,
+        legDepth: 0,
+        lat: sample.lat,
+        lng: sample.lng,
+        remainingMeters,
+        etaSec: Math.max(0, etaSec),
+        speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale),
+        isAtTerminal: false,
+        inOppositeLeg: false,
+        inNextCycle: false,
+        realBandera: stopBranch.bandera,
+        realBanderaColor: stopBranch.color,
+        effectiveOffsetSec: 0,
+        targetStopSec
+      };
+    }
+
+    const startAlong = Math.min(termAlong, Math.max(0, stopProj.along - 10));
+    const span = Math.max(1, stopProj.along - startAlong);
+    const along = Math.min(stopProj.along, startAlong + u * span);
+    const sample = sampleBranchAtAlong(stopBranch, along);
+    if (!sample) return null;
+    const remainingMeters = Math.max(0, stopProj.along - along);
+    const scale = span / Math.max(1, stopProj.along);
+    return {
+      activeBranch: stopBranch,
+      activeAlong: along,
+      viaBranch: null,
+      legDepth: 0,
+      lat: sample.lat,
+      lng: sample.lng,
+      remainingMeters,
+      etaSec: Math.max(0, etaSec),
+      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale),
+      isAtTerminal: along <= startAlong + 20 && effNow <= trip.startSec + 10,
+      inOppositeLeg: false,
+      inNextCycle: false,
+      realBandera: stopBranch.bandera,
+      realBanderaColor: stopBranch.color,
+      effectiveOffsetSec: 0,
+      targetStopSec
+    };
   }
 
-  const tEff = effNow + effectiveOffsetSec;
-  const etaSec = targetStopSec - tEff;
+  // ── Compute per-leg schedule offsets enforcing cabecera advance absorption ──
+  // An early bus (`> 0`) on `pp` or `prev` (or without a mid-route `legDepth === 0` GPS anchor)
+  // NEVER departs a punta de línea early: its positive advance is absorbed to `0` at the cabecera!
+  let baseOffsetSec = desvioSec || 0;
+  if (anchor && Number.isFinite(anchor.clockSec) && Number.isFinite(anchor.initialOffsetSec)) {
+    const elapsedSec = Math.max(0, effNow - anchor.clockSec);
+    baseOffsetSec = anchor.atPrevOriginTerminal ? 0 : computeGradualOffsetSec(anchor.initialOffsetSec, elapsedSec);
+  }
+
+  const originDepth = anchor && typeof anchor.legDepth === 'number' ? anchor.legDepth : 0;
+  const observedMidRouteOnTrip = Boolean(anchor && originDepth === 0 && !anchor.atOriginTerminal);
+
+  const prev = trip.prevTrip || null;
+  const pp = prev?.prevTrip || null;
+
+  const offsetPP = originDepth === 2 ? baseOffsetSec : 0;
+  let offsetPrev = baseOffsetSec;
+  if (anchor?.atPrevOriginTerminal) {
+    offsetPrev = 0;
+  } else if (originDepth === 2 && prev && pp) {
+    const layPPToPrev = Math.max(0, prev.startSec - pp.endSec);
+    offsetPrev = offsetPP >= 0 ? 0 : Math.min(0, offsetPP + Math.max(0, layPPToPrev - 90));
+  } else if (!anchor && offsetPrev > 0) {
+    // Without a mid-route GPS anchor on prevTrip, never depart prevTrip's origin cabecera early
+    if (prev && effNow < prev.startSec) offsetPrev = 0;
+  }
+
+  let offsetTrip;
+  if (observedMidRouteOnTrip) {
+    offsetTrip = baseOffsetSec;
+  } else if (offsetPrev >= 0) {
+    // Early or on-time bus arriving at (or waiting at) `trip`'s origin cabecera -> waits for `trip.startSec` and departs ON TIME (0)!
+    offsetTrip = 0;
+  } else if (originDepth >= 1 && prev) {
+    // Late bus arriving from `prevTrip` -> cabecera layover absorbs delay (keeping 90 s turnaround)
+    const layPrevToTrip = Math.max(0, trip.startSec - prev.endSec);
+    offsetTrip = Math.min(0, offsetPrev + Math.max(0, layPrevToTrip - 90));
+  } else {
+    offsetTrip = offsetPrev; // (< 0, late)
+  }
+
+  const tEffTrip = effNow + offsetTrip;
+  const tEffPrev = effNow + offsetPrev;
+  const tEffPP = effNow + offsetPP;
+  const etaSec = targetStopSec - tEffTrip;
 
   // Already passed the stop by more than 45 s, or beyond horizon
   if (etaSec < -45 || etaSec > maxAheadSec) return null;
 
-  const stopBranch = trip.branch;
-  const speedFactor = effectiveOffsetSec < -30 ? 1.08 : effectiveOffsetSec > 30 ? 0.94 : 1.0;
+  const speedFactorTrip = offsetTrip < -30 ? 1.08 : offsetTrip > 30 ? 0.94 : 1.0;
+  const speedFactorPrev = offsetPrev < -30 ? 1.08 : offsetPrev > 30 ? 0.94 : 1.0;
+  const speedFactorPP = offsetPP < -30 ? 1.08 : offsetPP > 30 ? 0.94 : 1.0;
 
   // 1) Directly on stopBranch (`legDepth = 0`, approaching or arriving at stop)
-  if (tEff >= trip.startSec) {
-    const ev = evalPointsAtSec(trip.points, Math.min(tEff, targetStopSec));
+  if (tEffTrip >= trip.startSec) {
+    const ev = evalPointsAtSec(trip.points, Math.min(tEffTrip, targetStopSec));
     const along = Math.min(stopProj.along, ev.along);
     const sample = sampleBranchAtAlong(stopBranch, along);
     if (!sample) return null;
@@ -571,23 +816,21 @@ export function evaluateTripState(
       lng: sample.lng,
       remainingMeters,
       etaSec: Math.max(0, etaSec),
-      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * speedFactor),
-      isAtTerminal: along <= 120 && tEff <= trip.startSec + 20,
+      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * speedFactorTrip),
+      isAtTerminal: along <= 120 && tEffTrip <= trip.startSec + 20,
       inOppositeLeg: false,
       inNextCycle: false,
       realBandera: stopBranch.bandera,
       realBanderaColor: stopBranch.color,
-      effectiveOffsetSec,
+      effectiveOffsetSec: offsetTrip,
       targetStopSec
     };
   }
 
   // 2) Chained return/feeder leg (`trip.prevTrip`, `legDepth = 1`) and turnaround layovers
-  if (trip.prevTrip) {
-    const prev = trip.prevTrip;
-
-    // 2a) Resting at `trip` origin cabecera between `prev.endSec` and `trip.startSec`
-    if (tEff >= prev.endSec) {
+  if (prev) {
+    // 2a) Resting at `trip` origin cabecera between `prev.endSec` (at `tEffPrev`) and `trip.startSec` (at `tEffTrip`)
+    if (tEffPrev >= prev.endSec) {
       const sample = sampleBranchAtAlong(stopBranch, 0);
       if (!sample) return null;
       return {
@@ -605,14 +848,45 @@ export function evaluateTripState(
         inNextCycle: false,
         realBandera: stopBranch.bandera,
         realBanderaColor: stopBranch.color,
-        effectiveOffsetSec,
+        effectiveOffsetSec: offsetTrip,
+        targetStopSec
+      };
+    }
+
+    // 2a-bis) Anchored waiting at `prevTrip`'s origin cabecera before `prev.startSec`
+    if (anchor?.atPrevOriginTerminal && effNow < prev.startSec) {
+      const termBranch = anchor.branch || prev.branch;
+      const termAlong = Number.isFinite(anchor.along) ? anchor.along : 0;
+      const sample = sampleBranchAtAlong(termBranch, termAlong) || sampleBranchAtAlong(prev.branch, 0);
+      if (!sample) return null;
+      const inPP = termBranch !== prev.branch;
+      const ppRem = inPP ? Math.max(0, termBranch.totalLen - termAlong) : 0;
+      const remainingMeters = inPP
+        ? ppRem + prev.branch.totalLen + stopProj.along
+        : Math.max(0, prev.branch.totalLen - termAlong) + stopProj.along;
+      return {
+        activeBranch: termBranch,
+        activeAlong: termAlong,
+        viaBranch: inPP ? prev.branch : null,
+        legDepth: inPP ? 2 : 1,
+        lat: sample.lat,
+        lng: sample.lng,
+        remainingMeters,
+        etaSec: Math.max(0, etaSec),
+        speedMps: 0,
+        isAtTerminal: true,
+        inOppositeLeg: !inPP,
+        inNextCycle: inPP,
+        realBandera: termBranch.bandera,
+        realBanderaColor: termBranch.color,
+        effectiveOffsetSec: 0,
         targetStopSec
       };
     }
 
     // 2b) Actively driving on `prevTrip` (`legDepth = 1`)
-    if (tEff >= prev.startSec) {
-      const ev = evalPointsAtSec(prev.points, tEff);
+    if (tEffPrev >= prev.startSec) {
+      const ev = evalPointsAtSec(prev.points, Math.min(tEffPrev, prev.endSec));
       const sample = sampleBranchAtAlong(prev.branch, ev.along);
       if (!sample) return null;
       const oppRem = Math.max(0, prev.branch.totalLen - ev.along);
@@ -626,23 +900,21 @@ export function evaluateTripState(
         lng: sample.lng,
         remainingMeters,
         etaSec: Math.max(0, etaSec),
-        speedMps: Math.min(25.0, ev.speedMps * speedFactor),
+        speedMps: Math.min(25.0, ev.speedMps * speedFactorPrev),
         isAtTerminal: oppRem <= 120,
         inOppositeLeg: true,
         inNextCycle: false,
         realBandera: prev.branch.bandera,
         realBanderaColor: prev.branch.color,
-        effectiveOffsetSec,
+        effectiveOffsetSec: offsetPrev,
         targetStopSec
       };
     }
 
     // 2c) Previous lap (`trip.prevTrip.prevTrip`, `legDepth = 2` -> `full_cycle`)!
-    if (prev.prevTrip) {
-      const pp = prev.prevTrip;
-
-      // Resting at `prevTrip` origin cabecera between `pp.endSec` and `prev.startSec`
-      if (tEff >= pp.endSec) {
+    if (pp) {
+      // Resting at `prevTrip` origin cabecera between `pp.endSec` (at `tEffPP`) and `prev.startSec` (at `tEffPrev`)
+      if (tEffPP >= pp.endSec) {
         const sample = sampleBranchAtAlong(prev.branch, 0);
         if (!sample) return null;
         return {
@@ -660,14 +932,14 @@ export function evaluateTripState(
           inNextCycle: false,
           realBandera: prev.branch.bandera,
           realBanderaColor: prev.branch.color,
-          effectiveOffsetSec,
+          effectiveOffsetSec: offsetPrev,
           targetStopSec
         };
       }
 
       // Actively driving on `prev.prevTrip` (`full_cycle`: `pp` -> `prev` -> `trip`)
-      if (tEff >= pp.startSec) {
-        const ev = evalPointsAtSec(pp.points, tEff);
+      if (tEffPP >= pp.startSec) {
+        const ev = evalPointsAtSec(pp.points, Math.min(tEffPP, pp.endSec));
         const sample = sampleBranchAtAlong(pp.branch, ev.along);
         if (!sample) return null;
         const ppRem = Math.max(0, pp.branch.totalLen - ev.along);
@@ -681,13 +953,13 @@ export function evaluateTripState(
           lng: sample.lng,
           remainingMeters,
           etaSec: Math.max(0, etaSec),
-          speedMps: Math.min(25.0, ev.speedMps * speedFactor),
+          speedMps: Math.min(25.0, ev.speedMps * speedFactorPP),
           isAtTerminal: ppRem <= 120,
           inOppositeLeg: false,
           inNextCycle: true,
           realBandera: pp.branch.bandera,
           realBanderaColor: pp.branch.color,
-          effectiveOffsetSec,
+          effectiveOffsetSec: offsetPP,
           targetStopSec
         };
       }
@@ -712,7 +984,7 @@ export function evaluateTripState(
     inNextCycle: false,
     realBandera: stopBranch.bandera,
     realBanderaColor: stopBranch.color,
-    effectiveOffsetSec,
+    effectiveOffsetSec: offsetTrip,
     targetStopSec
   };
 }
@@ -759,6 +1031,12 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
       spatialDiffSec = Math.min(
         testTripSpatial(item.trip.prevTrip),
         testTripSpatial(item.trip.prevTrip?.prevTrip)
+      );
+    } else if (bus.trajectory?.isAtTerminal) {
+      // Parked at a cabecera turnaround: check both outgoing `trip` and incoming `prevTrip` arrival!
+      spatialDiffSec = Math.min(
+        testTripSpatial(item.trip),
+        testTripSpatial(item.trip.prevTrip)
       );
     } else {
       spatialDiffSec = testTripSpatial(item.trip);

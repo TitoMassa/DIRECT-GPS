@@ -47,7 +47,7 @@ function clamp(v, min, max) {
  *  3. Direct route-distance / ETA ratio (avoiding turnaround-layover deflation on indirect legs)
  */
 function estimateInitialKinematics(bus, newTraj, stopId, nowSec, gpsMs, etaSec, aheadSec, isAtTerminal, isStaleTracker) {
-  if (isAtTerminal || isStaleTracker) {
+  if (isStaleTracker) {
     return { cruise: 0, observedSpeed: null, cadence: null, hasConfirmed: false, isStopped: true };
   }
 
@@ -64,15 +64,20 @@ function estimateInitialKinematics(bus, newTraj, stopId, nowSec, gpsMs, etaSec, 
     if (dtPrev >= 4 && dtPrev <= 110) {
       const moved = distanceMeters(prevFix.lat, prevFix.lng, bus.lat, bus.lng) ?? 0;
       const learnedCadence = clamp(dtPrev, 12, 55);
-      if (moved < 11 && dtPrev >= 8) {
+      const minMove = isAtTerminal ? 24 : 11;
+      if (moved < minMove && dtPrev >= 8) {
         return { cruise: 0, observedSpeed: null, cadence: learnedCadence, hasConfirmed: true, isStopped: true };
       }
       const maxPlausible = Math.max(1500, dtPrev * 30);
-      if (moved >= 11 && moved < maxPlausible) {
+      if (moved >= minMove && moved < maxPlausible) {
         const inst = clamp((moved * 1.04) / dtPrev, 1.0, 26.5);
         return { cruise: inst, observedSpeed: inst, cadence: learnedCadence, hasConfirmed: true, isStopped: false };
       }
     }
+  }
+
+  if (isAtTerminal) {
+    return { cruise: 0, observedSpeed: null, cadence: null, hasConfirmed: false, isStopped: true };
   }
 
   // 2) Local scheduled segment speed along the matched trip (distinguishes highway/bridge vs downtown!)
@@ -208,6 +213,10 @@ export class BusSimulator {
         prev.predDesvioSec = desvioSec;
         prev.isAtTerminal = Boolean(newTraj.isAtTerminal);
         prev.aheadSec = desvioSec;
+        if (prev.isAtTerminal) {
+          prev.isStopped = true;
+          prev.currentSpeedMps = 0;
+        }
 
         if (wasLiveGps) {
           // Anchor directly to the bus's last visual/GPS position so it starts RIGHT THERE with gradual recovery!
@@ -218,6 +227,11 @@ export class BusSimulator {
             buildGpsAnchorForTrip(bus.scheduledTrip, aLat, aLng, nowSec, desvioSec) || incomingAnchor;
         } else if (incomingAnchor && !prev.scheduleAnchor) {
           prev.scheduleAnchor = incomingAnchor;
+        }
+        if (prev.scheduleAnchor?.atOriginTerminal && nowSec < (bus.scheduledTrip.startSec || 0)) {
+          prev.isAtTerminal = true;
+          prev.isStopped = true;
+          prev.currentSpeedMps = 0;
         }
 
         if (!applyPositions) {
@@ -594,6 +608,9 @@ export class BusSimulator {
 
           if (ev.speedMps <= 0.05 || ev.isAtTerminal) {
             targetSpeed = 0;
+            if (ev.isAtTerminal && ev.speedMps <= 0.05) {
+              st.currentSpeedMps = 0;
+            }
           } else if (err < -4) {
             targetSpeed = clamp(ev.speedMps * 0.25, 0, 3.0);
           } else {
