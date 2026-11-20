@@ -68,6 +68,7 @@ const state = {
   stickyLiveTripByCoche: new Map(), // `${codLinea}:${coche}` -> { tripKey, dayKey, updatedAt }
   completedTripsByStop: new Map(), // `${dayKey}:${stopId}` -> Set<`${codLinea}:${tripKey}`>
   downstreamProbeCache: new Map(), // `${codLinea}:${terminalStopId}` -> { ts, arribos }
+  corridorFleet: [], // Latest parallel corridor-radar units returned by Worker (/api/arribos-linea & /api/arribos)
 
   // Catalog & Drilldown
   lineas: [],
@@ -1324,8 +1325,11 @@ function reconcileWithSchedulePrediction(
     const liveBusByTrip = liveBusByTripKeyByLine.get(cod) || new Map();
     const lineLive = liveByLine.get(cod) || [];
 
-    // Gather any fresh (< 90 s) downstream terminal probe results for this line
-    const downstreamBuses = [];
+    // Live corridor-radar units discovered in parallel upstream/downstream/opposite stops by the Worker
+    const corridorBuses = (state.corridorFleet || []).filter((u) => Number(u.codigoLinea) === Number(cod));
+
+    // Gather any fresh (< 90 s) fallback downstream terminal probe results for this line
+    const downstreamBuses = [...corridorBuses];
     for (const [k, entry] of state.downstreamProbeCache.entries()) {
       if (k.startsWith(`${cod}:`) && nowMs - entry.ts <= 90000 && Array.isArray(entry.arribos)) {
         downstreamBuses.push(...entry.arribos);
@@ -1333,7 +1337,7 @@ function reconcileWithSchedulePrediction(
     }
 
     // Detect trips that ALREADY PASSED `stopId` (e.g. a bus running 5+ min ahead of schedule) via:
-    //  1) live full_cycle buses past stopId, 2) downstream terminal probes, 3) FleetMemory units/trips
+    //  1) live full_cycle buses past stopId, 2) parallel corridor-radar probes, 3) FleetMemory units/trips
     const alreadyPassed = detectAlreadyPassedTrips({
       codLinea: cod,
       stopId,
@@ -1362,6 +1366,7 @@ function reconcileWithSchedulePrediction(
       liveMatchedTripKeys: matchedTrips,
       liveMatchedCoches: matchedCoches,
       liveBusByTripKey: liveBusByTrip,
+      corridorBuses,
       completedTripKeys: completedSet,
       activePredKeys,
       fleetMemory: fleetMem,
@@ -1434,9 +1439,8 @@ function reconcileWithSchedulePrediction(
 }
 
 /**
- * When online and an imminent (<= 14 min) unmatched scheduled turn has no live GPS or FleetMemory
- * record yet, performs a fast cached (75 s) check on the branch's terminal stop to verify whether
- * a live GPS bus ALREADY passed `stopId` early (e.g. 5 min ahead) — eliminating ghost arrivals!
+ * Fallback downstream probe when online in multi-line ("Todas") mode and an imminent (<= 14 min)
+ * unmatched scheduled turn belongs to a diverging branch not covered by the main avenue corridor probe.
  */
 async function probeDownstreamForImminentGhosts(buses, stopId, stopCoords) {
   if (state.isOffline || !stopCoords || !Array.isArray(buses) || buses.length === 0) return false;
@@ -1472,7 +1476,7 @@ async function probeDownstreamForImminentGhosts(buses, stopId, stopCoords) {
   await Promise.all(
     toProbe.map(async ({ cod, termStopId, pKey }) => {
       try {
-        const res = await api.arribos(termStopId, String(cod));
+        const res = await api.arribos(termStopId, String(cod), { skipCorridor: true });
         const arribos = Array.isArray(res?.data?.arribos) ? res.data.arribos : [];
         state.downstreamProbeCache.set(pKey, { ts: Date.now(), arribos });
         if (arribos.length > 0) anyFresh = true;
@@ -1487,6 +1491,7 @@ async function probeDownstreamForImminentGhosts(buses, stopId, stopCoords) {
 async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
   if (!state.activeStop) return;
   const stopId = state.activeStop.id;
+  state.corridorFleet = [];
 
   if (!state.catalogo) {
     state.catalogo = await api.catalogo().catch(() => null);
@@ -1599,10 +1604,15 @@ async function fetchArribos(showSkeleton = false) {
   }
 
   try {
-    // When focused on a single line, query /api/arribos-linea to discover ALL active cars (> 3) in parallel!
+    // Pass first known line on this stop as corridor hint in "Todas" mode so the Worker probes
+    // 1 upstream + 1 downstream stop in parallel even if 0 buses are currently returned at stopId!
+    const catStop = state.catalogo?.stopById?.get(stopId);
+    const hintLinea = Number(state.stopLinesList[0]?.codigo) || Number(catStop?.lineas?.[0]) || null;
+
+    // When focused on a single line, /api/arribos-linea runs full 3-zone corridor radar (upstream + downstream + opposite)!
     const res = state.focusedLineCode
       ? await api.arribosLineaCompleto(stopId, state.focusedLineCode)
-      : await api.arribos(stopId, '000');
+      : await api.arribos(stopId, '000', { hintLinea });
 
     if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
 
@@ -1615,6 +1625,7 @@ async function fetchArribos(showSkeleton = false) {
     const payload = res.data || {};
     state.dataSource = res.source || 'smartmovepro-soap';
     state.lastSyncAt = new Date();
+    state.corridorFleet = Array.isArray(payload.corridorFleet) ? payload.corridorFleet : [];
 
     if (payload.knownStop && state.activeStop.nombre === `Parada ${state.activeStop.id}`) {
       state.activeStop.nombre = payload.knownStop.nombre;
@@ -1674,7 +1685,11 @@ async function fetchArribos(showSkeleton = false) {
       { isOffline: false }
     );
 
-    if (state.simulateMode) {
+    // Single-line mode already probed downstream inside the Worker; only run client fallback in multi-line mode
+    // or if Worker returned 0 corridor probes!
+    const needsFallbackProbe =
+      state.simulateMode && !(state.focusedLineCode && (payload.corridorProbeCount || 0) >= 2);
+    if (needsFallbackProbe) {
       const probed = await probeDownstreamForImminentGhosts(reconciled, stopId, stopCoords);
       if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
       if (probed) {

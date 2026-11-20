@@ -109,6 +109,149 @@ function parseChofer(raw = '') {
   return { choferNombre: clean, choferLegajo: '', choferRaw: clean };
 }
 
+// Isolate-level caches to make parallel corridor radar probes ultra-fast & SmartMovePro rate-limit safe
+const LINE_STOPS_CACHE = new Map(); // lineNum -> { ts, branches }
+const PROBE_ARRIBOS_CACHE = new Map(); // `${stopId}:${lineCode}` -> { ts, arribos }
+const LINE_STOPS_TTL_MS = 6 * 3600 * 1000;
+const PROBE_ARRIBOS_TTL_MS = 18 * 1000;
+
+function parseGpsStampMs(raw = '') {
+  const m = String(raw || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return 0;
+  return Date.UTC(
+    parseInt(m[3], 10),
+    parseInt(m[2], 10) - 1,
+    parseInt(m[1], 10),
+    parseInt(m[4], 10) + 3,
+    parseInt(m[5], 10),
+    parseInt(m[6], 10)
+  );
+}
+
+/**
+ * Picks up to 8 strategically spaced probe stops across 3 corridor zones (without hitting
+ * Cloudflare's 50-subrequest limit or SmartMovePro's 429 rate limit):
+ *  - downstream (up to 3 stops AFTER stopId up to terminal): instantly spots early-passed buses!
+ *  - upstream (up to 3 stops BEFORE stopId): discovers full approaching fleet & cabecera pull-outs!
+ *  - opposite (up to 2 stops on return branch): tracks buses approaching turnaround for next trip!
+ */
+function selectStrategicCorridorProbes(branches = [], stopId = '', { maxDown = 3, maxUp = 3, maxOpp = 2 } = {}) {
+  const stopBranches = branches.filter((arr) =>
+    arr.some((p) => String(p.Identificador || '').toUpperCase() === stopId)
+  );
+  const primaryBranch = stopBranches[0] || branches[0] || [];
+  const oppBranch = branches.find((arr) => !stopBranches.includes(arr) && arr.length >= 5) || [];
+  const idx = primaryBranch.findIndex((p) => String(p.Identificador || '').toUpperCase() === stopId);
+
+  const probes = [];
+  const seen = new Set([stopId]);
+  const pushStop = (st, zone) => {
+    const id = String(st?.Identificador || '').trim().toUpperCase();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    probes.push({ stopId: id, zone });
+  };
+
+  if (idx >= 0) {
+    // 1) Downstream (paradas siguientes en el mismo sentido, incluyendo la última parada del ramal)
+    const after = primaryBranch.slice(idx + 1);
+    if (after.length > 0 && maxDown > 0) {
+      if (after.length <= maxDown) {
+        for (const st of after) pushStop(st, 'downstream');
+      } else if (maxDown === 1) {
+        pushStop(after[Math.min(after.length - 1, Math.max(4, Math.floor(after.length * 0.45)))], 'downstream');
+      } else {
+        const fracs = maxDown === 2 ? [0.4, 1.0] : [0.3, 0.7, 1.0];
+        for (const f of fracs) {
+          const i = Math.min(after.length - 1, Math.max(0, Math.round(f * (after.length - 1))));
+          pushStop(after[i], 'downstream');
+        }
+      }
+    }
+
+    // Also include final stop of any secondary branch sharing `stopId` (e.g. 104A, 105C diverging legs)
+    if (stopBranches.length > 1 && maxDown >= 2) {
+      for (let b = 1; b < stopBranches.length && probes.filter((p) => p.zone === 'downstream').length < maxDown + 1; b++) {
+        const sec = stopBranches[b];
+        const sIdx = sec.findIndex((p) => String(p.Identificador || '').toUpperCase() === stopId);
+        if (sIdx >= 0 && sec.length - 1 > sIdx) {
+          pushStop(sec[sec.length - 1], 'downstream');
+        }
+      }
+    }
+
+    // 2) Upstream (paradas anteriores en el mismo sentido)
+    const before = primaryBranch.slice(0, idx);
+    if (before.length > 0 && maxUp > 0) {
+      if (before.length <= maxUp) {
+        for (const st of before) pushStop(st, 'upstream');
+      } else if (maxUp === 1) {
+        pushStop(before[Math.max(0, before.length - Math.min(before.length, 6))], 'upstream');
+      } else {
+        const fracs = maxUp === 2 ? [0.3, 0.75] : [0.2, 0.55, 0.85];
+        for (const f of fracs) {
+          const i = Math.min(before.length - 1, Math.max(0, Math.round(f * (before.length - 1))));
+          pushStop(before[i], 'upstream');
+        }
+      }
+    }
+  }
+
+  // 3) Opposite return branch (colectivos acercándose a la cabecera de giro)
+  if (oppBranch.length >= 5 && maxOpp > 0) {
+    const fracs = maxOpp === 1 ? [0.85] : [0.5, 0.92];
+    for (const f of fracs) {
+      const i = Math.min(oppBranch.length - 1, Math.max(0, Math.round(f * (oppBranch.length - 1))));
+      pushStop(oppBranch[i], 'opposite');
+    }
+  }
+
+  return probes;
+}
+
+/**
+ * Merges every unique live bus seen across base + upstream/downstream/opposite corridor probes,
+ * retaining the freshest GPS fix per `(codigoLinea, identificadorCoche)`.
+ */
+function buildCorridorFleet(baseArribos = [], probeResults = []) {
+  const byUnit = new Map();
+  const ingest = (list, zone) => {
+    for (const a of list || []) {
+      const cod = Number(a.codigoLinea) || 0;
+      const coche = String(a.identificadorCoche || '').trim();
+      const lat = parseFloat(a.latitud);
+      const lng = parseFloat(a.longitud);
+      if (!cod || !coche || Number.isNaN(lat) || Number.isNaN(lng) || (lat === 0 && lng === 0)) continue;
+      const uKey = `${cod}:${coche}`;
+      const stampMs = parseGpsStampMs(a.ultimaFechaHoraGPS);
+      const prev = byUnit.get(uKey);
+      if (!prev || stampMs > prev._stampMs || (stampMs === prev._stampMs && prev.probeZone === 'opposite' && zone !== 'opposite')) {
+        byUnit.set(uKey, {
+          codigoLinea: cod,
+          descripcionLinea: a.descripcionLinea || '',
+          identificadorCoche: coche,
+          identificadorChofer: a.identificadorChofer || '',
+          choferNombre: a.choferNombre || '',
+          choferLegajo: a.choferLegajo || '',
+          esAdaptado: Boolean(a.esAdaptado),
+          descripcionBandera: a.descripcionBandera || '',
+          latitud: String(lat),
+          longitud: String(lng),
+          desvioHorario: a.desvioHorario || '',
+          ultimaFechaHoraGPS: a.ultimaFechaHoraGPS || '',
+          probeZone: zone,
+          _stampMs: stampMs
+        });
+      }
+    }
+  };
+  ingest(baseArribos, 'base');
+  for (const pr of probeResults) {
+    ingest(pr.arribos, pr.zone || 'corridor');
+  }
+  return Array.from(byUnit.values()).map(({ _stampMs, ...clean }) => clean);
+}
+
 async function soapRequest(method, bodyInnerXml) {
   const envelope = `<?xml version="1.0" encoding="utf-8"?>
 <v:Envelope xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns:d="http://www.w3.org/2001/XMLSchema" xmlns:c="http://schemas.xmlsoap.org/soap/encoding/" xmlns:v="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1087,11 +1230,14 @@ export default {
           };
         };
 
-        const basePayload = await fetchOneStop(stopId, lineCode);
+        const skipCorridor = searchParams.get('skipCorridor') === '1';
+        const hintLinea = Number(searchParams.get('hintLinea')) || 0;
 
-        // Full-fleet upstream anchor discovery when /api/arribos-linea is requested for a specific line
-        if (pathname === '/api/arribos-linea' && lineCode !== '000' && basePayload.arribos.length >= 3) {
-          const lineNum = Number(lineCode);
+        const getCachedLineBranches = async (lineNum) => {
+          if (!lineNum) return [];
+          const now = Date.now();
+          const hit = LINE_STOPS_CACHE.get(lineNum);
+          if (hit && now - hit.ts < LINE_STOPS_TTL_MS) return hit.branches;
           const stopsRes = await soapRequest(
             'RecuperarParadasCompletoPorLinea',
             `<usuario i:type="d:string">${SOAP_USER}</usuario>
@@ -1100,39 +1246,45 @@ export default {
              <isSublinea i:type="d:boolean">false</isSublinea>
              <isInteligente i:type="d:boolean">false</isInteligente>`
           ).catch(() => ({ paradas: {} }));
-
           const branches = Object.values(stopsRes?.paradas || {}).filter((arr) => Array.isArray(arr) && arr.length > 0);
-          const stopBranch =
-            branches.find((arr) => arr.some((p) => String(p.Identificador).toUpperCase() === stopId)) || branches[0] || [];
-          const oppBranch = branches.find((arr) => arr !== stopBranch && arr.length >= 5) || [];
-          const idx = stopBranch.findIndex((p) => String(p.Identificador).toUpperCase() === stopId);
-
-          const upstream = [];
-          if (idx >= 0) {
-            for (let i = idx - 1; i >= 0; i--) upstream.push(stopBranch[i]);
-            for (let i = oppBranch.length - 1; i >= 0; i--) upstream.push(oppBranch[i]);
-            for (let i = stopBranch.length - 1; i > idx; i--) upstream.push(stopBranch[i]);
+          if (branches.length > 0) {
+            if (LINE_STOPS_CACHE.size > 60) LINE_STOPS_CACHE.delete(LINE_STOPS_CACHE.keys().next().value);
+            LINE_STOPS_CACHE.set(lineNum, { ts: now, branches });
           }
+          return branches;
+        };
 
-          const probes = [];
-          const numProbes = Math.min(6, upstream.length);
-          for (let k = 1; k <= numProbes; k++) {
-            const pIdx = Math.min(upstream.length - 1, Math.floor((k * upstream.length) / (numProbes + 1)));
-            const st = upstream[pIdx];
-            if (st?.Identificador && !probes.some((p) => p.Identificador === st.Identificador)) {
-              probes.push(st);
-            }
+        const fetchProbeStopCached = async (sid, lcode, zone) => {
+          const pKey = `${sid}:${lcode}`;
+          const now = Date.now();
+          const hit = PROBE_ARRIBOS_CACHE.get(pKey);
+          if (hit && now - hit.ts < PROBE_ARRIBOS_TTL_MS) {
+            return { stopId: sid, zone, arribos: hit.arribos, cached: true };
           }
+          try {
+            const r = await fetchOneStop(sid, lcode);
+            const arr = r.arribos || [];
+            if (PROBE_ARRIBOS_CACHE.size > 250) PROBE_ARRIBOS_CACHE.delete(PROBE_ARRIBOS_CACHE.keys().next().value);
+            PROBE_ARRIBOS_CACHE.set(pKey, { ts: Date.now(), arribos: arr });
+            return { stopId: sid, zone, arribos: arr, cached: false };
+          } catch {
+            return { stopId: sid, zone, arribos: [], cached: false };
+          }
+        };
 
+        // ── Mode 1: Single-line full Corridor Radar (/api/arribos-linea) ──
+        // ALWAYS probes strategic stops BEFORE (upstream), AFTER (downstream up to cabecera),
+        // and OPPOSITE leg in parallel (<= 8 probes, 18s edge-cached) regardless of base arribo count!
+        if (pathname === '/api/arribos-linea' && lineCode !== '000' && !skipCorridor) {
+          const lineNum = Number(lineCode);
+          const [basePayload, branches] = await Promise.all([
+            fetchOneStop(stopId, lineCode),
+            getCachedLineBranches(lineNum)
+          ]);
+
+          const probes = selectStrategicCorridorProbes(branches, stopId, { maxDown: 3, maxUp: 3, maxOpp: 2 });
           const probeResults = await Promise.all(
-            probes.map(async (st) => {
-              try {
-                const r = await fetchOneStop(String(st.Identificador).toUpperCase(), lineCode);
-                return { stopId: String(st.Identificador).toUpperCase(), arribos: r.arribos || [] };
-              } catch {
-                return { stopId: String(st.Identificador).toUpperCase(), arribos: [] };
-              }
-            })
+            probes.map((p) => fetchProbeStopCached(p.stopId, lineCode, p.zone))
           );
 
           const parseMin = (txt) => {
@@ -1169,23 +1321,26 @@ export default {
             }
           }
 
-          // Deduplicate each probe stop to its earliest arrival per coche so Lap-2 probe rows don't skew travelDelta
-          const dedupedProbes = probeResults.map((pr) => {
-            const byCid = new Map();
-            for (const a of pr.arribos) {
-              const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
-              const pMin = parseMin(a.tiempoRestanteArribo);
-              const cur = byCid.get(cid);
-              if (!cur || (pMin !== null && (cur.pMin === null || pMin < cur.pMin))) {
-                byCid.set(cid, { arribo: a, pMin });
+          // Use ONLY upstream + opposite probes for `esExtendido` approaching-fleet discovery
+          // (downstream probes are strictly for early-passed ghost suppression & corridorFleet X-ray!)
+          const approachingProbes = probeResults
+            .filter((pr) => pr.zone === 'upstream' || pr.zone === 'opposite')
+            .map((pr) => {
+              const byCid = new Map();
+              for (const a of pr.arribos) {
+                const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+                const pMin = parseMin(a.tiempoRestanteArribo);
+                const cur = byCid.get(cid);
+                if (!cur || (pMin !== null && (cur.pMin === null || pMin < cur.pMin))) {
+                  byCid.set(cid, { arribo: a, pMin });
+                }
               }
-            }
-            return { stopId: pr.stopId, items: Array.from(byCid.entries()) };
-          });
+              return { stopId: pr.stopId, items: Array.from(byCid.entries()) };
+            });
 
           for (let pass = 0; pass < 4; pass++) {
             let added = false;
-            for (const pr of dedupedProbes) {
+            for (const pr of approachingProbes) {
               const deltas = [];
               for (const [cid, { pMin }] of pr.items) {
                 if (fleet.has(cid) && pMin !== null && fleet.get(cid).etaMin !== null) {
@@ -1224,11 +1379,18 @@ export default {
             .sort((a, b) => (a.etaMin ?? 999) - (b.etaMin ?? 999))
             .map((x) => x.arribo);
 
-          if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, merged, stopId, basePayload.stopCoords));
+          // Full corridor X-ray: every unique live unit seen upstream, at stopId, downstream, or opposite leg
+          const corridorFleet = buildCorridorFleet(merged, probeResults);
+
+          if (ctx?.waitUntil) {
+            ctx.waitUntil(recordObservedUnits(env, corridorFleet.length > 0 ? corridorFleet : merged, stopId, basePayload.stopCoords));
+          }
           return jsonResponse({
             data: {
               ...basePayload,
               arribos: merged,
+              corridorFleet,
+              corridorProbeCount: probes.length,
               extendedCount: merged.filter((x) => x.esExtendido).length,
               fullFleet: true
             },
@@ -1237,8 +1399,41 @@ export default {
           });
         }
 
-        if (ctx?.waitUntil) ctx.waitUntil(recordObservedUnits(env, basePayload.arribos, stopId, basePayload.stopCoords));
-        return jsonResponse({ data: basePayload, source: 'smartmovepro-soap', savedAt: Date.now() });
+        // ── Mode 2: Multi-line ("Todas") Corridor Radar (/api/arribos?codLinea=000) ──
+        // Fires 2 lightweight parallel probes (1 anterior + 1 siguiente along the avenue with codLinea=000,
+        // 18s cached) giving instant upstream/downstream X-ray for ALL lines sharing this stop at once!
+        const basePayload = await fetchOneStop(stopId, lineCode);
+        let corridorFleet = [];
+        let corridorProbeCount = 0;
+
+        if (!skipCorridor && lineCode === '000') {
+          const anchorLine = hintLinea || Number(basePayload.arribos[0]?.codigoLinea) || 0;
+          if (anchorLine > 0) {
+            const branches = await getCachedLineBranches(anchorLine);
+            const probes = selectStrategicCorridorProbes(branches, stopId, { maxDown: 1, maxUp: 1, maxOpp: 0 });
+            if (probes.length > 0) {
+              const probeResults = await Promise.all(
+                probes.map((p) => fetchProbeStopCached(p.stopId, '000', p.zone))
+              );
+              corridorFleet = buildCorridorFleet(basePayload.arribos, probeResults);
+              corridorProbeCount = probes.length;
+            }
+          }
+        }
+
+        if (ctx?.waitUntil) {
+          const toRecord = corridorFleet.length > 0 ? corridorFleet : basePayload.arribos;
+          ctx.waitUntil(recordObservedUnits(env, toRecord, stopId, basePayload.stopCoords));
+        }
+        return jsonResponse({
+          data: {
+            ...basePayload,
+            corridorFleet,
+            corridorProbeCount
+          },
+          source: 'smartmovepro-soap',
+          savedAt: Date.now()
+        });
       }
 
       return jsonResponse({ error: 'Endpoint no encontrado' }, 404);

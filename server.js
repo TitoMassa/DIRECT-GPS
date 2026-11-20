@@ -350,7 +350,8 @@ async function handleApi(req, res, urlObj) {
         return sendJson(res, 400, { error: 'Faltan parámetros idParada o codLinea' });
       }
       const result = await smartmove.getArribosLineaCompleto(idParada, codLinea);
-      recordFleetUnitsLocal(result?.data?.arribos, idParada, result?.data?.stopCoords);
+      const units = result?.data?.corridorFleet?.length ? result.data.corridorFleet : result?.data?.arribos;
+      recordFleetUnitsLocal(units, idParada, result?.data?.stopCoords);
       return sendJson(res, 200, result);
     }
 
@@ -359,7 +360,8 @@ async function handleApi(req, res, urlObj) {
       const codLinea = searchParams.get('codLinea') || '000';
       const simulate = searchParams.get('simulate') === '1';
       const result = await smartmove.getArribos(idParada, codLinea, simulate);
-      recordFleetUnitsLocal(result?.data?.arribos, idParada, result?.data?.stopCoords);
+      const units = result?.data?.corridorFleet?.length ? result.data.corridorFleet : result?.data?.arribos;
+      recordFleetUnitsLocal(units, idParada, result?.data?.stopCoords);
       return sendJson(res, 200, result);
     }
 

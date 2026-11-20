@@ -465,9 +465,13 @@ export const api = {
     return res;
   },
 
-  arribos: (idParada, codLinea = '000') => {
+  arribos: (idParada, codLinea = '000', { hintLinea = null, skipCorridor = false } = {}) => {
     const code = !codLinea || codLinea === '0' ? '000' : String(codLinea);
-    return apiGet(`/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(code)}`);
+    const extra = [];
+    if (hintLinea) extra.push(`hintLinea=${encodeURIComponent(hintLinea)}`);
+    if (skipCorridor) extra.push('skipCorridor=1');
+    const tail = extra.length ? `&${extra.join('&')}` : '';
+    return apiGet(`/api/arribos?idParada=${encodeURIComponent(idParada)}&codLinea=${encodeURIComponent(code)}${tail}`);
   },
 
   arribosLineaCompleto: (idParada, codLinea) =>

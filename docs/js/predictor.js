@@ -945,24 +945,33 @@ export function detectAlreadyPassedTrips({
     // Must be genuinely PAST this stop along stopBranch!
     if (proj.along <= stopProj.along + 65) return;
 
-    // If FleetMemory already knows which trip on this branch this exact coche is running, mark it immediately!
+    const tEff = clockSec + (desvioSec || 0);
+    const normEff = ((tEff % 86400) + 86400) % 86400;
+
+    // If FleetMemory already knows which trip on this branch this exact coche is running AND that trip
+    // is time-consistent at `proj.along` (so a full_cycle bus never marks its NEXT lap!), mark it passed!
     const cleanCoche = String(cocheId || '').trim();
     if (cleanCoche && activeMemTripsByCoche.has(cleanCoche)) {
       for (const tk of activeMemTripsByCoche.get(cleanCoche)) {
-        if (trips.some((t) => t.tripKey === tk)) {
+        const tr = trips.find((t) => t.tripKey === tk);
+        if (!tr) continue;
+        const schedAtBus = getTripSecAtAlong(tr, proj.along);
+        if (schedAtBus === null) continue;
+        let d = Math.abs((schedAtBus % 86400) - normEff);
+        if (d > 43200) d = 86400 - d;
+        if (d <= 28 * 60) {
           passed.add(tk);
         }
       }
     }
 
-    const tEff = clockSec + (desvioSec || 0);
     let bestTrip = null;
     let bestDiff = 16 * 60; // up to 16 min tolerance even if desvio slightly noisy
 
     for (const tr of trips) {
       const schedAtBus = getTripSecAtAlong(tr, proj.along);
       if (schedAtBus === null) continue;
-      let d = Math.abs((schedAtBus % 86400) - ((tEff % 86400) + 86400) % 86400);
+      let d = Math.abs((schedAtBus % 86400) - normEff);
       if (d > 43200) d = 86400 - d;
       if (d < bestDiff) {
         bestDiff = d;
@@ -986,7 +995,7 @@ export function detectAlreadyPassedTrips({
       }
     }
 
-    // 2) Live buses on `full_cycle` (already passed stopId) + downstream terminal probe buses
+    // 2) Live buses on `full_cycle` (already passed stopId) + downstream/corridor probe buses
     for (const b of [...liveBuses, ...downstreamBuses]) {
       if (Number(b.codigoLinea) !== Number(codLinea)) continue;
       const lat = typeof b.lat === 'number' ? b.lat : parseFloat(b.latitud);
@@ -996,11 +1005,12 @@ export function detectAlreadyPassedTrips({
           ? b.desvio.seconds
           : parseDesvioHorario(b.desvioHorario || '').seconds;
       const isLiveFullCycle = b.trajectory?.leg === 'full_cycle';
-      const isDownstream = !b.trajectory; // raw downstream probe bus
+      const isDownstream = !b.trajectory; // raw downstream/corridor probe bus
       if (isLiveFullCycle || isDownstream) {
         const hint = b.realBandera || b.descripcionBandera || '';
         const cocheId = b.identificadorCoche || b.coche || '';
-        markPassedBySpatialFix(stopBranch, stopProj, trips, lat, lng, desvioSec, nowSec, hint, cocheId);
+        const bClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS || b.ultimaGps || '') ?? nowSec;
+        markPassedBySpatialFix(stopBranch, stopProj, trips, lat, lng, desvioSec, bClock, hint, cocheId);
       }
     }
 
@@ -1095,8 +1105,8 @@ function computeExtraMetersAcrossBlock(block, srcIdx, targetIdx, stopCoords, sto
  * for active/upcoming scheduled turns that currently have NO live GPS unit — AND links future turns
  * belonging to the SAME vehicle block (`Sig. vuelta`) directly to their real circulating bus & driver!
  *
- * Anchors to last known online GPS position from `fleetMemory` when available so predicted buses
- * start right from their last real spot and gradually recover delay instead of snapping to on-time!
+ * Anchors to live Corridor Radar (`corridorBuses`) and last known online GPS (`fleetMemory`) so predicted
+ * buses start right from their exact real spot and gradually recover delay instead of snapping to on-time!
  */
 export function predictLineBusesForStop({
   codLinea,
@@ -1110,6 +1120,7 @@ export function predictLineBusesForStop({
   liveMatchedTripKeys = new Set(),
   liveMatchedCoches = new Set(),
   liveBusByTripKey = new Map(),
+  corridorBuses = [],
   completedTripKeys = new Set(),
   activePredKeys = new Set(),
   fleetMemory = null,
@@ -1136,64 +1147,83 @@ export function predictLineBusesForStop({
     }
   }
 
-  // Enrich `memByTrip` with recent `fleetMemory.units` (seen on ANY stop/direction in the last 35 min)
-  // so buses circulating on the opposite branch also propagate their coche & driver across their block!
-  if (fleetMemory && Array.isArray(fleetMemory.units)) {
-    for (const u of fleetMemory.units) {
-      if (Number(u.codigoLinea) !== Number(codLinea)) continue;
-      const cleanCoche = String(u.coche || '').trim();
-      if (!cleanCoche || knownCoches.has(cleanCoche)) continue;
-      if (u.updatedAt && nowMs - u.updatedAt > 35 * 60 * 1000) continue;
-      const uLat = Number(u.lat);
-      const uLng = Number(u.lng);
-      if (!Number.isFinite(uLat) || !Number.isFinite(uLng) || uLat === 0 || uLng === 0) continue;
+  // Helper: spatially match a live corridor probe bus or FleetMemory unit onto its exact trip in `model`
+  const ingestObservedUnit = (u, { allowOverwriteOlder = false } = {}) => {
+    if (Number(u.codigoLinea) !== Number(codLinea)) return;
+    const cleanCoche = String(u.identificadorCoche || u.coche || '').trim();
+    if (!cleanCoche) return;
+    if (!allowOverwriteOlder && knownCoches.has(cleanCoche)) return;
+    if (liveMatchedCoches.has(cleanCoche)) return;
+    if (u.updatedAt && nowMs - u.updatedAt > 35 * 60 * 1000) return;
 
-      const uClock =
-        parseGpsStampSecOfDay(u.ultimaGps) ??
-        (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : nowSec);
-      const tEff = uClock + (u.desvioSec || 0);
-      const normEff = ((tEff % 86400) + 86400) % 86400;
-      const uNormBandera = normalizeBandera(u.bandera || '');
+    const uLat = typeof u.lat === 'number' ? u.lat : parseFloat(u.latitud);
+    const uLng = typeof u.lng === 'number' ? u.lng : parseFloat(u.longitud);
+    if (!Number.isFinite(uLat) || !Number.isFinite(uLng) || (uLat === 0 && uLng === 0)) return;
 
-      let bestTr = null;
-      let bestDiff = 12 * 60;
-      for (const b of branches) {
-        if (uNormBandera) {
-          const nb = normalizeBandera(b.bandera);
-          if (nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) continue;
-        }
-        const proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
-        if (!proj || proj.perp > 130) continue;
-        for (const tr of model.getTripsForBranch(b)) {
-          const sched = getTripSecAtAlong(tr, proj.along);
-          if (sched === null) continue;
-          let d = Math.abs((sched % 86400) - normEff);
-          if (d > 43200) d = 86400 - d;
-          if (d < bestDiff) {
-            bestDiff = d;
-            bestTr = tr;
-          }
+    const ultimaGps = u.ultimaFechaHoraGPS || u.ultimaGps || '';
+    const desvioSec =
+      typeof u.desvioSec === 'number'
+        ? u.desvioSec
+        : parseDesvioHorario(u.desvioHorario || '').seconds;
+    const uClock =
+      parseGpsStampSecOfDay(ultimaGps) ??
+      (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : nowSec);
+    const tEff = uClock + (desvioSec || 0);
+    const normEff = ((tEff % 86400) + 86400) % 86400;
+    const uNormBandera = normalizeBandera(u.descripcionBandera || u.bandera || '');
+
+    let bestTr = null;
+    let bestDiff = 14 * 60;
+    for (const b of branches) {
+      if (uNormBandera) {
+        const nb = normalizeBandera(b.bandera);
+        if (nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) continue;
+      }
+      const proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+      if (!proj || proj.perp > 140) continue;
+      for (const tr of model.getTripsForBranch(b)) {
+        const sched = getTripSecAtAlong(tr, proj.along);
+        if (sched === null) continue;
+        let d = Math.abs((sched % 86400) - normEff);
+        if (d > 43200) d = 86400 - d;
+        if (d < bestDiff) {
+          bestDiff = d;
+          bestTr = tr;
         }
       }
+    }
 
-      if (bestTr && !memByTrip.has(bestTr.tripKey)) {
+    if (bestTr) {
+      const existing = memByTrip.get(bestTr.tripKey);
+      const uTs = u.updatedAt || nowMs;
+      if (!existing || (allowOverwriteOlder && uTs >= (existing.updatedAt || 0))) {
         memByTrip.set(bestTr.tripKey, {
           codigoLinea: Number(codLinea),
           tripKey: bestTr.tripKey,
           coche: cleanCoche,
           choferNombre: u.choferNombre || '',
           choferLegajo: u.choferLegajo || '',
-          choferRaw: u.choferRaw || '',
+          choferRaw: u.choferRaw || u.identificadorChofer || '',
           esAdaptado: Boolean(u.esAdaptado),
-          desvioSec: u.desvioSec || 0,
-          ultimaGps: u.ultimaGps || '',
+          desvioSec: desvioSec || 0,
+          ultimaGps,
           lat: uLat,
           lng: uLng,
-          updatedAt: u.updatedAt || nowMs
+          updatedAt: uTs
         });
         knownCoches.add(cleanCoche);
       }
     }
+  };
+
+  // 1) Ingest LIVE Corridor Radar sightings FIRST (real-time GPS from parallel upstream/downstream/opposite probes!)
+  for (const cb of corridorBuses || []) {
+    ingestObservedUnit(cb, { allowOverwriteOlder: true });
+  }
+
+  // 2) Enrich with recent `fleetMemory.units` (last 35 min across the city) for any remaining units
+  for (const u of fleetMemory?.units || []) {
+    ingestObservedUnit(u, { allowOverwriteOlder: false });
   }
 
   // Index live buses by coche so we never assign a live coche from Block A onto Block B via stale memory
