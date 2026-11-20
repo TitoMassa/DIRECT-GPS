@@ -871,6 +871,12 @@ function renderArribosList() {
           )})">+Flota</span>`
         : '';
 
+      const nextLapBadge = bus.isNextLap
+        ? `<span class="next-lap-pill" title="Misma unidad en su siguiente vuelta">Sig. vuelta</span>`
+        : '';
+
+      const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
+
       const driverHtml = bus.choferNombre
         ? `<span class="driver-inline">
              <strong>${escapeHtml(bus.choferNombre)}</strong>
@@ -878,19 +884,18 @@ function renderArribosList() {
            </span>`
         : `<span class="driver-inline"><span>—</span></span>`;
 
-      const gpsHtml =
-        bus.isPredicted || bus.gpsLost
-          ? `<span class="pred-meta" title="Posición estimada por horarios programados">${escapeHtml(
-              bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario'
-            )}</span>`
-          : bus.gpsTimeOnly
-            ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>`
-            : '';
+      const gpsHtml = isOfflineStyled
+        ? `<span class="pred-meta" title="Posición estimada por horarios programados">${escapeHtml(
+            bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario'
+          )}</span>`
+        : bus.gpsTimeOnly
+          ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>`
+          : '';
       const currentBandera = bus.realBandera || bus.descripcionBandera;
       const dirColor = bus.realBanderaColor || color;
 
       return `
-        <div class="arrival-card ${isSelected ? 'is-selected' : ''} ${bus.isPredicted || bus.gpsLost ? 'is-predicted' : ''}" data-bus-key="${escapeHtml(
+        <div class="arrival-card ${isSelected ? 'is-selected' : ''} ${isOfflineStyled ? 'is-predicted' : ''}" data-bus-key="${escapeHtml(
           bus.key
         )}" style="--line-color:${color}" role="button" tabindex="0">
           <div class="arrival-card-main">
@@ -904,6 +909,7 @@ function renderArribosList() {
                 ${cocheBadge}
                 ${desvioBadge}
                 ${turnoBadge}
+                ${nextLapBadge}
                 ${adaptedBadge}
                 ${extBadge}
               </div>
@@ -1027,7 +1033,8 @@ function updateInspectorFields(bus) {
   }
 
   const gpsParts = [];
-  if (bus.isPredicted || bus.gpsLost) {
+  const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
+  if (isOfflineStyled) {
     gpsParts.push(bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario');
   } else {
     if (bus.gpsTimeOnly) gpsParts.push(bus.gpsTimeOnly);
@@ -1043,8 +1050,12 @@ function updateInspectorFields(bus) {
 function focusBusOnMap(busKey) {
   const bus = state.arribos.find((b) => b.key === busKey);
   if (!bus) return;
+  const mapTarget =
+    bus.isNextLap && bus.nextLapOfKey
+      ? state.arribos.find((b) => b.key === bus.nextLapOfKey) || bus
+      : bus;
 
-  state.selectedBusKey = busKey;
+  state.selectedBusKey = mapTarget.key;
   state.inspectorOpen = false;
   el.busInspector.classList.add('hidden');
 
@@ -1060,7 +1071,7 @@ function focusBusOnMap(busKey) {
     selectedBusKey: state.selectedBusKey,
     simulateMode: state.simulateMode
   });
-  transitMap.focusBus(bus, 16);
+  transitMap.focusBus(mapTarget, 16);
 }
 
 // Tapping a bus chip directly on the map: open the ultra-compact inspector card
@@ -1184,6 +1195,7 @@ function reconcileWithSchedulePrediction(
 
   const liveMatchedTripKeysByLine = new Map();
   const liveMatchedCochesByLine = new Map();
+  const liveBusByTripKeyByLine = new Map();
   const seenReports = [];
 
   for (const [cod, buses] of liveByLine.entries()) {
@@ -1193,8 +1205,10 @@ function reconcileWithSchedulePrediction(
 
     const matchedTrips = new Set();
     const matchedCoches = new Set();
+    const liveBusByTrip = new Map();
     liveMatchedTripKeysByLine.set(cod, matchedTrips);
     liveMatchedCochesByLine.set(cod, matchedCoches);
+    liveBusByTripKeyByLine.set(cod, liveBusByTrip);
 
     for (const b of buses) {
       if (b.identificadorCoche) matchedCoches.add(b.identificadorCoche);
@@ -1208,6 +1222,7 @@ function reconcileWithSchedulePrediction(
         const m = matches.get(b.key);
         if (!m) continue;
         matchedTrips.add(m.tripKey);
+        liveBusByTrip.set(m.tripKey, b);
         completedSet.delete(`${cod}:${m.tripKey}`); // bus is actively approaching, definitely not completed
 
         if (b.identificadorCoche) {
@@ -1283,6 +1298,7 @@ function reconcileWithSchedulePrediction(
 
     const matchedTrips = liveMatchedTripKeysByLine.get(cod) || new Set();
     const matchedCoches = liveMatchedCochesByLine.get(cod) || new Set();
+    const liveBusByTrip = liveBusByTripKeyByLine.get(cod) || new Map();
     const lineLive = liveByLine.get(cod) || [];
 
     // Gather any fresh (< 90 s) downstream terminal probe results for this line
@@ -1322,6 +1338,7 @@ function reconcileWithSchedulePrediction(
       nowSec,
       liveMatchedTripKeys: matchedTrips,
       liveMatchedCoches: matchedCoches,
+      liveBusByTripKey: liveBusByTrip,
       completedTripKeys: completedSet,
       activePredKeys,
       fleetMemory: fleetMem,
@@ -1330,6 +1347,13 @@ function reconcileWithSchedulePrediction(
     });
 
     for (const p of preds) {
+      // Next-lap (`Sig. vuelta`) virtual cards mirror their active source bus; never steal live simulator state!
+      if (p.isNextLap) {
+        p.stopId = stopId;
+        predictedAll.push(p);
+        continue;
+      }
+
       // Spatial de-duplication: if an unmatched live GPS bus of the same line & branch is right next to
       // this predicted slot (e.g., running >16 min late), bind the live bus instead of spawning a ghost!
       const nearbyUnmatchedLive = lineLive.find(

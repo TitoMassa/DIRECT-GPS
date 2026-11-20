@@ -820,6 +820,19 @@ button {
   white-space: nowrap;
 }
 
+.next-lap-pill {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--accent-amber-soft);
+  color: var(--accent-amber);
+  white-space: nowrap;
+}
+
 /* Arrival Cards (Sober, Scannable, Zero Lag, Never Compressed) */
 .arrival-card {
   position: relative;

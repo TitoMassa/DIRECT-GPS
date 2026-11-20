@@ -274,32 +274,93 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     branchTrips.set(getBranchKey(b), trips);
   }
 
-  // Chain incoming feeder/return trips across cabeceras (layover 10 s .. 45 min)
-  const claimedReturn = new Set();
+  // Step 1: Estimate each branch's natural arrival-to-departure layover at its origin cabecera
+  // (e.g. 0-2 min at quick-turnaround cabeceras like Puerto/Centro vs 8-15 min at rest cabeceras)
+  const feedersByKey = new Map();
+  const branchTypicalLaySec = new Map();
   for (const b of branches) {
+    const bKey = getBranchKey(b);
     const feeders = pickIncomingBranches(branches, b);
-    const tripsB = branchTrips.get(getBranchKey(b)) || [];
-    if (!tripsB.length || !feeders.length) continue;
+    feedersByKey.set(bKey, feeders);
+    const tripsB = branchTrips.get(bKey) || [];
+    const feederTrips = feeders.flatMap((fb) => branchTrips.get(getBranchKey(fb)) || []);
+    const samples = [];
+    for (const t of tripsB) {
+      let bestPos = Infinity;
+      let bestNeg = Infinity;
+      for (const r of feederTrips) {
+        const lay = t.startSec - r.endSec;
+        if (lay >= 0 && lay <= 25 * 60 && lay < bestPos) bestPos = lay;
+        else if (lay >= -90 && lay < 0 && Math.abs(lay) < Math.abs(bestNeg)) bestNeg = lay;
+      }
+      if (bestPos < Infinity) samples.push(bestPos);
+      else if (bestNeg < Infinity) samples.push(bestNeg);
+    }
+    samples.sort((a, c) => a - c);
+    const med = samples.length > 0 ? samples[Math.floor(samples.length / 2)] : 300;
+    branchTypicalLaySec.set(bKey, med);
+  }
 
+  // Step 2: Chain incoming feeder/return trips chronologically across ALL branches (2-, 3- and 4-branch lines)
+  const allTripItems = branches
+    .flatMap((b) => (branchTrips.get(getBranchKey(b)) || []).map((trip) => ({ b, bKey: getBranchKey(b), trip })))
+    .sort((a, c) => a.trip.startSec - c.trip.startSec);
+
+  const claimedReturn = new Set();
+  for (const { bKey, trip: t } of allTripItems) {
+    const feeders = feedersByKey.get(bKey) || [];
+    if (!feeders.length) continue;
     const feederTrips = feeders.flatMap((fb) => branchTrips.get(getBranchKey(fb)) || []);
     if (!feederTrips.length) continue;
 
-    for (const t of tripsB) {
-      let bestPrev = null;
-      let bestLayover = Infinity;
-      for (const r of feederTrips) {
-        if (claimedReturn.has(r)) continue;
-        const layover = t.startSec - r.endSec;
-        if (layover >= 10 && layover <= 45 * 60 && layover < bestLayover) {
-          bestLayover = layover;
-          bestPrev = r;
-        }
+    const typicalLay = branchTypicalLaySec.get(bKey) ?? 300;
+    let bestPrev = null;
+    let bestScore = Infinity;
+
+    for (const r of feederTrips) {
+      if (claimedReturn.has(r)) continue;
+      const lay = t.startSec - r.endSec;
+      if (lay < -90 || lay > 45 * 60) continue;
+
+      let score = Math.abs(lay - typicalLay);
+      if (lay < 0 && typicalLay >= 150) {
+        score += 600; // never match an unarrived bus at a rest cabecera when a resting bus is waiting
+      } else if (lay < 0) {
+        score += 45;
       }
-      if (bestPrev) {
-        claimedReturn.add(bestPrev);
-        t.prevTrip = bestPrev;
-        bestPrev.nextTrip = t;
+      // Subtle FIFO bias so earlier-waiting buses depart first during multi-bus terminal queues
+      score -= Math.min(Math.max(0, lay), 15 * 60) * 0.04;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestPrev = r;
       }
+    }
+
+    if (bestPrev) {
+      claimedReturn.add(bestPrev);
+      t.prevTrip = bestPrev;
+      bestPrev.nextTrip = t;
+    }
+  }
+
+  // Step 3: Materialize full day-long vehicle blocks (`trip.block` & `trip.blockIndex`)
+  let blockSeq = 0;
+  const tripByKey = new Map();
+  for (const { trip } of allTripItems) {
+    tripByKey.set(trip.tripKey, trip);
+    if (trip.prevTrip) continue;
+    const blockId = `blk:${codLinea}:${resolved.tipo}:${++blockSeq}`;
+    const block = [];
+    let cur = trip;
+    const visited = new Set();
+    while (cur && !visited.has(cur)) {
+      visited.add(cur);
+      cur.blockId = blockId;
+      cur.block = block;
+      cur.blockIndex = block.length;
+      block.push(cur);
+      cur = cur.nextTrip;
     }
   }
 
@@ -309,6 +370,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     exactTipo: resolved.exact,
     branches,
     branchTrips,
+    tripByKey,
     getTripsForBranch: (b) => branchTrips.get(getBranchKey(b)) || []
   };
   byTipo.set(cacheKey, model);
@@ -389,9 +451,9 @@ function evalPointsAtSec(points, tEff) {
 
 /**
  * Builds a spatial-temporal GPS anchor for `trip` from a last-known GPS fix `(lat, lng, clockSec)`.
- * Anchoring guarantees that prediction starts RIGHT AT the bus's exact last GPS position (0 m jump)
- * with its real accumulated delay/advance, and then recovers gradually (~4.8 s/min) instead of
- * snapping magically to on-time punctuality!
+ * Evaluates up to 3 legs along the vehicle block (`trip`, `prevTrip`, and `prevTrip.prevTrip` / full_cycle)
+ * choosing the leg whose scheduled time at the GPS projection best matches `clockSec + fallbackDesvioSec`.
+ * Guarantees 0 m jump on GPS loss and preserves accumulated delay/advance with gradual recovery!
  */
 export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSec = 0) {
   if (!trip || typeof lat !== 'number' || typeof lng !== 'number' || Number.isNaN(lat) || Number.isNaN(lng)) {
@@ -399,70 +461,57 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
   }
   if (!Number.isFinite(clockSec)) return null;
 
-  const stopProj = projectOnPolyline(trip.branch.pts, trip.branch.cum, lat, lng);
-  const prevProj = trip.prevTrip
-    ? projectOnPolyline(trip.prevTrip.branch.pts, trip.prevTrip.branch.cum, lat, lng)
-    : null;
-
-  // Decide whether the last GPS fix lies on `trip.branch` or `trip.prevTrip.branch`
-  let chosenBranch = null;
-  let chosenTrip = null;
-  let chosenProj = null;
-
-  const onStopOk = stopProj && stopProj.perp <= 150;
-  const onPrevOk = prevProj && prevProj.perp <= 150;
-
-  if (onStopOk && onPrevOk) {
-    // Compare time consistency against both branches using fallbackDesvioSec
-    const effAnchor = clockSec + (fallbackDesvioSec || 0);
-    const stopSched = getTripSecAtAlong(trip, stopProj.along);
-    const prevSched = getTripSecAtAlong(trip.prevTrip, prevProj.along);
-    const errStop = stopSched !== null ? Math.abs(stopSched - effAnchor) : Infinity;
-    const errPrev = prevSched !== null ? Math.abs(prevSched - effAnchor) : Infinity;
-    if (errPrev + 120 < errStop) {
-      chosenBranch = trip.prevTrip.branch;
-      chosenTrip = trip.prevTrip;
-      chosenProj = prevProj;
-    } else {
-      chosenBranch = trip.branch;
-      chosenTrip = trip;
-      chosenProj = stopProj;
+  const candidates = [{ t: trip, depth: 0 }];
+  if (trip.prevTrip) {
+    candidates.push({ t: trip.prevTrip, depth: 1 });
+    if (trip.prevTrip.prevTrip) {
+      candidates.push({ t: trip.prevTrip.prevTrip, depth: 2 });
     }
-  } else if (onStopOk) {
-    chosenBranch = trip.branch;
-    chosenTrip = trip;
-    chosenProj = stopProj;
-  } else if (onPrevOk) {
-    chosenBranch = trip.prevTrip.branch;
-    chosenTrip = trip.prevTrip;
-    chosenProj = prevProj;
-  } else {
-    return null;
   }
 
-  const schedSecAtAnchor = getTripSecAtAlong(chosenTrip, chosenProj.along);
-  if (schedSecAtAnchor === null) return null;
+  let best = null;
+  let bestScore = Infinity;
 
-  let adjClock = clockSec;
-  if (schedSecAtAnchor > 86400 && adjClock < 6 * 3600) adjClock += 86400;
-  let rawOffset = schedSecAtAnchor - adjClock;
-  if (rawOffset > 43200) rawOffset -= 86400;
-  if (rawOffset < -43200) rawOffset += 86400;
+  for (const cand of candidates) {
+    const proj = projectOnPolyline(cand.t.branch.pts, cand.t.branch.cum, lat, lng);
+    if (!proj || proj.perp > 150) continue;
 
-  // Sanity guard: ignore anchor if > 60 min off schedule (stale/different cycle)
-  if (Math.abs(rawOffset) > 60 * 60) return null;
+    const schedSecAtAnchor = getTripSecAtAlong(cand.t, proj.along);
+    if (schedSecAtAnchor === null) continue;
 
-  return {
-    branch: chosenBranch,
-    isStopBranch: chosenBranch === trip.branch,
-    along: chosenProj.along,
-    clockSec: adjClock,
-    initialOffsetSec: rawOffset
-  };
+    let adjClock = clockSec;
+    if (schedSecAtAnchor > 86400 && adjClock < 6 * 3600) adjClock += 86400;
+    let rawOffset = schedSecAtAnchor - adjClock;
+    if (rawOffset > 43200) rawOffset -= 86400;
+    if (rawOffset < -43200) rawOffset += 86400;
+
+    // Sanity guard: ignore anchor if > 60 min off schedule (stale/different cycle)
+    if (Math.abs(rawOffset) > 60 * 60) continue;
+
+    // Score against known desvioSec so buses near turnarounds (shared streets) lock to the exact real leg!
+    let desvioErr = Math.abs(rawOffset - (fallbackDesvioSec || 0));
+    if (desvioErr > 43200) desvioErr = 86400 - desvioErr;
+    const score = desvioErr + cand.depth * 25;
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = {
+        branch: cand.t.branch,
+        isStopBranch: cand.depth === 0,
+        legDepth: cand.depth,
+        along: proj.along,
+        clockSec: adjClock,
+        initialOffsetSec: rawOffset
+      };
+    }
+  }
+
+  return best;
 }
 
 /**
- * Evaluates the exact real-time state of a scheduled trip approaching `stopProj` on `trip.branch`.
+ * Evaluates the exact real-time state of a scheduled trip approaching `stopProj` on `trip.branch`
+ * across up to 3 vehicle-block legs (`trip`, `prevTrip`, and `prevTrip.prevTrip` / `full_cycle`).
  * When `anchor` is supplied (from live GPS loss or FleetMemory), the bus starts RIGHT FROM its last
  * GPS position and gradually recovers its delay/advance instead of jumping magically to on-time!
  */
@@ -483,9 +532,10 @@ export function evaluateTripState(
     effNow += 86400;
   }
 
-  // If anchored to a real GPS fix that is ALREADY physically past `stopProj.along` on `stopBranch`,
-  // this trip ALREADY PASSED the stop -> never generate a ghost arrival!
-  if (anchor && anchor.isStopBranch && anchor.along > stopProj.along + 60) {
+  // Only reject as already-passed if anchored directly on THIS trip (`legDepth === 0`) past `stopProj.along`!
+  // Never reject a `legDepth === 2` (`full_cycle`) bus finishing the previous lap!
+  const isAnchorOnThisLeg = anchor && (anchor.legDepth === 0 || (anchor.legDepth === undefined && anchor.isStopBranch));
+  if (isAnchorOnThisLeg && anchor.along > stopProj.along + 60) {
     return null;
   }
 
@@ -502,19 +552,20 @@ export function evaluateTripState(
   if (etaSec < -45 || etaSec > maxAheadSec) return null;
 
   const stopBranch = trip.branch;
+  const speedFactor = effectiveOffsetSec < -30 ? 1.08 : effectiveOffsetSec > 30 ? 0.94 : 1.0;
 
-  // 1) Directly on stopBranch (or arriving at stop)
+  // 1) Directly on stopBranch (`legDepth = 0`, approaching or arriving at stop)
   if (tEff >= trip.startSec) {
     const ev = evalPointsAtSec(trip.points, Math.min(tEff, targetStopSec));
     const along = Math.min(stopProj.along, ev.along);
     const sample = sampleBranchAtAlong(stopBranch, along);
     if (!sample) return null;
     const remainingMeters = Math.max(0, stopProj.along - along);
-    // Speed scales naturally with gradual recovery factor (1.08x when late, 0.94x when early)
-    const speedFactor = effectiveOffsetSec < -30 ? 1.08 : effectiveOffsetSec > 30 ? 0.94 : 1.0;
     return {
       activeBranch: stopBranch,
       activeAlong: along,
+      viaBranch: null,
+      legDepth: 0,
       lat: sample.lat,
       lng: sample.lng,
       remainingMeters,
@@ -522,6 +573,7 @@ export function evaluateTripState(
       speedMps: remainingMeters <= 5 ? 0 : Math.min(11.5, ev.speedMps * speedFactor),
       isAtTerminal: along <= 120 && tEff <= trip.startSec + 20,
       inOppositeLeg: false,
+      inNextCycle: false,
       realBandera: stopBranch.bandera,
       realBanderaColor: stopBranch.color,
       effectiveOffsetSec,
@@ -529,19 +581,46 @@ export function evaluateTripState(
     };
   }
 
-  // 2) Before departure from cabecera: if chained return leg (`trip.prevTrip`) is currently active
+  // 2) Chained return/feeder leg (`trip.prevTrip`, `legDepth = 1`) and turnaround layovers
   if (trip.prevTrip) {
     const prev = trip.prevTrip;
-    if (tEff >= prev.startSec && tEff < prev.endSec) {
+
+    // 2a) Resting at `trip` origin cabecera between `prev.endSec` and `trip.startSec`
+    if (tEff >= prev.endSec) {
+      const sample = sampleBranchAtAlong(stopBranch, 0);
+      if (!sample) return null;
+      return {
+        activeBranch: stopBranch,
+        activeAlong: 0,
+        viaBranch: null,
+        legDepth: 0,
+        lat: sample.lat,
+        lng: sample.lng,
+        remainingMeters: stopProj.along,
+        etaSec: Math.max(0, etaSec),
+        speedMps: 0,
+        isAtTerminal: true,
+        inOppositeLeg: false,
+        inNextCycle: false,
+        realBandera: stopBranch.bandera,
+        realBanderaColor: stopBranch.color,
+        effectiveOffsetSec,
+        targetStopSec
+      };
+    }
+
+    // 2b) Actively driving on `prevTrip` (`legDepth = 1`)
+    if (tEff >= prev.startSec) {
       const ev = evalPointsAtSec(prev.points, tEff);
       const sample = sampleBranchAtAlong(prev.branch, ev.along);
       if (!sample) return null;
       const oppRem = Math.max(0, prev.branch.totalLen - ev.along);
       const remainingMeters = oppRem + stopProj.along;
-      const speedFactor = effectiveOffsetSec < -30 ? 1.08 : effectiveOffsetSec > 30 ? 0.94 : 1.0;
       return {
         activeBranch: prev.branch,
         activeAlong: ev.along,
+        viaBranch: null,
+        legDepth: 1,
         lat: sample.lat,
         lng: sample.lng,
         remainingMeters,
@@ -549,20 +628,79 @@ export function evaluateTripState(
         speedMps: Math.min(11.5, ev.speedMps * speedFactor),
         isAtTerminal: oppRem <= 120,
         inOppositeLeg: true,
+        inNextCycle: false,
         realBandera: prev.branch.bandera,
         realBanderaColor: prev.branch.color,
         effectiveOffsetSec,
         targetStopSec
       };
     }
+
+    // 2c) Previous lap (`trip.prevTrip.prevTrip`, `legDepth = 2` -> `full_cycle`)!
+    if (prev.prevTrip) {
+      const pp = prev.prevTrip;
+
+      // Resting at `prevTrip` origin cabecera between `pp.endSec` and `prev.startSec`
+      if (tEff >= pp.endSec) {
+        const sample = sampleBranchAtAlong(prev.branch, 0);
+        if (!sample) return null;
+        return {
+          activeBranch: prev.branch,
+          activeAlong: 0,
+          viaBranch: null,
+          legDepth: 1,
+          lat: sample.lat,
+          lng: sample.lng,
+          remainingMeters: prev.branch.totalLen + stopProj.along,
+          etaSec: Math.max(0, etaSec),
+          speedMps: 0,
+          isAtTerminal: true,
+          inOppositeLeg: true,
+          inNextCycle: false,
+          realBandera: prev.branch.bandera,
+          realBanderaColor: prev.branch.color,
+          effectiveOffsetSec,
+          targetStopSec
+        };
+      }
+
+      // Actively driving on `prev.prevTrip` (`full_cycle`: `pp` -> `prev` -> `trip`)
+      if (tEff >= pp.startSec) {
+        const ev = evalPointsAtSec(pp.points, tEff);
+        const sample = sampleBranchAtAlong(pp.branch, ev.along);
+        if (!sample) return null;
+        const ppRem = Math.max(0, pp.branch.totalLen - ev.along);
+        const remainingMeters = ppRem + prev.branch.totalLen + stopProj.along;
+        return {
+          activeBranch: pp.branch,
+          activeAlong: ev.along,
+          viaBranch: prev.branch,
+          legDepth: 2,
+          lat: sample.lat,
+          lng: sample.lng,
+          remainingMeters,
+          etaSec: Math.max(0, etaSec),
+          speedMps: Math.min(11.5, ev.speedMps * speedFactor),
+          isAtTerminal: ppRem <= 120,
+          inOppositeLeg: false,
+          inNextCycle: true,
+          realBandera: pp.branch.bandera,
+          realBanderaColor: pp.branch.color,
+          effectiveOffsetSec,
+          targetStopSec
+        };
+      }
+    }
   }
 
-  // 3) Waiting / staging at origin cabecera until scheduled departure (`trip.startSec`)
+  // 3) Waiting / staging at origin cabecera (first pull-out or unchained trip)
   const sample = sampleBranchAtAlong(stopBranch, 0);
   if (!sample) return null;
   return {
     activeBranch: stopBranch,
     activeAlong: 0,
+    viaBranch: null,
+    legDepth: 0,
     lat: sample.lat,
     lng: sample.lng,
     remainingMeters: stopProj.along,
@@ -570,6 +708,7 @@ export function evaluateTripState(
     speedMps: 0,
     isAtTerminal: true,
     inOppositeLeg: false,
+    inNextCycle: false,
     realBandera: stopBranch.bandera,
     realBanderaColor: stopBranch.color,
     effectiveOffsetSec,
@@ -579,7 +718,8 @@ export function evaluateTripState(
 
 /**
  * Matches a single bus `(lat, lng, desvioSec, etaMin, leg)` directly to its exact scheduled trip
- * using spatial-temporal curve alignment `|trip.secAt(busAlong) - (nowSec + desvioSec)|`!
+ * using spatial-temporal curve alignment `|trip.secAt(busAlong) - (nowSec + desvioSec)|` across
+ * up to 3 vehicle-block legs (`direct`, `previous_leg`, and `full_cycle`)!
  * Works accurately even when a bus is +20 min early or -40 min late!
  */
 function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera) {
@@ -592,27 +732,35 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
   let spatialDiffSec = Infinity;
   if (typeof bus.lat === 'number' && typeof bus.lng === 'number' && hasDesvio) {
     const tEff = nowSec + desvioSec;
-    const onStopProj = projectOnPolyline(item.branch.pts, item.branch.cum, bus.lat, bus.lng);
-    const isOpp = bus.trajectory?.leg === 'previous_leg' || bus.isOppositeLeg;
+    const normEff = ((tEff % 86400) + 86400) % 86400;
+    const leg = bus.trajectory?.leg;
+    const isOpp = leg === 'previous_leg' || bus.isOppositeLeg;
+    const isFullCycle = leg === 'full_cycle' || bus.isNextCycle;
 
-    if (!isOpp && onStopProj && onStopProj.perp <= 160) {
-      const schedAtBus = getTripSecAtAlong(item.trip, onStopProj.along);
-      if (schedAtBus !== null) {
-        let d = Math.abs((schedAtBus % 86400) - ((tEff % 86400) + 86400) % 86400);
-        if (d > 43200) d = 86400 - d;
-        spatialDiffSec = d;
-      }
-    } else if (isOpp && item.trip.prevTrip) {
-      const prevBr = item.trip.prevTrip.branch;
-      const onPrevProj = projectOnPolyline(prevBr.pts, prevBr.cum, bus.lat, bus.lng);
-      if (onPrevProj && onPrevProj.perp <= 160) {
-        const schedAtBus = getTripSecAtAlong(item.trip.prevTrip, onPrevProj.along);
-        if (schedAtBus !== null) {
-          let d = Math.abs((schedAtBus % 86400) - ((tEff % 86400) + 86400) % 86400);
-          if (d > 43200) d = 86400 - d;
-          spatialDiffSec = d;
-        }
-      }
+    const testTripSpatial = (tr) => {
+      if (!tr) return Infinity;
+      const proj = projectOnPolyline(tr.branch.pts, tr.branch.cum, bus.lat, bus.lng);
+      if (!proj || proj.perp > 160) return Infinity;
+      const schedAtBus = getTripSecAtAlong(tr, proj.along);
+      if (schedAtBus === null) return Infinity;
+      let d = Math.abs((schedAtBus % 86400) - normEff);
+      if (d > 43200) d = 86400 - d;
+      return d;
+    };
+
+    if (isFullCycle) {
+      // Bus is finishing the previous lap (`prevTrip.prevTrip`) or just turning onto `prevTrip`
+      spatialDiffSec = Math.min(
+        testTripSpatial(item.trip.prevTrip?.prevTrip),
+        testTripSpatial(item.trip.prevTrip)
+      );
+    } else if (isOpp) {
+      spatialDiffSec = Math.min(
+        testTripSpatial(item.trip.prevTrip),
+        testTripSpatial(item.trip.prevTrip?.prevTrip)
+      );
+    } else {
+      spatialDiffSec = testTripSpatial(item.trip);
     }
   }
 
@@ -888,8 +1036,63 @@ export function detectAlreadyPassedTrips({
 }
 
 /**
+ * Propagates a bus's current schedule deviation (`srcDesvioSec`) forward across intermediate cabeceras
+ * in its vehicle block (`block[srcIdx] -> ... -> block[targetIdx]`).
+ *  - Early buses (`> 0`) wait out their advance at cabeceras and depart future laps on time (`0`).
+ *  - Heavily delayed buses (`< 0`) absorb layover slack (leaving at least 2 min turnaround) plus
+ *    gradual en-route recovery, carrying only genuine residual delay into the next lap!
+ */
+function propagateBlockDesvioSec(block, srcIdx, targetIdx, srcDesvioSec = 0, elapsedSec = 0) {
+  if (!Array.isArray(block) || targetIdx <= srcIdx) {
+    return computeGradualOffsetSec(srcDesvioSec || 0, elapsedSec);
+  }
+  const curOffset = computeGradualOffsetSec(srcDesvioSec || 0, elapsedSec);
+  if (curOffset >= 0) return 0; // early/on-time buses reset at cabeceras
+
+  let absorbableSec = 0;
+  let enRouteTravelSec = 0;
+  for (let i = srcIdx; i < targetIdx; i++) {
+    const a = block[i];
+    const b = block[i + 1];
+    if (!a || !b) continue;
+    const lay = Math.max(0, b.startSec - a.endSec);
+    // Keep at least 120 s minimum physical turnaround before absorbing delay
+    absorbableSec += Math.max(0, lay - 120);
+    enRouteTravelSec += Math.max(0, (a.endSec - a.startSec) * (i === srcIdx ? 0.5 : 1));
+  }
+  // Also account for gradual en-route recovery (~3 s/min across intermediate travel)
+  absorbableSec += enRouteTravelSec * 0.05;
+  return Math.min(0, curOffset + absorbableSec);
+}
+
+/**
+ * Computes the exact physical street distance (meters) from `stopId` on `block[srcIdx]` through
+ * all intermediate legs to `stopProj` on `block[targetIdx]`.
+ * Adding `srcBus.routeMeters` yields the true multi-lap distance (never a bogus cabecera distance!).
+ */
+function computeExtraMetersAcrossBlock(block, srcIdx, targetIdx, stopCoords, stopProj) {
+  if (!Array.isArray(block) || targetIdx <= srcIdx || !stopProj) return 0;
+  const srcTrip = block[srcIdx];
+  let extra = 0;
+  if (srcTrip?.branch && stopCoords) {
+    const srcStopProj = projectOnPolyline(srcTrip.branch.pts, srcTrip.branch.cum, stopCoords.lat, stopCoords.lng);
+    if (srcStopProj && srcStopProj.perp <= 160) {
+      extra += Math.max(0, srcTrip.branch.totalLen - srcStopProj.along);
+    } else {
+      extra += srcTrip.branch.totalLen * 0.5;
+    }
+  }
+  for (let i = srcIdx + 1; i < targetIdx; i++) {
+    extra += block[i]?.branch?.totalLen || 0;
+  }
+  extra += stopProj.along;
+  return Math.max(0, extra);
+}
+
+/**
  * Synthesizes realistic, street-following predicted bus objects across ALL branches serving `stopId`
- * for active/upcoming scheduled turns that currently have NO live GPS unit.
+ * for active/upcoming scheduled turns that currently have NO live GPS unit — AND links future turns
+ * belonging to the SAME vehicle block (`Sig. vuelta`) directly to their real circulating bus & driver!
  *
  * Anchors to last known online GPS position from `fleetMemory` when available so predicted buses
  * start right from their last real spot and gradually recover delay instead of snapping to on-time!
@@ -905,6 +1108,7 @@ export function predictLineBusesForStop({
   nowSec = getArgentinaSecOfDay(),
   liveMatchedTripKeys = new Set(),
   liveMatchedCoches = new Set(),
+  liveBusByTripKey = new Map(),
   completedTripKeys = new Set(),
   activePredKeys = new Set(),
   fleetMemory = null,
@@ -917,17 +1121,89 @@ export function predictLineBusesForStop({
   const stopBranches = pickStopBranches(branches, stopId, stopCoords);
   if (stopBranches.length === 0) return [];
 
+  const nowMs = Date.now();
+
   // Index system FleetMemory trips for this line
   const memByTrip = new Map();
+  const knownCoches = new Set(liveMatchedCoches);
   if (fleetMemory && Array.isArray(fleetMemory.trips)) {
     for (const rec of fleetMemory.trips) {
       if (Number(rec.codigoLinea) === Number(codLinea) && rec.tripKey) {
         memByTrip.set(rec.tripKey, rec);
+        if (rec.coche) knownCoches.add(String(rec.coche).trim());
       }
     }
   }
 
-  const nowMs = Date.now();
+  // Enrich `memByTrip` with recent `fleetMemory.units` (seen on ANY stop/direction in the last 35 min)
+  // so buses circulating on the opposite branch also propagate their coche & driver across their block!
+  if (fleetMemory && Array.isArray(fleetMemory.units)) {
+    for (const u of fleetMemory.units) {
+      if (Number(u.codigoLinea) !== Number(codLinea)) continue;
+      const cleanCoche = String(u.coche || '').trim();
+      if (!cleanCoche || knownCoches.has(cleanCoche)) continue;
+      if (u.updatedAt && nowMs - u.updatedAt > 35 * 60 * 1000) continue;
+      const uLat = Number(u.lat);
+      const uLng = Number(u.lng);
+      if (!Number.isFinite(uLat) || !Number.isFinite(uLng) || uLat === 0 || uLng === 0) continue;
+
+      const uClock =
+        parseGpsStampSecOfDay(u.ultimaGps) ??
+        (u.updatedAt ? getArgentinaSecOfDay(new Date(u.updatedAt)) : nowSec);
+      const tEff = uClock + (u.desvioSec || 0);
+      const normEff = ((tEff % 86400) + 86400) % 86400;
+      const uNormBandera = normalizeBandera(u.bandera || '');
+
+      let bestTr = null;
+      let bestDiff = 12 * 60;
+      for (const b of branches) {
+        if (uNormBandera) {
+          const nb = normalizeBandera(b.bandera);
+          if (nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) continue;
+        }
+        const proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+        if (!proj || proj.perp > 130) continue;
+        for (const tr of model.getTripsForBranch(b)) {
+          const sched = getTripSecAtAlong(tr, proj.along);
+          if (sched === null) continue;
+          let d = Math.abs((sched % 86400) - normEff);
+          if (d > 43200) d = 86400 - d;
+          if (d < bestDiff) {
+            bestDiff = d;
+            bestTr = tr;
+          }
+        }
+      }
+
+      if (bestTr && !memByTrip.has(bestTr.tripKey)) {
+        memByTrip.set(bestTr.tripKey, {
+          codigoLinea: Number(codLinea),
+          tripKey: bestTr.tripKey,
+          coche: cleanCoche,
+          choferNombre: u.choferNombre || '',
+          choferLegajo: u.choferLegajo || '',
+          choferRaw: u.choferRaw || '',
+          esAdaptado: Boolean(u.esAdaptado),
+          desvioSec: u.desvioSec || 0,
+          ultimaGps: u.ultimaGps || '',
+          lat: uLat,
+          lng: uLng,
+          updatedAt: u.updatedAt || nowMs
+        });
+        knownCoches.add(cleanCoche);
+      }
+    }
+  }
+
+  // Index live buses by coche so we never assign a live coche from Block A onto Block B via stale memory
+  const liveBlockByCoche = new Map();
+  for (const [tk, lb] of liveBusByTripKey.entries()) {
+    const tr = model.tripByKey?.get(tk);
+    if (lb?.identificadorCoche && tr?.blockId) {
+      liveBlockByCoche.set(String(lb.identificadorCoche).trim(), tr.blockId);
+    }
+  }
+
   const candidates = [];
   const seenTripKeys = new Set();
 
@@ -945,16 +1221,100 @@ export function predictLineBusesForStop({
       const isAlreadyVisible = activePredKeys.has(predKey);
       const effectiveMaxAheadSec = (isAlreadyVisible ? maxAheadMin + 6 : maxAheadMin) * 60;
 
-      // Look up system memory for this trip (or its preceding return leg!)
-      let mem = memByTrip.get(trip.tripKey) || null;
-      let memFromPrev = false;
-      if (!mem && trip.prevTrip) {
-        mem = memByTrip.get(trip.prevTrip.tripKey) || null;
-        memFromPrev = Boolean(mem);
+      const block = trip.block || [trip];
+      const targetIdx = typeof trip.blockIndex === 'number' ? trip.blockIndex : 0;
+
+      // ── Step A: Check if an EARLIER trip in the EXACT SAME vehicle block is currently LIVE! ──
+      // (e.g. Coche 2595 doing 21:25 right now IS the exact bus scheduled for 23:09 on its next lap!)
+      let liveBlockSrc = null;
+      for (let i = targetIdx - 1; i >= Math.max(0, targetIdx - 6); i--) {
+        const earlier = block[i];
+        if (!earlier) continue;
+        const lb = liveBusByTripKey.get(earlier.tripKey);
+        if (lb) {
+          liveBlockSrc = { bus: lb, srcIdx: i, srcTrip: earlier };
+          break;
+        }
       }
-      if (mem && mem.coche && liveMatchedCoches.has(mem.coche)) {
-        mem = null;
+
+      if (liveBlockSrc) {
+        const targetStopSec = getTripStopSec(trip, stopId, stopProj.along);
+        if (targetStopSec === null) continue;
+        let effNow = nowSec;
+        if (targetStopSec > 86400 && effNow < 6 * 3600) effNow += 86400;
+
+        const srcBus = liveBlockSrc.bus;
+        const propagatedDesvio = propagateBlockDesvioSec(
+          block,
+          liveBlockSrc.srcIdx,
+          targetIdx,
+          srcBus.desvio?.seconds || 0,
+          0
+        );
+        const etaSec = targetStopSec - (effNow + propagatedDesvio);
+        if (etaSec < -45 || etaSec > effectiveMaxAheadSec) continue;
+
+        const extraMeters = computeExtraMetersAcrossBlock(block, liveBlockSrc.srcIdx, targetIdx, stopCoords, stopProj);
+        const baseRem = srcBus.routeMeters ?? srcBus.distanceMeters ?? 0;
+        const totalRemMeters = Math.max(stopProj.along, baseRem + extraMeters);
+        const desvioRaw = Math.abs(propagatedDesvio) >= 60 ? formatDesvioFromSec(propagatedDesvio) : '';
+
+        seenTripKeys.add(trip.tripKey);
+        candidates.push({
+          trip,
+          stopBranch,
+          stopProj,
+          predKey,
+          anchor: null,
+          desvioSec: propagatedDesvio,
+          desvioRaw,
+          mem: null,
+          liveBlockSrc: {
+            bus: srcBus,
+            extraMeters,
+            isLive: !srcBus.isPredicted && !srcBus.gpsLost
+          },
+          ev: {
+            activeBranch: stopBranch,
+            activeAlong: 0,
+            viaBranch: null,
+            legDepth: 0,
+            lat: srcBus.lat,
+            lng: srcBus.lng,
+            remainingMeters: totalRemMeters,
+            etaSec: Math.max(0, etaSec),
+            speedMps: 0,
+            isAtTerminal: false,
+            inOppositeLeg: Boolean(srcBus.isOppositeLeg),
+            inNextCycle: true,
+            realBandera: srcBus.realBandera || srcBus.descripcionBandera || stopBranch.bandera,
+            realBanderaColor: srcBus.realBanderaColor || stopBranch.color,
+            effectiveOffsetSec: propagatedDesvio,
+            targetStopSec
+          }
+        });
+        continue;
       }
+
+      // ── Step B: Otherwise, walk this trip's vehicle block backwards in FleetMemory (up to 6 legs) ──
+      let mem = null;
+      let memIdx = targetIdx;
+      for (let i = targetIdx; i >= Math.max(0, targetIdx - 6); i--) {
+        const rec = memByTrip.get(block[i]?.tripKey);
+        if (!rec) continue;
+        const ageMin = rec.updatedAt ? (nowMs - rec.updatedAt) / 60000 : 999;
+        if (ageMin > 150) continue;
+        // Guard: if this coche is currently live on a DIFFERENT vehicle block, ignore stale memory
+        const recCoche = String(rec.coche || '').trim();
+        if (recCoche && liveBlockByCoche.has(recCoche) && liveBlockByCoche.get(recCoche) !== trip.blockId) {
+          continue;
+        }
+        mem = rec;
+        memIdx = i;
+        break;
+      }
+
+      const memDepth = targetIdx - memIdx;
 
       // Build spatial-temporal GPS anchor from last online fix so the bus starts from its exact last GPS spot
       // and gradually recovers its delay/advance (~4.8 s/min late recovery, never magically on time!)
@@ -962,22 +1322,20 @@ export function predictLineBusesForStop({
       let desvioSec = 0;
       if (mem) {
         const ageMin = mem.updatedAt ? (nowMs - mem.updatedAt) / 60000 : 999;
-        if (ageMin <= 90) {
-          const memClockSec =
-            parseGpsStampSecOfDay(mem.ultimaGps) ??
-            (mem.updatedAt ? getArgentinaSecOfDay(new Date(mem.updatedAt)) : nowSec);
+        const memClockSec =
+          parseGpsStampSecOfDay(mem.ultimaGps) ??
+          (mem.updatedAt ? getArgentinaSecOfDay(new Date(mem.updatedAt)) : nowSec);
+        const elapsedSec = Math.max(0, nowSec - memClockSec);
+
+        if (memDepth <= 2 && ageMin <= 90) {
           const mLat = Number(mem.lat);
           const mLng = Number(mem.lng);
           if (Number.isFinite(mLat) && Number.isFinite(mLng) && mLat !== 0 && mLng !== 0) {
             anchor = buildGpsAnchorForTrip(trip, mLat, mLng, memClockSec, mem.desvioSec || 0);
           }
-          if (!anchor && Number.isFinite(mem.desvioSec)) {
-            const baseInit = memFromPrev
-              ? Math.max(-1800, Math.min(900, mem.desvioSec * 0.7))
-              : Math.max(-2400, Math.min(1500, mem.desvioSec));
-            const elapsedSec = Math.max(0, nowSec - memClockSec);
-            desvioSec = computeGradualOffsetSec(baseInit, elapsedSec);
-          }
+        }
+        if (!anchor && Number.isFinite(mem.desvioSec)) {
+          desvioSec = propagateBlockDesvioSec(block, memIdx, targetIdx, mem.desvioSec, elapsedSec);
         }
       }
 
@@ -988,38 +1346,126 @@ export function predictLineBusesForStop({
       if (!ev) continue;
 
       const curOffset = ev.effectiveOffsetSec || 0;
-      const desvioRaw = mem ? formatDesvioFromSec(curOffset) : '';
+      const desvioRaw =
+        mem && (memDepth === 0 || anchor || Math.abs(curOffset) >= 60) ? formatDesvioFromSec(curOffset) : '';
 
       seenTripKeys.add(trip.tripKey);
-      candidates.push({ trip, stopBranch, stopProj, ev, mem, anchor, desvioSec: curOffset, desvioRaw, predKey });
+      candidates.push({
+        trip,
+        stopBranch,
+        stopProj,
+        ev,
+        mem,
+        memDepth,
+        anchor,
+        desvioSec: curOffset,
+        desvioRaw,
+        predKey,
+        liveBlockSrc: null
+      });
     }
   }
 
   candidates.sort((a, b) => a.ev.etaSec - b.ev.etaSec);
 
   const usedCoches = new Set(liveMatchedCoches);
+  const emittedByBlockId = new Map(); // blockId -> first predicted bus emitted for this stop
   const predicted = [];
 
   for (const item of candidates) {
     if (predicted.length >= maxUpcoming) break;
 
-    const { trip, stopBranch, stopProj, ev, anchor, desvioSec, desvioRaw, predKey } = item;
+    const { trip, stopBranch, stopProj, ev, anchor, desvioSec, desvioRaw, predKey, liveBlockSrc } = item;
     let mem = item.mem;
-    if (mem?.coche && usedCoches.has(mem.coche)) {
+
+    // Detect if this predicted trip is a NEXT LAP of an earlier already-emitted predicted bus in the same block!
+    const earlierPredSameBlock =
+      !liveBlockSrc && trip.blockId ? emittedByBlockId.get(trip.blockId) || null : null;
+    const isNextLapOfLive = Boolean(liveBlockSrc);
+    const isNextLapOfPred = Boolean(earlierPredSameBlock);
+    const isNextLap = isNextLapOfLive || isNextLapOfPred;
+
+    // Never allow two DIFFERENT concurrent blocks to claim the same coche;
+    // DO allow a later lap of the SAME block (`isNextLap`) to keep its rightful coche!
+    if (!isNextLap && mem?.coche && usedCoches.has(String(mem.coche).trim())) {
       mem = null;
     }
 
-    const traj = buildTrajectoryFromBranchAlong(ev.activeBranch, ev.activeAlong, stopBranch, stopProj, {
-      isAtTerminal: ev.isAtTerminal,
-      etaSec: ev.etaSec
-    });
-    if (!traj) continue;
+    let finalLat = ev.lat;
+    let finalLng = ev.lng;
+    let finalRemMeters = ev.remainingMeters;
+    let nextLapOfKey = null;
+    let nextLapSourceLive = false;
+    let nextLapExtraMeters = 0;
+    let coche = '';
+    let choferNombre = '';
+    let choferLegajo = '';
+    let choferRaw = '';
+    let esAdaptado = false;
+    let ultimaGps = '';
+    let gpsTimeOnly = '';
+    let realBandera = ev.realBandera || stopBranch.bandera;
+    let realBanderaColor = ev.realBanderaColor || getLineColor(lineName);
+    let traj = null;
 
-    if (mem?.coche) usedCoches.add(mem.coche);
+    if (isNextLapOfLive) {
+      const src = liveBlockSrc.bus;
+      nextLapOfKey = src.key;
+      nextLapSourceLive = liveBlockSrc.isLive;
+      nextLapExtraMeters = liveBlockSrc.extraMeters;
+      coche = src.identificadorCoche || '';
+      choferNombre = src.choferNombre || '';
+      choferLegajo = src.choferLegajo || '';
+      choferRaw = src.choferRaw || '';
+      esAdaptado = Boolean(src.esAdaptado);
+      ultimaGps = src.ultimaFechaHoraGPS || '';
+      gpsTimeOnly = src.gpsTimeOnly || (ultimaGps ? formatGpsTimeOnly(ultimaGps) : '');
+      traj = src.trajectory || buildTrajectoryFromBranchAlong(stopBranch, 0, stopBranch, stopProj, { etaSec: ev.etaSec });
+    } else if (isNextLapOfPred) {
+      const src = earlierPredSameBlock;
+      const srcIdx = typeof src.scheduledTrip?.blockIndex === 'number' ? src.scheduledTrip.blockIndex : 0;
+      const tgtIdx = typeof trip.blockIndex === 'number' ? trip.blockIndex : srcIdx + 2;
+      nextLapOfKey = src.key;
+      nextLapSourceLive = false;
+      nextLapExtraMeters = computeExtraMetersAcrossBlock(trip.block || [], srcIdx, tgtIdx, stopCoords, stopProj);
+      finalLat = src.lat;
+      finalLng = src.lng;
+      finalRemMeters = Math.max(stopProj.along, (src.routeMeters ?? 0) + nextLapExtraMeters);
+      coche = src.identificadorCoche || mem?.coche || '';
+      choferNombre = src.choferNombre || mem?.choferNombre || '';
+      choferLegajo = src.choferLegajo || mem?.choferLegajo || '';
+      choferRaw = src.choferRaw || mem?.choferRaw || '';
+      esAdaptado = Boolean(src.esAdaptado || mem?.esAdaptado);
+      ultimaGps = src.ultimaFechaHoraGPS || mem?.ultimaGps || '';
+      const lastGpsTime = ultimaGps ? formatGpsTimeOnly(ultimaGps) : '';
+      gpsTimeOnly = src.gpsTimeOnly || (lastGpsTime ? `últ. ${lastGpsTime.slice(0, 5)}` : '');
+      realBandera = src.realBandera || stopBranch.bandera;
+      realBanderaColor = src.realBanderaColor || stopBranch.color;
+      traj = src.trajectory || buildTrajectoryFromBranchAlong(stopBranch, 0, stopBranch, stopProj, { etaSec: ev.etaSec });
+    } else {
+      traj = buildTrajectoryFromBranchAlong(ev.activeBranch, ev.activeAlong, stopBranch, stopProj, {
+        isAtTerminal: ev.isAtTerminal,
+        etaSec: ev.etaSec,
+        viaBranch: ev.viaBranch || null
+      });
+      if (!traj) continue;
+
+      if (mem?.coche) usedCoches.add(String(mem.coche).trim());
+      coche = mem?.coche || '';
+      choferNombre = mem?.choferNombre || '';
+      choferLegajo = mem?.choferLegajo || '';
+      choferRaw = mem?.choferRaw || '';
+      esAdaptado = Boolean(mem?.esAdaptado);
+      ultimaGps = mem?.ultimaGps || '';
+      const lastGpsTime = ultimaGps ? formatGpsTimeOnly(ultimaGps) : '';
+      gpsTimeOnly = lastGpsTime ? `últ. ${lastGpsTime.slice(0, 5)}` : '';
+    }
+
+    if (!traj) continue;
 
     const mins = Math.ceil(ev.etaSec / 60);
     const eta =
-      ev.etaSec <= 40 || ev.remainingMeters <= 45
+      ev.etaSec <= 40 || finalRemMeters <= 45
         ? { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' }
         : {
             minutes: mins,
@@ -1033,19 +1479,22 @@ export function predictLineBusesForStop({
     const desvio = desvioRaw
       ? parseDesvioHorario(desvioRaw)
       : { raw: '', status: 'none', label: '', shortLabel: '', sign: '', minutes: 0, seconds: 0 };
-    const lastGpsTime = mem?.ultimaGps ? formatGpsTimeOnly(mem.ultimaGps) : '';
-    const coche = mem?.coche || '';
 
-    predicted.push({
+    const built = {
       key: predKey,
       codigoLinea: Number(codLinea),
       descripcionLinea: lineName || `L${codLinea}`,
       descripcionBandera: stopBranch.bandera,
       descripcionCartelBandera: stopBranch.bandera,
-      tiempoRaw: eta.minutes === 0 ? 'Arribando..' : `${eta.minutes} min. est.`,
+      tiempoRaw:
+        eta.minutes === 0
+          ? 'Arribando..'
+          : nextLapSourceLive
+            ? `${eta.minutes} min. aprox.`
+            : `${eta.minutes} min. est.`,
       eta,
       etaSecondsRemaining: ev.etaSec,
-      esAdaptado: Boolean(mem?.esAdaptado),
+      esAdaptado,
       esLleno: false,
       esExtendido: false,
       viaParada: null,
@@ -1056,25 +1505,43 @@ export function predictLineBusesForStop({
       predAnchor: anchor,
       predDesvioSec: desvioSec,
       isPredicted: true,
-      predictionReason: mem ? 'last-online' : 'schedule',
-      lat: ev.lat,
-      lng: ev.lng,
-      distanceMeters: ev.remainingMeters,
-      routeMeters: ev.remainingMeters,
-      proximityPct: computeProximityPercent(eta.minutes, ev.remainingMeters),
+      isNextLap,
+      nextLapOfKey,
+      nextLapSourceLive,
+      nextLapExtraMeters,
+      predictionReason: isNextLapOfLive
+        ? nextLapSourceLive
+          ? 'next-lap-live'
+          : 'next-lap-offline'
+        : isNextLapOfPred
+          ? 'next-lap-offline'
+          : mem
+            ? 'last-online'
+            : 'schedule',
+      lat: finalLat,
+      lng: finalLng,
+      distanceMeters: finalRemMeters,
+      routeMeters: finalRemMeters,
+      proximityPct: computeProximityPercent(eta.minutes, finalRemMeters),
       identificadorCoche: coche,
-      choferNombre: mem?.choferNombre || '',
-      choferLegajo: mem?.choferLegajo || '',
-      choferRaw: mem?.choferRaw || '',
+      choferNombre,
+      choferLegajo,
+      choferRaw,
       desvio,
-      ultimaFechaHoraGPS: mem?.ultimaGps || '',
-      gpsTimeOnly: lastGpsTime ? `últ. ${lastGpsTime.slice(0, 5)}` : '',
+      ultimaFechaHoraGPS: ultimaGps,
+      gpsTimeOnly,
       trajectory: traj,
-      isOppositeLeg: ev.inOppositeLeg,
-      isNextCycle: false,
-      realBandera: ev.realBandera || stopBranch.bandera,
-      realBanderaColor: ev.realBanderaColor || getLineColor(lineName)
-    });
+      isOppositeLeg: Boolean(ev.inOppositeLeg),
+      isNextCycle: Boolean(ev.inNextCycle || isNextLap),
+      realBandera,
+      realBanderaColor
+    };
+
+    if (!isNextLap && trip.blockId && !emittedByBlockId.has(trip.blockId)) {
+      emittedByBlockId.set(trip.blockId, built);
+    }
+
+    predicted.push(built);
   }
 
   return predicted;

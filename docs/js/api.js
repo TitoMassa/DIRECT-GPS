@@ -658,8 +658,18 @@ export function matchBusesWithHorarios(buses = [], horarios = []) {
   const ordered = [...buses].sort((a, b) => (a.eta?.minutes ?? 999) - (b.eta?.minutes ?? 999));
 
   for (const bus of ordered) {
+    // Prefer canonical turnoProgramado already matched by the space-time predictor (including Sig. vuelta & extreme early/late)
+    if (bus.turnoProgramado) {
+      const exactSlot = horarios.find((s) => s.hora === bus.turnoProgramado && !usedSlots.has(s.hora));
+      if (exactSlot) {
+        usedSlots.add(exactSlot.hora);
+        slotToBus.set(exactSlot.hora, bus);
+        continue;
+      }
+    }
+
     if (!bus.eta || bus.eta.valid === false || typeof bus.eta.minutes !== 'number' || bus.eta.minutes > 240) {
-      bus.turnoProgramado = null;
+      if (!bus.turnoProgramado) bus.turnoProgramado = null;
       continue;
     }
     const desvioMin = bus.desvio?.minutes || 0;
@@ -681,7 +691,7 @@ export function matchBusesWithHorarios(buses = [], horarios = []) {
       usedSlots.add(bestSlot.hora);
       bus.turnoProgramado = bestSlot.hora;
       slotToBus.set(bestSlot.hora, bus);
-    } else {
+    } else if (!bus.turnoProgramado) {
       bus.turnoProgramado = null;
     }
   }

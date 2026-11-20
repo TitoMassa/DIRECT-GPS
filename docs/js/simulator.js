@@ -73,8 +73,15 @@ export class BusSimulator {
     const nowMs = Date.now();
     const nowSec = getArgentinaSecOfDay(new Date(nowMs));
     const seen = new Set();
+    const busByKey = new Map();
+    const nextLapBuses = [];
 
     for (const bus of buses) {
+      busByKey.set(bus.key, bus);
+      if (bus.isNextLap && bus.nextLapOfKey) {
+        nextLapBuses.push(bus);
+        continue;
+      }
       if (!bus.trajectory || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       seen.add(bus.key);
 
@@ -406,6 +413,22 @@ export class BusSimulator {
       this._applySampleToBus(bus, prev, false);
     }
 
+    // Mirror next-lap (`Sig. vuelta`) virtual cards onto their reconciled source bus (lat/lng, routeMeters, live status)
+    for (const bus of nextLapBuses) {
+      const src = busByKey.get(bus.nextLapOfKey);
+      if (!src) continue;
+      bus.lat = src.lat;
+      bus.lng = src.lng;
+      if (typeof src.routeMeters === 'number') {
+        bus.routeMeters = Math.max(0, src.routeMeters + (bus.nextLapExtraMeters || 0));
+        bus.distanceMeters = bus.routeMeters;
+      }
+      bus.nextLapSourceLive = !src.isPredicted && !src.gpsLost;
+      bus.predictionReason = bus.nextLapSourceLive ? 'next-lap-live' : 'next-lap-offline';
+      if (src.realBandera) bus.realBandera = src.realBandera;
+      if (src.realBanderaColor) bus.realBanderaColor = src.realBanderaColor;
+    }
+
     // Prune departed buses
     for (const key of this.units.keys()) {
       if (!seen.has(key)) this.units.delete(key);
@@ -547,6 +570,43 @@ export class BusSimulator {
       }
 
       this._applySampleToBus(bus, st, updateEta);
+    }
+
+    // Keep next-lap (`Sig. vuelta`) virtual cards smoothly synchronized with their source bus at 30fps
+    let busByKey = null;
+    for (const bus of buses) {
+      if (!bus.isNextLap || !bus.nextLapOfKey) continue;
+      if (!busByKey) busByKey = new Map(buses.map((b) => [b.key, b]));
+      const src = busByKey.get(bus.nextLapOfKey);
+      if (!src) continue;
+
+      bus.lat = src.lat;
+      bus.lng = src.lng;
+      if (typeof src.routeMeters === 'number') {
+        bus.routeMeters = Math.max(0, src.routeMeters + (bus.nextLapExtraMeters || 0));
+        bus.distanceMeters = bus.routeMeters;
+      }
+      if (src.realBandera) bus.realBandera = src.realBandera;
+      if (src.realBanderaColor) bus.realBanderaColor = src.realBanderaColor;
+
+      bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining ?? 0) - dt);
+      if (updateEta) {
+        const mins = Math.ceil(bus.etaSecondsRemaining / 60);
+        if (bus.etaSecondsRemaining <= 35) {
+          bus.eta = { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' };
+          bus.tiempoRaw = 'Arribando..';
+        } else {
+          bus.eta = {
+            minutes: mins,
+            valid: true,
+            display: `${mins}`,
+            unit: 'min',
+            urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
+          };
+          bus.tiempoRaw = bus.nextLapSourceLive ? `${mins} min. aprox.` : `${mins} min. est.`;
+        }
+        bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
+      }
     }
   }
 

@@ -223,8 +223,12 @@ export class TransitMap {
     const visibleBuses =
       filterLine === 'ALL' ? buses : buses.filter((b) => b.descripcionLinea === filterLine);
 
+    const primaryKeys = new Set(visibleBuses.filter((b) => !b.isNextLap).map((b) => b.key));
+
     for (const bus of visibleBuses) {
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+      // Same physical bus on a later lap (`Sig. vuelta`): never plot a duplicate marker on the map!
+      if (bus.isNextLap && bus.nextLapOfKey && primaryKeys.has(bus.nextLapOfKey)) continue;
       incomingKeys.add(bus.key);
 
       const isSelected = bus.key === selectedBusKey;

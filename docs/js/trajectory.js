@@ -270,7 +270,7 @@ export function buildTrajectoryFromBranchAlong(
   activeAlong,
   stopBranch,
   stopProj,
-  { isAtTerminal = false, etaSec = 600 } = {}
+  { isAtTerminal = false, etaSec = 600, viaBranch = null } = {}
 ) {
   if (!activeBranch || !stopBranch || !stopProj) return null;
 
@@ -286,6 +286,59 @@ export function buildTrajectoryFromBranchAlong(
 
   const stopBandera = stopBranch.bandera || '';
   const stopColor = stopBranch.color;
+
+  // 3-leg full_cycle: finishing `activeBranch` -> full `viaBranch` -> `stopBranch` up to `stopProj`
+  if (viaBranch) {
+    const clampedAlong = Math.max(0, Math.min(activeBranch.totalLen, activeAlong));
+    const startProj = sampleBranchAtAlong(activeBranch, clampedAlong);
+    const seg1Pts = slicePolyline(activeBranch.pts, startProj, null);
+    const seg2Pts = viaBranch.pts || [];
+    const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
+    const seg3Pts = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
+
+    const pathPts = [...seg1Pts, ...seg2Pts, ...seg3Pts];
+    const cum = buildCumDist(pathPts);
+    const totalMeters = cum[cum.length - 1] || 0;
+    const len1 = buildCumDist(seg1Pts).slice(-1)[0] || 0;
+    const len2 = buildCumDist(seg2Pts).slice(-1)[0] || 0;
+    const oppStartMeters = len1;
+    const turnaroundAtMeters = len1 + len2;
+
+    const actBandera = activeBranch.bandera || stopBandera;
+    const actColor = activeBranch.color || stopColor;
+    const viaBandera = viaBranch.bandera || 'Sentido opuesto';
+    const viaColor = viaBranch.color;
+
+    const stopAlongs = [
+      ...mapStopsInRange(activeBranch, clampedAlong, activeBranch.totalLen, 0),
+      ...mapStopsInRange(viaBranch, 0, viaBranch.totalLen, oppStartMeters),
+      ...mapStopsInRange(stopBranch, 0, stopProj.along, turnaroundAtMeters)
+    ].sort((a, b) => a - b);
+
+    const segments = [
+      { pts: seg1Pts, color: actColor, bandera: actBandera, startMeters: 0, endMeters: oppStartMeters },
+      { pts: seg2Pts, color: viaColor, bandera: viaBandera, startMeters: oppStartMeters, endMeters: turnaroundAtMeters },
+      { pts: seg3Pts, color: stopColor, bandera: stopBandera, startMeters: turnaroundAtMeters, endMeters: totalMeters }
+    ];
+
+    return {
+      leg: 'full_cycle',
+      isOppositeLeg: false,
+      isNextCycle: true,
+      isAtTerminal,
+      realBandera: actBandera,
+      realBanderaColor: actColor,
+      segments,
+      stopAlongs,
+      oppStartMeters,
+      turnaroundAtMeters,
+      pathPts,
+      pathCum: cum,
+      totalMeters,
+      walkedMeters: 0,
+      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+    };
+  }
 
   if (activeBranch === stopBranch) {
     const clampedAlong = Math.max(0, Math.min(stopProj.along, activeAlong));
