@@ -3649,12 +3649,18 @@ function renderLineFlotaView() {
           ${visibleCoches
             .map((c) => {
               const seen = formatRosterSeenInfo(c.lastSeenAt, c.lastDayKey, todayKey);
+              const isLiveNow = Boolean(c.enLineaAhora);
+              const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
               const driverTxt = c.lastChoferNombre
                 ? `${c.lastChoferNombre}${c.lastChoferLegajo ? ` (${c.lastChoferLegajo})` : ''}`
                 : '';
               const srParts = [
                 `Coche ${c.coche}${c.esAdaptado ? ', unidad adaptada' : ''}`,
-                seen.isToday ? `en servicio hoy, visto ${seen.whenSpoken}` : `visto por última vez ${seen.whenSpoken}`,
+                isLiveNow
+                  ? `en línea ahora, visto ${seen.whenSpoken}`
+                  : seen.isToday
+                    ? `en servicio hoy, visto ${seen.whenSpoken}`
+                    : `visto por última vez ${seen.whenSpoken}`,
                 driverTxt
                   ? `último chofer: ${c.lastChoferNombre}${c.lastChoferLegajo ? `, legajo ${c.lastChoferLegajo}` : ''}`
                   : 'chofer sin datos',
@@ -3669,7 +3675,7 @@ function renderLineFlotaView() {
                         <span class="flota-coche-title">#${escapeHtml(c.coche)}</span>
                         ${c.esAdaptado ? `<span class="adapted-icon-badge" title="Unidad adaptada">♿</span>` : ''}
                       </div>
-                      <span class="flota-status-pill ${seen.isToday ? 'is-today' : 'is-recent'}">${escapeHtml(seen.badge)}</span>
+                      <span class="flota-status-pill ${seen.isToday ? 'is-today' : 'is-recent'}">${escapeHtml(badgeLabel)}</span>
                     </div>
                     <div class="flota-row-sub">
                       <span>${driverTxt ? `Últ. chofer: <strong>${escapeHtml(c.lastChoferNombre)}</strong>${c.lastChoferLegajo ? ` <span class="legajo-chip">${escapeHtml(c.lastChoferLegajo)}</span>` : ''}` : 'Chofer s/d'}</span>
@@ -3743,35 +3749,96 @@ function renderLineFlotaView() {
   }
 
   const sched = fv.schedSummary;
+  const cap = data.capacity || null;
+  const activeNowCount =
+    typeof cap?.activeNow === 'number'
+      ? cap.activeNow
+      : allCoches.filter((c) => c.enLineaAhora).length;
+  const peakSimultaneousToday =
+    typeof cap?.peakSimultaneousToday === 'number' && cap.peakSimultaneousToday > 0
+      ? cap.peakSimultaneousToday
+      : Math.max(activeNowCount, Math.min(hoyCochesCount, sched?.totalServices || hoyCochesCount));
+  const replacementSwapsToday =
+    typeof cap?.replacementSwapsToday === 'number'
+      ? cap.replacementSwapsToday
+      : Math.max(0, hoyCochesCount - peakSimultaneousToday);
+  const learnedTypicalToday = Number(cap?.learnedTypicalToday) || 0;
+  const effectiveActiveServices = peakSimultaneousToday || learnedTypicalToday || hoyCochesCount;
+
   let crossCardHtml = '';
-  if (sched && sched.totalServices > 0) {
+  if ((sched && sched.totalServices > 0) || hoyCochesCount > 0 || learnedTypicalToday > 0) {
+    const tipoKey = sched?.tipoDia || cap?.tipoDia || getArgentinaTodayTipo();
     const tipoLabel =
-      sched.tipoDia === 'domingo' ? 'Domingo' : sched.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie';
-    const schedSub =
-      sched.cortadosCount > 0
-        ? `${sched.corridosCount} corridos · ${sched.cortadosCount} cortados${
-            sched.middayValleyCount < sched.totalServices ? ` · valle ${sched.middayValleyCount}` : ''
-          }`
-        : `${sched.totalServices === 1 ? 'Turno continuo' : 'Todos corridos'}${
-            sched.relevoEnLineaCount > 0 ? ` · ${sched.relevoEnLineaCount} c/ relevo` : ''
-          }`;
-    const obsVal = `${hoyCochesCount} ${hoyCochesCount === 1 ? 'coche' : 'coches'} hoy`;
-    const obsSub = `${allCoches.length} en ${retentionDays}d · ${allChoferes.length} ${
-      allChoferes.length === 1 ? 'chofer' : 'choferes'
-    }`;
-    const srCross = `Programación ${tipoLabel}: ${sched.totalServices} ${
-      sched.totalServices === 1 ? 'servicio' : 'servicios'
-    }, ${schedSub.replace(/·/g, ',')}. Detectados en el sistema: ${obsVal}, ${allCoches.length} coches en ${retentionDays} días y ${allChoferes.length} choferes.`;
+      tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    const schedTotal = sched?.totalServices || 0;
+    const schedVal =
+      schedTotal > 0
+        ? `${schedTotal} ${schedTotal === 1 ? 'servicio' : 'servicios'}`
+        : learnedTypicalToday > 0
+          ? `${learnedTypicalToday} ${learnedTypicalToday === 1 ? 'coche típico' : 'coches típicos'}`
+          : 'Sin horario fijo';
+
+    let schedSub = '';
+    if (schedTotal > 0) {
+      const baseRegime =
+        sched.cortadosCount > 0
+          ? `${sched.corridosCount} corridos · ${sched.cortadosCount} cortados${
+              sched.middayValleyCount < schedTotal ? ` · valle ${sched.middayValleyCount}` : ''
+            }`
+          : `${schedTotal === 1 ? 'Turno continuo' : 'Todos corridos'}${
+              sched.relevoEnLineaCount > 0 ? ` · ${sched.relevoEnLineaCount} c/ relevo` : ''
+            }`;
+      // Auto-learned comparison between real simultaneous peak/typical fleet and static timetable
+      let deltaTag = '';
+      const compareRef = peakSimultaneousToday > 0 ? peakSimultaneousToday : learnedTypicalToday;
+      if (compareRef > 0) {
+        const diff = compareRef - schedTotal;
+        if (diff === 0 && peakSimultaneousToday > 0) {
+          deltaTag = ' · Flota completa';
+        } else if (diff > 0) {
+          deltaTag = ` · +${diff} refuerzo detectado`;
+        } else if (diff < 0 && learnedTypicalToday > 0 && learnedTypicalToday < schedTotal && (cap?.sampleDaysForTipo || 0) >= 2) {
+          deltaTag = ` · Típico real: ${learnedTypicalToday}`;
+        }
+      }
+      schedSub = `${baseRegime}${deltaTag}`;
+    } else {
+      schedSub = 'Aprendido por escaneo automático';
+    }
+
+    const obsVal =
+      peakSimultaneousToday > 0
+        ? `${peakSimultaneousToday} ${peakSimultaneousToday === 1 ? 'simultáneo' : 'simultáneos'} hoy`
+        : `${hoyCochesCount} ${hoyCochesCount === 1 ? 'coche' : 'coches'} hoy`;
+
+    const obsSubParts = [];
+    if (activeNowCount > 0) {
+      obsSubParts.push(`${activeNowCount} en línea ahora`);
+    }
+    if (replacementSwapsToday > 0) {
+      obsSubParts.push(
+        `${hoyCochesCount} internos (${replacementSwapsToday} ${replacementSwapsToday === 1 ? 'reemplazo' : 'reemplazos'})`
+      );
+    } else if (peakSimultaneousToday > 0 && hoyCochesCount !== peakSimultaneousToday) {
+      obsSubParts.push(`${hoyCochesCount} vistos hoy`);
+    }
+    if (learnedTypicalToday > 0 && learnedTypicalToday !== peakSimultaneousToday) {
+      obsSubParts.push(`típico ${learnedTypicalToday}`);
+    }
+    obsSubParts.push(`${allCoches.length} en ${retentionDays}d · ${allChoferes.length} chof.`);
+    const obsSub = obsSubParts.join(' · ');
+
+    const srCross = `Programación ${tipoLabel}: ${schedVal}, ${schedSub.replace(/·/g, ',')}. Detectado en tiempo real por el sistema: ${obsVal}, ${obsSub.replace(/·/g, ',')}.`;
     crossCardHtml = `
-      <div class="flota-cross-card" role="region" aria-label="Cruce de servicios programados y flota detectada">
+      <div class="flota-cross-card" role="region" aria-label="Cruce de servicios programados y flota simultánea real">
         <span class="sr-only">${escapeHtml(srCross)}</span>
         <div class="flota-cross-cell" aria-hidden="true">
           <span class="flota-cross-label">Programado · ${escapeHtml(tipoLabel)}</span>
-          <span class="flota-cross-val">${sched.totalServices} ${sched.totalServices === 1 ? 'servicio' : 'servicios'}</span>
+          <span class="flota-cross-val">${escapeHtml(schedVal)}</span>
           <span class="flota-cross-sub">${escapeHtml(schedSub)}</span>
         </div>
         <div class="flota-cross-cell" aria-hidden="true">
-          <span class="flota-cross-label">Detectado · Sistema</span>
+          <span class="flota-cross-label">Flota real · Sistema</span>
           <span class="flota-cross-val">${escapeHtml(obsVal)}</span>
           <span class="flota-cross-sub">${escapeHtml(obsSub)}</span>
         </div>
@@ -3913,15 +3980,21 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
     state.flotaView.loading = false;
     state.flotaView.error = null;
 
-    // Keep summary badge in sync with freshly fetched line roster
+    // Keep summary badge in sync with freshly fetched line roster + live capacity
     if (data) {
+      const cHoy = (data.coches || []).filter((c) => c.vistoHoy).length;
+      const cap = data.capacity || null;
       state.flotaSummaryByLine.set(Number(linea.codigo), {
         codigoLinea: Number(linea.codigo),
         descripcionLinea: data.descripcionLinea || linea.descripcion,
-        cochesHoy: (data.coches || []).filter((c) => c.vistoHoy).length,
+        cochesHoy: cHoy,
         cochesSemana: (data.coches || []).length,
         choferesHoy: (data.choferes || []).filter((d) => d.vistoHoy).length,
         choferesSemana: (data.choferes || []).length,
+        activeNow: cap?.activeNow || 0,
+        peakSimultaneousToday: cap?.peakSimultaneousToday || cHoy,
+        replacementSwapsToday: cap?.replacementSwapsToday || 0,
+        learnedTypicalToday: cap?.learnedTypicalToday || 0,
         lastSeenAt: Date.now()
       });
     }
@@ -3931,13 +4004,21 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
       const cTotal = (data?.coches || []).length;
       const cHoy = (data?.coches || []).filter((c) => c.vistoHoy).length;
       const dTotal = (data?.choferes || []).length;
+      const peakSim = data?.capacity?.peakSimultaneousToday || cHoy;
+      const swaps = data?.capacity?.replacementSwapsToday || 0;
       const schedHint = schedSummary?.totalServices
         ? ` Programados hoy: ${formatFleetSummaryShort(schedSummary)}.`
         : '';
+      const simHint =
+        peakSim > 0
+          ? `${peakSim} ${peakSim === 1 ? 'coche simultáneo' : 'coches simultáneos'} hoy${
+              swaps > 0 ? ` (${cHoy} internos vistos, ${swaps} de reemplazo)` : ''
+            }`
+          : `${cHoy} hoy`;
       announce(
-        `Flota de línea ${linea.descripcion}:${schedHint} En el sistema: ${cTotal} ${
+        `Flota de línea ${linea.descripcion}:${schedHint} Detectado en el sistema: ${simHint}, ${cTotal} ${
           cTotal === 1 ? 'coche' : 'coches'
-        } (${cHoy} hoy) y ${dTotal} ${dTotal === 1 ? 'chofer' : 'choferes'}.`
+        } en la semana y ${dTotal} ${dTotal === 1 ? 'chofer' : 'choferes'}.`
       );
     }
   } catch (err) {
@@ -3969,13 +4050,22 @@ function renderDrilldown() {
           .map((l) => {
             const color = getLineColor(l.descripcion);
             const sum = state.flotaSummaryByLine.get(Number(l.codigo));
+            const peakOrHoy = sum ? sum.peakSimultaneousToday || sum.cochesHoy || 0 : 0;
+            const swapsNote =
+              sum && sum.replacementSwapsToday > 0
+                ? ` (${sum.cochesHoy} internos · ${sum.replacementSwapsToday} reempl.)`
+                : '';
+            const activeNote =
+              sum && sum.activeNow > 0 ? `${sum.activeNow} en línea ahora · ` : '';
             const countBadge =
               sum && sum.cochesSemana > 0
-                ? `<span class="line-tile-count" aria-hidden="true" title="${sum.cochesHoy} coches hoy · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${sum.cochesHoy > 0 ? `${sum.cochesHoy}/${sum.cochesSemana}` : `${sum.cochesSemana}`} c.</span>`
+                ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy}/${sum.cochesSemana}` : `${sum.cochesSemana}`} c.</span>`
                 : '';
             const flotaAria =
               sum && sum.cochesSemana > 0
-                ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${sum.cochesHoy} coches hoy, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
+                ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${peakOrHoy} coches simultáneos hoy${
+                    sum.replacementSwapsToday > 0 ? ` (${sum.cochesHoy} internos en total)` : ''
+                  }, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
                 : `Ver flota de coches y choferes de línea ${l.descripcion}`;
             return `
               <div class="line-tile" style="--line-color:${color}">

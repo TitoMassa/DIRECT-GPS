@@ -524,6 +524,17 @@ function getArgentinaDayKey(nowMs = Date.now()) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
+function getArgentinaServiceTipo(nowMs = Date.now()) {
+  const d = new Date(nowMs - 6 * 3600 * 1000);
+  const dow = d.getUTCDay();
+  if (dow === 0) return 'domingo';
+  if (dow === 6) return 'sabado';
+  return 'habil';
+}
+
+const SIMULTANEOUS_ACTIVE_WINDOW_MS = 38 * 60 * 1000; // 38 min covers full 20-min Cron cycle + cabecera layover
+const CAPACITY_HISTORY_RETENTION_MS = 28 * 86400 * 1000; // 4 weeks of day-type capacity learning
+
 function parseDesvioSeconds(raw = '') {
   const clean = String(raw || '').replace(/\s+/g, '');
   const m = clean.match(/^([+-])(\d{1,2}):(\d{2})$/);
@@ -632,6 +643,20 @@ export class FleetMemory {
         PRIMARY KEY (codigo_linea, driver_key)
       );
       CREATE INDEX IF NOT EXISTS idx_fleet_drivers_line ON fleet_drivers (codigo_linea, last_seen_at DESC);
+
+      CREATE TABLE IF NOT EXISTS fleet_capacity_daily (
+        day_key TEXT NOT NULL,
+        codigo_linea INTEGER NOT NULL,
+        tipo_dia TEXT NOT NULL,
+        peak_simultaneous INTEGER DEFAULT 0,
+        peak_at INTEGER DEFAULT 0,
+        active_now INTEGER DEFAULT 0,
+        total_unique_cars INTEGER DEFAULT 0,
+        samples_count INTEGER DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (day_key, codigo_linea)
+      );
+      CREATE INDEX IF NOT EXISTS idx_cap_line_tipo ON fleet_capacity_daily (codigo_linea, tipo_dia, updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS roster_meta (
         key TEXT PRIMARY KEY,
@@ -916,6 +941,223 @@ export class FleetMemory {
     }
   }
 
+  /**
+   * Recomputes and records real-time simultaneous fleet capacity for `touchedLineCodes` (or all lines).
+   * Distinguishes:
+   *  - `activeNow`: cars with a fresh GPS observation within the last 38 min on the current service day
+   *  - `peakSimultaneous`: highest concurrent active car count observed today (real active services!)
+   *  - `totalUniqueCars`: total distinct car numbers seen today (if `totalUniqueCars > peakSimultaneous`,
+   *    the difference is the exact number of broken-down / relief vehicle swaps today!)
+   */
+  _updateLiveCapacity(nowMs, todayKey, touchedLineCodes = null) {
+    const tipoDia = getArgentinaServiceTipo(nowMs);
+    const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+    const codes =
+      Array.isArray(touchedLineCodes) && touchedLineCodes.length > 0
+        ? Array.from(new Set(touchedLineCodes.map(Number).filter(Boolean)))
+        : [];
+
+    let rows;
+    if (codes.length > 0) {
+      const ph = codes.map(() => '?').join(',');
+      rows = this.sql
+        .exec(
+          `SELECT codigo_linea,
+                  COUNT(*) AS total_today,
+                  SUM(CASE WHEN last_seen_at >= ? THEN 1 ELSE 0 END) AS active_now
+           FROM fleet_cars
+           WHERE last_day_key = ? AND codigo_linea IN (${ph})
+           GROUP BY codigo_linea`,
+          activeCutoff,
+          todayKey,
+          ...codes
+        )
+        .toArray();
+    } else {
+      rows = this.sql
+        .exec(
+          `SELECT codigo_linea,
+                  COUNT(*) AS total_today,
+                  SUM(CASE WHEN last_seen_at >= ? THEN 1 ELSE 0 END) AS active_now
+           FROM fleet_cars
+           WHERE last_day_key = ?
+           GROUP BY codigo_linea`,
+          activeCutoff,
+          todayKey
+        )
+        .toArray();
+    }
+
+    for (const r of rows) {
+      const cod = Number(r.codigo_linea);
+      const totalUnique = Number(r.total_today) || 0;
+      const activeNow = Number(r.active_now) || 0;
+      if (!cod || totalUnique <= 0) continue;
+
+      this.sql.exec(
+        `INSERT INTO fleet_capacity_daily (
+          day_key, codigo_linea, tipo_dia, peak_simultaneous, peak_at,
+          active_now, total_unique_cars, samples_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(day_key, codigo_linea) DO UPDATE SET
+          tipo_dia = excluded.tipo_dia,
+          peak_at = CASE WHEN excluded.peak_simultaneous > fleet_capacity_daily.peak_simultaneous THEN excluded.peak_at ELSE fleet_capacity_daily.peak_at END,
+          peak_simultaneous = MAX(fleet_capacity_daily.peak_simultaneous, excluded.peak_simultaneous),
+          active_now = excluded.active_now,
+          total_unique_cars = MAX(fleet_capacity_daily.total_unique_cars, excluded.total_unique_cars),
+          samples_count = fleet_capacity_daily.samples_count + 1,
+          updated_at = excluded.updated_at`,
+        todayKey,
+        cod,
+        tipoDia,
+        activeNow,
+        nowMs,
+        activeNow,
+        totalUnique,
+        nowMs
+      );
+    }
+  }
+
+  /**
+   * Computes live & learned operational fleet capacity for one line (`codLineaParam`) or all lines.
+   * Learns typical active services per day-type (`habil` / `sabado` / `domingo`) via the 75th-percentile
+   * of recent daily simultaneous peaks (robust against partial early-morning days AND single-day replacement outliers).
+   */
+  _getCapacityByLine(nowMs, todayKey, codLineaParam = null) {
+    const todayTipo = getArgentinaServiceTipo(nowMs);
+    const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+    const minHistTs = nowMs - CAPACITY_HISTORY_RETENTION_MS;
+
+    const liveRows = codLineaParam
+      ? this.sql
+          .exec(
+            `SELECT codigo_linea,
+                    COUNT(*) AS total_today,
+                    SUM(CASE WHEN last_seen_at >= ? THEN 1 ELSE 0 END) AS active_now
+             FROM fleet_cars
+             WHERE last_day_key = ? AND codigo_linea = ?
+             GROUP BY codigo_linea`,
+            activeCutoff,
+            todayKey,
+            Number(codLineaParam)
+          )
+          .toArray()
+      : this.sql
+          .exec(
+            `SELECT codigo_linea,
+                    COUNT(*) AS total_today,
+                    SUM(CASE WHEN last_seen_at >= ? THEN 1 ELSE 0 END) AS active_now
+             FROM fleet_cars
+             WHERE last_day_key = ?
+             GROUP BY codigo_linea`,
+            activeCutoff,
+            todayKey
+          )
+          .toArray();
+
+    const capRows = codLineaParam
+      ? this.sql
+          .exec(
+            `SELECT day_key, codigo_linea, tipo_dia, peak_simultaneous, peak_at,
+                    active_now, total_unique_cars, samples_count, updated_at
+             FROM fleet_capacity_daily
+             WHERE codigo_linea = ? AND updated_at >= ?
+             ORDER BY day_key DESC`,
+            Number(codLineaParam),
+            minHistTs
+          )
+          .toArray()
+      : this.sql
+          .exec(
+            `SELECT day_key, codigo_linea, tipo_dia, peak_simultaneous, peak_at,
+                    active_now, total_unique_cars, samples_count, updated_at
+             FROM fleet_capacity_daily
+             WHERE updated_at >= ?
+             ORDER BY day_key DESC`,
+            minHistTs
+          )
+          .toArray();
+
+    const liveByLine = new Map();
+    for (const r of liveRows) {
+      liveByLine.set(Number(r.codigo_linea), {
+        activeNow: Number(r.active_now) || 0,
+        totalToday: Number(r.total_today) || 0
+      });
+    }
+
+    const histByLine = new Map();
+    for (const r of capRows) {
+      const cod = Number(r.codigo_linea);
+      if (!histByLine.has(cod)) histByLine.set(cod, []);
+      histByLine.get(cod).push(r);
+    }
+
+    const allCodes = new Set([...liveByLine.keys(), ...histByLine.keys()]);
+    if (codLineaParam) allCodes.add(Number(codLineaParam));
+
+    const computeQuantile75 = (vals) => {
+      const clean = vals.filter((v) => v > 0).sort((a, b) => a - b);
+      if (clean.length === 0) return 0;
+      const idx = Math.min(clean.length - 1, Math.floor((clean.length - 1) * 0.75));
+      return clean[idx];
+    };
+
+    const result = new Map();
+    for (const cod of allCodes) {
+      const live = liveByLine.get(cod) || { activeNow: 0, totalToday: 0 };
+      const rows = histByLine.get(cod) || [];
+      const todayRow = rows.find((r) => r.day_key === todayKey) || null;
+
+      const activeNow = live.activeNow;
+      const totalUniqueToday = Math.max(live.totalToday, Number(todayRow?.total_unique_cars) || 0);
+      const peakSimultaneousToday = Math.max(activeNow, Number(todayRow?.peak_simultaneous) || 0);
+      const peakAtToday =
+        activeNow > (Number(todayRow?.peak_simultaneous) || 0)
+          ? nowMs
+          : Number(todayRow?.peak_at) || null;
+      const replacementSwapsToday = Math.max(0, totalUniqueToday - peakSimultaneousToday);
+
+      const byTipo = { habil: [], sabado: [], domingo: [] };
+      for (const r of rows) {
+        const t = r.tipo_dia;
+        const p =
+          r.day_key === todayKey
+            ? Math.max(peakSimultaneousToday, Number(r.peak_simultaneous) || 0)
+            : Number(r.peak_simultaneous) || 0;
+        if (byTipo[t] && p > 0) {
+          byTipo[t].push(p);
+        }
+      }
+      if (!todayRow && peakSimultaneousToday > 0 && byTipo[todayTipo]) {
+        byTipo[todayTipo].push(peakSimultaneousToday);
+      }
+
+      const learnedByTipo = {
+        habil: computeQuantile75(byTipo.habil),
+        sabado: computeQuantile75(byTipo.sabado),
+        domingo: computeQuantile75(byTipo.domingo)
+      };
+      const learnedTypicalToday = learnedByTipo[todayTipo] || peakSimultaneousToday || 0;
+      const sampleDaysForTipo = byTipo[todayTipo]?.length || 0;
+
+      result.set(cod, {
+        tipoDia: todayTipo,
+        activeNow,
+        peakSimultaneousToday,
+        peakAtToday,
+        totalUniqueToday,
+        replacementSwapsToday,
+        learnedTypicalToday,
+        sampleDaysForTipo,
+        learnedByTipo
+      });
+    }
+
+    return result;
+  }
+
   _pruneOld(nowMs) {
     const cutoff = nowMs - 4 * 86400 * 1000;
     const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
@@ -924,6 +1166,7 @@ export class FleetMemory {
     this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
     this.sql.exec('DELETE FROM fleet_cars WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_drivers WHERE last_seen_at < ?', rosterCutoff);
+    this.sql.exec('DELETE FROM fleet_capacity_daily WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
   }
 
   async fetch(request) {
@@ -946,6 +1189,7 @@ export class FleetMemory {
       const body = await request.json().catch(() => ({}));
       const units = Array.isArray(body.units) ? body.units : [];
       let count = 0;
+      const touchedLines = new Set();
 
       if (!body.pruneOnly) {
         for (const u of units) {
@@ -994,8 +1238,12 @@ export class FleetMemory {
             nowMs
           );
           this._upsertRosterUnit(u, nowMs, todayKey);
+          touchedLines.add(cod);
           count++;
         }
+
+        // Measure and update live simultaneous capacity across all lines on cycle completion (or touched lines per tick)
+        this._updateLiveCapacity(nowMs, todayKey, body.cycleCompleted ? null : Array.from(touchedLines));
 
         if (Number.isInteger(body.nextCursor)) {
           this._setMeta('scan_cursor', body.nextCursor);
@@ -1055,9 +1303,11 @@ export class FleetMemory {
         )
         .toArray();
 
+      const capByLine = this._getCapacityByLine(nowMs, todayKey);
       const byLine = new Map();
       const ensureLine = (cod, desc) => {
         if (!byLine.has(cod)) {
+          const cap = capByLine.get(cod) || null;
           byLine.set(cod, {
             codigoLinea: cod,
             descripcionLinea: desc || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
@@ -1065,6 +1315,10 @@ export class FleetMemory {
             cochesSemana: 0,
             choferesHoy: 0,
             choferesSemana: 0,
+            activeNow: cap?.activeNow || 0,
+            peakSimultaneousToday: cap?.peakSimultaneousToday || 0,
+            replacementSwapsToday: cap?.replacementSwapsToday || 0,
+            learnedTypicalToday: cap?.learnedTypicalToday || 0,
             lastSeenAt: 0
           });
         }
@@ -1128,11 +1382,13 @@ export class FleetMemory {
         )
         .toArray();
 
+      const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
       const coches = carRows
         .map((r) => ({
           coche: r.coche,
           esAdaptado: Boolean(r.es_adaptado),
           vistoHoy: r.last_day_key === todayKey,
+          enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
           lastChoferNombre: r.last_chofer_nombre || '',
           lastChoferLegajo: r.last_chofer_legajo || '',
           lastBandera: r.last_bandera || '',
@@ -1176,6 +1432,7 @@ export class FleetMemory {
         drvRows[0]?.descripcion_linea ||
         LINE_NAMES_BY_CODE[codLinea] ||
         `L${codLinea}`;
+      const capacity = this._getCapacityByLine(nowMs, todayKey, codLinea).get(codLinea) || null;
 
       return Response.json({
         codigoLinea: codLinea,
@@ -1183,6 +1440,7 @@ export class FleetMemory {
         dayKey: todayKey,
         retentionDays: ROSTER_RETENTION_DAYS,
         meta: this._getRosterMetaSummary(),
+        capacity,
         coches,
         choferes
       });
@@ -1192,6 +1450,7 @@ export class FleetMemory {
       const body = await request.json().catch(() => ({}));
       const units = Array.isArray(body.units) ? body.units : [];
       let count = 0;
+      const touchedLines = new Set();
       for (const u of units) {
         const cod = Number(u.codigoLinea);
         const coche = String(u.coche || '').trim();
@@ -1240,7 +1499,11 @@ export class FleetMemory {
           nowMs
         );
         this._upsertRosterUnit(u, nowMs, todayKey);
+        touchedLines.add(cod);
         count++;
+      }
+      if (touchedLines.size > 0) {
+        this._updateLiveCapacity(nowMs, todayKey, Array.from(touchedLines));
       }
       if (body.stopSnapshot && body.stopSnapshot.idParada) {
         const sid = String(body.stopSnapshot.idParada).trim().toUpperCase();
@@ -1263,6 +1526,7 @@ export class FleetMemory {
       const entries = Array.isArray(body.entries) ? body.entries : [];
       const dayKey = String(body.dayKey || todayKey).slice(0, 10);
       let count = 0;
+      const touchedLines = new Set();
 
       for (const e of entries) {
         const cod = Number(e.codigoLinea ?? body.codigoLinea);
@@ -1369,9 +1633,13 @@ export class FleetMemory {
           nowMs
         );
         this._upsertRosterUnit({ ...e, codigoLinea: cod, coche }, nowMs, dayKey);
+        touchedLines.add(cod);
         count++;
       }
 
+      if (touchedLines.size > 0) {
+        this._updateLiveCapacity(nowMs, dayKey, Array.from(touchedLines));
+      }
       if (Math.random() < 0.05) this._pruneOld(nowMs);
       return Response.json({ ok: true, count, dayKey });
     }
