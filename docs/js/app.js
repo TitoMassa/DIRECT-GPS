@@ -18,6 +18,7 @@ import {
 import {
   parseRouteBranches,
   resolveBusTrajectory,
+  resolveTrailDirection,
   buildTrajectoryFromBranchAlong,
   pickStopBranches,
   projectOnPolyline
@@ -94,11 +95,12 @@ const state = {
   routeBranchesCache: new Map(),
   horariosArchiveCache: new Map(), // codLinea -> full horarios/<codLinea>.json
   horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
-  lastRealGpsByUnit: new Map(), // baseId -> { latest, prev, prevMoving } ({ lat, lng, gpsMs, ts })
+  lastRealGpsByUnit: new Map(), // baseId -> { latest, prev, prevMoving, trail[], confirmedDir }
   fleetMemory: { dayKey: '', stopSnapshot: null, trips: [], units: [] },
   fleetMemoryLastFetchMs: 0,
   sessionObservedTrips: new Map(), // `${codLinea}:${tripKey}` -> latest online observation
-  stickyLiveTripByCoche: new Map(), // `${codLinea}:${coche}` -> { tripKey, dayKey, updatedAt }
+  stickyLiveTripByCoche: new Map(), // `${codLinea}:${coche}` -> { tripKey, serviceNumber, blockId, dayKey, updatedAt }
+  serviceEvidenceByCoche: new Map(), // `${codLinea}:${coche}` -> { serviceNumber, blockId, dayKey, avgErrSec, count, updatedAt }
   completedTripsByStop: new Map(), // `${dayKey}:${stopId}` -> Set<`${codLinea}:${tripKey}`>
   downstreamProbeCache: new Map(), // `${codLinea}:${terminalStopId}` -> { ts, arribos }
   corridorFleet: [], // Latest parallel corridor-radar units returned by Worker (/api/arribos-linea & /api/arribos)
@@ -898,36 +900,107 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
 }
 
 /**
- * Maintains the penultimate (`anteúltimo`) and latest (`último`) real GPS fixes per physical bus unit,
- * plus the last moving fix so heading never drops to `null` on repeated-timestamp 10s polls.
+ * Maintains an internal multi-point GPS position trail (up to 8 spatially distinct moving fixes)
+ * plus penultimate/latest fixes and route-aligned `confirmedDir` per physical bus unit.
+ * Hydrates from server `FleetMemory` (`gpsTrail` + `dirBandera`) on cold start so direction
+ * relative to the route polyline is known from Poll #1 and remains rock-steady through red lights.
  */
+const MAX_UNIT_TRAIL_POINTS = 8;
+const UNIT_TRAIL_MAX_AGE_MS = 12 * 60 * 1000;
+
 function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.now()) {
   const gpsMs = parseGpsTimestampMs(gpsRaw);
   const curFix = { lat, lng, gpsMs, ts: now };
   let hist = state.lastRealGpsByUnit.get(baseId);
 
+  const pushToTrail = (trail, fix) => {
+    if (!fix || typeof fix.lat !== 'number' || typeof fix.lng !== 'number') return;
+    if (Number.isNaN(fix.lat) || Number.isNaN(fix.lng) || (fix.lat === 0 && fix.lng === 0)) return;
+    const last = trail[trail.length - 1];
+    if (!last) {
+      trail.push(fix);
+      return;
+    }
+    const moved = distanceMeters(last.lat, last.lng, fix.lat, fix.lng) || 0;
+    // Update stationary point in place so traffic-light waits NEVER evict earlier moving trail points!
+    if (moved < 10) {
+      if ((fix.gpsMs ?? fix.ts) >= (last.gpsMs ?? last.ts)) {
+        trail[trail.length - 1] = { ...last, gpsMs: fix.gpsMs ?? last.gpsMs, ts: Math.max(last.ts || 0, fix.ts || 0) };
+      }
+      return;
+    }
+    trail.push(fix);
+    const refT = fix.gpsMs ?? fix.ts ?? now;
+    while (trail.length > MAX_UNIT_TRAIL_POINTS) trail.shift();
+    while (trail.length > 2 && refT - (trail[0].gpsMs ?? trail[0].ts ?? refT) > UNIT_TRAIL_MAX_AGE_MS) {
+      trail.shift();
+    }
+  };
+
   if (!hist || !hist.latest) {
-    // Cold-start enrichment: check if FleetMemory has an earlier GPS fix 4–110 s before `gpsMs`
+    // Cold-start hydration from central FleetMemory (multi-point trail + server-persisted confirmed direction)
+    const initTrail = [];
     let memPrev = null;
-    if (coche && gpsMs && Array.isArray(state.fleetMemory?.units)) {
+    let initConfirmedDir = null;
+
+    if (coche && Array.isArray(state.fleetMemory?.units)) {
       const memUnit = state.fleetMemory.units.find(
         (u) => Number(u.codigoLinea) === Number(codLinea) && String(u.coche || '').trim() === coche
       );
-      if (memUnit && typeof memUnit.lat === 'number' && typeof memUnit.lng === 'number') {
-        const mMs = parseGpsTimestampMs(memUnit.ultimaGps);
-        if (mMs && gpsMs - mMs >= 4000 && gpsMs - mMs <= 110000) {
-          memPrev = { lat: memUnit.lat, lng: memUnit.lng, gpsMs: mMs, ts: memUnit.updatedAt || mMs };
+      if (memUnit) {
+        const refMs = gpsMs ?? now;
+        const serverTrail = Array.isArray(memUnit.gpsTrail) ? memUnit.gpsTrail : [];
+        for (const pt of serverTrail) {
+          const pLat = Number(Array.isArray(pt) ? pt[0] : pt?.lat);
+          const pLng = Number(Array.isArray(pt) ? pt[1] : pt?.lng);
+          const pMs = Number(Array.isArray(pt) ? pt[2] : pt?.gpsMs) || null;
+          if (!Number.isFinite(pLat) || !Number.isFinite(pLng) || (pLat === 0 && pLng === 0)) continue;
+          if (pMs && refMs - pMs > UNIT_TRAIL_MAX_AGE_MS) continue;
+          if (pMs && gpsMs && pMs >= gpsMs - 2000) continue;
+          pushToTrail(initTrail, { lat: pLat, lng: pLng, gpsMs: pMs, ts: pMs || memUnit.updatedAt || now });
+        }
+
+        // Fallback single point if server doesn't have gpsTrail yet
+        if (initTrail.length === 0 && typeof memUnit.lat === 'number' && typeof memUnit.lng === 'number') {
+          const mMs = parseGpsTimestampMs(memUnit.ultimaGps);
+          if (mMs && gpsMs && gpsMs - mMs >= 4000 && gpsMs - mMs <= UNIT_TRAIL_MAX_AGE_MS) {
+            pushToTrail(initTrail, { lat: memUnit.lat, lng: memUnit.lng, gpsMs: mMs, ts: memUnit.updatedAt || mMs });
+          }
+        }
+
+        if (initTrail.length > 0) {
+          const lastServer = initTrail[initTrail.length - 1];
+          const ageSec = gpsMs && lastServer.gpsMs ? (gpsMs - lastServer.gpsMs) / 1000 : 30;
+          if (ageSec >= 3 && ageSec <= 180) memPrev = lastServer;
+        }
+
+        if (memUnit.dirBandera && memUnit.updatedAt && now - memUnit.updatedAt <= 8 * 60 * 1000) {
+          initConfirmedDir = {
+            bandera: String(memUnit.dirBandera).trim(),
+            confidence: 0.72,
+            gpsMs: parseGpsTimestampMs(memUnit.ultimaGps),
+            ts: memUnit.updatedAt,
+            fromServer: true
+          };
         }
       }
     }
-    const movedMem = memPrev ? distanceMeters(memPrev.lat, memPrev.lng, lat, lng) || 0 : 0;
+
+    pushToTrail(initTrail, curFix);
+    const prevMovingCand =
+      initTrail.length >= 2 ? initTrail[initTrail.length - 2] : memPrev;
+    const movedMem = prevMovingCand ? distanceMeters(prevMovingCand.lat, prevMovingCand.lng, lat, lng) || 0 : 0;
+
     hist = {
       latest: curFix,
       prev: memPrev,
-      prevMoving: memPrev && movedMem >= 20 ? memPrev : null
+      prevMoving: prevMovingCand && movedMem >= 20 ? prevMovingCand : null,
+      trail: initTrail,
+      confirmedDir: initConfirmedDir
     };
     state.lastRealGpsByUnit.set(baseId, hist);
   } else {
+    if (!Array.isArray(hist.trail)) hist.trail = [hist.latest];
     const movedFromLatest = distanceMeters(hist.latest.lat, hist.latest.lng, lat, lng) || 0;
     const gpsDeltaSec =
       gpsMs !== null && hist.latest.gpsMs !== null ? (gpsMs - hist.latest.gpsMs) / 1000 : null;
@@ -941,8 +1014,30 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
         hist.prevMoving = hist.latest;
       }
       hist.latest = curFix;
+      pushToTrail(hist.trail, curFix);
     } else if (gpsDeltaSec === null || gpsDeltaSec >= -2) {
       hist.latest.ts = now;
+      if (hist.trail.length > 0) hist.trail[hist.trail.length - 1].ts = now;
+    }
+  }
+
+  // Continuously update confirmed direction relative to the line's route polylines from the multi-point trail
+  const branches = state.routeBranchesCache.get(Number(codLinea)) || [];
+  if (branches.length > 0) {
+    const dir = resolveTrailDirection(hist, branches, { currentFix: curFix });
+    if (dir && dir.source === 'trail' && dir.bandera) {
+      hist.confirmedDir = {
+        bandera: dir.bandera,
+        branchIndex: dir.index,
+        confidence: dir.confidence,
+        along: dir.along,
+        gpsMs,
+        ts: now,
+        fromServer: false
+      };
+    } else if (!dir && hist.confirmedDir) {
+      // Clear stale/completed confirmed direction once bus reaches terminal or ages out
+      hist.confirmedDir = null;
     }
   }
 
@@ -957,7 +1052,7 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
       ? hist.prev
       : null;
 
-  return { headingPrevFix, prevGpsFix };
+  return { headingPrevFix, prevGpsFix, gpsHist: hist, confirmedDir: hist.confirmedDir || null };
 }
 
 function normalizeArrivals(rawList, stopId, stopCoords) {
@@ -991,17 +1086,24 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
     const gpsRaw = String(a.ultimaFechaHoraGPS || '').trim();
     const gpsTimeOnly = formatGpsTimeOnly(gpsRaw);
+    const gpsMs = parseGpsTimestampMs(gpsRaw);
 
     let headingPrevFix = null;
     let prevGpsFix = null;
+    let gpsHist = null;
+    let confirmedDir = null;
     if (validPos && !isLiveNextLap) {
       const rec = recordUnitGpsFix(baseId, a.codigoLinea, coche, lat, lng, gpsRaw, now);
       headingPrevFix = rec.headingPrevFix;
       prevGpsFix = rec.prevGpsFix;
+      gpsHist = rec.gpsHist;
+      confirmedDir = rec.confirmedDir;
     } else if (validPos) {
       const hist = state.lastRealGpsByUnit.get(baseId);
       headingPrevFix = hist?.prevMoving || hist?.prev || null;
       prevGpsFix = hist?.prev || null;
+      gpsHist = hist || null;
+      confirmedDir = hist?.confirmedDir || null;
     }
 
     const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
@@ -1009,13 +1111,14 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const draftBus = {
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
+      gpsMs,
       descripcionBandera: (a.descripcionBandera || a.descripcionCortaBandera || 'Servicio urbano').trim(),
       eta
     };
 
     const trajectory =
       validPos && stopCoords
-        ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, headingPrevFix)
+        ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, gpsHist || headingPrevFix)
         : null;
 
     const routeMeters = trajectory ? trajectory.totalMeters : straightDist;
@@ -1050,6 +1153,8 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
       prevGpsFix,
+      confirmedDirectionBandera: trajectory?.confirmedDirectionBandera || confirmedDir?.bandera || '',
+      directionSource: trajectory?.directionSource || (confirmedDir ? 'persisted' : 'eta'),
       distanceMeters: straightDist,
       routeMeters,
       proximityPct: computeProximityPercent(eta.minutes, routeMeters),
@@ -1878,10 +1983,15 @@ function reconcileWithSchedulePrediction(
   }
   const completedSet = state.completedTripsByStop.get(completedStopKey);
 
-  // Prune stale sticky entries (> 2 hours old; survives 00:00 midnight rollover)
+  // Prune stale sticky & service-evidence entries (> 2 hours old or from prior service day)
   for (const [k, v] of state.stickyLiveTripByCoche.entries()) {
     if (nowMs - v.updatedAt > 2 * 3600 * 1000) {
       state.stickyLiveTripByCoche.delete(k);
+    }
+  }
+  for (const [k, v] of state.serviceEvidenceByCoche.entries()) {
+    if (v.dayKey !== todayDayKey || nowMs - v.updatedAt > 6 * 3600 * 1000) {
+      state.serviceEvidenceByCoche.delete(k);
     }
   }
 
@@ -1933,9 +2043,14 @@ function reconcileWithSchedulePrediction(
       if (b.identificadorCoche) matchedCoches.add(b.identificadorCoche);
     }
 
+    const lineCorridorBuses = (state.corridorFleet || []).filter((u) => Number(u.codigoLinea) === Number(cod));
+
     if (model && stopCoords) {
       const matches = matchLiveBusesToTrips(model, stopId, stopCoords, buses, nowSec, {
-        stickyTripByCoche: state.stickyLiveTripByCoche
+        stickyTripByCoche: state.stickyLiveTripByCoche,
+        corridorBuses: lineCorridorBuses,
+        gpsHistoryByUnit: state.lastRealGpsByUnit,
+        serviceEvidenceByCoche: state.serviceEvidenceByCoche
       });
       for (const b of buses) {
         const m = matches.get(b.key);
@@ -1945,11 +2060,49 @@ function reconcileWithSchedulePrediction(
         completedSet.delete(`${cod}:${m.tripKey}`); // bus is actively approaching, definitely not completed
 
         if (!b.isNextLap && b.identificadorCoche) {
-          state.stickyLiveTripByCoche.set(`${cod}:${b.identificadorCoche}`, {
+          const cocheKey = `${cod}:${b.identificadorCoche}`;
+
+          // If the global assignment auto-corrected this car to a different service, clean up the stale
+          // local observation so no phantom duplicate remains on the old trip!
+          if (m.wasAutoCorrected && m.supersededTripKey) {
+            const staleKey = `${cod}:${m.supersededTripKey}`;
+            const staleObs = state.sessionObservedTrips.get(staleKey);
+            if (staleObs && String(staleObs.coche || '').trim() === String(b.identificadorCoche).trim()) {
+              state.sessionObservedTrips.delete(staleKey);
+            }
+          }
+
+          state.stickyLiveTripByCoche.set(cocheKey, {
             tripKey: m.tripKey,
+            serviceNumber: m.serviceNumber || null,
+            blockId: m.blockId || null,
             dayKey: todayDayKey,
             updatedAt: nowMs
           });
+
+          if (m.serviceNumber) {
+            const prevEv = state.serviceEvidenceByCoche.get(cocheKey);
+            const curErr = typeof m.rawErrorSec === 'number' ? m.rawErrorSec : 300;
+            if (prevEv && prevEv.serviceNumber === m.serviceNumber && !m.wasAutoCorrected) {
+              state.serviceEvidenceByCoche.set(cocheKey, {
+                serviceNumber: m.serviceNumber,
+                blockId: m.blockId || prevEv.blockId || null,
+                dayKey: todayDayKey,
+                avgErrSec: Math.round(prevEv.avgErrSec * 0.65 + curErr * 0.35),
+                count: Math.min(20, (prevEv.count || 1) + 1),
+                updatedAt: nowMs
+              });
+            } else {
+              state.serviceEvidenceByCoche.set(cocheKey, {
+                serviceNumber: m.serviceNumber,
+                blockId: m.blockId || null,
+                dayKey: todayDayKey,
+                avgErrSec: curErr,
+                count: 1,
+                updatedAt: nowMs
+              });
+            }
+          }
         }
 
         // If this is a cold-start Poll 1 on a shared two-way street (no `prevGpsFix` heading vector yet)
@@ -1995,12 +2148,21 @@ function reconcileWithSchedulePrediction(
           }
         }
 
-        // Persist last-seen online vehicle & driver into central system FleetMemory (primary arrival only)
+        // Persist last-seen online vehicle, GPS position trail & confirmed direction into central FleetMemory
         if (!b.isNextLap && b.identificadorCoche) {
+          const unitHist = state.lastRealGpsByUnit.get(`${cod}-c${b.identificadorCoche}`);
+          const compactTrail = Array.isArray(unitHist?.trail)
+            ? unitHist.trail
+                .slice(-6)
+                .map((pt) => [Number(pt.lat.toFixed(6)), Number(pt.lng.toFixed(6)), pt.gpsMs || pt.ts || nowMs])
+            : [];
+          const dirBandera =
+            b.confirmedDirectionBandera || unitHist?.confirmedDir?.bandera || '';
           const rec = {
             dayKey: todayDayKey,
             codigoLinea: cod,
             tripKey: m.tripKey,
+            supersededTripKey: m.supersededTripKey || '',
             turnoHora: m.turnoHora,
             coche: b.identificadorCoche,
             choferNombre: b.choferNombre || '',
@@ -2010,6 +2172,8 @@ function reconcileWithSchedulePrediction(
             desvioSec: b.desvio?.seconds || 0,
             desvioRaw: b.desvio?.raw || '',
             bandera: b.realBandera || b.descripcionBandera || '',
+            dirBandera,
+            gpsTrail: compactTrail,
             realLeg: b.trajectory?.leg || null,
             prevFix: b.prevGpsFix || null,
             ultimaGps: b.ultimaFechaHoraGPS || '',
@@ -2145,6 +2309,8 @@ function reconcileWithSchedulePrediction(
         if (nearbyUnmatchedLive.identificadorCoche) {
           state.stickyLiveTripByCoche.set(`${cod}:${nearbyUnmatchedLive.identificadorCoche}`, {
             tripKey: p.tripKey,
+            serviceNumber: p.serviceNumber || null,
+            blockId: p.scheduledTrip?.blockId || null,
             dayKey: todayDayKey,
             updatedAt: nowMs
           });

@@ -439,14 +439,285 @@ export function buildTrajectoryFromBranchAlong(
   };
 }
 
+function normalizeBanderaLite(str = '') {
+  return String(str || '')
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * Resolves which route branch a physical bus is genuinely travelling along using an internal
+ * multi-point GPS position trail (`[{ lat, lng, gpsMs, ts }, ...]`) plus persisted direction hysteresis.
+ *
+ * Combines 3 geometric signals across the trail:
+ *  1. Net forward progress along each branch polyline (`Δalong > 0` vs `< 0`)
+ *  2. Recency-weighted tangent alignment (`dot(gpsDir, branchTangent)`)
+ *  3. Mean perpendicular lane proximity (disambiguates parallel one-way streets in Corrientes)
+ *
+ * Also handles cabecera U-turns cleanly by checking the freshest moving tail (`>= 55 m`),
+ * and holds the last confirmed branch steady while stopped at red lights until terminal turnaround.
+ */
+export function resolveTrailDirection(
+  trailOrHist,
+  branches = [],
+  { currentFix = null, maxAgeMs = 8 * 60 * 1000, persistMaxAgeMs = 6 * 60 * 1000 } = {}
+) {
+  if (!Array.isArray(branches) || branches.length === 0 || !trailOrHist) return null;
+
+  const isArray = Array.isArray(trailOrHist);
+  const rawTrail = isArray
+    ? trailOrHist
+    : Array.isArray(trailOrHist.trail)
+      ? trailOrHist.trail
+      : [];
+  const confirmedDir = !isArray && trailOrHist.confirmedDir ? trailOrHist.confirmedDir : null;
+
+  // Build chronological list of valid fixes, appending currentFix if fresher/distinct
+  const fixes = [];
+  for (const pt of rawTrail) {
+    if (!pt || typeof pt.lat !== 'number' || typeof pt.lng !== 'number') continue;
+    if (Number.isNaN(pt.lat) || Number.isNaN(pt.lng) || (pt.lat === 0 && pt.lng === 0)) continue;
+    fixes.push({
+      lat: pt.lat,
+      lng: pt.lng,
+      gpsMs: typeof pt.gpsMs === 'number' && Number.isFinite(pt.gpsMs) ? pt.gpsMs : null,
+      ts: typeof pt.ts === 'number' && Number.isFinite(pt.ts) ? pt.ts : 0
+    });
+  }
+
+  // Fallback for legacy `{ prevMoving, prev, latest }` without `.trail`
+  if (fixes.length === 0 && !isArray) {
+    const legacyPts = [trailOrHist.prevMoving, trailOrHist.prev, trailOrHist.latest].filter(
+      (p) => p && typeof p.lat === 'number' && typeof p.lng === 'number'
+    );
+    for (const p of legacyPts) {
+      if (!fixes.some((f) => f.lat === p.lat && f.lng === p.lng)) {
+        fixes.push({ lat: p.lat, lng: p.lng, gpsMs: p.gpsMs ?? null, ts: p.ts || 0 });
+      }
+    }
+  }
+
+  if (currentFix && typeof currentFix.lat === 'number' && typeof currentFix.lng === 'number') {
+    const last = fixes[fixes.length - 1];
+    const distLast = last ? distanceMeters(last.lat, last.lng, currentFix.lat, currentFix.lng) || 0 : Infinity;
+    const curMs = typeof currentFix.gpsMs === 'number' ? currentFix.gpsMs : null;
+    const isDup =
+      last &&
+      distLast < 4 &&
+      (curMs === null || last.gpsMs === null || Math.abs(curMs - last.gpsMs) < 3000);
+    if (!isDup) {
+      fixes.push({
+        lat: currentFix.lat,
+        lng: currentFix.lng,
+        gpsMs: curMs,
+        ts: currentFix.ts || Date.now()
+      });
+    }
+  }
+
+  if (fixes.length === 0) return null;
+
+  const latestFix = fixes[fixes.length - 1];
+  const refTime = latestFix.gpsMs ?? latestFix.ts ?? 0;
+
+  // Prune fixes older than maxAgeMs relative to latestFix
+  const recentFixes =
+    refTime > 0
+      ? fixes.filter((f) => {
+          const ft = f.gpsMs ?? f.ts ?? refTime;
+          return refTime - ft <= maxAgeMs;
+        })
+      : fixes;
+
+  // Compact near-stationary jitter points (< 14 m apart) so red-light waits keep the moving trail intact
+  const movingPts = [];
+  for (const f of recentFixes) {
+    if (movingPts.length === 0) {
+      movingPts.push(f);
+    } else {
+      const prev = movingPts[movingPts.length - 1];
+      const d = distanceMeters(prev.lat, prev.lng, f.lat, f.lng) || 0;
+      if (d >= 14) {
+        movingPts.push(f);
+      }
+    }
+  }
+
+  const evaluateWindow = (pts) => {
+    if (pts.length < 2) return null;
+    let totalSpan = 0;
+    const segDirs = [];
+    for (let i = 1; i < pts.length; i++) {
+      const d = distanceMeters(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng) || 0;
+      if (d < 14) continue;
+      totalSpan += d;
+      const dir = unitVector(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng);
+      if (dir) {
+        segDirs.push({ idx: i, dist: d, dir, recency: 0.55 + 0.45 * (i / Math.max(1, pts.length - 1)) });
+      }
+    }
+    if (totalSpan < 22 || segDirs.length === 0) return null;
+
+    const scored = [];
+    for (const b of branches) {
+      if (!b?.pts || b.pts.length < 2) continue;
+      const latestProj = projectOnPolyline(b.pts, b.cum, latestFix.lat, latestFix.lng);
+      if (!latestProj || latestProj.perp > 240) continue;
+
+      const projs = pts.map((p) => projectOnPolyline(b.pts, b.cum, p.lat, p.lng));
+      let fwdMeters = 0;
+      let bwdMeters = 0;
+      let validAlongSpan = 0;
+      let dotWeighted = 0;
+      let weightSum = 0;
+      let perpSum = 0;
+      let perpCount = 0;
+
+      for (const p of projs) {
+        if (p && Number.isFinite(p.perp)) {
+          perpSum += p.perp;
+          perpCount++;
+        }
+      }
+
+      for (const seg of segDirs) {
+        const pPrev = projs[seg.idx - 1];
+        const pCur = projs[seg.idx];
+        if (!pPrev || !pCur) continue;
+        const w = seg.dist * seg.recency;
+
+        // Tangent consensus against both endpoints of segment for curved avenues
+        const tCur = pCur.tangent;
+        const tPrev = pPrev.tangent;
+        if (tCur) {
+          const dCur = seg.dir[0] * tCur[0] + seg.dir[1] * tCur[1];
+          const dPrev = tPrev ? seg.dir[0] * tPrev[0] + seg.dir[1] * tPrev[1] : dCur;
+          const dot = (dCur * 0.65 + dPrev * 0.35);
+          dotWeighted += dot * w;
+          weightSum += w;
+        }
+
+        // Net along-polyline progress (ignore wrap-around jumps on self-crossing corridors)
+        const dAlong = pCur.along - pPrev.along;
+        if (Math.abs(dAlong) <= seg.dist * 2.4 + 220) {
+          if (dAlong >= 0) fwdMeters += dAlong;
+          else bwdMeters += -dAlong;
+          validAlongSpan += seg.dist;
+        }
+      }
+
+      if (weightSum <= 0) continue;
+      const meanDot = dotWeighted / weightSum;
+      const netAlong = fwdMeters - bwdMeters;
+      const alongRatio =
+        validAlongSpan >= 18 ? Math.max(-1, Math.min(1, netAlong / Math.max(25, validAlongSpan))) : meanDot;
+      const meanPerp = perpCount > 0 ? perpSum / perpCount : latestProj.perp;
+
+      // Combined directional evidence: tangent consensus + net forward along progress - lane offset penalty
+      const score = meanDot * 1.0 + alongRatio * 1.0 - Math.min(0.55, meanPerp / 220);
+      scored.push({
+        branch: b,
+        score,
+        meanDot,
+        alongRatio,
+        netAlong,
+        meanPerp,
+        latestAlong: latestProj.along,
+        latestPerp: latestProj.perp,
+        totalSpan
+      });
+    }
+
+    if (scored.length === 0) return null;
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored[0];
+    const second = scored[1] || null;
+    const margin = second ? top.score - second.score : top.score + 0.5;
+    if (top.score < 0.42 || (top.meanDot < 0.25 && top.alongRatio < 0.32)) return null;
+    if (second && margin < 0.28) return null;
+
+    return {
+      branch: top.branch,
+      bandera: top.branch.bandera || '',
+      index: top.branch.index,
+      along: top.latestAlong,
+      perp: top.latestPerp,
+      meanDot: top.meanDot,
+      netAlong: top.netAlong,
+      totalSpan: top.totalSpan,
+      sampleCount: pts.length,
+      confidence: Math.max(0.5, Math.min(1.0, margin / 1.45)),
+      source: 'trail'
+    };
+  };
+
+  // Evaluate both the full moving trail and the freshest tail (to catch fresh cabecera U-turns quickly!)
+  const fullRes = evaluateWindow(movingPts);
+  const tailPts = movingPts.length >= 3 ? movingPts.slice(-3) : null;
+  const tailRes = tailPts ? evaluateWindow(tailPts) : null;
+
+  if (
+    tailRes &&
+    tailRes.totalSpan >= 55 &&
+    tailRes.meanDot >= 0.62 &&
+    tailRes.netAlong >= 40 &&
+    (!fullRes || tailRes.branch !== fullRes.branch)
+  ) {
+    return tailRes;
+  }
+  if (fullRes) return fullRes;
+  if (tailRes) return tailRes;
+
+  // Hysteresis fallback: keep previously confirmed direction steady while stopped at red lights
+  if (confirmedDir && confirmedDir.bandera) {
+    const dirAgeMs =
+      confirmedDir.gpsMs && latestFix.gpsMs
+        ? latestFix.gpsMs - confirmedDir.gpsMs
+        : confirmedDir.ts && latestFix.ts
+          ? latestFix.ts - confirmedDir.ts
+          : 0;
+    const maxPersist = confirmedDir.fromServer ? Math.max(persistMaxAgeMs, 8 * 60 * 1000) : persistMaxAgeMs;
+    if (dirAgeMs >= -60000 && dirAgeMs <= maxPersist) {
+      const normTarget = normalizeBanderaLite(confirmedDir.bandera);
+      const matchedBranch = branches.find((b) => normalizeBanderaLite(b.bandera) === normTarget);
+      if (matchedBranch) {
+        const proj = projectOnPolyline(matchedBranch.pts, matchedBranch.cum, latestFix.lat, latestFix.lng);
+        const nearEndTerminal = matchedBranch.totalLen - proj.along <= 240;
+        // Hold direction while still on/near that branch and not yet parked at the far turnaround terminal
+        if (proj.perp <= 200 && !nearEndTerminal) {
+          return {
+            branch: matchedBranch,
+            bandera: matchedBranch.bandera || '',
+            index: matchedBranch.index,
+            along: proj.along,
+            perp: proj.perp,
+            meanDot: null,
+            netAlong: 0,
+            totalSpan: 0,
+            sampleCount: fixes.length,
+            confidence: Math.max(0.45, (confirmedDir.confidence || 0.7) * 0.85),
+            source: 'persisted'
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Resolves the true direction & cycle of a live bus:
  *  - 'direct': on stopBranch approaching the stop directly
  *  - 'previous_leg': on oppositeBranch heading to turnaround terminal before stopBranch
  *  - 'full_cycle': on stopBranch AFTER the stop (already passed it) -> far terminal -> full paired returnBranch -> turnaround -> stop
  * Computes exact remaining routeMeters along the real street polylines and per-direction color segments.
+ * Accepts either a legacy single `prevFix` `{ lat, lng }` or a rich unit GPS history `{ trail, prevMoving, confirmedDir }`.
  */
-export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], prevFix = null) {
+export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], prevFixOrHist = null) {
   if (!stopCoords || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') {
     return null;
   }
@@ -482,8 +753,37 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
 
   const stopProj = projectOnPolyline(stopBranch.pts, stopBranch.cum, stopCoords.lat, stopCoords.lng);
   const busOnStop = projectOnPolyline(stopBranch.pts, stopBranch.cum, bus.lat, bus.lng);
-  const { oppositeBranch, busOnOpp } = pickBestOppositeBranch(branches, stopBranch, bus.lat, bus.lng);
+  let { oppositeBranch, busOnOpp } = pickBestOppositeBranch(branches, stopBranch, bus.lat, bus.lng);
   const returnBranch = pickPairedReturnBranch(branches, stopBranch);
+
+  // Signal 1: Multi-point GPS trail direction aligned against route polylines (+ persisted hysteresis)
+  let headingDir = null; // 'stop' | 'opp' | null
+  let confirmedBranch = null;
+  let directionConfidence = 0;
+  let directionSource = 'eta';
+
+  const isRichHist = Boolean(
+    prevFixOrHist && (Array.isArray(prevFixOrHist) || Array.isArray(prevFixOrHist.trail) || prevFixOrHist.confirmedDir)
+  );
+  const trailDir = isRichHist
+    ? resolveTrailDirection(prevFixOrHist, branches, {
+        currentFix: { lat: bus.lat, lng: bus.lng, gpsMs: bus.gpsMs ?? null, ts: Date.now() }
+      })
+    : null;
+
+  if (trailDir && trailDir.branch) {
+    confirmedBranch = trailDir.branch;
+    directionConfidence = trailDir.confidence;
+    directionSource = trailDir.source;
+    if (trailDir.branch === stopBranch) {
+      headingDir = 'stop';
+    } else {
+      headingDir = 'opp';
+      // On 3-4 branch lines (103C, 104A, 104D, 105C), lock oppositeBranch to the trail-confirmed branch!
+      oppositeBranch = trailDir.branch;
+      busOnOpp = projectOnPolyline(oppositeBranch.pts, oppositeBranch.cum, bus.lat, bus.lng);
+    }
+  }
 
   // Hypothesis 1: bus is already on stopBranch BEFORE stop, heading directly toward stop
   const directDist =
@@ -521,12 +821,14 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   const estOppMin = loopDist < Infinity ? loopDist / 210 + 3 : Infinity;
   const estCycleMin = fullCycleDist < Infinity ? fullCycleDist / 210 + (returnBranch ? 6 : 3) : Infinity;
 
-  // Signal 1: Real observed GPS heading vector between consecutive polls for this exact bus unit
-  let headingDir = null; // 'stop' | 'opp' | null
-  if (prevFix && typeof prevFix.lat === 'number' && typeof prevFix.lng === 'number') {
-    const moved = distanceMeters(prevFix.lat, prevFix.lng, bus.lat, bus.lng) || 0;
+  // Legacy 2-point heading fallback when caller passed a single prevFix or trail had no multi-point consensus
+  const fallbackPrevFix = !isRichHist
+    ? prevFixOrHist
+    : prevFixOrHist?.prevMoving || prevFixOrHist?.prev || null;
+  if (!headingDir && fallbackPrevFix && typeof fallbackPrevFix.lat === 'number' && typeof fallbackPrevFix.lng === 'number') {
+    const moved = distanceMeters(fallbackPrevFix.lat, fallbackPrevFix.lng, bus.lat, bus.lng) || 0;
     if (moved >= 25) {
-      const gpsDir = unitVector(prevFix.lat, prevFix.lng, bus.lat, bus.lng);
+      const gpsDir = unitVector(fallbackPrevFix.lat, fallbackPrevFix.lng, bus.lat, bus.lng);
       if (gpsDir && busOnStop.tangent) {
         const dotStop = gpsDir[0] * busOnStop.tangent[0] + gpsDir[1] * busOnStop.tangent[1];
         const dotOpp =
@@ -536,8 +838,14 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
 
         if (oppositeBranch && dotOpp > 0.35 && dotOpp > dotStop + 0.3) {
           headingDir = 'opp';
+          confirmedBranch = oppositeBranch;
+          directionConfidence = 0.6;
+          directionSource = 'heading';
         } else if (dotStop > 0.35 && dotStop > dotOpp + 0.3) {
           headingDir = 'stop';
+          confirmedBranch = stopBranch;
+          directionConfidence = 0.6;
+          directionSource = 'heading';
         }
       }
     }
@@ -562,7 +870,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     return 'previous_leg';
   };
 
-  // Signal 2: Combine GPS heading + ETA vs Route Distance Consistency across all 3 hypotheses
+  // Signal 2: Combine GPS trail direction + ETA vs Route Distance Consistency across all 3 hypotheses
   let leg = 'direct';
   const hasOpposite = Boolean(oppositeBranch && busOnOpp && busOnOpp.perp < 650);
 
@@ -681,6 +989,10 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       isOppositeLeg: false,
       isNextCycle: true,
       isAtTerminal,
+      confirmedBranch,
+      confirmedDirectionBandera: confirmedBranch?.bandera || '',
+      directionConfidence,
+      directionSource,
       realBandera: stopBandera,
       realBanderaColor: stopColor,
       segments,
@@ -721,6 +1033,10 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       isOppositeLeg: true,
       isNextCycle: false,
       isAtTerminal,
+      confirmedBranch,
+      confirmedDirectionBandera: confirmedBranch?.bandera || '',
+      directionConfidence,
+      directionSource,
       realBandera: oppBandera,
       realBanderaColor: oppColor,
       segments,
@@ -753,6 +1069,10 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     isOppositeLeg: false,
     isNextCycle: false,
     isAtTerminal,
+    confirmedBranch,
+    confirmedDirectionBandera: confirmedBranch?.bandera || '',
+    directionConfidence,
+    directionSource,
     realBandera: stopBandera,
     realBanderaColor: stopColor,
     segments: [{ pts: pathPts, color: stopColor, bandera: stopBandera, startMeters: 0, endMeters: totalMeters }],

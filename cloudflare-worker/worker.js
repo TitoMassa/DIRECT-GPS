@@ -581,6 +581,8 @@ export class FleetMemory {
         lat REAL,
         lng REAL,
         stop_id TEXT DEFAULT '',
+        gps_trail TEXT DEFAULT '',
+        dir_bandera TEXT DEFAULT '',
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (codigo_linea, coche)
       );
@@ -637,6 +639,18 @@ export class FleetMemory {
       );
     `);
 
+    // Idempotent schema migrations for existing Durable Object instances
+    try {
+      this.sql.exec("ALTER TABLE unit_last_seen ADD COLUMN gps_trail TEXT DEFAULT ''");
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE unit_last_seen ADD COLUMN dir_bandera TEXT DEFAULT ''");
+    } catch {
+      // Column already exists
+    }
+
     // One-time backfill from existing unit_last_seen rows (last 7 days) so production rosters start populated
     try {
       const hasCars = this.sql.exec('SELECT 1 AS ok FROM fleet_cars LIMIT 1').toArray().length > 0;
@@ -675,6 +689,79 @@ export class FleetMemory {
     }
 
     this._ready = true;
+  }
+
+  _parseGpsTrail(rawJson) {
+    if (!rawJson) return [];
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (!Array.isArray(parsed)) return [];
+      const out = [];
+      for (const pt of parsed) {
+        const lat = Number(Array.isArray(pt) ? pt[0] : pt?.lat);
+        const lng = Number(Array.isArray(pt) ? pt[1] : pt?.lng);
+        const gpsMs = Number(Array.isArray(pt) ? pt[2] : pt?.gpsMs) || 0;
+        if (Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0)) {
+          out.push([lat, lng, gpsMs]);
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  _mergeUnitTrail(cod, coche, incomingTrail, lat, lng, ultimaGps, nowMs) {
+    const existingRows = this.sql
+      .exec('SELECT gps_trail FROM unit_last_seen WHERE codigo_linea = ? AND coche = ?', cod, coche)
+      .toArray();
+    const rawList = existingRows.length > 0 ? this._parseGpsTrail(existingRows[0].gps_trail) : [];
+
+    if (Array.isArray(incomingTrail)) {
+      for (const pt of incomingTrail) {
+        const pLat = Number(Array.isArray(pt) ? pt[0] : pt?.lat);
+        const pLng = Number(Array.isArray(pt) ? pt[1] : pt?.lng);
+        const pMs = Number(Array.isArray(pt) ? pt[2] : pt?.gpsMs) || 0;
+        if (Number.isFinite(pLat) && Number.isFinite(pLng) && (pLat !== 0 || pLng !== 0)) {
+          rawList.push([Number(pLat.toFixed(6)), Number(pLng.toFixed(6)), pMs || nowMs]);
+        }
+      }
+    }
+
+    if (Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0)) {
+      const obsMs = parseGpsStampMs(ultimaGps) || nowMs;
+      rawList.push([Number(lat.toFixed(6)), Number(lng.toFixed(6)), obsMs]);
+    }
+
+    if (rawList.length === 0) return '';
+
+    rawList.sort((a, b) => (a[2] || 0) - (b[2] || 0));
+    const latestMs = rawList[rawList.length - 1][2] || nowMs;
+    const minMs = latestMs - 15 * 60 * 1000;
+
+    // Compact stationary points (< ~10 m) in place so traffic-light waits never flush moving history
+    const compacted = [];
+    for (const pt of rawList) {
+      if (pt[2] && pt[2] < minMs) continue;
+      const prev = compacted[compacted.length - 1];
+      if (!prev) {
+        compacted.push(pt);
+        continue;
+      }
+      const dLat = (pt[0] - prev[0]) * 110850;
+      const dLng = (pt[1] - prev[1]) * 111320 * Math.cos((pt[0] * Math.PI) / 180);
+      const dist = Math.hypot(dLat, dLng);
+      if (dist < 10) {
+        if ((pt[2] || 0) >= (prev[2] || 0)) {
+          compacted[compacted.length - 1] = [prev[0], prev[1], pt[2] || prev[2]];
+        }
+      } else {
+        compacted.push(pt);
+      }
+    }
+
+    const trimmed = compacted.slice(-6);
+    return trimmed.length > 0 ? JSON.stringify(trimmed) : '';
   }
 
   _getMeta(key, fallback = null) {
@@ -867,11 +954,13 @@ export class FleetMemory {
           if (!cod || !coche) continue;
           const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
           const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
+          const ultimaGps = String(u.ultimaGps || '').trim();
+          const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
           this.sql.exec(
             `INSERT INTO unit_last_seen (
               codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
-            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(codigo_linea, coche) DO UPDATE SET
               day_key = excluded.day_key,
               chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
@@ -885,6 +974,7 @@ export class FleetMemory {
               lat = COALESCE(excluded.lat, unit_last_seen.lat),
               lng = COALESCE(excluded.lng, unit_last_seen.lng),
               stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+              gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
               updated_at = excluded.updated_at`,
             cod,
             coche,
@@ -896,10 +986,11 @@ export class FleetMemory {
             Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
             String(u.desvioRaw || '').trim(),
             String(u.bandera || '').trim(),
-            String(u.ultimaGps || '').trim(),
+            ultimaGps,
             lat,
             lng,
             String(u.stopId || '').trim().toUpperCase(),
+            mergedTrail,
             nowMs
           );
           this._upsertRosterUnit(u, nowMs, todayKey);
@@ -1105,11 +1196,15 @@ export class FleetMemory {
         const cod = Number(u.codigoLinea);
         const coche = String(u.coche || '').trim();
         if (!cod || !coche) continue;
+        const lat = Number.isFinite(u.lat) ? u.lat : null;
+        const lng = Number.isFinite(u.lng) ? u.lng : null;
+        const ultimaGps = String(u.ultimaGps || '').trim();
+        const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
         this.sql.exec(
           `INSERT INTO unit_last_seen (
             codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(codigo_linea, coche) DO UPDATE SET
             day_key = excluded.day_key,
             trip_key = CASE WHEN excluded.trip_key != '' THEN excluded.trip_key ELSE unit_last_seen.trip_key END,
@@ -1124,6 +1219,7 @@ export class FleetMemory {
             lat = COALESCE(excluded.lat, unit_last_seen.lat),
             lng = COALESCE(excluded.lng, unit_last_seen.lng),
             stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
             updated_at = excluded.updated_at`,
           cod,
           coche,
@@ -1136,10 +1232,11 @@ export class FleetMemory {
           Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
           String(u.desvioRaw || '').trim(),
           String(u.bandera || '').trim(),
-          String(u.ultimaGps || '').trim(),
-          Number.isFinite(u.lat) ? u.lat : null,
-          Number.isFinite(u.lng) ? u.lng : null,
+          ultimaGps,
+          lat,
+          lng,
           String(u.stopId || '').trim().toUpperCase(),
+          mergedTrail,
           nowMs
         );
         this._upsertRosterUnit(u, nowMs, todayKey);
@@ -1176,6 +1273,22 @@ export class FleetMemory {
         const lat = Number.isFinite(Number(e.lat)) ? Number(e.lat) : null;
         const lng = Number.isFinite(Number(e.lng)) ? Number(e.lng) : null;
         const desvioSec = Number.isFinite(Number(e.desvioSec)) ? Math.round(Number(e.desvioSec)) : 0;
+        const ultimaGps = String(e.ultimaGps || '').trim();
+        const dirBandera = String(e.dirBandera || '').trim();
+        const supersededTripKey = String(e.supersededTripKey || '').trim();
+        const mergedTrail = this._mergeUnitTrail(cod, coche, e.gpsTrail, lat, lng, ultimaGps, nowMs);
+
+        // Self-correction cleanup: if global matching moved this car off an earlier misassigned service,
+        // remove the stale trip_assignments row if it still points to this same car!
+        if (supersededTripKey && supersededTripKey !== tripKey) {
+          this.sql.exec(
+            'DELETE FROM trip_assignments WHERE day_key = ? AND codigo_linea = ? AND trip_key = ? AND coche = ?',
+            dayKey,
+            cod,
+            supersededTripKey,
+            coche
+          );
+        }
 
         this.sql.exec(
           `INSERT INTO trip_assignments (
@@ -1207,7 +1320,7 @@ export class FleetMemory {
           e.esAdaptado ? 1 : 0,
           desvioSec,
           String(e.desvioRaw || '').trim(),
-          String(e.ultimaGps || '').trim(),
+          ultimaGps,
           lat,
           lng,
           String(e.stopId || '').trim().toUpperCase(),
@@ -1217,8 +1330,8 @@ export class FleetMemory {
         this.sql.exec(
           `INSERT INTO unit_last_seen (
             codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, dir_bandera, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(codigo_linea, coche) DO UPDATE SET
             day_key = excluded.day_key,
             trip_key = excluded.trip_key,
@@ -1233,6 +1346,8 @@ export class FleetMemory {
             lat = COALESCE(excluded.lat, unit_last_seen.lat),
             lng = COALESCE(excluded.lng, unit_last_seen.lng),
             stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+            dir_bandera = CASE WHEN excluded.dir_bandera != '' THEN excluded.dir_bandera ELSE unit_last_seen.dir_bandera END,
             updated_at = excluded.updated_at`,
           cod,
           coche,
@@ -1245,10 +1360,12 @@ export class FleetMemory {
           desvioSec,
           String(e.desvioRaw || '').trim(),
           String(e.bandera || '').trim(),
-          String(e.ultimaGps || '').trim(),
+          ultimaGps,
           lat,
           lng,
           String(e.stopId || '').trim().toUpperCase(),
+          mergedTrail,
+          dirBandera,
           nowMs
         );
         this._upsertRosterUnit({ ...e, codigoLinea: cod, coche }, nowMs, dayKey);
@@ -1286,7 +1403,7 @@ export class FleetMemory {
         unitRows = this.sql
           .exec(
             `SELECT codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, dir_bandera, updated_at
              FROM unit_last_seen
              WHERE codigo_linea IN (${ph}) AND updated_at > ?
              ORDER BY updated_at DESC`,
@@ -1309,7 +1426,7 @@ export class FleetMemory {
         unitRows = this.sql
           .exec(
             `SELECT codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+                    es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, dir_bandera, updated_at
              FROM unit_last_seen
              WHERE updated_at > ?
              ORDER BY updated_at DESC LIMIT 600`,
@@ -1365,6 +1482,8 @@ export class FleetMemory {
           desvioSec: r.desvio_sec,
           desvioRaw: r.desvio_raw,
           bandera: r.bandera,
+          dirBandera: r.dir_bandera || '',
+          gpsTrail: this._parseGpsTrail(r.gps_trail).map(([la, ln, ms]) => ({ lat: la, lng: ln, gpsMs: ms })),
           ultimaGps: r.ultima_gps,
           lat: r.lat,
           lng: r.lng,

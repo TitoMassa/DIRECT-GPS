@@ -542,9 +542,11 @@ export const api = {
       const key = `${dayKey}:${e.codigoLinea}:${e.tripKey}`;
       // Round desvio to 30s bucket to avoid noisy writes on every 10s poll
       const desvioBucket = Math.round((e.desvioSec || 0) / 30);
-      const sig = `${e.coche}|${e.choferNombre || ''}|${e.choferLegajo || ''}|${desvioBucket}`;
+      const trailLen = Array.isArray(e.gpsTrail) ? e.gpsTrail.length : 0;
+      const sig = `${e.coche}|${e.choferNombre || ''}|${e.choferLegajo || ''}|${desvioBucket}|${e.dirBandera || ''}|${trailLen >= 2 ? 1 : 0}`;
       const prev = reportedTripSigs.get(key);
-      if (prev && prev.sig === sig && nowMs - prev.ts < 240000) continue;
+      // Always transmit immediately when an assignment was auto-corrected (supersededTripKey)
+      if (!e.supersededTripKey && prev && prev.sig === sig && nowMs - prev.ts < 180000) continue;
       reportedTripSigs.set(key, { sig, ts: nowMs });
       toSend.push(e);
     }

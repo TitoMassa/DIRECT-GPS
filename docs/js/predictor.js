@@ -4,7 +4,8 @@ import {
   pickIncomingBranches,
   projectOnPolyline,
   sampleBranchAtAlong,
-  buildTrajectoryFromBranchAlong
+  buildTrajectoryFromBranchAlong,
+  resolveTrailDirection
 } from './trajectory.js';
 import {
   computeProximityPercent,
@@ -1840,11 +1841,124 @@ function findNextSameBranchPassTime(trip, stopId, stopAlong) {
   return null;
 }
 
-function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera, getProjForBranch) {
+/**
+ * Exact Kuhn-Munkres / Hungarian minimum-cost rectangular assignment solver.
+ * Assigns `R` live physical buses to `C` scheduled services (or unassigned slack of cost `unassignedPenalty`)
+ * minimizing the exact global sum of errors across the entire line simultaneously.
+ * Complexity O(R^2 * (C + R)) — for Corrientes fleet sizes (<= 15), executes in < 0.05 ms.
+ */
+export function solveMinCostAssignment(costMatrix = [], unassignedPenalty = 2400) {
+  const R = costMatrix.length;
+  if (R === 0) return [];
+  const C = costMatrix[0]?.length || 0;
+  if (C === 0) return new Array(R).fill(-1);
+
+  const W = C + R;
+  const BIG = 1e9;
+  const a = Array.from({ length: R + 1 }, () => new Array(W + 1).fill(BIG));
+
+  for (let i = 1; i <= R; i++) {
+    const row = costMatrix[i - 1];
+    for (let j = 1; j <= C; j++) {
+      const val = row[j - 1];
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        a[i][j] = val;
+      }
+    }
+    // Dedicated unassigned slack column for row i so every row always has a finite fallback
+    a[i][C + i] = unassignedPenalty;
+  }
+
+  const u = new Array(R + 1).fill(0);
+  const v = new Array(W + 1).fill(0);
+  const p = new Array(W + 1).fill(0);
+  const way = new Array(W + 1).fill(0);
+
+  for (let i = 1; i <= R; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array(W + 1).fill(Infinity);
+    const used = new Array(W + 1).fill(false);
+
+    do {
+      used[j0] = true;
+      const i0 = p[j0];
+      let delta = Infinity;
+      let j1 = 0;
+
+      for (let j = 1; j <= W; j++) {
+        if (!used[j]) {
+          const cur = a[i0][j] - u[i0] - v[j];
+          if (cur < minv[j]) {
+            minv[j] = cur;
+            way[j] = j0;
+          }
+          if (minv[j] < delta) {
+            delta = minv[j];
+            j1 = j;
+          }
+        }
+      }
+
+      for (let j = 0; j <= W; j++) {
+        if (used[j]) {
+          u[p[j]] += delta;
+          v[j] -= delta;
+        } else {
+          minv[j] -= delta;
+        }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+
+    do {
+      const j1 = way[j0];
+      p[j0] = p[j1];
+      j0 = j1;
+    } while (j0 !== 0);
+  }
+
+  const assignment = new Array(R).fill(-1);
+  for (let j = 1; j <= C; j++) {
+    if (p[j] > 0) {
+      const rIdx = p[j] - 1;
+      const val = costMatrix[rIdx][j - 1];
+      if (typeof val === 'number' && Number.isFinite(val) && val < unassignedPenalty) {
+        assignment[rIdx] = j - 1;
+      }
+    }
+  }
+  return assignment;
+}
+
+/**
+ * Scores a stop-approaching bus against a candidate scheduled trip `item`.
+ * Returns `{ rawScore, effScore }` (seconds of error) or `null` if outside tolerance.
+ * `rawScore` is 100% unbiased (used for global auto-correction); `effScore` includes only a
+ * lightweight anti-flicker hysteresis tie-breaker (-90 s same trip / -65 s same service today).
+ */
+function scoreBusAgainstCandidate(
+  bus,
+  item,
+  nowSec,
+  stickyRec,
+  evidenceRec,
+  busNormBandera,
+  getProjForBranch
+) {
   const desvioSec = bus.desvio?.seconds || 0;
   const hasDesvio = bus.desvio && bus.desvio.status !== 'none';
-  const isSticky = Boolean(stickyTripKey && item.trip.tripKey === stickyTripKey);
+  const stickyTripKey = stickyRec?.tripKey || null;
+  const stickyService = stickyRec?.serviceNumber || null;
+  const isStickyTrip = Boolean(stickyTripKey && item.trip.tripKey === stickyTripKey);
+  const isStickyService = Boolean(stickyService && item.trip.serviceNumber === stickyService);
   const effNow = toServiceSec(nowSec);
+
+  const confirmedBranch =
+    !bus.trajectory?.isAtTerminal &&
+    (bus.trajectory?.directionSource === 'trail' || bus.trajectory?.directionSource === 'persisted')
+      ? bus.trajectory.confirmedBranch
+      : null;
 
   // ── Signal A: Exact spatial-temporal match using GPS coordinate + SmartMovePro desvio ──
   // Independent of SmartMovePro's noisy ETA and works even if the bus is 30 min late or 15 min early!
@@ -1863,11 +1977,15 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
       if (schedAtBus === null) return Infinity;
       let d = Math.abs(schedAtBus - tEff);
       if (d > 43200) d = Math.abs(d - 86400);
+      // Multi-point GPS trail direction penalty: prevent matching opposite-direction trips on two-way avenues
+      if (confirmedBranch && tr.branch !== confirmedBranch) {
+        const nearTerminal = proj.along <= 240 || (tr.branch.totalLen || 0) - proj.along <= 240;
+        if (!nearTerminal) d += 9 * 60;
+      }
       return d;
     };
 
     if (isFullCycle) {
-      // Bus is finishing the previous lap (`prevTrip.prevTrip`) or just turning onto `prevTrip`
       spatialDiffSec = Math.min(
         testTripSpatial(item.trip.prevTrip?.prevTrip),
         testTripSpatial(item.trip.prevTrip)
@@ -1878,13 +1996,11 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
         testTripSpatial(item.trip.prevTrip?.prevTrip)
       );
     } else if (bus.trajectory?.isAtTerminal) {
-      // Parked at a cabecera turnaround: check both outgoing `trip` and incoming `prevTrip` arrival!
       spatialDiffSec = Math.min(
         testTripSpatial(item.trip),
         testTripSpatial(item.trip.prevTrip)
       );
     } else {
-      // Also check `prevTrip` when the bus is on a shared two-way street before `item.trip.startSec`
       spatialDiffSec =
         effNow < item.trip.startSec - 120 && item.trip.prevTrip
           ? Math.min(testTripSpatial(item.trip), testTripSpatial(item.trip.prevTrip))
@@ -1904,35 +2020,137 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
   // Combine both signals: spatial-temporal dominates when available (exact even at ±35 min off-schedule!)
   let bestRawDiff;
   let maxAllowed;
-  if (spatialDiffSec <= 14 * 60) {
-    // Also verify ETA isn't pointing to a completely different cycle (> 45 min apart)
+  if (spatialDiffSec <= 15 * 60) {
     if (etaDiffSec < Infinity && etaDiffSec > 45 * 60) return null;
     bestRawDiff = spatialDiffSec;
-    maxAllowed = isSticky ? 18 * 60 : 14 * 60;
+    maxAllowed = isStickyTrip || isStickyService ? 18 * 60 : 15 * 60;
   } else {
     if (etaDiffSec === Infinity) return null;
     let baseTolMin = (bus.eta?.minutes || 0) >= 35 || !hasDesvio ? 18 : 14;
     if (bus.esExtendido || bus.isOppositeLeg) baseTolMin += 5;
-    if (Math.abs(desvioSec) >= 6 * 60) baseTolMin += 5; // very early/late buses have wider ETA variance
-    maxAllowed = isSticky ? Math.max(baseTolMin * 60, 24 * 60) : baseTolMin * 60;
+    if (Math.abs(desvioSec) >= 6 * 60) baseTolMin += 5;
+    maxAllowed = isStickyTrip || isStickyService ? Math.max(baseTolMin * 60, 22 * 60) : baseTolMin * 60;
     bestRawDiff = etaDiffSec;
   }
 
   if (bestRawDiff > maxAllowed) return null;
 
-  let score = bestRawDiff;
-  if (isSticky) score -= 5 * 60;
+  let rawScore = bestRawDiff;
   if (busNormBandera && item.normBandera && item.normBandera !== busNormBandera) {
-    score += 3 * 60;
+    rawScore += 3 * 60;
   }
-  return score;
+
+  // Lightweight anti-flicker tie-breaker ONLY — small enough that global auto-correction ALWAYS overrides stale guesses!
+  let hysteresisBonus = 0;
+  if (isStickyTrip) {
+    hysteresisBonus = 90;
+  } else if (isStickyService) {
+    hysteresisBonus = 65;
+  } else if (
+    evidenceRec &&
+    evidenceRec.serviceNumber === item.trip.serviceNumber &&
+    evidenceRec.count >= 2 &&
+    evidenceRec.avgErrSec <= 240
+  ) {
+    hysteresisBonus = 75;
+  }
+
+  return {
+    rawScore,
+    effScore: Math.max(0, rawScore - hysteresisBonus)
+  };
 }
 
 /**
- * Matches live GPS buses of one line to their exact canonical scheduled `trip` & `turnoProgramado`
- * across ALL branches serving `stopId`. Uses spatial-temporal matching (`|secAt(busAlong) - (now + desvio)|`)
- * + ETA consistency + sticky-coche stability so even very early (+15m) or very late (-35m) buses
- * are linked accurately without spawning ghost arrivals!
+ * Scores a live Corridor Radar peer unit (seen anywhere along the line by Worker probes, even
+ * outside the active stop's arrivals) against all trips of a candidate service `serviceNumber`.
+ * Allows a real Service 2 spotted elsewhere on the corridor to claim Service 2 in the global
+ * matrix and immediately auto-correct a misassigned bus approaching the active stop!
+ */
+function scoreCorridorPeerAgainstService(unit, serviceTrips, model, nowSec, unitHist) {
+  const uLat = parseFloat(unit.latitud ?? unit.lat);
+  const uLng = parseFloat(unit.longitud ?? unit.lng);
+  if (Number.isNaN(uLat) || Number.isNaN(uLng) || (uLat === 0 && uLng === 0)) return null;
+
+  const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || '').trim();
+  const parsedDesvio =
+    typeof unit.desvioSec === 'number'
+      ? { seconds: unit.desvioSec, status: 'ok' }
+      : parseDesvioHorario(unit.desvioHorario || '');
+  const hasDesvio = parsedDesvio && parsedDesvio.status !== 'none';
+  const desvioSec = parsedDesvio?.seconds || 0;
+
+  const effNow = toServiceSec(nowSec);
+  const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
+  const uClock = uClockRaw !== null ? toServiceSec(uClockRaw) : effNow;
+  // Ignore stale corridor fixes older than 6 minutes
+  if (Math.abs(effNow - uClock) > 6 * 60 && Math.abs(effNow - uClock) < 20 * 3600) return null;
+
+  const tEff = uClock + desvioSec;
+  const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || '');
+
+  // Resolve direction from multi-point GPS trail!
+  const trailDir = unitHist
+    ? resolveTrailDirection(unitHist, model.branches, {
+        currentFix: { lat: uLat, lng: uLng, ts: Date.now() }
+      })
+    : null;
+  if (!hasDesvio && !trailDir) return null;
+
+  const projByBranch = new Map();
+  const getProj = (b) => {
+    if (!projByBranch.has(b)) projByBranch.set(b, projectOnPolyline(b.pts, b.cum, uLat, uLng));
+    return projByBranch.get(b);
+  };
+
+  let bestTrip = null;
+  let bestRaw = 14 * 60;
+
+  for (const tr of serviceTrips) {
+    // Skip trips far outside the current time window
+    if (tEff < tr.startSec - 16 * 60 || tEff > tr.endSec + 16 * 60) continue;
+    const proj = getProj(tr.branch);
+    if (!proj || proj.perp > 150) continue;
+
+    const sched = getTripSecAtAlong(tr, proj.along);
+    if (sched === null) continue;
+    let d = Math.abs(sched - tEff);
+    if (d > 43200) d = Math.abs(d - 86400);
+
+    // Direction check from multi-point trail (or 2-point fallback)
+    if (trailDir?.branch) {
+      const nearTerminal = proj.along <= 240 || (tr.branch.totalLen || 0) - proj.along <= 240;
+      if (trailDir.branch === tr.branch) {
+        d = Math.max(0, d - 45);
+      } else if (!nearTerminal) {
+        d += 12 * 60;
+      }
+    }
+
+    const nb = normalizeBandera(tr.branch.bandera);
+    if (uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) {
+      d += 40;
+    }
+
+    if (d < bestRaw) {
+      bestRaw = d;
+      bestTrip = tr;
+    }
+  }
+
+  if (!bestTrip) return null;
+  return { trip: bestTrip, rawScore: bestRaw, effScore: bestRaw };
+}
+
+/**
+ * Globally matches ALL live GPS buses of one line (stop arrivals + Corridor Radar peers) to their
+ * canonical scheduled `serviceNumber` & `trip` simultaneously using exact minimum-cost bipartite
+ * assignment (Hungarian algorithm).
+ *
+ * Self-corrects on the fly: if Bus A tentatively took Service 2 on an earlier poll, the moment the
+ * true Service 2 appears (at the stop OR anywhere on the corridor), the global solver re-optimizes
+ * ALL cars on the line together, moves Bus B -> Service 2, shifts Bus A -> its true service, and
+ * emits `supersededTripKey` so stale client/server records are cleaned automatically!
  */
 export function matchLiveBusesToTrips(
   model,
@@ -1940,7 +2158,12 @@ export function matchLiveBusesToTrips(
   stopCoords,
   buses = [],
   nowSec = getArgentinaSecOfDay(),
-  { stickyTripByCoche = null } = {}
+  {
+    stickyTripByCoche = null,
+    corridorBuses = [],
+    gpsHistoryByUnit = null,
+    serviceEvidenceByCoche = null
+  } = {}
 ) {
   const matches = new Map();
   if (!model || !Array.isArray(buses) || buses.length === 0) return matches;
@@ -1960,16 +2183,207 @@ export function matchLiveBusesToTrips(
   }
   if (pool.length === 0) return matches;
 
-  const usedTrips = new Set();
-  const ordered = [...buses].sort((a, b) => (a.eta?.minutes ?? 999) - (b.eta?.minutes ?? 999));
+  // Group stop-serving trips AND all line trips by canonical service slot (`serviceNumber` or fallback `blockId`)
+  const getSlotKey = (tr) => (tr.serviceNumber ? `srv:${tr.serviceNumber}` : `blk:${tr.blockId || tr.tripKey}`);
+  const stopPoolBySlot = new Map();
+  const allTripsBySlot = new Map();
 
-  for (const bus of ordered) {
-    const stickyKey = !bus.isNextLap && bus.identificadorCoche ? `${model.codLinea}:${bus.identificadorCoche}` : null;
+  for (const item of pool) {
+    const sk = getSlotKey(item.trip);
+    if (!stopPoolBySlot.has(sk)) stopPoolBySlot.set(sk, []);
+    stopPoolBySlot.get(sk).push(item);
+  }
+  for (const b of model.branches) {
+    for (const tr of model.getTripsForBranch(b)) {
+      const sk = getSlotKey(tr);
+      if (!allTripsBySlot.has(sk)) allTripsBySlot.set(sk, []);
+      allTripsBySlot.get(sk).push(tr);
+    }
+  }
+
+  const slotKeys = Array.from(allTripsBySlot.keys());
+  const primaryBuses = buses.filter((b) => !b.isNextLap);
+  const nextLapBuses = buses.filter((b) => b.isNextLap);
+  const primaryCocheSet = new Set(primaryBuses.map((b) => String(b.identificadorCoche || '').trim()).filter(Boolean));
+
+  // Include live Corridor Radar peers of the same line (not already in `primaryBuses`) so a real
+  // Service N spotted elsewhere on the route claims its true service and prevents misassignment!
+  const peerUnits = [];
+  const seenPeerCoches = new Set();
+  for (const u of corridorBuses || []) {
+    if (Number(u.codigoLinea) !== Number(model.codLinea)) continue;
+    const c = String(u.identificadorCoche || u.coche || '').trim();
+    if (!c || primaryCocheSet.has(c) || seenPeerCoches.has(c)) continue;
+    seenPeerCoches.add(c);
+    peerUnits.push(u);
+  }
+
+  const totalRows = primaryBuses.length + peerUnits.length;
+  const totalCols = slotKeys.length;
+  const UNASSIGNED_PENALTY = 2400; // 40 min — strictly above any valid match (<= 22 min)
+
+  const rawMatrix = Array.from({ length: totalRows }, () => new Array(totalCols).fill(Infinity));
+  const effMatrix = Array.from({ length: totalRows }, () => new Array(totalCols).fill(Infinity));
+  const bestItemMatrix = Array.from({ length: totalRows }, () => new Array(totalCols).fill(null));
+  const prevStickyByRow = new Array(primaryBuses.length).fill(null);
+
+  // Fill rows for stop-approaching primary buses
+  primaryBuses.forEach((bus, rIdx) => {
+    const coche = String(bus.identificadorCoche || '').trim();
+    const stickyKey = coche ? `${model.codLinea}:${coche}` : null;
     const stickyRec = stickyKey && stickyTripByCoche ? stickyTripByCoche.get(stickyKey) : null;
-    const stickyTripKey = stickyRec?.tripKey || null;
+    const evidenceRec = stickyKey && serviceEvidenceByCoche ? serviceEvidenceByCoche.get(stickyKey) : null;
+    prevStickyByRow[rIdx] = stickyRec;
     const busNormBandera = normalizeBandera(bus.descripcionBandera || '');
 
-    // Memoize branch projections for this bus across all ~40-80 candidate trips (huge perf win!)
+    const projCache = new Map();
+    const getProjForBranch = (branch) => {
+      if (!projCache.has(branch)) {
+        projCache.set(branch, projectOnPolyline(branch.pts, branch.cum, bus.lat, bus.lng));
+      }
+      return projCache.get(branch);
+    };
+
+    slotKeys.forEach((sk, cIdx) => {
+      const items = stopPoolBySlot.get(sk) || [];
+      let bestItem = null;
+      let bestEff = Infinity;
+      let bestRaw = Infinity;
+      for (const item of items) {
+        const res = scoreBusAgainstCandidate(
+          bus,
+          item,
+          nowSec,
+          stickyRec,
+          evidenceRec,
+          busNormBandera,
+          getProjForBranch
+        );
+        if (res && res.effScore < bestEff) {
+          bestEff = res.effScore;
+          bestRaw = res.rawScore;
+          bestItem = item;
+        }
+      }
+      if (bestItem) {
+        rawMatrix[rIdx][cIdx] = bestRaw;
+        effMatrix[rIdx][cIdx] = bestEff;
+        bestItemMatrix[rIdx][cIdx] = bestItem;
+      }
+    });
+  });
+
+  // Fill rows for corridor peer units (competing globally for canonical services!)
+  peerUnits.forEach((unit, pIdx) => {
+    const rIdx = primaryBuses.length + pIdx;
+    const c = String(unit.identificadorCoche || unit.coche || '').trim();
+    const unitHist = gpsHistoryByUnit ? gpsHistoryByUnit.get(`${model.codLinea}-c${c}`) : null;
+    const stickyKey = c ? `${model.codLinea}:${c}` : null;
+    const stickyRec = stickyKey && stickyTripByCoche ? stickyTripByCoche.get(stickyKey) : null;
+
+    slotKeys.forEach((sk, cIdx) => {
+      const sTrips = allTripsBySlot.get(sk) || [];
+      const res = scoreCorridorPeerAgainstService(unit, sTrips, model, nowSec, unitHist);
+      if (res) {
+        const sameStickySrv = stickyRec?.serviceNumber && res.trip.serviceNumber === stickyRec.serviceNumber;
+        rawMatrix[rIdx][cIdx] = res.rawScore;
+        effMatrix[rIdx][cIdx] = Math.max(0, res.effScore - (sameStickySrv ? 45 : 0));
+        bestItemMatrix[rIdx][cIdx] = { trip: res.trip, isPeer: true };
+      }
+    });
+  });
+
+  // Solve BOTH sticky-smoothed assignment and 100% unbiased global optimum
+  const effAssign = solveMinCostAssignment(effMatrix, UNASSIGNED_PENALTY);
+  const rawAssign = solveMinCostAssignment(rawMatrix, UNASSIGNED_PENALTY);
+
+  // Evaluate raw global cost of both solutions: if the unbiased global optimum beats the
+  // sticky-smoothed solution by >= 120 s (2 min) or matches more buses, auto-correct ALL buses immediately!
+  const evalRawTotal = (assign) => {
+    let matched = 0;
+    let sum = 0;
+    for (let r = 0; r < totalRows; r++) {
+      const c = assign[r];
+      if (c >= 0 && Number.isFinite(rawMatrix[r][c])) {
+        matched++;
+        sum += rawMatrix[r][c];
+      } else {
+        sum += UNASSIGNED_PENALTY;
+      }
+    }
+    return { matched, sum };
+  };
+  const effEval = evalRawTotal(effAssign);
+  const rawEval = evalRawTotal(rawAssign);
+  const chosenAssign =
+    rawEval.matched > effEval.matched || rawEval.sum + 120 <= effEval.sum ? rawAssign : effAssign;
+
+  const usedTrips = new Set();
+  const primaryMatchByCoche = new Map();
+
+  const applyBusMatch = (bus, bestItem, rawErrSec, prevSticky) => {
+    usedTrips.add(bestItem.trip);
+    const turnoHora = formatSecHHMM(bestItem.stSec);
+    bus.turnoProgramado = turnoHora;
+    bus.tripKey = bestItem.trip.tripKey;
+    bus.scheduledTrip = bestItem.trip;
+    bus.stopProj = bestItem.stopProj;
+    bus.serviceNumber = bestItem.trip.serviceNumber || null;
+    bus.turnoIndex = bestItem.trip.turnoIndex || 1;
+    bus.serviceTurnosCount = bestItem.trip.serviceTurnosCount || 1;
+    bus.lapNumber = bestItem.trip.lapNumber || null;
+    bus.shiftLaps = bestItem.trip.shiftLaps || null;
+    bus.isHalfLap = Boolean(bestItem.trip.isHalfLap);
+    bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
+    bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
+    bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
+
+    // Detect genuine on-the-fly auto-correction (different serviceNumber than previous sticky assignment,
+    // NOT merely normal lap progression to the next leg of the same service!)
+    let supersededTripKey = null;
+    if (
+      prevSticky &&
+      prevSticky.tripKey &&
+      prevSticky.tripKey !== bestItem.trip.tripKey &&
+      prevSticky.serviceNumber &&
+      bestItem.trip.serviceNumber &&
+      prevSticky.serviceNumber !== bestItem.trip.serviceNumber
+    ) {
+      supersededTripKey = prevSticky.tripKey;
+    }
+
+    const matchInfo = {
+      trip: bestItem.trip,
+      tripKey: bestItem.trip.tripKey,
+      prevTripKey: bestItem.trip.prevTrip?.tripKey || null,
+      serviceNumber: bestItem.trip.serviceNumber || null,
+      blockId: bestItem.trip.blockId || null,
+      turnoHora,
+      targetStopSec: bestItem.stSec,
+      rawErrorSec: Number.isFinite(rawErrSec) ? Math.round(rawErrSec) : null,
+      wasAutoCorrected: Boolean(supersededTripKey),
+      supersededTripKey
+    };
+    matches.set(bus.key, matchInfo);
+    if (!bus.isNextLap && bus.identificadorCoche) {
+      primaryMatchByCoche.set(String(bus.identificadorCoche).trim(), matchInfo);
+    }
+  };
+
+  // Apply winning global assignments to stop primary buses
+  primaryBuses.forEach((bus, rIdx) => {
+    const cIdx = chosenAssign[rIdx];
+    if (cIdx < 0) return;
+    const bestItem = bestItemMatrix[rIdx][cIdx];
+    if (!bestItem || bestItem.isPeer) return;
+    applyBusMatch(bus, bestItem, rawMatrix[rIdx][cIdx], prevStickyByRow[rIdx]);
+  });
+
+  // Match `isNextLap` (`occ > 1`) entries consistently to the SAME physical bus's next lap in its assigned service!
+  for (const bus of nextLapBuses) {
+    const coche = String(bus.identificadorCoche || '').trim();
+    const primaryMatch = coche ? primaryMatchByCoche.get(coche) : null;
+    const busNormBandera = normalizeBandera(bus.descripcionBandera || '');
     const projCache = new Map();
     const getProjForBranch = (branch) => {
       if (!projCache.has(branch)) {
@@ -1981,38 +2395,33 @@ export function matchLiveBusesToTrips(
     let bestItem = null;
     let bestScore = Infinity;
 
-    for (const item of pool) {
-      if (usedTrips.has(item.trip)) continue;
-      const score = scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera, getProjForBranch);
-      if (score !== null && score < bestScore) {
-        bestScore = score;
-        bestItem = item;
+    // Prefer the exact next same-branch trip in the same serviceNumber as the bus's primary arrival
+    if (primaryMatch?.serviceNumber) {
+      const sameSrvItems = (stopPoolBySlot.get(`srv:${primaryMatch.serviceNumber}`) || []).filter(
+        (it) => !usedTrips.has(it.trip) && it.stSec > primaryMatch.targetStopSec + 10 * 60
+      );
+      for (const item of sameSrvItems) {
+        const res = scoreBusAgainstCandidate(bus, item, nowSec, null, null, busNormBandera, getProjForBranch);
+        if (res && res.rawScore < bestScore) {
+          bestScore = res.rawScore;
+          bestItem = item;
+        }
+      }
+    }
+
+    if (!bestItem) {
+      for (const item of pool) {
+        if (usedTrips.has(item.trip)) continue;
+        const res = scoreBusAgainstCandidate(bus, item, nowSec, null, null, busNormBandera, getProjForBranch);
+        if (res && res.rawScore < bestScore) {
+          bestScore = res.rawScore;
+          bestItem = item;
+        }
       }
     }
 
     if (bestItem) {
-      usedTrips.add(bestItem.trip);
-      const turnoHora = formatSecHHMM(bestItem.stSec);
-      bus.turnoProgramado = turnoHora;
-      bus.tripKey = bestItem.trip.tripKey;
-      bus.scheduledTrip = bestItem.trip;
-      bus.stopProj = bestItem.stopProj;
-      bus.serviceNumber = bestItem.trip.serviceNumber || null;
-      bus.turnoIndex = bestItem.trip.turnoIndex || 1;
-      bus.serviceTurnosCount = bestItem.trip.serviceTurnosCount || 1;
-      bus.lapNumber = bestItem.trip.lapNumber || null;
-      bus.shiftLaps = bestItem.trip.shiftLaps || null;
-      bus.isHalfLap = Boolean(bestItem.trip.isHalfLap);
-      bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
-      bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
-      bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
-      matches.set(bus.key, {
-        trip: bestItem.trip,
-        tripKey: bestItem.trip.tripKey,
-        prevTripKey: bestItem.trip.prevTrip?.tripKey || null,
-        turnoHora,
-        targetStopSec: bestItem.stSec
-      });
+      applyBusMatch(bus, bestItem, bestScore, null);
     }
   }
 
@@ -2344,9 +2753,12 @@ export function predictLineBusesForStop({
     const uNormBandera = normalizeBandera(u.descripcionBandera || u.bandera || '');
 
     const unitHist = gpsHistoryByUnit ? gpsHistoryByUnit.get(`${codLinea}-c${cleanCoche}`) : null;
+    const trailDir = unitHist
+      ? resolveTrailDirection(unitHist, branches, { currentFix: { lat: uLat, lng: uLng, ts: nowMs } })
+      : null;
     const prevFix = unitHist?.prevMoving || unitHist?.prev || null;
     const gpsDir =
-      prevFix && (distanceMeters(prevFix.lat, prevFix.lng, uLat, uLng) ?? 0) >= 20
+      !trailDir && prevFix && (distanceMeters(prevFix.lat, prevFix.lng, uLat, uLng) ?? 0) >= 20
         ? unitVector(prevFix.lat, prevFix.lng, uLat, uLng)
         : null;
 
@@ -2357,7 +2769,11 @@ export function predictLineBusesForStop({
       if (!proj || proj.perp > 140) continue;
 
       let dirPenalty = 0;
-      if (gpsDir && proj.tangent) {
+      if (trailDir?.branch) {
+        const nearTerminal = proj.along <= 240 || (b.totalLen || 0) - proj.along <= 240;
+        if (trailDir.branch === b) dirPenalty = -120;
+        else if (!nearTerminal) dirPenalty = 2400;
+      } else if (gpsDir && proj.tangent) {
         const dot = gpsDir[0] * proj.tangent[0] + gpsDir[1] * proj.tangent[1];
         if (dot < -0.25) dirPenalty = 2400;
         else if (dot > 0.35) dirPenalty = -90;
