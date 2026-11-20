@@ -24,7 +24,7 @@ import {
   getArgentinaSecOfDay,
   getArgentinaDayKey
 } from './predictor.js';
-import { BusSimulator } from './simulator.js';
+import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
 
@@ -61,7 +61,7 @@ const state = {
   routeBranchesCache: new Map(),
   horariosArchiveCache: new Map(), // codLinea -> full horarios/<codLinea>.json
   horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
-  lastRealGpsByUnit: new Map(), // busKey -> { lat, lng, ts }
+  lastRealGpsByUnit: new Map(), // baseId -> { latest, prev, prevMoving } ({ lat, lng, gpsMs, ts })
   fleetMemory: { dayKey: '', stopSnapshot: null, trips: [], units: [] },
   fleetMemoryLastFetchMs: 0,
   sessionObservedTrips: new Map(), // `${codLinea}:${tripKey}` -> latest online observation
@@ -532,7 +532,11 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   if (state.focusedLineCode && !state.stopLinesList.some((l) => l.codigo === state.focusedLineCode) && lineObj) {
     state.stopLinesList.push({ codigo: Number(lineObj.codigo), descripcion: lineObj.descripcion });
   }
-  state.lastRealGpsByUnit.clear();
+  // Prune stale (>10 min) GPS history instead of wiping it so penultimate-to-latest speed & heading survive stop switches!
+  const pruneBefore = Date.now() - 10 * 60 * 1000;
+  for (const [k, v] of state.lastRealGpsByUnit.entries()) {
+    if (!v?.latest || v.latest.ts < pruneBefore) state.lastRealGpsByUnit.delete(k);
+  }
   busSimulator.clear();
 
   el.btnShowRoutes.classList.remove('active');
@@ -600,6 +604,69 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
   return state.fleetMemory;
 }
 
+/**
+ * Maintains the penultimate (`anteúltimo`) and latest (`último`) real GPS fixes per physical bus unit,
+ * plus the last moving fix so heading never drops to `null` on repeated-timestamp 10s polls.
+ */
+function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.now()) {
+  const gpsMs = parseGpsTimestampMs(gpsRaw);
+  const curFix = { lat, lng, gpsMs, ts: now };
+  let hist = state.lastRealGpsByUnit.get(baseId);
+
+  if (!hist || !hist.latest) {
+    // Cold-start enrichment: check if FleetMemory has an earlier GPS fix 4–110 s before `gpsMs`
+    let memPrev = null;
+    if (coche && gpsMs && Array.isArray(state.fleetMemory?.units)) {
+      const memUnit = state.fleetMemory.units.find(
+        (u) => Number(u.codigoLinea) === Number(codLinea) && String(u.coche || '').trim() === coche
+      );
+      if (memUnit && typeof memUnit.lat === 'number' && typeof memUnit.lng === 'number') {
+        const mMs = parseGpsTimestampMs(memUnit.ultimaGps);
+        if (mMs && gpsMs - mMs >= 4000 && gpsMs - mMs <= 110000) {
+          memPrev = { lat: memUnit.lat, lng: memUnit.lng, gpsMs: mMs, ts: memUnit.updatedAt || mMs };
+        }
+      }
+    }
+    const movedMem = memPrev ? distanceMeters(memPrev.lat, memPrev.lng, lat, lng) || 0 : 0;
+    hist = {
+      latest: curFix,
+      prev: memPrev,
+      prevMoving: memPrev && movedMem >= 20 ? memPrev : null
+    };
+    state.lastRealGpsByUnit.set(baseId, hist);
+  } else {
+    const movedFromLatest = distanceMeters(hist.latest.lat, hist.latest.lng, lat, lng) || 0;
+    const gpsDeltaSec =
+      gpsMs !== null && hist.latest.gpsMs !== null ? (gpsMs - hist.latest.gpsMs) / 1000 : null;
+    const isNewerFix =
+      (gpsDeltaSec !== null && gpsDeltaSec >= 3) ||
+      (gpsDeltaSec === null && movedFromLatest >= 10);
+
+    if (isNewerFix) {
+      hist.prev = hist.latest;
+      if (movedFromLatest >= 20) {
+        hist.prevMoving = hist.latest;
+      }
+      hist.latest = curFix;
+    } else if (gpsDeltaSec === null || gpsDeltaSec >= -2) {
+      hist.latest.ts = now;
+    }
+  }
+
+  const candHeading = hist.prevMoving || hist.prev;
+  const headingPrevFix =
+    candHeading && (distanceMeters(candHeading.lat, candHeading.lng, lat, lng) || 0) >= 20
+      ? candHeading
+      : null;
+
+  const prevGpsFix =
+    hist.prev && (hist.prev.gpsMs === null || gpsMs === null || hist.prev.gpsMs < gpsMs - 2000)
+      ? hist.prev
+      : null;
+
+  return { headingPrevFix, prevGpsFix };
+}
+
 function normalizeArrivals(rawList, stopId, stopCoords) {
   const seenCounts = new Map();
   const primaryRouteByBaseId = new Map();
@@ -629,9 +696,21 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       validPos && stopCoords ? distanceMeters(lat, lng, stopCoords.lat, stopCoords.lng) : null;
     const desvio = parseDesvioHorario(a.desvioHorario);
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
-    const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
+    const gpsRaw = String(a.ultimaFechaHoraGPS || '').trim();
+    const gpsTimeOnly = formatGpsTimeOnly(gpsRaw);
 
-    const prevFix = state.lastRealGpsByUnit.get(baseId) || null;
+    let headingPrevFix = null;
+    let prevGpsFix = null;
+    if (validPos && !isLiveNextLap) {
+      const rec = recordUnitGpsFix(baseId, a.codigoLinea, coche, lat, lng, gpsRaw, now);
+      headingPrevFix = rec.headingPrevFix;
+      prevGpsFix = rec.prevGpsFix;
+    } else if (validPos) {
+      const hist = state.lastRealGpsByUnit.get(baseId);
+      headingPrevFix = hist?.prevMoving || hist?.prev || null;
+      prevGpsFix = hist?.prev || null;
+    }
+
     const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
 
     const draftBus = {
@@ -643,14 +722,8 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
 
     const trajectory =
       validPos && stopCoords
-        ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, prevFix)
+        ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, headingPrevFix)
         : null;
-
-    if (validPos && !isLiveNextLap) {
-      if (!prevFix || (distanceMeters(prevFix.lat, prevFix.lng, lat, lng) || 0) >= 15) {
-        state.lastRealGpsByUnit.set(baseId, { lat, lng, ts: now });
-      }
-    }
 
     const routeMeters = trajectory ? trajectory.totalMeters : straightDist;
     if (!isLiveNextLap && typeof routeMeters === 'number') {
@@ -679,6 +752,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       turnoProgramado: null,
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
+      prevGpsFix,
       distanceMeters: straightDist,
       routeMeters,
       proximityPct: computeProximityPercent(eta.minutes, routeMeters),
@@ -687,7 +761,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       choferLegajo: chofer.legajo,
       choferRaw: chofer.raw,
       desvio,
-      ultimaFechaHoraGPS: String(a.ultimaFechaHoraGPS || '').trim(),
+      ultimaFechaHoraGPS: gpsRaw,
       gpsTimeOnly,
       trajectory,
       isPredicted: false,
@@ -821,7 +895,8 @@ function renderLineFilters() {
       // Immediately hide non-selected lines from Leaflet (zero ghost markers!)
       transitMap.updateBuses(state.arribos, {
         filterLine: state.filterLine,
-        selectedBusKey: null
+        selectedBusKey: null,
+        simulateMode: state.simulateMode
       });
 
       // When focusing a single line, automatically fetch its FULL ACTIVE FLEET (> 3 cars) via upstream probe propagation!
@@ -1677,6 +1752,26 @@ async function fetchArribos(showSkeleton = false) {
         : payload.stopCoords || null;
 
     const liveBuses = normalizeArrivals(rawArribos, stopId, stopCoords);
+
+    // Also record Corridor Radar sightings so buses spotted along the route already have penultimate GPS speed when entering arrivals
+    const nowRecordMs = Date.now();
+    for (const cb of state.corridorFleet) {
+      const cbCoche = String(cb.identificadorCoche || '').trim();
+      const cbLat = parseFloat(cb.latitud);
+      const cbLng = parseFloat(cb.longitud);
+      if (cbCoche && cb.codigoLinea && !Number.isNaN(cbLat) && !Number.isNaN(cbLng) && cbLat !== 0 && cbLng !== 0) {
+        recordUnitGpsFix(
+          `${cb.codigoLinea}-c${cbCoche}`,
+          cb.codigoLinea,
+          cbCoche,
+          cbLat,
+          cbLng,
+          String(cb.ultimaFechaHoraGPS || '').trim(),
+          nowRecordMs
+        );
+      }
+    }
+
     let reconciled = reconcileWithSchedulePrediction(
       liveBuses,
       stopId,

@@ -232,7 +232,8 @@ export class TransitMap {
       incomingKeys.add(bus.key);
 
       const isSelected = bus.key === selectedBusKey;
-      const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: false });
+      const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
+      const iconSig = `${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${etaShort}|${bus.desvio?.status || ''}|${bus.isPredicted ? 1 : 0}|${bus.gpsLost ? 1 : 0}|${isSelected ? 1 : 0}`;
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
@@ -244,10 +245,14 @@ export class TransitMap {
           const curPos = existing.marker.getLatLng();
           this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
         }
-        existing.marker.setIcon(icon);
+        if (existing.iconSig !== iconSig) {
+          existing.marker.setIcon(this._buildBusIcon(bus, { selected: isSelected, dimmed: false }));
+          existing.iconSig = iconSig;
+        }
         existing.marker.setZIndexOffset(isSelected ? 1000 : 500);
         existing.data = bus;
       } else {
+        const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: false });
         const marker = L.marker([bus.lat, bus.lng], {
           icon,
           zIndexOffset: isSelected ? 1000 : 500
@@ -257,7 +262,7 @@ export class TransitMap {
           this.onBusSelect(bus.key);
         });
 
-        this.busMarkers.set(bus.key, { marker, data: bus });
+        this.busMarkers.set(bus.key, { marker, data: bus, iconSig });
       }
     }
 

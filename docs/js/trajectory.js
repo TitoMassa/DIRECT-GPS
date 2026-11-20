@@ -336,7 +336,7 @@ export function buildTrajectoryFromBranchAlong(
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+      speedMps: Math.max(2.2, Math.min(24.0, totalMeters / Math.max(45, etaSec)))
     };
   }
 
@@ -363,7 +363,7 @@ export function buildTrajectoryFromBranchAlong(
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+      speedMps: Math.max(2.2, Math.min(24.0, totalMeters / Math.max(45, etaSec)))
     };
   }
 
@@ -405,7 +405,7 @@ export function buildTrajectoryFromBranchAlong(
     pathCum: cum,
     totalMeters,
     walkedMeters: 0,
-    speedMps: Math.max(2.2, Math.min(11.0, totalMeters / Math.max(45, etaSec)))
+    speedMps: Math.max(2.2, Math.min(24.0, totalMeters / Math.max(45, etaSec)))
   };
 }
 
@@ -648,7 +648,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
+      speedMps: Math.max(2.2, Math.min(24.0, totalMeters / etaSec))
     };
   }
 
@@ -688,7 +688,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       pathCum: cum,
       totalMeters,
       walkedMeters: 0,
-      speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
+      speedMps: Math.max(2.2, Math.min(24.0, totalMeters / etaSec))
     };
   }
 
@@ -720,8 +720,40 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     pathCum: cum,
     totalMeters,
     walkedMeters: 0,
-    speedMps: Math.max(2.2, Math.min(11.0, totalMeters / etaSec))
+    speedMps: Math.max(2.2, Math.min(24.0, totalMeters / etaSec))
   };
+}
+
+function projectOnPolylineWindow(pts, cum, lat, lng, minAlong, maxAlong, preferAlong) {
+  let best = null;
+  let bestScore = Infinity;
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const segStartAlong = cum[i] || 0;
+    const segEndAlong = cum[i + 1] || 0;
+    if (segEndAlong < minAlong || segStartAlong > maxAlong) continue;
+    const aLat = pts[i][0];
+    const aLng = pts[i][1];
+    const bLat = pts[i + 1][0];
+    const bLng = pts[i + 1][1];
+    const dx = bLat - aLat;
+    const dy = bLng - aLng;
+    const lenSq = dx * dx + dy * dy;
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((lat - aLat) * dx + (lng - aLng) * dy) / lenSq));
+    const pLat = aLat + dx * t;
+    const pLng = aLng + dy * t;
+    const along = segStartAlong + (segEndAlong - segStartAlong) * t;
+    if (along < minAlong || along > maxAlong) continue;
+    const perp = distanceMeters(lat, lng, pLat, pLng);
+    if (perp === null) continue;
+    // Strong preference for forward position matching expected lag prevents snapping onto overlapping return lanes
+    const score = perp + (Number.isFinite(preferAlong) ? Math.abs(along - preferAlong) * 0.18 : 0);
+    if (score < bestScore) {
+      bestScore = score;
+      best = { segIdx: i, t, lat: pLat, lng: pLng, along, perp };
+    }
+  }
+  return best;
 }
 
 /**
@@ -737,10 +769,24 @@ export function prependPathToTrajectory(prevTraj, fromMeters, newTraj) {
   if (!startSample) return newTraj;
 
   const targetStart = newTraj.pathPts[0];
-  const endProj = projectOnPolyline(prevTraj.pathPts, prevTraj.pathCum, targetStart[0], targetStart[1]);
+  const expectedAlong = Math.max(fromMeters, prevTraj.totalMeters - newTraj.totalMeters);
+  const windowPad = Math.max(220, (expectedAlong - fromMeters) * 0.45);
+  const windowedProj = projectOnPolylineWindow(
+    prevTraj.pathPts,
+    prevTraj.pathCum,
+    targetStart[0],
+    targetStart[1],
+    Math.max(0, fromMeters - 15),
+    expectedAlong + windowPad,
+    expectedAlong
+  );
+  const endProj =
+    windowedProj && windowedProj.perp <= 140
+      ? windowedProj
+      : projectOnPolyline(prevTraj.pathPts, prevTraj.pathCum, targetStart[0], targetStart[1], Math.max(0, fromMeters - 15));
 
   const prefixPts = [[startSample.lat, startSample.lng]];
-  if (endProj.along > fromMeters + 3) {
+  if (endProj && endProj.along > fromMeters + 3) {
     for (let i = 0; i < prevTraj.pathPts.length; i++) {
       const m = prevTraj.pathCum[i];
       if (m > fromMeters + 2 && m < endProj.along - 2) {
@@ -754,21 +800,54 @@ export function prependPathToTrajectory(prevTraj, fromMeters, newTraj) {
   const totalMeters = mergedCum[mergedCum.length - 1] || newTraj.totalMeters;
   const addedMeters = Math.max(0, totalMeters - newTraj.totalMeters);
 
-  const shiftedSegments = (newTraj.segments || []).map((s, idx) =>
-    idx === 0
-      ? { ...s, pts: [...prefixPts, ...s.pts], startMeters: 0, endMeters: s.endMeters + addedMeters }
-      : { ...s, startMeters: s.startMeters + addedMeters, endMeters: s.endMeters + addedMeters }
-  );
+  const firstNewSeg = newTraj.segments?.[0];
+  const crossesDirection =
+    Boolean(
+      firstNewSeg &&
+        startSample.currentBandera &&
+        firstNewSeg.bandera &&
+        startSample.currentBandera !== firstNewSeg.bandera &&
+        addedMeters > 8
+    );
+
+  const shiftedSegments = crossesDirection
+    ? [
+        {
+          pts: [...prefixPts, newTraj.pathPts[0]],
+          color: startSample.currentBranchColor || firstNewSeg.color,
+          bandera: startSample.currentBandera,
+          startMeters: 0,
+          endMeters: addedMeters
+        },
+        ...(newTraj.segments || []).map((s) => ({
+          ...s,
+          startMeters: s.startMeters + addedMeters,
+          endMeters: s.endMeters + addedMeters
+        }))
+      ]
+    : (newTraj.segments || []).map((s, idx) =>
+        idx === 0
+          ? { ...s, pts: [...prefixPts, ...s.pts], startMeters: 0, endMeters: s.endMeters + addedMeters }
+          : { ...s, startMeters: s.startMeters + addedMeters, endMeters: s.endMeters + addedMeters }
+      );
+
+  const oppStartMeters = newTraj.oppStartMeters ? newTraj.oppStartMeters + addedMeters : 0;
+  const turnaroundAtMeters = newTraj.turnaroundAtMeters
+    ? newTraj.turnaroundAtMeters + addedMeters
+    : crossesDirection && prevTraj.leg === 'previous_leg' && newTraj.leg === 'direct'
+      ? addedMeters
+      : 0;
 
   return {
     ...newTraj,
+    isOppositeLeg: newTraj.isOppositeLeg || (crossesDirection && prevTraj.leg === 'previous_leg'),
     pathPts: mergedPts,
     pathCum: mergedCum,
     totalMeters,
     segments: shiftedSegments,
     stopAlongs: (newTraj.stopAlongs || []).map((sa) => sa + addedMeters),
-    oppStartMeters: newTraj.oppStartMeters ? newTraj.oppStartMeters + addedMeters : 0,
-    turnaroundAtMeters: newTraj.turnaroundAtMeters ? newTraj.turnaroundAtMeters + addedMeters : 0,
+    oppStartMeters,
+    turnaroundAtMeters,
     walkedMeters: 0
   };
 }

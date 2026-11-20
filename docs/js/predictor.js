@@ -206,7 +206,7 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     const last = pts[pts.length - 1];
     const avgSpeed =
       pts.length >= 2 && last.sec > first.sec
-        ? Math.max(2.5, Math.min(11, (last.along - first.along) / (last.sec - first.sec)))
+        ? Math.max(2.5, Math.min(22, (last.along - first.along) / (last.sec - first.sec)))
         : 5.0;
 
     const fullPts = pts.map((p) => ({ stopId: p.stopId, along: p.along, sec: p.sec }));
@@ -446,7 +446,7 @@ function evalPointsAtSec(points, tEff) {
   const duDt = (0.84 + 0.16 * 0.5 * Math.PI * Math.sin(Math.PI * u)) / dt;
   return {
     along: a.along + dist * uSmooth,
-    speedMps: Math.max(0, Math.min(11.5, dist * duDt))
+    speedMps: Math.max(0, Math.min(25.0, dist * duDt))
   };
 }
 
@@ -571,7 +571,7 @@ export function evaluateTripState(
       lng: sample.lng,
       remainingMeters,
       etaSec: Math.max(0, etaSec),
-      speedMps: remainingMeters <= 5 ? 0 : Math.min(11.5, ev.speedMps * speedFactor),
+      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * speedFactor),
       isAtTerminal: along <= 120 && tEff <= trip.startSec + 20,
       inOppositeLeg: false,
       inNextCycle: false,
@@ -626,7 +626,7 @@ export function evaluateTripState(
         lng: sample.lng,
         remainingMeters,
         etaSec: Math.max(0, etaSec),
-        speedMps: Math.min(11.5, ev.speedMps * speedFactor),
+        speedMps: Math.min(25.0, ev.speedMps * speedFactor),
         isAtTerminal: oppRem <= 120,
         inOppositeLeg: true,
         inNextCycle: false,
@@ -681,7 +681,7 @@ export function evaluateTripState(
           lng: sample.lng,
           remainingMeters,
           etaSec: Math.max(0, etaSec),
-          speedMps: Math.min(11.5, ev.speedMps * speedFactor),
+          speedMps: Math.min(25.0, ev.speedMps * speedFactor),
           isAtTerminal: ppRem <= 120,
           inOppositeLeg: false,
           inNextCycle: true,

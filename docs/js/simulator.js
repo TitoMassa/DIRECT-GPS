@@ -8,6 +8,15 @@ import {
 } from './predictor.js';
 
 const STATIONARY_OFFLINE_THRESHOLD_SEC = 180; // Full 3 minutes stationary outside a cabecera before switching to predicted mode
+const LEG_ORDER = { full_cycle: 0, previous_leg: 1, direct: 2 };
+
+function isCompatibleLegTransition(prevLeg, newLeg) {
+  if (!prevLeg || !newLeg) return false;
+  if (prevLeg === newLeg) return true;
+  const prevRank = LEG_ORDER[prevLeg];
+  const newRank = LEG_ORDER[newLeg];
+  return prevRank !== undefined && newRank !== undefined && newRank > prevRank;
+}
 
 /**
  * Parses SmartMovePro GPS timestamp ("DD/MM/YYYY HH:MM:SS" in Argentina UTC-3) into UTC epoch ms.
@@ -32,12 +41,71 @@ function clamp(v, min, max) {
 }
 
 /**
+ * Estimates initial cruising speed on first sight using (in priority order):
+ *  1. Real distance covered between penultimate (`anteúltimo`) and latest (`último`) GPS fixes
+ *  2. Local scheduled segment speed along the matched timetable trip
+ *  3. Direct route-distance / ETA ratio (avoiding turnaround-layover deflation on indirect legs)
+ */
+function estimateInitialKinematics(bus, newTraj, stopId, nowSec, gpsMs, etaSec, aheadSec, isAtTerminal, isStaleTracker) {
+  if (isAtTerminal || isStaleTracker) {
+    return { cruise: 0, observedSpeed: null, cadence: null, hasConfirmed: false, isStopped: true };
+  }
+
+  // 1) Penultimate -> latest GPS fix distance/time (works on Frame 1 when history/FleetMemory has prior fix!)
+  const prevFix = bus.prevGpsFix;
+  if (
+    prevFix &&
+    typeof prevFix.lat === 'number' &&
+    typeof prevFix.lng === 'number' &&
+    typeof prevFix.gpsMs === 'number' &&
+    typeof gpsMs === 'number'
+  ) {
+    const dtPrev = (gpsMs - prevFix.gpsMs) / 1000;
+    if (dtPrev >= 4 && dtPrev <= 110) {
+      const moved = distanceMeters(prevFix.lat, prevFix.lng, bus.lat, bus.lng) ?? 0;
+      const learnedCadence = clamp(dtPrev, 12, 55);
+      if (moved < 11 && dtPrev >= 8) {
+        return { cruise: 0, observedSpeed: null, cadence: learnedCadence, hasConfirmed: true, isStopped: true };
+      }
+      const maxPlausible = Math.max(1500, dtPrev * 30);
+      if (moved >= 11 && moved < maxPlausible) {
+        const inst = clamp((moved * 1.04) / dtPrev, 1.0, 26.5);
+        return { cruise: inst, observedSpeed: inst, cadence: learnedCadence, hasConfirmed: true, isStopped: false };
+      }
+    }
+  }
+
+  // 2) Local scheduled segment speed along the matched trip (distinguishes highway/bridge vs downtown!)
+  if (bus.scheduledTrip && bus.stopProj) {
+    const ev = evaluateTripState(bus.scheduledTrip, stopId, bus.stopProj, nowSec, aheadSec, {
+      maxAheadSec: 160 * 60
+    });
+    if (ev && !ev.isAtTerminal && ev.speedMps > 1.2) {
+      const schedSpd = clamp(ev.speedMps * 0.92, 2.8, 18.0);
+      return { cruise: schedSpd, observedSpeed: null, cadence: null, hasConfirmed: false, isStopped: false };
+    }
+  }
+
+  // 3) Direct route-distance / ETA ratio (on indirect legs ETA includes terminal layover, so use urban default)
+  const fallbackSpd =
+    newTraj.leg === 'direct'
+      ? clamp((newTraj.totalMeters / etaSec) * 0.85, 3.0, 14.0)
+      : 5.2;
+
+  return { cruise: fallbackSpd, observedSpeed: null, cadence: null, hasConfirmed: false, isStopped: false };
+}
+
+/**
  * Physically-faithful, zero-backjump kinematic vehicle predictor for EN VIVO mode.
  *
  * Operating rules:
- *  - 'gps': tracks fresh real GPS fixes with velocity EMA, zero-backjump hold, stop micro-deceleration,
- *    and cabecera layover hold. If a live GPS bus stays stationary (<20 m) at a non-cabecera spot, it
- *    remains QUIET at its real GPS spot for a full 3 minutes (180 s) before switching to predicted mode!
+ *  - 'gps': learns each unit's real speed from the exact distance & clock delta between its
+ *    penultimate (`anteúltimo`) and latest (`último`) GPS fixes, adapts dead-reckoning lookahead
+ *    and silence windows to each tracker's real reporting cadence (12–55 s), gently bleeds off
+ *    moving overshoots without stopping, and smoothly splices forward lag (including across
+ *    turnarounds) with zero teleports. If a live GPS bus stays stationary (<20 m) at a non-cabecera
+ *    spot, it remains QUIET at its real GPS spot for a full 3 minutes (180 s) before switching to
+ *    predicted mode.
  *  - 'schedule': tracks the official stop-by-stop timetable anchored to the bus's exact last known GPS
  *    position (`scheduleAnchor`), preserving accumulated delay and recovering gradually (~4.8 s/min)
  *    instead of jumping magically to on-time punctuality.
@@ -96,7 +164,7 @@ export class BusSimulator {
         const incomingAnchor = bus.predAnchor || null;
 
         if (!prev) {
-          const initSpeed = newTraj.isAtTerminal ? 0 : clamp(newTraj.speedMps || 4.2, 0, 7.5);
+          const initSpeed = newTraj.isAtTerminal ? 0 : clamp(newTraj.speedMps || 4.8, 0, 22.0);
           this.units.set(bus.key, {
             mode: 'schedule',
             scheduledTrip: bus.scheduledTrip,
@@ -110,10 +178,14 @@ export class BusSimulator {
             lastGpsMs: null,
             lastGpsPollMs: nowMs,
             lastRealRem: newRealRem,
+            lastRealLat: bus.lat,
+            lastRealLng: bus.lng,
+            lastRealLeg: newTraj.leg,
+            observedGpsIntervalSec: null,
             hasConfirmedFix: false,
             observedSpeedMps: null,
             cruiseSpeedMps: initSpeed,
-            currentSpeedMps: initSpeed * 0.55,
+            currentSpeedMps: initSpeed * 0.75,
             isStopped: newTraj.isAtTerminal,
             isAtTerminal: Boolean(newTraj.isAtTerminal),
             aheadSec: desvioSec,
@@ -157,10 +229,10 @@ export class BusSimulator {
 
         const prevSimRem = Math.max(0, prev.activeTraj.totalMeters - prev.walkedMeters);
         const deltaRem = newRealRem - prevSimRem;
-        const sameLeg = prev.activeTraj.leg === newTraj.leg;
+        const compatibleLeg = isCompatibleLegTransition(prev.activeTraj.leg, newTraj.leg);
 
-        if (!sameLeg || Math.abs(deltaRem) > 220) {
-          if (sameLeg && deltaRem < 0 && -deltaRem <= 320) {
+        if (!compatibleLeg || Math.abs(deltaRem) > 260) {
+          if (compatibleLeg && deltaRem < 0 && -deltaRem <= 950) {
             prev.activeTraj = prependPathToTrajectory(prev.activeTraj, prev.walkedMeters, newTraj);
             prev.walkedMeters = 0;
           } else {
@@ -178,18 +250,26 @@ export class BusSimulator {
       const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
       const rawAgeSec = gpsMs ? (nowMs - gpsMs) / 1000 : 0;
       const gpsAgeSec = rawAgeSec >= 0 && rawAgeSec < 7200 ? rawAgeSec : 0;
-      const isStaleTracker = gpsAgeSec > 45;
+      const priorCadence = clamp(prev?.observedGpsIntervalSec || 28, 14, 55);
+      const staleThresholdSec = Math.max(65, priorCadence * 1.75);
+      const isStaleTracker = gpsAgeSec > staleThresholdSec;
 
       const isAtTerminal = Boolean(newTraj.isAtTerminal);
       const aheadSec = bus.desvio?.seconds || 0;
       const likelyTerminalRest = isAtTerminal && aheadSec >= 60;
 
-      const conservativeInitSpeed =
-        isStaleTracker || isAtTerminal
-          ? 0
-          : clamp((newRealRem / etaSec) * 0.62, 1.8, 3.8);
-
       if (!prev) {
+        const initKin = estimateInitialKinematics(
+          bus,
+          newTraj,
+          stopId || bus.stopId || '',
+          nowSec,
+          gpsMs,
+          etaSec,
+          aheadSec,
+          isAtTerminal,
+          isStaleTracker
+        );
         // Record when this bus was first observed at (anchorLat, anchorLng); use GPS timestamp if already aging
         const initialStationarySince =
           gpsMs && gpsMs < nowMs && nowMs - gpsMs < 7200000 ? gpsMs : nowMs;
@@ -216,11 +296,15 @@ export class BusSimulator {
           lastGpsMs: gpsMs,
           lastGpsPollMs: nowMs,
           lastRealRem: newRealRem,
-          hasConfirmedFix: false,
-          observedSpeedMps: null,
-          cruiseSpeedMps: conservativeInitSpeed,
-          currentSpeedMps: alreadyFrozen3Min ? 0 : conservativeInitSpeed * 0.4,
-          isStopped: !alreadyFrozen3Min && (isStaleTracker || isAtTerminal),
+          lastRealLat: bus.lat,
+          lastRealLng: bus.lng,
+          lastRealLeg: newTraj.leg,
+          observedGpsIntervalSec: initKin.cadence,
+          hasConfirmedFix: initKin.hasConfirmed,
+          observedSpeedMps: initKin.observedSpeed,
+          cruiseSpeedMps: initKin.cruise,
+          currentSpeedMps: alreadyFrozen3Min || initKin.isStopped ? 0 : initKin.cruise * 0.78,
+          isStopped: !alreadyFrozen3Min && initKin.isStopped,
           isAtTerminal,
           aheadSec,
           overshootMeters: 0,
@@ -312,7 +396,11 @@ export class BusSimulator {
       prev.scheduleAnchor = null;
       bus.gpsLost = false;
 
-      const movedFromLastReal = Math.abs(prev.lastRealRem - newRealRem);
+      const straightFromLastReal =
+        typeof prev.lastRealLat === 'number' && typeof prev.lastRealLng === 'number'
+          ? distanceMeters(prev.lastRealLat, prev.lastRealLng, bus.lat, bus.lng) ?? 0
+          : Math.abs(prev.lastRealRem - newRealRem);
+      const movedFromLastReal = Math.max(Math.abs(prev.lastRealRem - newRealRem), straightFromLastReal);
       const gpsTimeDeltaSec = gpsMs && prev.lastGpsMs ? (gpsMs - prev.lastGpsMs) / 1000 : null;
       const isSameGpsTimestamp = gpsTimeDeltaSec !== null && gpsTimeDeltaSec < 2;
       const isFreshFix =
@@ -320,47 +408,82 @@ export class BusSimulator {
         (gpsTimeDeltaSec === null && movedFromLastReal >= 8) ||
         recoveredFromSchedule;
 
-      // 1. Update real velocity / stopped state ONLY on genuinely fresh GPS fixes
+      // 1. Update real velocity & reporting cadence ONLY on genuinely fresh GPS fixes
+      //    measuring exact distance covered between penultimate (`anteúltimo`) and latest (`último`) GPS fixes!
       if (isFreshFix) {
         const dtReal =
           gpsTimeDeltaSec !== null && gpsTimeDeltaSec >= 3 && gpsTimeDeltaSec <= 180
             ? gpsTimeDeltaSec
             : Math.max(5, (nowMs - prev.lastGpsPollMs) / 1000);
 
-        const realAdvance = prev.lastRealRem - newRealRem;
-        const minMoveThreshold = isAtTerminal ? 20 : 11;
+        if (gpsTimeDeltaSec !== null && gpsTimeDeltaSec >= 5 && gpsTimeDeltaSec <= 75) {
+          const sampleCadence = clamp(gpsTimeDeltaSec, 12, 55);
+          prev.observedGpsIntervalSec =
+            prev.observedGpsIntervalSec !== null
+              ? 0.55 * sampleCadence + 0.45 * prev.observedGpsIntervalSec
+              : sampleCadence;
+        }
 
-        if ((realAdvance < minMoveThreshold && dtReal >= 7) || (likelyTerminalRest && realAdvance < 28)) {
+        const routeAdvance = prev.lastRealRem - newRealRem;
+        const minMoveThreshold = isAtTerminal ? 20 : 11;
+        const speedLegOk = isCompatibleLegTransition(prev.lastRealLeg || prev.activeTraj?.leg, newTraj.leg);
+        const routeMatchesDisplacement =
+          speedLegOk &&
+          routeAdvance >= -25 &&
+          Math.abs(routeAdvance) <= Math.max(220, straightFromLastReal * 2.3 + 140);
+
+        // Exact street-following distance between penultimate & latest GPS fixes (fallback to straight-line on leg jump)
+        const effectiveAdvance = routeMatchesDisplacement
+          ? routeAdvance
+          : straightFromLastReal >= minMoveThreshold
+            ? straightFromLastReal * 1.05
+            : 0;
+        const maxPlausibleAdvance = Math.max(1500, dtReal * 30);
+
+        if (
+          (effectiveAdvance < minMoveThreshold && straightFromLastReal < minMoveThreshold && dtReal >= 7) ||
+          (likelyTerminalRest && effectiveAdvance < 28 && straightFromLastReal < 28)
+        ) {
           // Bus is stationary (< 3 min at traffic light/stop, or resting at cabecera) -> HOLD QUIET at 0 m/s!
           prev.isStopped = true;
           prev.cruiseSpeedMps = 0;
           if (prev.observedSpeedMps !== null) {
-            prev.observedSpeedMps = Math.max(2.2, prev.observedSpeedMps * 0.85);
+            prev.observedSpeedMps = Math.max(2.5, prev.observedSpeedMps * 0.85);
           }
-        } else if (realAdvance >= minMoveThreshold && realAdvance < 900) {
-          const instSpeed = clamp(realAdvance / dtReal, 0.9, 10.5);
-          prev.observedSpeedMps =
-            prev.observedSpeedMps !== null ? 0.62 * instSpeed + 0.38 * prev.observedSpeedMps : instSpeed;
+        } else if (effectiveAdvance >= minMoveThreshold && effectiveAdvance < maxPlausibleAdvance) {
+          const instSpeed = clamp(effectiveAdvance / dtReal, 0.9, 26.5);
+          if (prev.observedSpeedMps === null) {
+            prev.observedSpeedMps = instSpeed;
+          } else if (instSpeed > prev.observedSpeedMps * 1.35 || instSpeed < prev.observedSpeedMps * 0.65) {
+            // Fast adaptation on speed regime transitions (entering highway/bridge or dense downtown traffic)
+            prev.observedSpeedMps = 0.80 * instSpeed + 0.20 * prev.observedSpeedMps;
+          } else {
+            prev.observedSpeedMps = 0.68 * instSpeed + 0.32 * prev.observedSpeedMps;
+          }
           prev.cruiseSpeedMps = prev.observedSpeedMps;
           prev.isStopped = false;
         } else if (recoveredFromSchedule) {
           prev.isStopped = isAtTerminal;
-          prev.cruiseSpeedMps = isAtTerminal ? 0 : Math.max(2.8, prev.currentSpeedMps || 4.0);
+          prev.cruiseSpeedMps = isAtTerminal ? 0 : Math.max(3.2, prev.currentSpeedMps || 4.8);
         }
 
         prev.hasConfirmedFix = true;
         prev.lastGpsMs = gpsMs ?? prev.lastGpsMs;
         prev.lastGpsPollMs = nowMs;
         prev.lastRealRem = newRealRem;
+        prev.lastRealLat = bus.lat;
+        prev.lastRealLng = bus.lng;
+        prev.lastRealLeg = newTraj.leg;
       } else if (isSameGpsTimestamp || isStaleTracker || likelyTerminalRest) {
         const silentSec = (nowMs - prev.lastGpsPollMs) / 1000;
-        if (silentSec > 24 || isStaleTracker || likelyTerminalRest) {
+        const silentStopThreshold = Math.max(48, priorCadence * 1.60);
+        if (silentSec > silentStopThreshold || isStaleTracker || likelyTerminalRest) {
           prev.isStopped = true;
           prev.cruiseSpeedMps = 0;
         }
       }
 
-      // 2. Smoothly reconcile position without ANY backward jumps when in EN VIVO mode
+      // 2. Smoothly reconcile position without ANY backward jumps or forward teleports when in EN VIVO mode
       if (!applyPositions) {
         prev.activeTraj = newTraj;
         prev.walkedMeters = 0;
@@ -378,15 +501,20 @@ export class BusSimulator {
 
       const prevSimRem = Math.max(0, prev.activeTraj.totalMeters - prev.walkedMeters);
       const deltaRem = newRealRem - prevSimRem;
-      const sameLegType = prev.activeTraj.leg === newTraj.leg;
+      const compatibleLeg = isCompatibleLegTransition(prev.activeTraj.leg, newTraj.leg);
+      const learnedCadence = clamp(prev.observedGpsIntervalSec || 28, 14, 55);
+      const refSpeed = prev.observedSpeedMps || prev.cruiseSpeedMps || 5.0;
+      const expectedStepMeters = refSpeed * learnedCadence;
+      const maxOvershootHold = clamp(Math.max(260, expectedStepMeters * 0.95), 260, 720);
+      const maxForwardSplice = clamp(Math.max(650, expectedStepMeters * 2.2), 650, 1650);
 
-      if (sameLegType && deltaRem >= 0 && deltaRem <= 180) {
+      if (compatibleLeg && deltaRem >= 0 && deltaRem <= maxOvershootHold) {
         prev.activeTraj = newTraj;
         prev.walkedMeters = clamp(deltaRem, 0, newTraj.totalMeters);
         prev.overshootMeters = deltaRem;
         prev.lagMeters = 0;
-        prev.deadReckonMeters = 0;
-      } else if (sameLegType && deltaRem < 0 && -deltaRem <= 340) {
+        prev.deadReckonMeters = deltaRem;
+      } else if (compatibleLeg && deltaRem < 0 && -deltaRem <= maxForwardSplice) {
         const lag = -deltaRem;
         const spliced = prependPathToTrajectory(prev.activeTraj, prev.walkedMeters, newTraj);
         prev.activeTraj = spliced;
@@ -467,9 +595,9 @@ export class BusSimulator {
           if (ev.speedMps <= 0.05 || ev.isAtTerminal) {
             targetSpeed = 0;
           } else if (err < -4) {
-            targetSpeed = clamp(ev.speedMps * 0.25, 0, 2.0);
+            targetSpeed = clamp(ev.speedMps * 0.25, 0, 3.0);
           } else {
-            targetSpeed = clamp(ev.speedMps + clamp(err / 6.5, 0, 2.5), 0, 11.0);
+            targetSpeed = clamp(ev.speedMps + clamp(err / 6.0, 0, 4.5), 0, 26.0);
           }
 
           st.etaSecondsRemaining = ev.etaSec;
@@ -478,8 +606,8 @@ export class BusSimulator {
           }
         }
 
-        const maxAccel = 0.85;
-        const maxBrake = 1.85;
+        const maxAccel = targetSpeed > 11 ? 1.85 : 1.15;
+        const maxBrake = st.currentSpeedMps > 11 ? 2.4 : 1.85;
         const dv = targetSpeed - st.currentSpeedMps;
         if (dv > 0) st.currentSpeedMps += Math.min(dv, maxAccel * dt);
         else st.currentSpeedMps += Math.max(dv, -maxBrake * dt);
@@ -494,11 +622,15 @@ export class BusSimulator {
         continue;
       }
 
-      // ── Mode B: Live GPS kinematic prediction ──
+      // ── Mode B: Live GPS kinematic prediction (adaptive cadence + velocity) ──
       const silentSec = (nowMs - st.lastGpsPollMs) / 1000;
+      const cadence = clamp(st.observedGpsIntervalSec || 28, 14, 55);
+      const refSpeed = st.observedSpeedMps || st.cruiseSpeedMps || 5.0;
+      const expectedStepMeters = refSpeed * cadence;
       const maxLookahead = st.hasConfirmedFix
-        ? clamp((st.observedSpeedMps || 3.5) * 13, 42, 80)
-        : 40;
+        ? clamp(expectedStepMeters * 1.30, 90, 1250)
+        : clamp(Math.max(4.8, st.cruiseSpeedMps || 4.8) * 32, 110, 480);
+      const silentTaperStart = Math.max(30, cadence * 1.20);
 
       const reachedTurnaround =
         (traj.turnaroundAtMeters > 40 && Math.abs(st.walkedMeters - traj.turnaroundAtMeters) < 25) ||
@@ -506,27 +638,51 @@ export class BusSimulator {
 
       let targetSpeed = 0;
 
-      if (st.lagMeters > 3) {
-        const baseCruise = st.isStopped ? 1.8 : Math.max(2.2, st.cruiseSpeedMps);
-        const catchupBoost = clamp(st.lagMeters / 8.5, 0.4, 3.6);
-        targetSpeed = clamp(baseCruise + catchupBoost, 1.5, 10.8);
-      } else if (st.isStopped || st.overshootMeters > 6 || (reachedTurnaround && st.aheadSec >= 45)) {
+      if (st.lagMeters > 2) {
+        const baseCruise = st.isStopped ? 2.2 : Math.max(2.8, st.cruiseSpeedMps);
+        const maxCatchupSpeed = clamp(Math.max(12.5, baseCruise * 1.42), 12.5, 29.0);
+        const maxBoost = Math.max(4.5, baseCruise * 0.42);
+        const catchupBoost = clamp(st.lagMeters / 7.5, 0.5, maxBoost);
+        targetSpeed = clamp(baseCruise + catchupBoost, 1.8, maxCatchupSpeed);
+      } else if (st.isStopped || (reachedTurnaround && st.aheadSec >= 45)) {
         targetSpeed = 0;
+      } else if (st.overshootMeters > 4) {
+        // Real bus is moving behind our slight overshoot: gently ease speed so it catches up smoothly without freezing!
+        const cruise = Math.max(1.5, st.cruiseSpeedMps);
+        const overshootSec = st.overshootMeters / cruise;
+        if (overshootSec <= 4.5) {
+          targetSpeed = cruise * 0.65;
+        } else if (overshootSec <= 10) {
+          targetSpeed = cruise * 0.35;
+        } else if (overshootSec <= 18) {
+          targetSpeed = cruise * 0.12;
+        } else {
+          targetSpeed = 0;
+        }
+        if (silentSec > silentTaperStart) {
+          targetSpeed *= clamp(1 - (silentSec - silentTaperStart) / 16, 0, 1);
+        }
       } else {
         targetSpeed = st.cruiseSpeedMps;
 
-        const taperStart = maxLookahead * 0.62;
+        const taperStart = maxLookahead * 0.80;
         if (st.deadReckonMeters > taperStart) {
           const ratio = clamp(1 - (st.deadReckonMeters - taperStart) / (maxLookahead - taperStart), 0, 1);
           targetSpeed *= ratio;
         }
 
-        if (silentSec > 16) {
-          targetSpeed *= clamp(1 - (silentSec - 16) / 10, 0, 1);
+        if (silentSec > silentTaperStart) {
+          targetSpeed *= clamp(1 - (silentSec - silentTaperStart) / 16, 0, 1);
         }
       }
 
-      if (targetSpeed > 1.8 && Array.isArray(traj.stopAlongs) && traj.stopAlongs.length > 0) {
+      if (
+        targetSpeed > 1.8 &&
+        targetSpeed <= 13.5 &&
+        st.lagMeters <= 5 &&
+        Array.isArray(traj.stopAlongs) &&
+        traj.stopAlongs.length > 0
+      ) {
         const w = st.walkedMeters;
         for (let i = 0; i < traj.stopAlongs.length; i++) {
           const distToStop = traj.stopAlongs[i] - w;
@@ -538,8 +694,8 @@ export class BusSimulator {
         }
       }
 
-      const maxAccel = 0.85;
-      const maxBrake = 1.85;
+      const maxAccel = targetSpeed > 11 ? 1.85 : 1.15;
+      const maxBrake = st.currentSpeedMps > 11 ? 2.4 : 1.85;
       const dv = targetSpeed - st.currentSpeedMps;
       if (dv > 0) {
         st.currentSpeedMps += Math.min(dv, maxAccel * dt);
@@ -551,10 +707,11 @@ export class BusSimulator {
       }
 
       const advance = st.currentSpeedMps * dt;
+      let actualMove = 0;
       if (advance > 0) {
         const prevW = st.walkedMeters;
         st.walkedMeters = Math.min(traj.totalMeters, st.walkedMeters + advance);
-        const actualMove = st.walkedMeters - prevW;
+        actualMove = st.walkedMeters - prevW;
 
         if (st.lagMeters > 0) {
           const consumed = Math.min(st.lagMeters, actualMove);
@@ -563,6 +720,12 @@ export class BusSimulator {
         } else {
           st.deadReckonMeters += actualMove;
         }
+      }
+
+      if (st.overshootMeters > 0 && !st.isStopped && st.cruiseSpeedMps > 0.5) {
+        const estimatedRealAdvance = st.cruiseSpeedMps * dt;
+        const netCatchup = Math.max(0, estimatedRealAdvance - actualMove);
+        st.overshootMeters = Math.max(0, st.overshootMeters - netCatchup);
       }
 
       if (st.currentSpeedMps > 0.35) {
