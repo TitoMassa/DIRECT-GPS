@@ -1142,22 +1142,52 @@ export default {
             return m ? parseInt(m[1], 10) : null;
           };
 
+          // Keep the EARLIEST arrival per coche in `fleet` for accurate probe delta propagation,
+          // and preserve genuine later-lap entries from SmartMovePro (`esSiguienteVuelta: true`)
+          // so a 2nd lap NEVER overwrites or erases the imminent 1st arrival of the same bus!
           const fleet = new Map();
-          for (const a of basePayload.arribos) {
+          const extraNextLaps = [];
+          const sortedBase = [...basePayload.arribos].sort(
+            (a, b) => (parseMin(a.tiempoRestanteArribo) ?? 999) - (parseMin(b.tiempoRestanteArribo) ?? 999)
+          );
+          for (const a of sortedBase) {
             const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
-            fleet.set(cid, {
-              arribo: { ...a, esExtendido: false, viaParada: null },
-              etaMin: parseMin(a.tiempoRestanteArribo)
-            });
+            const etaMin = parseMin(a.tiempoRestanteArribo);
+            if (!fleet.has(cid)) {
+              fleet.set(cid, {
+                arribo: { ...a, esExtendido: false, viaParada: null, esSiguienteVuelta: false },
+                etaMin
+              });
+            } else {
+              const prevEta = fleet.get(cid).etaMin;
+              if (etaMin !== null && prevEta !== null && etaMin - prevEta >= 20) {
+                extraNextLaps.push({
+                  arribo: { ...a, esExtendido: false, viaParada: null, esSiguienteVuelta: true },
+                  etaMin
+                });
+              }
+            }
           }
+
+          // Deduplicate each probe stop to its earliest arrival per coche so Lap-2 probe rows don't skew travelDelta
+          const dedupedProbes = probeResults.map((pr) => {
+            const byCid = new Map();
+            for (const a of pr.arribos) {
+              const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+              const pMin = parseMin(a.tiempoRestanteArribo);
+              const cur = byCid.get(cid);
+              if (!cur || (pMin !== null && (cur.pMin === null || pMin < cur.pMin))) {
+                byCid.set(cid, { arribo: a, pMin });
+              }
+            }
+            return { stopId: pr.stopId, items: Array.from(byCid.entries()) };
+          });
 
           for (let pass = 0; pass < 4; pass++) {
             let added = false;
-            for (const pr of probeResults) {
+            for (const pr of dedupedProbes) {
               const deltas = [];
-              for (const a of pr.arribos) {
-                const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
-                const pMin = parseMin(a.tiempoRestanteArribo);
+              for (const [cid, { pMin }] of pr.items) {
                 if (fleet.has(cid) && pMin !== null && fleet.get(cid).etaMin !== null) {
                   const d = fleet.get(cid).etaMin - pMin;
                   if (d >= 0 && d <= 100) deltas.push(d);
@@ -1167,20 +1197,19 @@ export default {
               deltas.sort((a, b) => a - b);
               const travelDelta = deltas[Math.floor(deltas.length / 2)];
 
-              for (const a of pr.arribos) {
-                const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
-                const pMin = parseMin(a.tiempoRestanteArribo);
+              for (const [cid, { arribo: a, pMin }] of pr.items) {
                 if (!fleet.has(cid) && pMin !== null) {
                   const estMin = Math.max(1, Math.round(pMin + travelDelta));
                   fleet.set(cid, {
                     arribo: {
                       ...a,
                       tiempoRestanteArribo: `${estMin} min. est.`,
-                      descripcionBandera: basePayload.arribos[0]?.descripcionBandera || a.descripcionBandera,
+                      descripcionBandera: sortedBase[0]?.descripcionBandera || a.descripcionBandera,
                       latitudParada: String(basePayload.stopCoords?.lat ?? ''),
                       longitudParada: String(basePayload.stopCoords?.lng ?? ''),
                       esExtendido: true,
-                      viaParada: pr.stopId
+                      viaParada: pr.stopId,
+                      esSiguienteVuelta: false
                     },
                     etaMin: estMin
                   });
@@ -1191,7 +1220,7 @@ export default {
             if (!added) break;
           }
 
-          const merged = Array.from(fleet.values())
+          const merged = [...fleet.values(), ...extraNextLaps]
             .sort((a, b) => (a.etaMin ?? 999) - (b.etaMin ?? 999))
             .map((x) => x.arribo);
 

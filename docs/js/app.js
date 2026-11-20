@@ -601,15 +601,23 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
 
 function normalizeArrivals(rawList, stopId, stopCoords) {
   const seenCounts = new Map();
+  const primaryRouteByBaseId = new Map();
   const now = Date.now();
 
-  return (rawList || []).map((a) => {
+  // Sort by ascending ETA first so the 1st occurrence (`occ === 1`) of any coche is ALWAYS its earliest arrival,
+  // and any subsequent occurrence (`occ > 1` or `esSiguienteVuelta`) is cleanly linked as `Sig. vuelta`!
+  const sortedRaw = [...(rawList || [])].sort(
+    (a, b) => (parseEtaMinutes(a.tiempoRestanteArribo).minutes ?? 999) - (parseEtaMinutes(b.tiempoRestanteArribo).minutes ?? 999)
+  );
+
+  return sortedRaw.map((a) => {
     const lineName = (a.descripcionLinea || '').trim() || `L${a.codigoLinea}`;
     const coche = String(a.identificadorCoche || '').trim();
     const baseId = coche ? `${a.codigoLinea}-c${coche}` : `${a.codigoLinea}-${lineName}`;
     const occ = (seenCounts.get(baseId) || 0) + 1;
     seenCounts.set(baseId, occ);
     const key = occ > 1 ? `${baseId}-${occ}` : baseId;
+    const isLiveNextLap = Boolean(coche && (occ > 1 || a.esSiguienteVuelta));
 
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
@@ -622,7 +630,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
     const gpsTimeOnly = formatGpsTimeOnly(a.ultimaFechaHoraGPS);
 
-    const prevFix = state.lastRealGpsByUnit.get(key) || null;
+    const prevFix = state.lastRealGpsByUnit.get(baseId) || null;
     const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
 
     const draftBus = {
@@ -637,13 +645,21 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
         ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, prevFix)
         : null;
 
-    if (validPos) {
+    if (validPos && !isLiveNextLap) {
       if (!prevFix || (distanceMeters(prevFix.lat, prevFix.lng, lat, lng) || 0) >= 15) {
-        state.lastRealGpsByUnit.set(key, { lat, lng, ts: now });
+        state.lastRealGpsByUnit.set(baseId, { lat, lng, ts: now });
       }
     }
 
     const routeMeters = trajectory ? trajectory.totalMeters : straightDist;
+    if (!isLiveNextLap && typeof routeMeters === 'number') {
+      primaryRouteByBaseId.set(baseId, routeMeters);
+    }
+    const primaryRem = primaryRouteByBaseId.get(baseId);
+    const nextLapExtraMeters =
+      isLiveNextLap && typeof routeMeters === 'number' && typeof primaryRem === 'number'
+        ? Math.max(0, routeMeters - primaryRem)
+        : 0;
     const etaSec = eta.minutes <= 0 ? 45 : eta.minutes * 60;
 
     return {
@@ -673,8 +689,13 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       ultimaFechaHoraGPS: String(a.ultimaFechaHoraGPS || '').trim(),
       gpsTimeOnly,
       trajectory,
+      isPredicted: false,
+      isNextLap: isLiveNextLap,
+      nextLapOfKey: isLiveNextLap && occ > 1 ? baseId : null,
+      nextLapSourceLive: isLiveNextLap,
+      nextLapExtraMeters,
       isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
-      isNextCycle: Boolean(trajectory?.isNextCycle),
+      isNextCycle: Boolean(trajectory?.isNextCycle || isLiveNextLap),
       realBandera: trajectory?.realBandera || draftBus.descripcionBandera,
       realBanderaColor: trajectory?.realBanderaColor || getLineColor(lineName)
     };
@@ -1180,7 +1201,7 @@ function reconcileWithSchedulePrediction(
   // scheduled bus for a unit that already passed ahead of schedule!
   if (!isOffline) {
     for (const prev of prevArribos) {
-      if (prev.isPredicted || !prev.tripKey || !prev.identificadorCoche) continue;
+      if (prev.isPredicted || prev.isNextLap || !prev.tripKey || !prev.identificadorCoche) continue;
       const ck = `${prev.codigoLinea}:${prev.identificadorCoche}`;
       if (!curLiveCoches.has(ck)) {
         const wasPassing =
@@ -1225,7 +1246,7 @@ function reconcileWithSchedulePrediction(
         liveBusByTrip.set(m.tripKey, b);
         completedSet.delete(`${cod}:${m.tripKey}`); // bus is actively approaching, definitely not completed
 
-        if (b.identificadorCoche) {
+        if (!b.isNextLap && b.identificadorCoche) {
           state.stickyLiveTripByCoche.set(`${cod}:${b.identificadorCoche}`, {
             tripKey: m.tripKey,
             dayKey: todayDayKey,
@@ -1234,13 +1255,15 @@ function reconcileWithSchedulePrediction(
         }
 
         // Seamless GPS recovery handoff: transfer simulator state from prior predicted marker!
-        const predKey = `pred:${cod}:${m.tripKey}`;
-        if (busSimulator.transferState(predKey, b.key)) {
-          if (state.selectedBusKey === predKey) state.selectedBusKey = b.key;
+        if (!b.isNextLap) {
+          const predKey = `pred:${cod}:${m.tripKey}`;
+          if (busSimulator.transferState(predKey, b.key)) {
+            if (state.selectedBusKey === predKey) state.selectedBusKey = b.key;
+          }
         }
 
-        // Persist last-seen online vehicle & driver into central system FleetMemory
-        if (b.identificadorCoche) {
+        // Persist last-seen online vehicle & driver into central system FleetMemory (primary arrival only)
+        if (!b.isNextLap && b.identificadorCoche) {
           const rec = {
             dayKey: todayDayKey,
             codigoLinea: cod,

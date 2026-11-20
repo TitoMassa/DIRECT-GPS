@@ -287,14 +287,15 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     const samples = [];
     for (const t of tripsB) {
       let bestPos = Infinity;
-      let bestNeg = Infinity;
+      let bestNeg = null;
       for (const r of feederTrips) {
         const lay = t.startSec - r.endSec;
         if (lay >= 0 && lay <= 25 * 60 && lay < bestPos) bestPos = lay;
-        else if (lay >= -90 && lay < 0 && Math.abs(lay) < Math.abs(bestNeg)) bestNeg = lay;
+        else if (lay >= -90 && lay < 0 && (bestNeg === null || Math.abs(lay) < Math.abs(bestNeg))) bestNeg = lay;
       }
-      if (bestPos < Infinity) samples.push(bestPos);
-      else if (bestNeg < Infinity) samples.push(bestNeg);
+      if (bestPos < Infinity || bestNeg !== null) {
+        samples.push(bestNeg !== null && Math.abs(bestNeg) < bestPos ? bestNeg : bestPos);
+      }
     }
     samples.sort((a, c) => a - c);
     const med = samples.length > 0 ? samples[Math.floor(samples.length / 2)] : 300;
@@ -735,7 +736,7 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
     const normEff = ((tEff % 86400) + 86400) % 86400;
     const leg = bus.trajectory?.leg;
     const isOpp = leg === 'previous_leg' || bus.isOppositeLeg;
-    const isFullCycle = leg === 'full_cycle' || bus.isNextCycle;
+    const isFullCycle = leg === 'full_cycle' || bus.isNextCycle || bus.isNextLap;
 
     const testTripSpatial = (tr) => {
       if (!tr) return Infinity;
@@ -837,7 +838,7 @@ export function matchLiveBusesToTrips(
   const ordered = [...buses].sort((a, b) => (a.eta?.minutes ?? 999) - (b.eta?.minutes ?? 999));
 
   for (const bus of ordered) {
-    const stickyKey = bus.identificadorCoche ? `${model.codLinea}:${bus.identificadorCoche}` : null;
+    const stickyKey = !bus.isNextLap && bus.identificadorCoche ? `${model.codLinea}:${bus.identificadorCoche}` : null;
     const stickyRec = stickyKey && stickyTripByCoche ? stickyTripByCoche.get(stickyKey) : null;
     const stickyTripKey = stickyRec?.tripKey || null;
     const busNormBandera = normalizeBandera(bus.descripcionBandera || '');
@@ -1296,6 +1297,69 @@ export function predictLineBusesForStop({
         continue;
       }
 
+      // ── Step A2: Forward vehicle-block check! ──
+      // If a LATER trip in this exact block is already matched to a live bus (e.g. SmartMovePro only returned
+      // its next lap while the bus is still physically on THIS imminent trip or just passed it!),
+      // NEVER spawn an anonymous offline ghost!
+      let futureLiveSrc = null;
+      for (let i = targetIdx + 1; i <= Math.min(block.length - 1, targetIdx + 4); i++) {
+        const later = block[i];
+        if (!later) continue;
+        const lb = liveBusByTripKey.get(later.tripKey);
+        if (lb && !lb.isNextLap) {
+          futureLiveSrc = { bus: lb, laterIdx: i, laterTrip: later };
+          break;
+        }
+      }
+
+      if (futureLiveSrc) {
+        const srcBus = futureLiveSrc.bus;
+        const fLat = srcBus.lat;
+        const fLng = srcBus.lng;
+        if (typeof fLat === 'number' && typeof fLng === 'number') {
+          const projThis = projectOnPolyline(stopBranch.pts, stopBranch.cum, fLat, fLng);
+          const projNext = trip.nextTrip
+            ? projectOnPolyline(trip.nextTrip.branch.pts, trip.nextTrip.branch.cum, fLat, fLng)
+            : null;
+          // 1) Already physically passed `stopId` on this trip, or already running the return leg -> suppress ghost!
+          if (projThis && projThis.perp <= 150 && projThis.along > stopProj.along + 65) {
+            continue;
+          }
+          if (projNext && projNext.perp <= 140 && (!projThis || projThis.perp > 150)) {
+            continue;
+          }
+          // 2) Still physically approaching `stopId` on this trip (or its prevTrip) -> bind directly to live bus!
+          const liveAnchor = buildGpsAnchorForTrip(trip, fLat, fLng, nowSec, srcBus.desvio?.seconds || 0);
+          if (liveAnchor) {
+            const ev = evaluateTripState(trip, stopId, stopProj, nowSec, srcBus.desvio?.seconds || 0, {
+              maxAheadSec: effectiveMaxAheadSec,
+              anchor: liveAnchor
+            });
+            if (ev) {
+              const curOffset = ev.effectiveOffsetSec || srcBus.desvio?.seconds || 0;
+              const desvioRaw = srcBus.desvio?.raw || formatDesvioFromSec(curOffset);
+              seenTripKeys.add(trip.tripKey);
+              candidates.push({
+                trip,
+                stopBranch,
+                stopProj,
+                ev,
+                mem: null,
+                anchor: liveAnchor,
+                desvioSec: curOffset,
+                desvioRaw,
+                predKey,
+                liveBlockSrc: null,
+                promotedLiveSrc: { bus: srcBus, laterIdx: futureLiveSrc.laterIdx }
+              });
+              continue;
+            }
+          }
+          // Earlier trip in same block already behind the live bus -> never emit a ghost
+          continue;
+        }
+      }
+
       // ── Step B: Otherwise, walk this trip's vehicle block backwards in FleetMemory (up to 6 legs) ──
       let mem = null;
       let memIdx = targetIdx;
@@ -1361,7 +1425,8 @@ export function predictLineBusesForStop({
         desvioSec: curOffset,
         desvioRaw,
         predKey,
-        liveBlockSrc: null
+        liveBlockSrc: null,
+        promotedLiveSrc: null
       });
     }
   }
@@ -1375,19 +1440,19 @@ export function predictLineBusesForStop({
   for (const item of candidates) {
     if (predicted.length >= maxUpcoming) break;
 
-    const { trip, stopBranch, stopProj, ev, anchor, desvioSec, desvioRaw, predKey, liveBlockSrc } = item;
+    const { trip, stopBranch, stopProj, ev, anchor, desvioSec, desvioRaw, predKey, liveBlockSrc, promotedLiveSrc } = item;
     let mem = item.mem;
 
     // Detect if this predicted trip is a NEXT LAP of an earlier already-emitted predicted bus in the same block!
     const earlierPredSameBlock =
-      !liveBlockSrc && trip.blockId ? emittedByBlockId.get(trip.blockId) || null : null;
+      !liveBlockSrc && !promotedLiveSrc && trip.blockId ? emittedByBlockId.get(trip.blockId) || null : null;
     const isNextLapOfLive = Boolean(liveBlockSrc);
     const isNextLapOfPred = Boolean(earlierPredSameBlock);
     const isNextLap = isNextLapOfLive || isNextLapOfPred;
 
     // Never allow two DIFFERENT concurrent blocks to claim the same coche;
     // DO allow a later lap of the SAME block (`isNextLap`) to keep its rightful coche!
-    if (!isNextLap && mem?.coche && usedCoches.has(String(mem.coche).trim())) {
+    if (!isNextLap && !promotedLiveSrc && mem?.coche && usedCoches.has(String(mem.coche).trim())) {
       mem = null;
     }
 
@@ -1408,7 +1473,38 @@ export function predictLineBusesForStop({
     let realBanderaColor = ev.realBanderaColor || getLineColor(lineName);
     let traj = null;
 
-    if (isNextLapOfLive) {
+    if (promotedLiveSrc) {
+      const src = promotedLiveSrc.bus;
+      traj = buildTrajectoryFromBranchAlong(ev.activeBranch, ev.activeAlong, stopBranch, stopProj, {
+        isAtTerminal: ev.isAtTerminal,
+        etaSec: ev.etaSec,
+        viaBranch: ev.viaBranch || null
+      });
+      if (!traj) continue;
+      finalLat = src.lat;
+      finalLng = src.lng;
+      finalRemMeters = traj.totalMeters;
+      nextLapSourceLive = !src.isPredicted && !src.gpsLost;
+      coche = src.identificadorCoche || '';
+      choferNombre = src.choferNombre || '';
+      choferLegajo = src.choferLegajo || '';
+      choferRaw = src.choferRaw || '';
+      esAdaptado = Boolean(src.esAdaptado);
+      ultimaGps = src.ultimaFechaHoraGPS || '';
+      gpsTimeOnly = src.gpsTimeOnly || (ultimaGps ? formatGpsTimeOnly(ultimaGps) : '');
+      // Demote the later-lap live card into `Sig. vuelta` referencing this imminent primary arrival!
+      const tgtIdx = typeof trip.blockIndex === 'number' ? trip.blockIndex : 0;
+      src.isNextLap = true;
+      src.nextLapOfKey = predKey;
+      src.nextLapSourceLive = nextLapSourceLive;
+      src.nextLapExtraMeters = computeExtraMetersAcrossBlock(
+        trip.block || [],
+        tgtIdx,
+        promotedLiveSrc.laterIdx,
+        stopCoords,
+        stopProj
+      );
+    } else if (isNextLapOfLive) {
       const src = liveBlockSrc.bus;
       nextLapOfKey = src.key;
       nextLapSourceLive = liveBlockSrc.isLive;
@@ -1509,15 +1605,17 @@ export function predictLineBusesForStop({
       nextLapOfKey,
       nextLapSourceLive,
       nextLapExtraMeters,
-      predictionReason: isNextLapOfLive
-        ? nextLapSourceLive
-          ? 'next-lap-live'
-          : 'next-lap-offline'
-        : isNextLapOfPred
-          ? 'next-lap-offline'
-          : mem
-            ? 'last-online'
-            : 'schedule',
+      predictionReason: promotedLiveSrc
+        ? 'live-promoted'
+        : isNextLapOfLive
+          ? nextLapSourceLive
+            ? 'next-lap-live'
+            : 'next-lap-offline'
+          : isNextLapOfPred
+            ? 'next-lap-offline'
+            : mem
+              ? 'last-online'
+              : 'schedule',
       lat: finalLat,
       lng: finalLng,
       distanceMeters: finalRemMeters,
