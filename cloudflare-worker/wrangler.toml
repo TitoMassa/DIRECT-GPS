@@ -9,3 +9,6 @@ class_name = "FleetMemory"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FleetMemory"]
+
+[triggers]
+crons = ["*/5 * * * *"]

@@ -163,11 +163,11 @@ export function minimizeApp() {
 export function setSystemBarsTheme(theme) {
   if (!isNative) return;
   const isLight = theme === 'light';
-  const color = isLight ? '#e5ebf2' : '#0f141b';
+  const color = isLight ? '#f4f5f7' : '#0b0d10';
   // StatusBar "DARK" style = light icons (for dark backgrounds)
   safe(() => StatusBar.setStyle({ style: isLight ? 'LIGHT' : 'DARK' }));
   safe(() => StatusBar.setBackgroundColor({ color }));
-  safe(() => SystemUi.setNavigationBar({ color: isLight ? '#ffffff' : '#10151c', lightButtons: isLight }));
+  safe(() => SystemUi.setNavigationBar({ color: isLight ? '#ffffff' : '#12151a', lightButtons: isLight }));
 }
 
 export function setKeepAwake(enabled) {

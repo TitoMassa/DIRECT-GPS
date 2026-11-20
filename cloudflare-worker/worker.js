@@ -66,6 +66,86 @@ const CORRIENTES_HUBS = [
   { name: 'Hospital Escuela', lat: -27.47582, lng: -58.83461 }
 ];
 
+// Central Fleet & Driver Roster configuration (rolling 7-day retention + daily 03:00 ART view)
+const ROSTER_RETENTION_DAYS = 7;
+const ROSTER_RETENTION_MS = ROSTER_RETENTION_DAYS * 86400 * 1000;
+const CRON_SCAN_INTERVAL_MIN = 5;
+const CRON_BATCH_SIZE = 18; // <= 18 SOAP + 2 DO = 20 subrequests/tick (Cloudflare Free limit: 50)
+const CRON_CONCURRENCY = 3; // Gentle waves to stay well under SmartMovePro rate limits
+
+const LINE_NAMES_BY_CODE = {
+  94: '102A',
+  96: '102C',
+  97: '102B',
+  113: '104A',
+  114: '104C',
+  115: '104B',
+  118: '104D',
+  132: '103A',
+  133: '103B',
+  134: '103C',
+  342: '109A',
+  346: '105A',
+  347: '105B',
+  348: '105C',
+  350: '106A',
+  351: '106B',
+  352: '106C',
+  353: '109B',
+  356: '108A',
+  357: '108C',
+  433: 'RIACHUELO - ERSA',
+  517: '904A CAMPUS / NAC',
+  607: '904B SARM / NAC',
+  608: '904C BQRAS / NAC',
+  705: 'SANTA ANA-INGENIO',
+  744: 'AEROBUS',
+  851: 'LINEA 110 / PROV',
+  852: 'CHAC CORR /NAC',
+  853: 'CHAC RES / NAC',
+  854: 'PTO. TIROL / PROV',
+  1037: '904A',
+  1038: '904B',
+  1039: '904C'
+};
+
+// Strategic downstream (~85% along each Ida & Vuelta branch) + 6 multi-line city hub probes (cod=0 -> '000').
+// 70 targets / 18 per 5-min Cron tick = complete sweep of all Corrientes lines every 20 minutes automatically.
+const FLEET_SCAN_TARGETS = [
+  [94, 'CT31939'], [94, 'CT31409'],
+  [97, 'CT31507'], [97, 'CT31254'],
+  [96, 'CT31210'], [96, 'CT32204'],
+  [132, 'CT31507'], [132, 'CT31572V'],
+  [133, 'CT31766'], [133, 'CT32257'],
+  [134, 'CT31764'], [134, 'CT32257'],
+  [113, 'CT31518'], [113, 'CT31463'], [113, 'CT31196'],
+  [115, 'CT31635'], [115, 'CT31466'],
+  [114, 'CT31976'], [114, 'CT31568V'],
+  [118, 'CT31775'], [118, 'CT32093'], [118, 'CT31861'],
+  [346, 'CT31544'], [346, 'CT32222'],
+  [347, 'CT31543'], [347, 'CT31991I'],
+  [348, 'CT31361'], [348, 'CT31256B'], [348, 'CT31552'], [348, 'CT312792'],
+  [350, 'CT31397'], [350, 'CT32070'],
+  [351, 'CT31396'], [351, 'CT31974'],
+  [352, 'CT31221'], [352, 'CT47849'],
+  [356, 'CT31189'], [356, 'CT31267'],
+  [357, 'CT31874'], [357, 'CT31143'],
+  [342, 'CT31244B'], [342, 'CT31922'],
+  [353, 'CT31244B'], [353, 'CT31340'],
+  [1037, 'CT31648'], [1037, 'CH326'],
+  [517, 'CH115'],
+  [1038, 'L9041075'], [1038, 'L9041098'],
+  [607, 'L9041075'], [607, 'CT31212'],
+  [1039, 'L9041057'], [1039, 'CT31212'],
+  [608, 'L9041057'], [608, 'CT31212'],
+  [852, 'CH490'], [852, 'CH455'], [852, 'CH430'],
+  [854, 'CH1010'], [854, 'CH1007'],
+  [433, 'CT31373'], [433, 'RCH010'],
+  [705, 'CT31392B'], [705, 'CT31363'],
+  [0, 'CT31180'], [0, 'CT31181'], [0, 'CT31498'], [0, 'CT31942'], [0, 'CT31581'], [0, 'CT31350']
+];
+const CRON_FULL_CYCLE_MIN = Math.ceil(FLEET_SCAN_TARGETS.length / CRON_BATCH_SIZE) * CRON_SCAN_INTERVAL_MIN;
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -107,6 +187,76 @@ function parseChofer(raw = '') {
   const m = clean.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
   if (m) return { choferNombre: m[1].trim(), choferLegajo: m[2].trim(), choferRaw: clean };
   return { choferNombre: clean, choferLegajo: '', choferRaw: clean };
+}
+
+const INVALID_DRIVER_TOKENS = new Set([
+  '',
+  '-',
+  '--',
+  '—',
+  '0',
+  'S/D',
+  'SD',
+  'N/A',
+  'SIN CHOFER',
+  'NO ASIGNADO',
+  'DESCONOCIDO',
+  'SIN ASIGNAR',
+  'NINGUNO',
+  'NULL',
+  'UNDEFINED'
+]);
+
+function normalizeDriverNameKey(nombre = '') {
+  return String(nombre || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+}
+
+function normalizeDriverRecord(choferNombre = '', choferLegajo = '', choferRaw = '') {
+  let nombre = String(choferNombre || '').trim();
+  let legajo = String(choferLegajo || '').trim();
+  const raw = String(choferRaw || '').trim();
+  if (!nombre && !legajo && raw) {
+    const parsed = parseChofer(raw);
+    nombre = parsed.choferNombre;
+    legajo = parsed.choferLegajo;
+  }
+  const cleanLeg = legajo.replace(/^0+$/, '').trim();
+  const normName = normalizeDriverNameKey(nombre);
+  const validName = normName && !INVALID_DRIVER_TOKENS.has(normName) && normName.length >= 2;
+  const validLeg = cleanLeg && !INVALID_DRIVER_TOKENS.has(cleanLeg.toUpperCase());
+  if (!validName && !validLeg) return null;
+
+  const displayName = validName ? nombre : `Legajo ${cleanLeg}`;
+  const driverKey = validLeg ? `leg:${cleanLeg.toUpperCase()}` : `name:${normName}`;
+  const legacyNameKey = validLeg && validName ? `name:${normName}` : '';
+  return {
+    driverKey,
+    legacyNameKey,
+    nombre: displayName,
+    legajo: validLeg ? cleanLeg : '',
+    raw: raw || (validLeg ? `${displayName} (${cleanLeg})` : displayName)
+  };
+}
+
+function resolveObservationTime(ultimaGps, nowMs) {
+  const gpsMs = parseGpsStampMs(ultimaGps);
+  // If SmartMovePro returns a frozen GPS fix older than 18 hours, credit it to its actual GPS timestamp
+  if (gpsMs > 0 && nowMs - gpsMs > 18 * 3600 * 1000 && gpsMs <= nowMs + 600000) {
+    return { obsMs: gpsMs, obsDayKey: getArgentinaDayKey(gpsMs) };
+  }
+  return { obsMs: nowMs, obsDayKey: getArgentinaDayKey(nowMs) };
+}
+
+function compareCocheIds(a, b) {
+  const na = Number(String(a || '').replace(/\D+/g, ''));
+  const nb = Number(String(b || '').replace(/\D+/g, ''));
+  if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) return na - nb;
+  return String(a || '').localeCompare(String(b || ''));
 }
 
 // Isolate-level caches to make parallel corridor radar probes ultra-fast & SmartMovePro rate-limit safe
@@ -306,8 +456,70 @@ async function getLineas() {
   return normalized;
 }
 
+async function fetchOneStop(sid, lcode) {
+  const raw = await soapRequest(
+    'RecuperarProximosArribos',
+    `<identificadorParada i:type="d:string">${escapeXml(sid)}</identificadorParada>
+     <codigoLineaParada i:type="d:int">${escapeXml(lcode)}</codigoLineaParada>
+     <codigoAplicacion i:type="d:int">${SOAP_APP_CODE}</codigoAplicacion>
+     <localidad i:type="d:string">${escapeXml(SOAP_LOCALIDAD)}</localidad>
+     <usuario i:type="d:string">${SOAP_USER}</usuario>
+     <clave i:type="d:string">${SOAP_PASS}</clave>`
+  );
+  const rawArribos = Array.isArray(raw?.arribos) ? raw.arribos : [];
+  let sLat = null;
+  let sLng = null;
+  for (const a of rawArribos) {
+    if (a.LatitudParada && a.LongitudParada) {
+      sLat = parseFloat(a.LatitudParada);
+      sLng = parseFloat(a.LongitudParada);
+      break;
+    }
+  }
+  const known = QUICK_STOPS.find((s) => s.id === sid);
+  if ((sLat === null || Number.isNaN(sLat)) && known) {
+    sLat = known.lat;
+    sLng = known.lng;
+  }
+  const arribos = rawArribos.map((a) => {
+    const chofer = parseChofer(a.IdentificadorChofer);
+    const cod = Number(a.CodigoLineaParada) || 0;
+    return {
+      codigoLinea: cod,
+      tiempoRestanteArribo: String(a.Arribo || '').trim(),
+      descripcionLinea: String(a.DescripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim(),
+      descripcionBandera: String(a.DescripcionBandera || '').trim(),
+      descripcionCortaBandera: String(a.DescripcionCortaBandera || '').trim(),
+      descripcionCartelBandera: String(a.DescripcionCartelBandera || '').trim(),
+      esAdaptado: String(a.EsAdaptado || '').toLowerCase() === 'true',
+      latitud: String(a.Latitud || ''),
+      longitud: String(a.Longitud || ''),
+      latitudParada: String(a.LatitudParada || (sLat ?? '')),
+      longitudParada: String(a.LongitudParada || (sLng ?? '')),
+      esLleno: false,
+      identificadorCoche: String(a.IdentificadorCoche || '').trim(),
+      identificadorChofer: chofer.choferRaw,
+      choferNombre: chofer.choferNombre,
+      choferLegajo: chofer.choferLegajo,
+      desvioHorario: String(a.DesvioHorario || '').trim(),
+      ultimaFechaHoraGPS: String(a.UltimaFechaHoraGPS || '').trim(),
+      mensajeError: String(a.MensajeError || '').trim()
+    };
+  });
+  return {
+    arribos,
+    idParada: sid,
+    codLinea: lcode,
+    stopCoords: sLat !== null && sLng !== null ? { lat: sLat, lng: sLng } : null,
+    knownStop: known || null,
+    codigoEstado: raw?.CodigoEstado ?? 0,
+    mensaje: raw?.MensajeEstado || null
+  };
+}
+
 function getArgentinaDayKey(nowMs = Date.now()) {
-  const d = new Date(nowMs - 3 * 3600 * 1000);
+  // Service day rolls over at 03:00 AM ART (UTC-6 shift) so 05:00 AM starts fresh with zero previous-day cars
+  const d = new Date(nowMs - 6 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
@@ -320,7 +532,7 @@ function parseDesvioSeconds(raw = '') {
 }
 
 // Persistent SQLite-backed Durable Object (Workers Free tier): stores last-seen online
-// vehicle/driver/turn assignments system-wide across all users and sessions.
+// vehicle/driver/turn assignments AND the automated central fleet + driver rosters per line.
 export class FleetMemory {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -379,15 +591,252 @@ export class FleetMemory {
         payload_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS fleet_cars (
+        codigo_linea INTEGER NOT NULL,
+        coche TEXT NOT NULL,
+        descripcion_linea TEXT DEFAULT '',
+        es_adaptado INTEGER DEFAULT 0,
+        last_chofer_nombre TEXT DEFAULT '',
+        last_chofer_legajo TEXT DEFAULT '',
+        last_chofer_raw TEXT DEFAULT '',
+        last_bandera TEXT DEFAULT '',
+        last_gps TEXT DEFAULT '',
+        last_stop_id TEXT DEFAULT '',
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        last_day_key TEXT NOT NULL,
+        seen_count INTEGER DEFAULT 1,
+        PRIMARY KEY (codigo_linea, coche)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fleet_cars_line ON fleet_cars (codigo_linea, last_seen_at DESC);
+
+      CREATE TABLE IF NOT EXISTS fleet_drivers (
+        codigo_linea INTEGER NOT NULL,
+        driver_key TEXT NOT NULL,
+        descripcion_linea TEXT DEFAULT '',
+        chofer_nombre TEXT NOT NULL,
+        chofer_legajo TEXT DEFAULT '',
+        chofer_raw TEXT DEFAULT '',
+        last_coche TEXT NOT NULL,
+        last_es_adaptado INTEGER DEFAULT 0,
+        last_bandera TEXT DEFAULT '',
+        last_gps TEXT DEFAULT '',
+        last_stop_id TEXT DEFAULT '',
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        last_day_key TEXT NOT NULL,
+        seen_count INTEGER DEFAULT 1,
+        PRIMARY KEY (codigo_linea, driver_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fleet_drivers_line ON fleet_drivers (codigo_linea, last_seen_at DESC);
+
+      CREATE TABLE IF NOT EXISTS roster_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
+
+    // One-time backfill from existing unit_last_seen rows (last 7 days) so production rosters start populated
+    try {
+      const hasCars = this.sql.exec('SELECT 1 AS ok FROM fleet_cars LIMIT 1').toArray().length > 0;
+      if (!hasCars) {
+        const nowMs = Date.now();
+        const minTs = nowMs - ROSTER_RETENTION_MS;
+        const legacy = this.sql
+          .exec(
+            `SELECT codigo_linea, coche, day_key, chofer_nombre, chofer_legajo, chofer_raw,
+                    es_adaptado, bandera, ultima_gps, stop_id, updated_at
+             FROM unit_last_seen WHERE updated_at >= ?`,
+            minTs
+          )
+          .toArray();
+        for (const row of legacy) {
+          this._upsertRosterUnit(
+            {
+              codigoLinea: row.codigo_linea,
+              coche: row.coche,
+              descripcionLinea: LINE_NAMES_BY_CODE[row.codigo_linea] || '',
+              choferNombre: row.chofer_nombre,
+              choferLegajo: row.chofer_legajo,
+              choferRaw: row.chofer_raw,
+              esAdaptado: Boolean(row.es_adaptado),
+              bandera: row.bandera,
+              ultimaGps: row.ultima_gps,
+              stopId: row.stop_id
+            },
+            row.updated_at || nowMs,
+            row.day_key || getArgentinaDayKey(row.updated_at || nowMs)
+          );
+        }
+      }
+    } catch {
+      // Non-fatal backfill guard
+    }
+
     this._ready = true;
+  }
+
+  _getMeta(key, fallback = null) {
+    const rows = this.sql.exec('SELECT value FROM roster_meta WHERE key = ?', key).toArray();
+    if (!rows.length) return fallback;
+    try {
+      return JSON.parse(rows[0].value);
+    } catch {
+      return rows[0].value;
+    }
+  }
+
+  _setMeta(key, value) {
+    this.sql.exec(
+      `INSERT INTO roster_meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      key,
+      JSON.stringify(value)
+    );
+  }
+
+  _getRosterMetaSummary() {
+    return {
+      lastCronAt: Number(this._getMeta('last_cron_at', 0)) || null,
+      lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || null,
+      totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0,
+      lastBatchUnits: Number(this._getMeta('last_batch_units', 0)) || 0,
+      scanIntervalMin: CRON_SCAN_INTERVAL_MIN,
+      fullCycleMin: CRON_FULL_CYCLE_MIN,
+      retentionDays: ROSTER_RETENTION_DAYS
+    };
+  }
+
+  _upsertRosterUnit(u, nowMs, explicitDayKey = '') {
+    const cod = Number(u.codigoLinea);
+    const coche = String(u.coche || u.identificadorCoche || '').trim();
+    if (!cod || !coche) return;
+
+    const ultimaGps = String(u.ultimaGps || u.ultimaFechaHoraGPS || '').trim();
+    const { obsMs, obsDayKey } = resolveObservationTime(ultimaGps, nowMs);
+    const effectiveDayKey = explicitDayKey && obsMs === nowMs ? explicitDayKey : obsDayKey;
+    if (obsMs < nowMs - ROSTER_RETENTION_MS) return;
+
+    const descLinea = String(u.descripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim();
+    const bandera = String(u.bandera || u.descripcionBandera || '').trim();
+    const stopId = String(u.stopId || '').trim().toUpperCase();
+    const esAdaptado = u.esAdaptado ? 1 : 0;
+
+    const driver = normalizeDriverRecord(
+      u.choferNombre || '',
+      u.choferLegajo || '',
+      u.choferRaw || u.identificadorChofer || ''
+    );
+    const dNombre = driver ? driver.nombre : '';
+    const dLegajo = driver ? driver.legajo : '';
+    const dRaw = driver ? driver.raw : '';
+
+    this.sql.exec(
+      `INSERT INTO fleet_cars (
+        codigo_linea, coche, descripcion_linea, es_adaptado,
+        last_chofer_nombre, last_chofer_legajo, last_chofer_raw,
+        last_bandera, last_gps, last_stop_id,
+        first_seen_at, last_seen_at, last_day_key, seen_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+        descripcion_linea = CASE WHEN excluded.descripcion_linea != '' THEN excluded.descripcion_linea ELSE fleet_cars.descripcion_linea END,
+        es_adaptado = MAX(fleet_cars.es_adaptado, excluded.es_adaptado),
+        last_chofer_nombre = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_chofer_nombre != '' THEN excluded.last_chofer_nombre ELSE fleet_cars.last_chofer_nombre END,
+        last_chofer_legajo = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_chofer_legajo != '' THEN excluded.last_chofer_legajo ELSE fleet_cars.last_chofer_legajo END,
+        last_chofer_raw = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_chofer_raw != '' THEN excluded.last_chofer_raw ELSE fleet_cars.last_chofer_raw END,
+        last_bandera = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_cars.last_bandera END,
+        last_gps = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_cars.last_gps END,
+        last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_cars.last_stop_id END,
+        first_seen_at = MIN(fleet_cars.first_seen_at, excluded.first_seen_at),
+        last_day_key = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at THEN excluded.last_day_key ELSE fleet_cars.last_day_key END,
+        last_seen_at = MAX(fleet_cars.last_seen_at, excluded.last_seen_at),
+        seen_count = fleet_cars.seen_count + 1`,
+      cod,
+      coche,
+      descLinea,
+      esAdaptado,
+      dNombre,
+      dLegajo,
+      dRaw,
+      bandera,
+      ultimaGps,
+      stopId,
+      obsMs,
+      obsMs,
+      effectiveDayKey
+    );
+
+    if (driver) {
+      let mergedFirst = obsMs;
+      let mergedCount = 1;
+      // If this driver was previously indexed by name only and now arrives with legajo, deduplicate cleanly
+      if (driver.legacyNameKey) {
+        const legacyRows = this.sql
+          .exec(
+            'SELECT first_seen_at, seen_count FROM fleet_drivers WHERE codigo_linea = ? AND driver_key = ?',
+            cod,
+            driver.legacyNameKey
+          )
+          .toArray();
+        if (legacyRows.length > 0) {
+          mergedFirst = Math.min(obsMs, Number(legacyRows[0].first_seen_at) || obsMs);
+          mergedCount = (Number(legacyRows[0].seen_count) || 0) + 1;
+          this.sql.exec(
+            'DELETE FROM fleet_drivers WHERE codigo_linea = ? AND driver_key = ?',
+            cod,
+            driver.legacyNameKey
+          );
+        }
+      }
+
+      this.sql.exec(
+        `INSERT INTO fleet_drivers (
+          codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo, chofer_raw,
+          last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+          first_seen_at, last_seen_at, last_day_key, seen_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(codigo_linea, driver_key) DO UPDATE SET
+          descripcion_linea = CASE WHEN excluded.descripcion_linea != '' THEN excluded.descripcion_linea ELSE fleet_drivers.descripcion_linea END,
+          chofer_nombre = CASE WHEN excluded.chofer_nombre != '' AND excluded.chofer_nombre NOT LIKE 'Legajo %' THEN excluded.chofer_nombre ELSE fleet_drivers.chofer_nombre END,
+          chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE fleet_drivers.chofer_legajo END,
+          chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE fleet_drivers.chofer_raw END,
+          last_coche = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at THEN excluded.last_coche ELSE fleet_drivers.last_coche END,
+          last_es_adaptado = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at THEN excluded.last_es_adaptado ELSE fleet_drivers.last_es_adaptado END,
+          last_bandera = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_drivers.last_bandera END,
+          last_gps = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_drivers.last_gps END,
+          last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_drivers.last_stop_id END,
+          first_seen_at = MIN(fleet_drivers.first_seen_at, excluded.first_seen_at),
+          last_day_key = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at THEN excluded.last_day_key ELSE fleet_drivers.last_day_key END,
+          last_seen_at = MAX(fleet_drivers.last_seen_at, excluded.last_seen_at),
+          seen_count = fleet_drivers.seen_count + 1`,
+        cod,
+        driver.driverKey,
+        descLinea,
+        driver.nombre,
+        driver.legajo,
+        driver.raw,
+        coche,
+        esAdaptado,
+        bandera,
+        ultimaGps,
+        stopId,
+        mergedFirst,
+        obsMs,
+        effectiveDayKey,
+        mergedCount
+      );
+    }
   }
 
   _pruneOld(nowMs) {
     const cutoff = nowMs - 4 * 86400 * 1000;
+    const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
     this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', cutoff);
     this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
     this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
+    this.sql.exec('DELETE FROM fleet_cars WHERE last_seen_at < ?', rosterCutoff);
+    this.sql.exec('DELETE FROM fleet_drivers WHERE last_seen_at < ?', rosterCutoff);
   }
 
   async fetch(request) {
@@ -395,6 +844,258 @@ export class FleetMemory {
     const url = new URL(request.url);
     const nowMs = Date.now();
     const todayKey = getArgentinaDayKey(nowMs);
+
+    if (request.method === 'GET' && url.pathname === '/cron-state') {
+      return Response.json({
+        scanCursor: Number(this._getMeta('scan_cursor', 0)) || 0,
+        lastCronAt: Number(this._getMeta('last_cron_at', 0)) || 0,
+        lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || 0,
+        lastPruneDay: String(this._getMeta('last_prune_day', '') || ''),
+        totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/cron-ingest') {
+      const body = await request.json().catch(() => ({}));
+      const units = Array.isArray(body.units) ? body.units : [];
+      let count = 0;
+
+      if (!body.pruneOnly) {
+        for (const u of units) {
+          const cod = Number(u.codigoLinea);
+          const coche = String(u.coche || u.identificadorCoche || '').trim();
+          if (!cod || !coche) continue;
+          const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
+          const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
+          this.sql.exec(
+            `INSERT INTO unit_last_seen (
+              codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, updated_at
+            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+              day_key = excluded.day_key,
+              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+              es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
+              desvio_sec = excluded.desvio_sec,
+              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+              bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+              lat = COALESCE(excluded.lat, unit_last_seen.lat),
+              lng = COALESCE(excluded.lng, unit_last_seen.lng),
+              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+              updated_at = excluded.updated_at`,
+            cod,
+            coche,
+            todayKey,
+            String(u.choferNombre || '').trim(),
+            String(u.choferLegajo || '').trim(),
+            String(u.choferRaw || '').trim(),
+            u.esAdaptado ? 1 : 0,
+            Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+            String(u.desvioRaw || '').trim(),
+            String(u.bandera || '').trim(),
+            String(u.ultimaGps || '').trim(),
+            lat,
+            lng,
+            String(u.stopId || '').trim().toUpperCase(),
+            nowMs
+          );
+          this._upsertRosterUnit(u, nowMs, todayKey);
+          count++;
+        }
+
+        if (Number.isInteger(body.nextCursor)) {
+          this._setMeta('scan_cursor', body.nextCursor);
+        }
+        this._setMeta('last_cron_at', nowMs);
+        this._setMeta('last_batch_units', count);
+        if (body.cycleCompleted) {
+          this._setMeta('last_cycle_at', nowMs);
+          const prevSweeps = Number(this._getMeta('total_sweeps', 0)) || 0;
+          this._setMeta('total_sweeps', prevSweeps + 1);
+          this._pruneOld(nowMs);
+        }
+      }
+
+      const lastPruneDay = String(this._getMeta('last_prune_day', '') || '');
+      if (body.pruneOnly || lastPruneDay !== todayKey) {
+        this._pruneOld(nowMs);
+        this._setMeta('last_prune_day', todayKey);
+      }
+
+      return Response.json({
+        ok: true,
+        count,
+        dayKey: todayKey,
+        meta: this._getRosterMetaSummary()
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/flota-resumen') {
+      const minTs = nowMs - ROSTER_RETENTION_MS;
+      const carRows = this.sql
+        .exec(
+          `SELECT codigo_linea,
+                  MAX(descripcion_linea) AS descripcion_linea,
+                  COUNT(*) AS coches_semana,
+                  SUM(CASE WHEN last_day_key = ? THEN 1 ELSE 0 END) AS coches_hoy,
+                  MAX(last_seen_at) AS last_seen_at
+           FROM fleet_cars
+           WHERE last_seen_at >= ?
+           GROUP BY codigo_linea`,
+          todayKey,
+          minTs
+        )
+        .toArray();
+      const drvRows = this.sql
+        .exec(
+          `SELECT codigo_linea,
+                  MAX(descripcion_linea) AS descripcion_linea,
+                  COUNT(*) AS choferes_semana,
+                  SUM(CASE WHEN last_day_key = ? THEN 1 ELSE 0 END) AS choferes_hoy,
+                  MAX(last_seen_at) AS last_seen_at
+           FROM fleet_drivers
+           WHERE last_seen_at >= ?
+           GROUP BY codigo_linea`,
+          todayKey,
+          minTs
+        )
+        .toArray();
+
+      const byLine = new Map();
+      const ensureLine = (cod, desc) => {
+        if (!byLine.has(cod)) {
+          byLine.set(cod, {
+            codigoLinea: cod,
+            descripcionLinea: desc || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
+            cochesHoy: 0,
+            cochesSemana: 0,
+            choferesHoy: 0,
+            choferesSemana: 0,
+            lastSeenAt: 0
+          });
+        }
+        return byLine.get(cod);
+      };
+
+      for (const r of carRows) {
+        const entry = ensureLine(Number(r.codigo_linea), r.descripcion_linea);
+        entry.cochesHoy = Number(r.coches_hoy) || 0;
+        entry.cochesSemana = Number(r.coches_semana) || 0;
+        entry.lastSeenAt = Math.max(entry.lastSeenAt, Number(r.last_seen_at) || 0);
+      }
+      for (const r of drvRows) {
+        const entry = ensureLine(Number(r.codigo_linea), r.descripcion_linea);
+        entry.choferesHoy = Number(r.choferes_hoy) || 0;
+        entry.choferesSemana = Number(r.choferes_semana) || 0;
+        entry.lastSeenAt = Math.max(entry.lastSeenAt, Number(r.last_seen_at) || 0);
+      }
+
+      const lineas = Array.from(byLine.values()).sort((a, b) =>
+        a.descripcionLinea.localeCompare(b.descripcionLinea, 'es', { numeric: true })
+      );
+
+      return Response.json({
+        dayKey: todayKey,
+        retentionDays: ROSTER_RETENTION_DAYS,
+        meta: this._getRosterMetaSummary(),
+        lineas
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/flota') {
+      const codLinea = Number(url.searchParams.get('codLinea'));
+      if (!codLinea) return Response.json({ error: 'Falta codLinea' }, { status: 400 });
+      const minTs = nowMs - ROSTER_RETENTION_MS;
+
+      const carRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, descripcion_linea, es_adaptado,
+                  last_chofer_nombre, last_chofer_legajo, last_chofer_raw,
+                  last_bandera, last_gps, last_stop_id,
+                  first_seen_at, last_seen_at, last_day_key, seen_count
+           FROM fleet_cars
+           WHERE codigo_linea = ? AND last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          codLinea,
+          minTs
+        )
+        .toArray();
+
+      const drvRows = this.sql
+        .exec(
+          `SELECT codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo, chofer_raw,
+                  last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+                  first_seen_at, last_seen_at, last_day_key, seen_count
+           FROM fleet_drivers
+           WHERE codigo_linea = ? AND last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          codLinea,
+          minTs
+        )
+        .toArray();
+
+      const coches = carRows
+        .map((r) => ({
+          coche: r.coche,
+          esAdaptado: Boolean(r.es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          lastChoferNombre: r.last_chofer_nombre || '',
+          lastChoferLegajo: r.last_chofer_legajo || '',
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          firstSeenAt: r.first_seen_at,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key,
+          seenCount: r.seen_count || 1
+        }))
+        .sort((a, b) => {
+          if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+          if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+          return compareCocheIds(a.coche, b.coche);
+        });
+
+      const choferes = drvRows
+        .map((r) => ({
+          driverKey: r.driver_key,
+          choferNombre: r.chofer_nombre,
+          choferLegajo: r.chofer_legajo || '',
+          lastCoche: r.last_coche || '',
+          lastEsAdaptado: Boolean(r.last_es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          firstSeenAt: r.first_seen_at,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key,
+          seenCount: r.seen_count || 1
+        }))
+        .sort((a, b) => {
+          if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+          if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+          return a.choferNombre.localeCompare(b.choferNombre, 'es');
+        });
+
+      const descripcionLinea =
+        carRows[0]?.descripcion_linea ||
+        drvRows[0]?.descripcion_linea ||
+        LINE_NAMES_BY_CODE[codLinea] ||
+        `L${codLinea}`;
+
+      return Response.json({
+        codigoLinea: codLinea,
+        descripcionLinea,
+        dayKey: todayKey,
+        retentionDays: ROSTER_RETENTION_DAYS,
+        meta: this._getRosterMetaSummary(),
+        coches,
+        choferes
+      });
+    }
 
     if (request.method === 'POST' && url.pathname === '/record-units') {
       const body = await request.json().catch(() => ({}));
@@ -441,6 +1142,7 @@ export class FleetMemory {
           String(u.stopId || '').trim().toUpperCase(),
           nowMs
         );
+        this._upsertRosterUnit(u, nowMs, todayKey);
         count++;
       }
       if (body.stopSnapshot && body.stopSnapshot.idParada) {
@@ -549,6 +1251,7 @@ export class FleetMemory {
           String(e.stopId || '').trim().toUpperCase(),
           nowMs
         );
+        this._upsertRosterUnit({ ...e, codigoLinea: cod, coche }, nowMs, dayKey);
         count++;
       }
 
@@ -681,6 +1384,80 @@ const stopSnapThrottle = new Map(); // stopId -> ts
 const fallbackTrips = new Map();
 const fallbackUnits = new Map();
 const fallbackStops = new Map();
+const fallbackRosterCars = new Map(); // `${cod}:${coche}` -> car row
+const fallbackRosterDrivers = new Map(); // `${cod}:${driverKey}` -> driver row
+const fallbackRosterMeta = {
+  scanCursor: 0,
+  lastCronAt: null,
+  lastCycleAt: null,
+  totalSweeps: 0,
+  lastBatchUnits: 0
+};
+
+function upsertFallbackRosterUnit(u, nowMs = Date.now(), explicitDayKey = '') {
+  const cod = Number(u.codigoLinea);
+  const coche = String(u.coche || u.identificadorCoche || '').trim();
+  if (!cod || !coche) return;
+  const ultimaGps = String(u.ultimaGps || u.ultimaFechaHoraGPS || '').trim();
+  const { obsMs, obsDayKey } = resolveObservationTime(ultimaGps, nowMs);
+  const effectiveDayKey = explicitDayKey && obsMs === nowMs ? explicitDayKey : obsDayKey;
+  if (obsMs < nowMs - ROSTER_RETENTION_MS) return;
+
+  const descLinea = String(u.descripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim();
+  const bandera = String(u.bandera || u.descripcionBandera || '').trim();
+  const stopId = String(u.stopId || '').trim().toUpperCase();
+  const esAdaptado = Boolean(u.esAdaptado);
+  const driver = normalizeDriverRecord(
+    u.choferNombre || '',
+    u.choferLegajo || '',
+    u.choferRaw || u.identificadorChofer || ''
+  );
+
+  const carKey = `${cod}:${coche}`;
+  const prevCar = fallbackRosterCars.get(carKey);
+  const isNewerCar = !prevCar || obsMs >= prevCar.lastSeenAt;
+  fallbackRosterCars.set(carKey, {
+    codigoLinea: cod,
+    descripcionLinea: descLinea || prevCar?.descripcionLinea || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
+    coche,
+    esAdaptado: esAdaptado || Boolean(prevCar?.esAdaptado),
+    lastChoferNombre: (isNewerCar && driver?.nombre) || prevCar?.lastChoferNombre || '',
+    lastChoferLegajo: (isNewerCar && driver?.legajo) || prevCar?.lastChoferLegajo || '',
+    lastBandera: (isNewerCar && bandera) || prevCar?.lastBandera || '',
+    lastGps: (isNewerCar && ultimaGps) || prevCar?.lastGps || '',
+    lastStopId: (isNewerCar && stopId) || prevCar?.lastStopId || '',
+    firstSeenAt: prevCar ? Math.min(prevCar.firstSeenAt, obsMs) : obsMs,
+    lastSeenAt: prevCar ? Math.max(prevCar.lastSeenAt, obsMs) : obsMs,
+    lastDayKey: isNewerCar ? effectiveDayKey : prevCar.lastDayKey,
+    seenCount: (prevCar?.seenCount || 0) + 1
+  });
+
+  if (driver) {
+    let prevDrv = fallbackRosterDrivers.get(`${cod}:${driver.driverKey}`);
+    if (driver.legacyNameKey && fallbackRosterDrivers.has(`${cod}:${driver.legacyNameKey}`)) {
+      const legacy = fallbackRosterDrivers.get(`${cod}:${driver.legacyNameKey}`);
+      fallbackRosterDrivers.delete(`${cod}:${driver.legacyNameKey}`);
+      if (!prevDrv) prevDrv = legacy;
+    }
+    const isNewerDrv = !prevDrv || obsMs >= prevDrv.lastSeenAt;
+    fallbackRosterDrivers.set(`${cod}:${driver.driverKey}`, {
+      codigoLinea: cod,
+      descripcionLinea: descLinea || prevDrv?.descripcionLinea || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
+      driverKey: driver.driverKey,
+      choferNombre: driver.nombre.startsWith('Legajo ') && prevDrv?.choferNombre ? prevDrv.choferNombre : driver.nombre,
+      choferLegajo: driver.legajo || prevDrv?.choferLegajo || '',
+      lastCoche: isNewerDrv ? coche : prevDrv.lastCoche,
+      lastEsAdaptado: isNewerDrv ? esAdaptado : Boolean(prevDrv?.lastEsAdaptado),
+      lastBandera: (isNewerDrv && bandera) || prevDrv?.lastBandera || '',
+      lastGps: (isNewerDrv && ultimaGps) || prevDrv?.lastGps || '',
+      lastStopId: (isNewerDrv && stopId) || prevDrv?.lastStopId || '',
+      firstSeenAt: prevDrv ? Math.min(prevDrv.firstSeenAt, obsMs) : obsMs,
+      lastSeenAt: prevDrv ? Math.max(prevDrv.lastSeenAt, obsMs) : obsMs,
+      lastDayKey: isNewerDrv ? effectiveDayKey : prevDrv.lastDayKey,
+      seenCount: (prevDrv?.seenCount || 0) + 1
+    });
+  }
+}
 
 function getFleetStub(env) {
   if (!env?.FLEET_MEMORY) return null;
@@ -698,12 +1475,13 @@ async function recordObservedUnits(env, arribos = [], stopId = '', stopCoords = 
     const sig = `${a.choferNombre || ''}|${a.choferLegajo || ''}|${a.desvioHorario || ''}|${a.ultimaFechaHoraGPS || ''}`;
     const k = `${cod}:${coche}`;
     const prev = isolateWriteThrottle.get(k);
-    if (prev && prev.sig === sig && nowMs - prev.ts < 45000) continue;
+    if (prev && prev.sig === sig && nowMs - prev.ts < 60000) continue;
     isolateWriteThrottle.set(k, { ts: nowMs, sig });
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
     const item = {
       codigoLinea: cod,
+      descripcionLinea: String(a.descripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim(),
       coche,
       choferNombre: a.choferNombre || '',
       choferLegajo: a.choferLegajo || '',
@@ -720,6 +1498,7 @@ async function recordObservedUnits(env, arribos = [], stopId = '', stopCoords = 
     };
     batch.push(item);
     fallbackUnits.set(k, { ...item, dayKey: getArgentinaDayKey(nowMs), tripKey: '' });
+    upsertFallbackRosterUnit(item, nowMs);
   }
 
   let stopSnapshot = null;
@@ -752,6 +1531,144 @@ async function recordObservedUnits(env, arribos = [], stopId = '', stopCoords = 
   }
 }
 
+/**
+ * Automated background fleet & driver scanner (executed by Cloudflare Cron Trigger every 5 min).
+ * Rotates through FLEET_SCAN_TARGETS in gentle batches of 18 probes (<= 20 subrequests/run,
+ * safely under Cloudflare Workers Free 50-subrequest limit), sweeping ALL 33 Corrientes lines
+ * every 20 minutes even when zero users are using the app.
+ */
+export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn = fetchOneStop) {
+  // Argentina local time (UTC-3, no DST)
+  const art = new Date(nowMs - 3 * 3600 * 1000);
+  const artMinOfDay = art.getUTCHours() * 60 + art.getUTCMinutes();
+  const stub = getFleetStub(env);
+
+  // Dead-night quiet window: 01:30–04:30 ART -> skip heavy SOAP scanning, run daily retention prune at 03:00 ART
+  if (artMinOfDay >= 90 && artMinOfDay < 270) {
+    if (artMinOfDay >= 180 && artMinOfDay < 195 && stub) {
+      try {
+        await stub.fetch('https://fleet-memory/cron-ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pruneOnly: true })
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+    return { skipped: true, reason: 'night-quiet-window', artMinOfDay, probesRun: 0, unitsFound: 0 };
+  }
+
+  let scanCursor = fallbackRosterMeta.scanCursor || 0;
+  if (stub) {
+    try {
+      const stateRes = await stub.fetch('https://fleet-memory/cron-state');
+      const stateJson = await stateRes.json();
+      if (Number.isInteger(stateJson?.scanCursor)) {
+        scanCursor = stateJson.scanCursor;
+      }
+    } catch {
+      // Fall back to 0 if DO state read fails
+    }
+  }
+
+  const total = FLEET_SCAN_TARGETS.length;
+  const start = ((scanCursor % total) + total) % total;
+  const end = Math.min(total, start + CRON_BATCH_SIZE);
+  const batchTargets = FLEET_SCAN_TARGETS.slice(start, end);
+  const cycleCompleted = end >= total;
+  const nextCursor = cycleCompleted ? 0 : end;
+
+  // Deduplicate units discovered in this batch, keeping freshest GPS per (codigoLinea, coche)
+  const byUnit = new Map();
+  let probesSucceeded = 0;
+
+  for (let i = 0; i < batchTargets.length; i += CRON_CONCURRENCY) {
+    const wave = batchTargets.slice(i, i + CRON_CONCURRENCY);
+    const waveRes = await Promise.all(
+      wave.map(([cod, stopId]) =>
+        fetchStopFn(stopId, cod === 0 ? '000' : String(cod))
+          .then((r) => ({ ok: true, stopId, arribos: r?.arribos || [] }))
+          .catch(() => ({ ok: false, stopId, arribos: [] }))
+      )
+    );
+
+    for (const r of waveRes) {
+      if (r.ok) probesSucceeded++;
+      for (const a of r.arribos) {
+        const cod = Number(a.codigoLinea);
+        const coche = String(a.identificadorCoche || '').trim();
+        if (!cod || !coche) continue;
+        const key = `${cod}:${coche}`;
+        const gpsMs = parseGpsStampMs(a.ultimaFechaHoraGPS);
+        const prev = byUnit.get(key);
+        const hasChofer = Boolean(String(a.choferNombre || a.choferLegajo || a.identificadorChofer || '').trim());
+        const prevHasChofer = Boolean(prev && (prev.choferNombre || prev.choferLegajo || prev.choferRaw));
+        if (!prev || gpsMs > prev._gpsMs || (gpsMs === prev._gpsMs && hasChofer && !prevHasChofer)) {
+          const lat = parseFloat(a.latitud);
+          const lng = parseFloat(a.longitud);
+          byUnit.set(key, {
+            codigoLinea: cod,
+            descripcionLinea: String(a.descripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim(),
+            coche,
+            choferNombre: a.choferNombre || prev?.choferNombre || '',
+            choferLegajo: a.choferLegajo || prev?.choferLegajo || '',
+            choferRaw: a.identificadorChofer || prev?.choferRaw || '',
+            esAdaptado: Boolean(a.esAdaptado || prev?.esAdaptado),
+            desvioSec: parseDesvioSeconds(a.desvioHorario),
+            desvioRaw: a.desvioHorario || prev?.desvioRaw || '',
+            bandera: a.descripcionBandera || prev?.bandera || '',
+            ultimaGps: a.ultimaFechaHoraGPS || prev?.ultimaGps || '',
+            lat: !Number.isNaN(lat) && lat !== 0 ? lat : prev?.lat ?? null,
+            lng: !Number.isNaN(lng) && lng !== 0 ? lng : prev?.lng ?? null,
+            stopId: r.stopId,
+            _gpsMs: gpsMs
+          });
+        }
+      }
+    }
+  }
+
+  const units = Array.from(byUnit.values()).map(({ _gpsMs, ...clean }) => clean);
+
+  // Update isolate fallback too
+  fallbackRosterMeta.scanCursor = nextCursor;
+  fallbackRosterMeta.lastCronAt = nowMs;
+  fallbackRosterMeta.lastBatchUnits = units.length;
+  if (cycleCompleted) {
+    fallbackRosterMeta.lastCycleAt = nowMs;
+    fallbackRosterMeta.totalSweeps += 1;
+  }
+  for (const u of units) upsertFallbackRosterUnit(u, nowMs);
+
+  if (stub) {
+    try {
+      await stub.fetch('https://fleet-memory/cron-ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          units,
+          nextCursor,
+          cycleCompleted
+        })
+      });
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  return {
+    skipped: false,
+    start,
+    end,
+    nextCursor,
+    cycleCompleted,
+    probesRun: batchTargets.length,
+    probesSucceeded,
+    unitsFound: units.length
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
@@ -765,10 +1682,131 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.0',
+          version: '2.1',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
+          autoFleetScan: {
+            intervalMin: CRON_SCAN_INTERVAL_MIN,
+            fullCycleMin: CRON_FULL_CYCLE_MIN,
+            retentionDays: ROSTER_RETENTION_DAYS,
+            targets: FLEET_SCAN_TARGETS.length
+          },
           timestamp: Date.now()
+        });
+      }
+
+      if (pathname === '/api/flota-resumen' && request.method === 'GET') {
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch('https://fleet-memory/flota-resumen');
+            const data = await doRes.json();
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+          } catch {
+            // Fall through to in-memory fallback
+          }
+        }
+        const nowMs = Date.now();
+        const todayKey = getArgentinaDayKey(nowMs);
+        const minTs = nowMs - ROSTER_RETENTION_MS;
+        const byLine = new Map();
+        const ensureLine = (cod, desc) => {
+          if (!byLine.has(cod)) {
+            byLine.set(cod, {
+              codigoLinea: cod,
+              descripcionLinea: desc || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
+              cochesHoy: 0,
+              cochesSemana: 0,
+              choferesHoy: 0,
+              choferesSemana: 0,
+              lastSeenAt: 0
+            });
+          }
+          return byLine.get(cod);
+        };
+        for (const c of fallbackRosterCars.values()) {
+          if (c.lastSeenAt < minTs) continue;
+          const entry = ensureLine(c.codigoLinea, c.descripcionLinea);
+          entry.cochesSemana += 1;
+          if (c.lastDayKey === todayKey) entry.cochesHoy += 1;
+          entry.lastSeenAt = Math.max(entry.lastSeenAt, c.lastSeenAt);
+        }
+        for (const d of fallbackRosterDrivers.values()) {
+          if (d.lastSeenAt < minTs) continue;
+          const entry = ensureLine(d.codigoLinea, d.descripcionLinea);
+          entry.choferesSemana += 1;
+          if (d.lastDayKey === todayKey) entry.choferesHoy += 1;
+          entry.lastSeenAt = Math.max(entry.lastSeenAt, d.lastSeenAt);
+        }
+        const lineas = Array.from(byLine.values()).sort((a, b) =>
+          a.descripcionLinea.localeCompare(b.descripcionLinea, 'es', { numeric: true })
+        );
+        return jsonResponse({
+          data: {
+            dayKey: todayKey,
+            retentionDays: ROSTER_RETENTION_DAYS,
+            meta: {
+              ...fallbackRosterMeta,
+              scanIntervalMin: CRON_SCAN_INTERVAL_MIN,
+              fullCycleMin: CRON_FULL_CYCLE_MIN,
+              retentionDays: ROSTER_RETENTION_DAYS
+            },
+            lineas
+          },
+          source: 'fleet-memory-mem',
+          savedAt: nowMs
+        });
+      }
+
+      if (pathname === '/api/flota' && request.method === 'GET') {
+        const codLinea = Number(searchParams.get('codLinea'));
+        if (!codLinea) return jsonResponse({ error: 'Falta codLinea' }, 400);
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch(`https://fleet-memory/flota?codLinea=${encodeURIComponent(codLinea)}`);
+            const data = await doRes.json();
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+          } catch {
+            // Fall through to in-memory fallback
+          }
+        }
+        const nowMs = Date.now();
+        const todayKey = getArgentinaDayKey(nowMs);
+        const minTs = nowMs - ROSTER_RETENTION_MS;
+        const coches = Array.from(fallbackRosterCars.values())
+          .filter((c) => c.codigoLinea === codLinea && c.lastSeenAt >= minTs)
+          .map((c) => ({ ...c, vistoHoy: c.lastDayKey === todayKey }))
+          .sort((a, b) => {
+            if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+            if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+            return compareCocheIds(a.coche, b.coche);
+          });
+        const choferes = Array.from(fallbackRosterDrivers.values())
+          .filter((d) => d.codigoLinea === codLinea && d.lastSeenAt >= minTs)
+          .map((d) => ({ ...d, vistoHoy: d.lastDayKey === todayKey }))
+          .sort((a, b) => {
+            if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+            if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+            return a.choferNombre.localeCompare(b.choferNombre, 'es');
+          });
+        return jsonResponse({
+          data: {
+            codigoLinea: codLinea,
+            descripcionLinea: LINE_NAMES_BY_CODE[codLinea] || `L${codLinea}`,
+            dayKey: todayKey,
+            retentionDays: ROSTER_RETENTION_DAYS,
+            meta: {
+              ...fallbackRosterMeta,
+              scanIntervalMin: CRON_SCAN_INTERVAL_MIN,
+              fullCycleMin: CRON_FULL_CYCLE_MIN,
+              retentionDays: ROSTER_RETENTION_DAYS
+            },
+            coches,
+            choferes
+          },
+          source: 'fleet-memory-mem',
+          savedAt: nowMs
         });
       }
 
@@ -837,6 +1875,7 @@ export default {
           };
           fallbackTrips.set(`${dayKey}:${cod}:${tripKey}`, rec);
           fallbackUnits.set(`${cod}:${coche}`, { ...rec, bandera: String(e.bandera || '').trim() });
+          upsertFallbackRosterUnit({ ...rec, bandera: String(e.bandera || '').trim() }, nowMs, dayKey);
         }
 
         const stub = getFleetStub(env);
@@ -1172,66 +2211,6 @@ export default {
         const rawCode = String(searchParams.get('codLinea') || '000').trim();
         const lineCode = !rawCode || rawCode === '0' ? '000' : rawCode;
 
-        const fetchOneStop = async (sid, lcode) => {
-          const raw = await soapRequest(
-            'RecuperarProximosArribos',
-            `<identificadorParada i:type="d:string">${escapeXml(sid)}</identificadorParada>
-             <codigoLineaParada i:type="d:int">${escapeXml(lcode)}</codigoLineaParada>
-             <codigoAplicacion i:type="d:int">${SOAP_APP_CODE}</codigoAplicacion>
-             <localidad i:type="d:string">${escapeXml(SOAP_LOCALIDAD)}</localidad>
-             <usuario i:type="d:string">${SOAP_USER}</usuario>
-             <clave i:type="d:string">${SOAP_PASS}</clave>`
-          );
-          const rawArribos = Array.isArray(raw?.arribos) ? raw.arribos : [];
-          let sLat = null;
-          let sLng = null;
-          for (const a of rawArribos) {
-            if (a.LatitudParada && a.LongitudParada) {
-              sLat = parseFloat(a.LatitudParada);
-              sLng = parseFloat(a.LongitudParada);
-              break;
-            }
-          }
-          const known = QUICK_STOPS.find((s) => s.id === sid);
-          if ((sLat === null || Number.isNaN(sLat)) && known) {
-            sLat = known.lat;
-            sLng = known.lng;
-          }
-          const arribos = rawArribos.map((a) => {
-            const chofer = parseChofer(a.IdentificadorChofer);
-            return {
-              codigoLinea: Number(a.CodigoLineaParada) || 0,
-              tiempoRestanteArribo: String(a.Arribo || '').trim(),
-              descripcionLinea: String(a.DescripcionLinea || '').trim(),
-              descripcionBandera: String(a.DescripcionBandera || '').trim(),
-              descripcionCortaBandera: String(a.DescripcionCortaBandera || '').trim(),
-              descripcionCartelBandera: String(a.DescripcionCartelBandera || '').trim(),
-              esAdaptado: String(a.EsAdaptado || '').toLowerCase() === 'true',
-              latitud: String(a.Latitud || ''),
-              longitud: String(a.Longitud || ''),
-              latitudParada: String(a.LatitudParada || (sLat ?? '')),
-              longitudParada: String(a.LongitudParada || (sLng ?? '')),
-              esLleno: false,
-              identificadorCoche: String(a.IdentificadorCoche || '').trim(),
-              identificadorChofer: chofer.choferRaw,
-              choferNombre: chofer.choferNombre,
-              choferLegajo: chofer.choferLegajo,
-              desvioHorario: String(a.DesvioHorario || '').trim(),
-              ultimaFechaHoraGPS: String(a.UltimaFechaHoraGPS || '').trim(),
-              mensajeError: String(a.MensajeError || '').trim()
-            };
-          });
-          return {
-            arribos,
-            idParada: sid,
-            codLinea: lcode,
-            stopCoords: sLat !== null && sLng !== null ? { lat: sLat, lng: sLng } : null,
-            knownStop: known || null,
-            codigoEstado: raw?.CodigoEstado ?? 0,
-            mensaje: raw?.MensajeEstado || null
-          };
-        };
-
         const skipCorridor = searchParams.get('skipCorridor') === '1';
         const hintLinea = Number(searchParams.get('hintLinea')) || 0;
 
@@ -1441,6 +2420,15 @@ export default {
       return jsonResponse({ error: 'Endpoint no encontrado' }, 404);
     } catch (err) {
       return jsonResponse({ error: 'Error conectando con SWParadas.asmx', detail: err.message }, 502);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    const task = runScheduledFleetScan(env, event?.scheduledTime || Date.now());
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(task);
+    } else {
+      await task;
     }
   }
 };

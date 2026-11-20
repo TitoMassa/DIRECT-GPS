@@ -66,29 +66,32 @@ export function getDirectionColor(branchIndex = 0) {
   return DIRECTION_COLORS[idx % DIRECTION_COLORS.length];
 }
 
-// 100% libres, sin API key, mapas no satelitales sobre Leaflet + OpenStreetMap
+// 100% libres, sin API key, teselas nativas (cero filtro CSS invert que lagea en móvil)
 export const MAP_TILES = {
   dark: {
     id: 'dark',
-    label: 'OSM Nocturno',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    maxZoom: 19,
-    darkFilter: true
+    label: 'Grafito Nocturno',
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> · <a href="https://carto.com/attributions">CARTO</a>',
+    maxZoom: 20,
+    darkFilter: false
   },
   light: {
     id: 'light',
-    label: 'OSM Clásico',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    maxZoom: 19,
+    label: 'Mapa Claro',
+    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> · <a href="https://carto.com/attributions">CARTO</a>',
+    maxZoom: 20,
     darkFilter: false
   },
-  hot: {
-    id: 'hot',
-    label: 'OSM Urbano',
-    url: 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · HOT',
+  osm: {
+    id: 'osm',
+    label: 'OSM Detalle',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    subdomains: 'abc',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     maxZoom: 19,
     darkFilter: false
   }

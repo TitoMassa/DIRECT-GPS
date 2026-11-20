@@ -19,47 +19,67 @@ function unitVector(lat1, lng1, lat2, lng2) {
   return [dx / len, dy / len];
 }
 
-export function projectOnPolyline(pts, cum, lat, lng, minAlong = -Infinity) {
-  let best = {
-    segIdx: 0,
-    t: 0,
-    lat: pts[0][0],
-    lng: pts[0][1],
-    along: 0,
-    perp: Infinity,
-    tangent: null
-  };
+const METERS_PER_DEG_LAT = 110850;
+const METERS_PER_DEG_LNG_EQ = 111320;
 
-  for (let i = 0; i < pts.length - 1; i++) {
-    const segStartAlong = cum[i] || 0;
+export function projectOnPolyline(pts, cum, lat, lng, minAlong = -Infinity) {
+  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const scaleLng = METERS_PER_DEG_LNG_EQ * cosLat;
+  let bestPerpSq = Infinity;
+  let bestIdx = 0;
+  let bestT = 0;
+  let bestLat = pts[0][0];
+  let bestLng = pts[0][1];
+  let bestAlong = 0;
+  let bestALat = pts[0][0];
+  let bestALng = pts[0][1];
+  let bestBLat = pts[0][0];
+  let bestBLng = pts[0][1];
+  let found = false;
+
+  for (let i = 0, n = pts.length - 1; i < n; i++) {
     const segEndAlong = cum[i + 1] || 0;
     if (segEndAlong < minAlong) continue;
+    const segStartAlong = cum[i] || 0;
     const aLat = pts[i][0];
     const aLng = pts[i][1];
     const bLat = pts[i + 1][0];
     const bLng = pts[i + 1][1];
-    const dx = bLat - aLat;
-    const dy = bLng - aLng;
-    const lenSq = dx * dx + dy * dy;
-    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((lat - aLat) * dx + (lng - aLng) * dy) / lenSq));
-    const pLat = aLat + dx * t;
-    const pLng = aLng + dy * t;
+    const dyM = (bLat - aLat) * METERS_PER_DEG_LAT;
+    const dxM = (bLng - aLng) * scaleLng;
+    const lenSq = dxM * dxM + dyM * dyM;
+    const pyM = (lat - aLat) * METERS_PER_DEG_LAT;
+    const pxM = (lng - aLng) * scaleLng;
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, (pxM * dxM + pyM * dyM) / lenSq));
     const along = segStartAlong + (segEndAlong - segStartAlong) * t;
     if (along < minAlong) continue;
-    const perp = distanceMeters(lat, lng, pLat, pLng);
-    if (perp !== null && perp < best.perp) {
-      best = {
-        segIdx: i,
-        t,
-        lat: pLat,
-        lng: pLng,
-        along,
-        perp,
-        tangent: unitVector(aLat, aLng, bLat, bLng)
-      };
+    const rdx = pxM - dxM * t;
+    const rdy = pyM - dyM * t;
+    const perpSq = rdx * rdx + rdy * rdy;
+    if (perpSq < bestPerpSq) {
+      bestPerpSq = perpSq;
+      bestIdx = i;
+      bestT = t;
+      bestLat = aLat + (bLat - aLat) * t;
+      bestLng = aLng + (bLng - aLng) * t;
+      bestAlong = along;
+      bestALat = aLat;
+      bestALng = aLng;
+      bestBLat = bLat;
+      bestBLng = bLng;
+      found = true;
     }
   }
-  return best;
+
+  return {
+    segIdx: bestIdx,
+    t: bestT,
+    lat: bestLat,
+    lng: bestLng,
+    along: bestAlong,
+    perp: found ? Math.sqrt(bestPerpSq) : Infinity,
+    tangent: found ? unitVector(bestALat, bestALng, bestBLat, bestBLng) : null
+  };
 }
 
 function slicePolyline(pts, startProj, endProj) {
@@ -76,6 +96,17 @@ function slicePolyline(pts, startProj, endProj) {
   return out;
 }
 
+function findCumSegment(cum, meters) {
+  let lo = 0;
+  let hi = cum.length - 2;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid + 1] < meters) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 export function sampleBranchAtAlong(branch, alongMeters) {
   const { pts, cum, totalLen } = branch;
   if (!pts || pts.length === 0) return null;
@@ -86,8 +117,7 @@ export function sampleBranchAtAlong(branch, alongMeters) {
     const lastIdx = pts.length - 1;
     return { segIdx: Math.max(0, lastIdx - 1), t: 1, lat: pts[lastIdx][0], lng: pts[lastIdx][1], along: totalLen };
   }
-  let i = 0;
-  while (i < cum.length - 2 && cum[i + 1] < alongMeters) i++;
+  const i = findCumSegment(cum, alongMeters);
   const segStart = cum[i];
   const segLen = Math.max(0.001, cum[i + 1] - segStart);
   const t = Math.max(0, Math.min(1, (alongMeters - segStart) / segLen));
@@ -738,10 +768,12 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
 }
 
 function projectOnPolylineWindow(pts, cum, lat, lng, minAlong, maxAlong, preferAlong) {
+  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const scaleLng = METERS_PER_DEG_LNG_EQ * cosLat;
   let best = null;
   let bestScore = Infinity;
 
-  for (let i = 0; i < pts.length - 1; i++) {
+  for (let i = 0, n = pts.length - 1; i < n; i++) {
     const segStartAlong = cum[i] || 0;
     const segEndAlong = cum[i + 1] || 0;
     if (segEndAlong < minAlong || segStartAlong > maxAlong) continue;
@@ -749,21 +781,29 @@ function projectOnPolylineWindow(pts, cum, lat, lng, minAlong, maxAlong, preferA
     const aLng = pts[i][1];
     const bLat = pts[i + 1][0];
     const bLng = pts[i + 1][1];
-    const dx = bLat - aLat;
-    const dy = bLng - aLng;
-    const lenSq = dx * dx + dy * dy;
-    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((lat - aLat) * dx + (lng - aLng) * dy) / lenSq));
-    const pLat = aLat + dx * t;
-    const pLng = aLng + dy * t;
+    const dyM = (bLat - aLat) * METERS_PER_DEG_LAT;
+    const dxM = (bLng - aLng) * scaleLng;
+    const lenSq = dxM * dxM + dyM * dyM;
+    const pyM = (lat - aLat) * METERS_PER_DEG_LAT;
+    const pxM = (lng - aLng) * scaleLng;
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, (pxM * dxM + pyM * dyM) / lenSq));
     const along = segStartAlong + (segEndAlong - segStartAlong) * t;
     if (along < minAlong || along > maxAlong) continue;
-    const perp = distanceMeters(lat, lng, pLat, pLng);
-    if (perp === null) continue;
+    const rdx = pxM - dxM * t;
+    const rdy = pyM - dyM * t;
+    const perp = Math.sqrt(rdx * rdx + rdy * rdy);
     // Strong preference for forward position matching expected lag prevents snapping onto overlapping return lanes
     const score = perp + (Number.isFinite(preferAlong) ? Math.abs(along - preferAlong) * 0.18 : 0);
     if (score < bestScore) {
       bestScore = score;
-      best = { segIdx: i, t, lat: pLat, lng: pLng, along, perp };
+      best = {
+        segIdx: i,
+        t,
+        lat: aLat + (bLat - aLat) * t,
+        lng: aLng + (bLng - aLng) * t,
+        along,
+        perp
+      };
     }
   }
   return best;
@@ -885,18 +925,20 @@ export function sampleTrajectory(traj, walkedMeters) {
   }
 
   const clamped = Math.max(0, walkedMeters);
-  let i = 0;
-  while (i < pathCum.length - 2 && pathCum[i + 1] < clamped) {
-    i++;
-  }
+  const i = findCumSegment(pathCum, clamped);
   const segStart = pathCum[i];
   const segLen = Math.max(0.001, pathCum[i + 1] - segStart);
   const frac = Math.max(0, Math.min(1, (clamped - segStart) / segLen));
   const lat = pathPts[i][0] + (pathPts[i + 1][0] - pathPts[i][0]) * frac;
   const lng = pathPts[i][1] + (pathPts[i + 1][1] - pathPts[i][1]) * frac;
 
-  const activeSeg =
-    segments.find((s) => clamped >= s.startMeters && clamped <= s.endMeters) || segments[0] || lastSeg;
+  let activeSeg = segments[0] || lastSeg;
+  for (let s = 0; s < segments.length; s++) {
+    if (clamped >= segments[s].startMeters && clamped <= segments[s].endMeters) {
+      activeSeg = segments[s];
+      break;
+    }
+  }
 
   let inOppositeLeg = false;
   let inNextCycle = false;

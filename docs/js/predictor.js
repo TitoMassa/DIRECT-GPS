@@ -1,5 +1,6 @@
 import {
   pickStopBranches,
+  pickPairedReturnBranch,
   pickIncomingBranches,
   projectOnPolyline,
   sampleBranchAtAlong,
@@ -14,6 +15,11 @@ import {
 import { getLineColor } from './config.js';
 
 const modelCacheByBranches = new WeakMap(); // branches[] -> Map<`${codLinea}:${tipoDia}`, LineScheduleModel>
+
+// Interprovincial 904 lines (Corrientes-Chaco) operate continuous shifts with NO horarios cortados.
+// Urban lines (102-109) regularly have horarios cortados (peak cars pulling in mid-morning / returning midday).
+export const INTERPROVINCIAL_LINE_CODES = new Set([1037, 1038, 1039, 517, 607, 608]); // 904A, 904B, 904C + aliases
+const INTERURBAN_LINE_CODES = new Set([705, 433]); // SANTA ANA-INGENIO, RIACHUELO - ERSA
 
 function getBranchKey(b) {
   return `${b?.index ?? 0}:${b?.git || normalizeBandera(b?.bandera || '')}`;
@@ -68,10 +74,18 @@ export function getArgentinaSecOfDay(date = new Date()) {
   return art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds() + art.getUTCMilliseconds() / 1000;
 }
 
+// Service day key rolls over at 03:00 AM ART (UTC-6 shift) so 00:00-02:59 stays in the night's service
+// and 03:00 AM starts a 100% clean day with zero previous-day driver/bus leakage.
 export function getArgentinaDayKey(date = new Date()) {
-  const art = new Date(date.getTime() - 3 * 3600 * 1000);
+  const serviceArt = new Date(date.getTime() - (3 * 3600 + SERVICE_DAY_CUTOFF_SEC) * 1000);
   const pad = (n) => String(n).padStart(2, '0');
-  return `${art.getUTCFullYear()}-${pad(art.getUTCMonth() + 1)}-${pad(art.getUTCDate())}`;
+  return `${serviceArt.getUTCFullYear()}-${pad(serviceArt.getUTCMonth() + 1)}-${pad(serviceArt.getUTCDate())}`;
+}
+
+export function getArgentinaServiceTipo(date = new Date()) {
+  const serviceArt = new Date(date.getTime() - (3 * 3600 + SERVICE_DAY_CUTOFF_SEC) * 1000);
+  const dow = serviceArt.getUTCDay();
+  return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
 }
 
 /**
@@ -192,12 +206,12 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       if (bestTrip) {
         const last = bestTrip.tr.points[bestTrip.tr.points.length - 1];
         const safeSec = Math.max(last.sec + 1, bestTrip.sec);
-        bestTrip.tr.points.push({ sIdx, stopId: st.id, along: st.along, sec: safeSec });
+        bestTrip.tr.points.push({ sIdx, stopId: st.stopId, along: st.along, sec: safeSec });
         usedTrips.add(bestTrip.tr);
       } else {
         trips.push({
           branch,
-          points: [{ sIdx, stopId: st.id, along: st.along, sec: rawSec }]
+          points: [{ sIdx, stopId: st.stopId, along: st.along, sec: rawSec }]
         });
       }
     }
@@ -214,15 +228,20 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     const avgSpeed =
       pts.length >= 2 && last.sec > first.sec
         ? Math.max(2.5, Math.min(22, (last.along - first.along) / (last.sec - first.sec)))
-        : 5.0;
+        : 5.5;
+
+    // Terminal approach/tail deadheads move faster than stop-congested downtown averages,
+    // preventing artificial endpoint overlaps on immediate-turnaround cabeceras (e.g. 103A).
+    const headSpd = Math.max(avgSpeed, 6.5);
+    const tailSpd = Math.max(avgSpeed, 7.0);
 
     const fullPts = pts.map((p) => ({ stopId: p.stopId, along: p.along, sec: p.sec }));
     if (first.along > 25) {
-      const startSec = first.sec - first.along / avgSpeed;
+      const startSec = first.sec - first.along / headSpd;
       fullPts.unshift({ stopId: null, along: 0, sec: startSec });
     }
     if (branch.totalLen - last.along > 25) {
-      const endSec = last.sec + (branch.totalLen - last.along) / avgSpeed;
+      const endSec = last.sec + (branch.totalLen - last.along) / tailSpd;
       fullPts.push({ stopId: null, along: branch.totalLen, sec: endSec });
     }
 
@@ -247,7 +266,9 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       endSec,
       stopTimeMap,
       prevTrip: null,
-      nextTrip: null
+      nextTrip: null,
+      layoverFromPrevSec: null,
+      linkConfidence: 'none'
     });
   }
 
@@ -256,8 +277,171 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
 }
 
 /**
+ * Estimates a cabecera's true scheduled rest/layover duration using mutually-isolated turnarounds
+ * (where only 1 arrival precedes a departure's first feasible slot, plus the first arrival of the day).
+ * Immune to peak-hour headway < layover corruption (e.g. 904B, 105A, 103B) and morning pull-outs (102B, 105B).
+ */
+function estimateTypicalTerminalLayover(arrivals, departures, longLayoverMode) {
+  if (!arrivals.length || !departures.length) return longLayoverMode ? 600 : 300;
+  const maxProbe = longLayoverMode ? 55 * 60 : 28 * 60;
+  const isolated = [];
+
+  for (let i = 0; i < arrivals.length; i++) {
+    const arr = arrivals[i];
+    let firstDep = null;
+    for (let j = 0; j < departures.length; j++) {
+      const lay = departures[j].startSec - arr.endSec;
+      if (lay >= -120 && lay <= maxProbe) {
+        firstDep = departures[j];
+        break;
+      }
+    }
+    if (!firstDep) continue;
+
+    let arrCount = 0;
+    for (let k = 0; k < arrivals.length; k++) {
+      const lay = firstDep.startSec - arrivals[k].endSec;
+      if (lay >= -120 && lay <= maxProbe) arrCount++;
+    }
+    const lay = firstDep.startSec - arr.endSec;
+    if (arrCount === 1 || i === 0) {
+      isolated.push(lay);
+    }
+  }
+
+  if (isolated.length > 0) {
+    isolated.sort((a, b) => a - b);
+    return isolated[Math.floor(isolated.length / 2)];
+  }
+
+  const fallback = [];
+  for (const arr of arrivals) {
+    const dep = departures.find((d) => {
+      const l = d.startSec - arr.endSec;
+      return l >= -120 && l <= maxProbe;
+    });
+    if (dep) fallback.push(dep.startSec - arr.endSec);
+  }
+  if (!fallback.length) return longLayoverMode ? 600 : 300;
+  fallback.sort((a, b) => a - b);
+  return fallback[Math.floor(fallback.length / 2)];
+}
+
+/**
+ * Global Optimal Monotonic (FIFO) Terminal Sequence Alignment via Dynamic Programming.
+ * Guarantees zero bus overtaking at cabeceras, recovers exact variable-duration laps,
+ * keeps 904 (interprovincial) continuous with no false cuts, and cleanly cuts urban 102-109
+ * blocks at horarios cortados so out-of-service cars are never linked to another car's lap.
+ */
+function alignTerminalFIFO(
+  arrivals,
+  departures,
+  { isInterprovincial = false, isInterurban = false, preferSamePair = false, pairMap = null } = {}
+) {
+  const n = arrivals.length;
+  const m = departures.length;
+  if (!n || !m) return [];
+
+  const longMode = isInterprovincial || isInterurban;
+  const typicalLay = estimateTypicalTerminalLayover(arrivals, departures, longMode);
+  const isImmediate = typicalLay <= 150;
+
+  const minLay = isInterurban ? -60 : isImmediate ? -120 : typicalLay >= 420 ? 90 : -30;
+  const maxLay = isInterurban
+    ? Math.max(60 * 60, typicalLay + 35 * 60)
+    : isInterprovincial
+      ? Math.max(36 * 60, typicalLay + 22 * 60)
+      : isImmediate
+        ? 11 * 60
+        : Math.max(20 * 60, Math.min(28 * 60, typicalLay + 11 * 60));
+
+  const skipCost = isInterurban
+    ? 2600
+    : isInterprovincial
+      ? 1900
+      : isImmediate
+        ? 480
+        : Math.max(460, Math.min(720, typicalLay * 0.9));
+
+  const INF = 1e12;
+  const dp = Array.from({ length: n + 1 }, () => new Float64Array(m + 1).fill(INF));
+  const bt = Array.from({ length: n + 1 }, () => new Uint8Array(m + 1)); // 1=skipArr, 2=skipDep, 3=match
+
+  for (let i = 0; i <= n; i++) {
+    dp[i][0] = i * skipCost;
+    bt[i][0] = 1;
+  }
+  for (let j = 0; j <= m; j++) {
+    dp[0][j] = j * skipCost;
+    bt[0][j] = 2;
+  }
+  bt[0][0] = 0;
+
+  for (let i = 1; i <= n; i++) {
+    const arr = arrivals[i - 1];
+    for (let j = 1; j <= m; j++) {
+      const dep = departures[j - 1];
+      let best = dp[i - 1][j] + skipCost;
+      let move = 1;
+
+      const cSkipDep = dp[i][j - 1] + skipCost;
+      if (cSkipDep < best) {
+        best = cSkipDep;
+        move = 2;
+      }
+
+      const lay = dep.startSec - arr.endSec;
+      if (lay >= minLay && lay <= maxLay) {
+        let matchCost = Math.abs(lay - typicalLay);
+        if (lay < 0) matchCost += isImmediate ? 45 : 350;
+        if (!longMode && lay > typicalLay + 360) {
+          matchCost += (lay - typicalLay - 360) * 0.65;
+        }
+        if (preferSamePair && pairMap && pairMap.get(dep.branch) !== arr.branch) {
+          matchCost += 90;
+        }
+        const cMatch = dp[i - 1][j - 1] + matchCost;
+        if (cMatch < best) {
+          best = cMatch;
+          move = 3;
+        }
+      }
+
+      dp[i][j] = best;
+      bt[i][j] = move;
+    }
+  }
+
+  const pairs = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    const mv = bt[i][j];
+    if (mv === 3) {
+      const arr = arrivals[i - 1];
+      const dep = departures[j - 1];
+      const lay = dep.startSec - arr.endSec;
+      const dev = Math.abs(lay - typicalLay);
+      const confidence =
+        longMode ? (dev <= 11 * 60 ? 'high' : 'medium') : dev <= 4.5 * 60 ? 'high' : 'medium';
+      pairs.push({ arr, dep, lay, typicalLay, confidence });
+      i--;
+      j--;
+    } else if (mv === 1) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+  pairs.reverse();
+  return pairs;
+}
+
+/**
  * Builds and caches the complete space-time schedule model for one line and day type,
- * chaining incoming feeder/return branches across cabeceras (supporting 2-, 3- and 4-branch lines).
+ * reconstructing variable-duration vehicle rotations via Global FIFO DP alignment,
+ * respecting urban horarios cortados vs. continuous 904 interprovincial operations,
+ * and recovering true active-rotation service numbering (Servicio 1..N once all services are active).
  */
 export function buildLineScheduleModel(codLinea, branches = [], horariosFile = null, requestedTipo = 'habil') {
   if (!codLinea || !Array.isArray(branches) || branches.length === 0 || !horariosFile) return null;
@@ -275,114 +459,267 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     return byTipo.get(cacheKey);
   }
 
+  const numCode = Number(codLinea);
+  const isInterprovincial = INTERPROVINCIAL_LINE_CODES.has(numCode);
+  const isInterurban = INTERURBAN_LINE_CODES.has(numCode);
+
   const branchTrips = new Map(); // branchKey -> Trip[]
   for (const b of branches) {
     const trips = reconstructBranchTrips(b, horariosFile, resolved.tipo);
     branchTrips.set(getBranchKey(b), trips);
   }
 
-  // Step 1: Estimate each branch's natural arrival-to-departure layover at its origin cabecera
-  // (e.g. 0-2 min at quick-turnaround cabeceras like Puerto/Centro vs 8-15 min at rest cabeceras)
-  const feedersByKey = new Map();
-  const branchTypicalLaySec = new Map();
+  const pairMap = new Map();
   for (const b of branches) {
-    const bKey = getBranchKey(b);
+    pairMap.set(b, pickPairedReturnBranch(branches, b));
+  }
+
+  // Separate structurally disjoint shuttle sub-loops (e.g. 103C: 3.8 km Montaña shuttle vs 12.2 km Puerto trunk)
+  // while preserving genuine shared-hub branch interchanges (e.g. 104A, 104D, 105C).
+  const shuttleIsolated = new Set();
+  for (const b of branches) {
+    const p = pairMap.get(b);
+    if (!p || p === b || pairMap.get(p) !== b) continue;
     const feeders = pickIncomingBranches(branches, b);
-    feedersByKey.set(bKey, feeders);
-    const tripsB = branchTrips.get(bKey) || [];
-    const feederTrips = feeders.flatMap((fb) => branchTrips.get(getBranchKey(fb)) || []);
-    const samples = [];
-    for (const t of tripsB) {
-      let bestPos = Infinity;
-      let bestNeg = null;
-      for (const r of feederTrips) {
-        const lay = t.startSec - r.endSec;
-        if (lay >= 0 && lay <= 25 * 60 && lay < bestPos) bestPos = lay;
-        else if (lay >= -90 && lay < 0 && (bestNeg === null || Math.abs(lay) < Math.abs(bestNeg))) bestNeg = lay;
-      }
-      if (bestPos < Infinity || bestNeg !== null) {
-        samples.push(bestNeg !== null && Math.abs(bestNeg) < bestPos ? bestNeg : bestPos);
-      }
+    const foreignFeeders = feeders.filter((f) => f !== p && (branchTrips.get(getBranchKey(f)) || []).length > 0);
+    if (!foreignFeeders.length) continue;
+    const avgPairLen = (b.totalLen + p.totalLen) * 0.5;
+    const foreignLen = Math.max(...foreignFeeders.map((f) => f.totalLen));
+    const ratio = Math.max(avgPairLen, foreignLen) / Math.max(1, Math.min(avgPairLen, foreignLen));
+    const nB = (branchTrips.get(getBranchKey(b)) || []).length;
+    const nP = (branchTrips.get(getBranchKey(p)) || []).length;
+    if (ratio >= 2.2 && nB > 0 && nP > 0 && Math.abs(nB - nP) <= 2) {
+      shuttleIsolated.add(b);
     }
-    samples.sort((a, c) => a - c);
-    const med = samples.length > 0 ? samples[Math.floor(samples.length / 2)] : 300;
-    branchTypicalLaySec.set(bKey, med);
   }
 
-  // Step 2: Chain incoming feeder/return trips chronologically across ALL branches (2-, 3- and 4-branch lines)
-  const allTripItems = branches
-    .flatMap((b) => (branchTrips.get(getBranchKey(b)) || []).map((trip) => ({ b, bKey: getBranchKey(b), trip })))
-    .sort((a, c) => a.trip.startSec - c.trip.startSec);
+  // Group branches into physical cabeceras and align each cabecera with Global FIFO DP
+  const handledOut = new Set();
+  const terminals = [];
+  for (const b of branches) {
+    if (handledOut.has(b) || !(branchTrips.get(getBranchKey(b)) || []).length) continue;
 
-  const claimedReturn = new Set();
-  for (const { bKey, trip: t } of allTripItems) {
-    const feeders = feedersByKey.get(bKey) || [];
+    if (shuttleIsolated.has(b)) {
+      terminals.push({ inBranches: [pairMap.get(b)], outBranches: [b], preferSamePair: false });
+      handledOut.add(b);
+      continue;
+    }
+
+    const feeders = pickIncomingBranches(branches, b).filter(
+      (fb) => !shuttleIsolated.has(fb) || pairMap.get(fb) === b
+    );
     if (!feeders.length) continue;
-    const feederTrips = feeders.flatMap((fb) => branchTrips.get(getBranchKey(fb)) || []);
-    if (!feederTrips.length) continue;
 
-    const typicalLay = branchTypicalLaySec.get(bKey) ?? 300;
-    let bestPrev = null;
-    let bestScore = Infinity;
-
-    for (const r of feederTrips) {
-      if (claimedReturn.has(r)) continue;
-      const lay = t.startSec - r.endSec;
-      if (lay < -90 || lay > 45 * 60) continue;
-
-      let score = Math.abs(lay - typicalLay);
-      if (lay < 0 && typicalLay >= 150) {
-        score += 600; // never match an unarrived bus at a rest cabecera when a resting bus is waiting
-      } else if (lay < 0) {
-        score += 45;
-      }
-      // Subtle FIFO bias so earlier-waiting buses depart first during multi-bus terminal queues
-      score -= Math.min(Math.max(0, lay), 15 * 60) * 0.04;
-
-      if (score < bestScore) {
-        bestScore = score;
-        bestPrev = r;
+    const siblings = [b];
+    handledOut.add(b);
+    for (const other of branches) {
+      if (handledOut.has(other) || shuttleIsolated.has(other)) continue;
+      if (!(branchTrips.get(getBranchKey(other)) || []).length) continue;
+      const oFeed = pickIncomingBranches(branches, other).filter(
+        (fb) => !shuttleIsolated.has(fb) || pairMap.get(fb) === other
+      );
+      if (oFeed.some((f) => feeders.includes(f))) {
+        siblings.push(other);
+        handledOut.add(other);
       }
     }
 
-    if (bestPrev) {
-      claimedReturn.add(bestPrev);
-      t.prevTrip = bestPrev;
-      bestPrev.nextTrip = t;
+    const inSet = new Set();
+    for (const sb of siblings) {
+      for (const f of pickIncomingBranches(branches, sb)) {
+        if (!shuttleIsolated.has(f) || siblings.includes(pairMap.get(f))) {
+          inSet.add(f);
+        }
+      }
+    }
+    terminals.push({
+      inBranches: [...inSet],
+      outBranches: siblings,
+      preferSamePair: siblings.length > 1 || inSet.size > 1
+    });
+  }
+
+  for (const term of terminals) {
+    const arrivals = term.inBranches
+      .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
+      .sort((a, c) => a.endSec - c.endSec);
+    const departures = term.outBranches
+      .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
+      .sort((a, c) => a.startSec - c.startSec);
+
+    const aligned = alignTerminalFIFO(arrivals, departures, {
+      isInterprovincial,
+      isInterurban,
+      preferSamePair: term.preferSamePair,
+      pairMap
+    });
+
+    for (const { arr, dep, lay, confidence } of aligned) {
+      if (!arr.nextTrip && !dep.prevTrip) {
+        arr.nextTrip = dep;
+        dep.prevTrip = arr;
+        dep.layoverFromPrevSec = lay;
+        dep.linkConfidence = confidence;
+      }
     }
   }
 
-  // Step 3: Materialize full day-long vehicle blocks (`trip.block` & `trip.blockIndex`)
-  let blockSeq = 0;
+  // Step 3: Materialize continuous vehicle blocks & order morning services by first full active rotation!
+  const allTrips = branches
+    .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
+    .sort((a, c) => a.startSec - c.startSec);
+
   const tripByKey = new Map();
-  for (const { trip } of allTripItems) {
+  const rawBlocks = [];
+  for (const trip of allTrips) {
     tripByKey.set(trip.tripKey, trip);
     if (trip.prevTrip) continue;
-    const blockId = `blk:${codLinea}:${resolved.tipo}:${++blockSeq}`;
     const block = [];
     let cur = trip;
     const visited = new Set();
     while (cur && !visited.has(cur)) {
       visited.add(cur);
-      cur.blockId = blockId;
       cur.block = block;
       cur.blockIndex = block.length;
       block.push(cur);
       cur = cur.nextTrip;
     }
+    rawBlocks.push(block);
   }
 
+  // Real-world Corrientes service numbering: once all active morning services are running,
+  // departures starting from the first car's 2nd lap follow exact numeric order (Servicio 1, 2, 3, ...).
+  const firstTrip = allTrips[0] || null;
+  const primaryBranch = firstTrip?.branch || branches[0] || null;
+  const primaryTrips = primaryBranch ? branchTrips.get(getBranchKey(primaryBranch)) || [] : [];
+  const firstBlock = firstTrip?.block || null;
+  const firstBlockLap2 = firstBlock ? firstBlock.filter((t) => t.branch === primaryBranch)[1] || null : null;
+
+  const orderedBlocks = [];
+  const peakServiceBlocks = new Set();
+  const seenBlocks = new Set();
+  if (firstBlockLap2) {
+    const lap2Idx = primaryTrips.indexOf(firstBlockLap2);
+    for (let k = lap2Idx; k < primaryTrips.length; k++) {
+      const blk = primaryTrips[k].block;
+      if (!blk || seenBlocks.has(blk)) break;
+      seenBlocks.add(blk);
+      peakServiceBlocks.add(blk);
+      orderedBlocks.push(blk);
+    }
+  }
+  for (const blk of rawBlocks) {
+    if (!seenBlocks.has(blk)) {
+      seenBlocks.add(blk);
+      orderedBlocks.push(blk);
+    }
+  }
+
+  const blockInfos = [];
+  const blockInfoById = new Map();
+
+  orderedBlocks.forEach((blk, idx) => {
+    const serviceNumber = idx + 1;
+    const blockId = `blk:${numCode}:${resolved.tipo}:${serviceNumber}`;
+    const startSec = blk[0]?.startSec ?? 0;
+    const endSec = blk[blk.length - 1]?.endSec ?? 0;
+    const isPeakService = peakServiceBlocks.has(blk);
+    const durationSec = Math.max(0, endSec - startSec);
+    // Urban horarios cortados: short split/refuerzo blocks (< 5.5h, e.g. 05:00-08:30 peak)
+    // vs full ~8h shift or ~16h all-day continuous rotations. Interprovincial 904 NEVER has cortados.
+    const isCortado = !isInterprovincial && durationSec < 5.5 * 3600;
+
+    const branchLapCounts = new Map();
+    const info = {
+      blockId,
+      serviceNumber,
+      isPeakService,
+      isCortado,
+      isInterprovincial,
+      startSec,
+      endSec,
+      legCount: blk.length,
+      trips: blk
+    };
+
+    for (const t of blk) {
+      const bk = getBranchKey(t.branch);
+      const lap = (branchLapCounts.get(bk) || 0) + 1;
+      branchLapCounts.set(bk, lap);
+      t.blockId = blockId;
+      t.serviceNumber = serviceNumber;
+      t.lapNumber = lap;
+      t.isCortadoBlock = isCortado;
+      t.blockInfo = info;
+    }
+
+    blockInfos.push(info);
+    blockInfoById.set(blockId, info);
+  });
+
   const model = {
-    codLinea: Number(codLinea),
+    codLinea: numCode,
     tipoDia: resolved.tipo,
     exactTipo: resolved.exact,
+    isInterprovincial,
     branches,
+    primaryBranch,
     branchTrips,
     tripByKey,
+    blocks: blockInfos,
+    blockInfoById,
     getTripsForBranch: (b) => branchTrips.get(getBranchKey(b)) || []
   };
   byTipo.set(cacheKey, model);
   return model;
+}
+
+/**
+ * Maps every scheduled pass slot at `stopId` to its reconstructed continuous vehicle rotation block
+ * (Servicio/Bloque, vuelta number, variable lap durations, and whether the rotation is cortado or continuo).
+ */
+export function buildStopTimetableBlocks(model, stopId, stopCoords) {
+  const slotMetaByHora = new Map(); // 'HH:MM' -> { trip, blockInfo, lapAtStop, totalLapsAtStop, stopSlots }
+  const blockSlotsById = new Map(); // blockId -> Array<{ hora, sec, trip, lapAtStop }>
+  if (!model || !stopCoords) return { slotMetaByHora, blockSlotsById };
+
+  const stopBranches = pickStopBranches(model.branches, stopId, stopCoords);
+  if (!stopBranches.length) return { slotMetaByHora, blockSlotsById };
+
+  for (const sb of stopBranches) {
+    const sp = projectOnPolyline(sb.pts, sb.cum, stopCoords.lat, stopCoords.lng);
+    for (const tr of model.getTripsForBranch(sb)) {
+      const stSec = getTripStopSec(tr, stopId, sp?.along ?? 0);
+      if (stSec === null) continue;
+      const hora = formatSecHHMM(stSec);
+      const bId = tr.blockId || tr.tripKey;
+      if (!blockSlotsById.has(bId)) blockSlotsById.set(bId, []);
+      blockSlotsById.get(bId).push({ hora, sec: stSec, trip: tr });
+    }
+  }
+
+  for (const [bId, slots] of blockSlotsById.entries()) {
+    slots.sort((a, b) => a.sec - b.sec);
+    const info = model.blockInfoById?.get(bId) || null;
+    slots.forEach((s, idx) => {
+      s.lapAtStop = idx + 1;
+      s.deltaPrevMin = idx > 0 ? Math.round((s.sec - slots[idx - 1].sec) / 60) : null;
+      if (!slotMetaByHora.has(s.hora)) {
+        slotMetaByHora.set(s.hora, {
+          hora: s.hora,
+          sec: s.sec,
+          trip: s.trip,
+          blockId: bId,
+          blockInfo: info,
+          lapAtStop: idx + 1,
+          totalLapsAtStop: slots.length,
+          stopSlots: slots
+        });
+      }
+    });
+  }
+
+  return { slotMetaByHora, blockSlotsById };
 }
 
 /**
@@ -1067,7 +1404,20 @@ export function evaluateTripState(
  * up to 3 vehicle-block legs (`direct`, `previous_leg`, and `full_cycle`)!
  * Works accurately even when a bus is +20 min early or -40 min late!
  */
-function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera) {
+function findNextSameBranchPassTime(trip, stopId, stopAlong) {
+  const block = trip?.block;
+  if (!Array.isArray(block) || typeof trip.blockIndex !== 'number') return null;
+  for (let i = trip.blockIndex + 1; i < Math.min(block.length, trip.blockIndex + 5); i++) {
+    const next = block[i];
+    if (next && next.branch === trip.branch) {
+      const sec = getTripStopSec(next, stopId, stopAlong);
+      return sec !== null ? formatSecHHMM(sec) : null;
+    }
+  }
+  return null;
+}
+
+function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera, getProjForBranch) {
   const desvioSec = bus.desvio?.seconds || 0;
   const hasDesvio = bus.desvio && bus.desvio.status !== 'none';
   const isSticky = Boolean(stickyTripKey && item.trip.tripKey === stickyTripKey);
@@ -1084,7 +1434,7 @@ function scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBande
 
     const testTripSpatial = (tr) => {
       if (!tr) return Infinity;
-      const proj = projectOnPolyline(tr.branch.pts, tr.branch.cum, bus.lat, bus.lng);
+      const proj = getProjForBranch(tr.branch);
       if (!proj || proj.perp > 160) return Infinity;
       const schedAtBus = getTripSecAtAlong(tr, proj.along);
       if (schedAtBus === null) return Infinity;
@@ -1196,12 +1546,21 @@ export function matchLiveBusesToTrips(
     const stickyTripKey = stickyRec?.tripKey || null;
     const busNormBandera = normalizeBandera(bus.descripcionBandera || '');
 
+    // Memoize branch projections for this bus across all ~40-80 candidate trips (huge perf win!)
+    const projCache = new Map();
+    const getProjForBranch = (branch) => {
+      if (!projCache.has(branch)) {
+        projCache.set(branch, projectOnPolyline(branch.pts, branch.cum, bus.lat, bus.lng));
+      }
+      return projCache.get(branch);
+    };
+
     let bestItem = null;
     let bestScore = Infinity;
 
     for (const item of pool) {
       if (usedTrips.has(item.trip)) continue;
-      const score = scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera);
+      const score = scoreBusAgainstCandidate(bus, item, nowSec, stickyTripKey, busNormBandera, getProjForBranch);
       if (score !== null && score < bestScore) {
         bestScore = score;
         bestItem = item;
@@ -1215,6 +1574,10 @@ export function matchLiveBusesToTrips(
       bus.tripKey = bestItem.trip.tripKey;
       bus.scheduledTrip = bestItem.trip;
       bus.stopProj = bestItem.stopProj;
+      bus.serviceNumber = bestItem.trip.serviceNumber || null;
+      bus.lapNumber = bestItem.trip.lapNumber || null;
+      bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
+      bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
       matches.set(bus.key, {
         trip: bestItem.trip,
         tripKey: bestItem.trip.tripKey,
@@ -1512,16 +1875,18 @@ export function predictLineBusesForStop({
 
   const nowMs = Date.now();
   const effNow = toServiceSec(nowSec);
+  const todayServiceKey = getArgentinaDayKey();
 
-  // Index system FleetMemory trips for this line
+  // Index system FleetMemory trips for this line — strictly current service day only
+  // (daily bus/driver assignments vary every day and must never leak across service days!)
   const memByTrip = new Map();
   const knownCoches = new Set(liveMatchedCoches);
   if (fleetMemory && Array.isArray(fleetMemory.trips)) {
     for (const rec of fleetMemory.trips) {
-      if (Number(rec.codigoLinea) === Number(codLinea) && rec.tripKey) {
-        memByTrip.set(rec.tripKey, rec);
-        if (rec.coche) knownCoches.add(String(rec.coche).trim());
-      }
+      if (Number(rec.codigoLinea) !== Number(codLinea) || !rec.tripKey) continue;
+      if (rec.dayKey && rec.dayKey !== todayServiceKey) continue;
+      memByTrip.set(rec.tripKey, rec);
+      if (rec.coche) knownCoches.add(String(rec.coche).trim());
     }
   }
 
@@ -1615,8 +1980,9 @@ export function predictLineBusesForStop({
     ingestObservedUnit(cb, { allowOverwriteOlder: true });
   }
 
-  // 2) Enrich with recent `fleetMemory.units` (last 35 min across the city) for any remaining units
+  // 2) Enrich with recent `fleetMemory.units` (last 35 min, current service day only)
   for (const u of fleetMemory?.units || []) {
+    if (u.dayKey && u.dayKey !== todayServiceKey) continue;
     ingestObservedUnit(u, { allowOverwriteOlder: false });
   }
 
@@ -1649,10 +2015,10 @@ export function predictLineBusesForStop({
       const block = trip.block || [trip];
       const targetIdx = typeof trip.blockIndex === 'number' ? trip.blockIndex : 0;
 
-      // ── Step A: Check if an EARLIER trip in the EXACT SAME vehicle block is currently LIVE! ──
-      // (e.g. Coche 2595 doing 21:25 right now IS the exact bus scheduled for 23:09 on its next lap!)
+      // ── Step A: Check if an EARLIER trip in the EXACT SAME continuous vehicle block is currently LIVE! ──
+      // (Because FIFO DP cuts blocks cleanly at horarios cortados, a car that pulls into garage NEVER links here!)
       let liveBlockSrc = null;
-      for (let i = targetIdx - 1; i >= Math.max(0, targetIdx - 6); i--) {
+      for (let i = targetIdx - 1; i >= Math.max(0, targetIdx - 4); i--) {
         const earlier = block[i];
         if (!earlier) continue;
         const lb = liveBusByTripKey.get(earlier.tripKey);
@@ -1785,14 +2151,14 @@ export function predictLineBusesForStop({
         }
       }
 
-      // ── Step B: Otherwise, walk this trip's vehicle block backwards in FleetMemory (up to 6 legs) ──
+      // ── Step B: Otherwise, walk this trip's continuous vehicle block backwards in FleetMemory (up to 4 legs / 125 min) ──
       let mem = null;
       let memIdx = targetIdx;
-      for (let i = targetIdx; i >= Math.max(0, targetIdx - 6); i--) {
+      for (let i = targetIdx; i >= Math.max(0, targetIdx - 4); i--) {
         const rec = memByTrip.get(block[i]?.tripKey);
         if (!rec) continue;
         const ageMin = rec.updatedAt ? (nowMs - rec.updatedAt) / 60000 : 999;
-        if (ageMin > 150) continue;
+        if (ageMin > 125) continue;
         // Guard: if this coche is currently live on a DIFFERENT vehicle block, ignore stale memory
         const recCoche = String(rec.coche || '').trim();
         if (recCoche && liveBlockByCoche.has(recCoche) && liveBlockByCoche.get(recCoche) !== trip.blockId) {
@@ -2033,6 +2399,10 @@ export function predictLineBusesForStop({
       turnoProgramado: turnoHora,
       tripKey: trip.tripKey,
       scheduledTrip: trip,
+      serviceNumber: trip.serviceNumber || null,
+      lapNumber: trip.lapNumber || null,
+      isCortadoBlock: Boolean(trip.isCortadoBlock),
+      nextLapStopTime: findNextSameBranchPassTime(trip, stopId, stopProj?.along ?? 0),
       stopProj,
       predAnchor: anchor,
       predDesvioSec: desvioSec,

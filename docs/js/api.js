@@ -54,7 +54,7 @@ async function apiGet(path, fallbackFn = null, timeoutMs = 8000) {
   try {
     const res = await fetchWithTimeout(
       `${API_BASE}${path}`,
-      { headers: { Accept: 'application/json' } },
+      { headers: { Accept: 'application/json' }, cache: 'no-store' },
       timeoutMs
     );
     const ct = res.headers.get('content-type') || '';
@@ -299,7 +299,9 @@ export function getArgentinaNow() {
 }
 
 export function getArgentinaTodayTipo() {
-  const dow = getArgentinaNow().getUTCDay();
+  // Service day cuts over at 03:00 AM ART so 00:00-02:59 stays in the prior service day
+  const serviceArt = new Date(Date.now() - 6 * 3600 * 1000);
+  const dow = serviceArt.getUTCDay();
   return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
 }
 
@@ -562,7 +564,12 @@ export const api = {
     } catch {
       // Ignore network errors while offline; next online poll will report
     }
-  }
+  },
+
+  // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite, never locally cached) ──
+  flotaResumen: () => apiGet('/api/flota-resumen', null, 7000),
+
+  flotaLinea: (codLinea) => apiGet(`/api/flota?codLinea=${encodeURIComponent(codLinea)}`, null, 7000)
 };
 
 /**
@@ -576,6 +583,15 @@ export async function warmOfflineArchive() {
   if (typeof navigator !== 'undefined' && navigator.connection?.saveData) return;
   warmStarted = true;
 
+  const waitIdle = () =>
+    new Promise((resolve) => {
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(() => resolve(), { timeout: 600 });
+      } else {
+        setTimeout(resolve, 180);
+      }
+    });
+
   try {
     const cat = await loadCatalogo();
     if (!cat?.lineas?.length) return;
@@ -587,23 +603,19 @@ export async function warmOfflineArchive() {
     }
 
     const hasCacheApi = typeof caches !== 'undefined';
-    let idx = 0;
-    const worker = async () => {
-      while (idx < urls.length) {
-        if (isBrowserOffline()) return;
-        const u = urls[idx++];
-        try {
-          if (hasCacheApi) {
-            const hit = await caches.match(u);
-            if (hit) continue;
-          }
-          await fetch(u, { priority: 'low' }).catch(() => {});
-        } catch {
-          // ignore
+    for (const u of urls) {
+      if (isBrowserOffline()) return;
+      try {
+        if (hasCacheApi) {
+          const hit = await caches.match(u);
+          if (hit) continue;
         }
+        await waitIdle();
+        await fetch(u, { priority: 'low' }).catch(() => {});
+      } catch {
+        // ignore
       }
-    };
-    await Promise.all([worker(), worker()]);
+    }
   } catch {
     // Non-fatal
   }
@@ -679,7 +691,7 @@ export function matchBusesWithHorarios(buses = [], horarios = []) {
       continue;
     }
     const desvioMin = bus.desvio?.minutes || 0;
-    const expectedSchedMin = (nowMin + bus.eta.minutes + desvioMin) % 1440;
+    const expectedSchedMin = (((nowMin + bus.eta.minutes + desvioMin) % 1440) + 1440) % 1440;
 
     let bestSlot = null;
     let bestDiff = bus.esExtendido ? 14 : 10;

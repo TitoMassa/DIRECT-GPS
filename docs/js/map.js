@@ -6,17 +6,30 @@ export class TransitMap {
     this.onBusSelect = onBusSelect || (() => {});
     this.onStopPick = onStopPick || (() => {});
 
+    this.canvasRenderer = L.canvas({ padding: 0.35 });
+
     this.map = L.map(containerId, {
       center: [CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng],
       zoom: CORRIENTES_CENTER.zoom,
       zoomControl: false,
       attributionControl: true,
+      keyboard: false,
       preferCanvas: true,
+      renderer: this.canvasRenderer,
       zoomSnap: 0.5,
       zoomDelta: 0.5,
       inertia: true,
-      inertiaDeceleration: 2800,
+      inertiaDeceleration: 3000,
+      fadeAnimation: false,
       bounceAtZoomLimits: false
+    });
+
+    this.isInteracting = false;
+    this.map.on('movestart zoomstart', () => {
+      this.isInteracting = true;
+    });
+    this.map.on('moveend zoomend', () => {
+      this.isInteracting = false;
     });
 
     this.tileKey = 'dark';
@@ -32,13 +45,18 @@ export class TransitMap {
     this.busLayer = L.layerGroup().addTo(this.map);
     this.userLayer = L.layerGroup().addTo(this.map);
 
-    this.busMarkers = new Map(); // busKey -> { marker, lat, lng, data }
+    this.busMarkers = new Map(); // busKey -> { marker, lat, lng, data, iconSig }
     this.stopMarker = null;
+    this.activeStopSig = '';
     this.activeStopCoords = null;
     this.selectedBusKey = null;
 
     // Keep tiles & projection aligned on rotation, Android split-screen, or soft keyboard
     const container = this.map.getContainer();
+    if (container) {
+      container.setAttribute('tabindex', '-1');
+      container.querySelectorAll('.leaflet-control-attribution a').forEach((a) => a.setAttribute('tabindex', '-1'));
+    }
     if (typeof ResizeObserver !== 'undefined' && container) {
       let resizeRaf = 0;
       this._resizeObserver = new ResizeObserver(() => {
@@ -56,12 +74,12 @@ export class TransitMap {
   _getPadding() {
     const header = document.querySelector('.top-bar');
     const dock = document.getElementById('transit-dock');
-    const topPad = header ? Math.max(64, Math.round(header.getBoundingClientRect().bottom + 14)) : 72;
+    const topPad = header ? Math.max(60, Math.round(header.getBoundingClientRect().bottom + 14)) : 68;
     const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
     const isBottomSheet = window.innerWidth <= 860 && !isLandscapeRail;
 
     if (isBottomSheet) {
-      const dockH = dock ? Math.round(dock.getBoundingClientRect().height) : Math.round(window.innerHeight * 0.48);
+      const dockH = dock ? Math.round(dock.getBoundingClientRect().height) : Math.round(window.innerHeight * 0.45);
       const bottomPad = Math.min(dockH + 18, Math.round(window.innerHeight * 0.65));
       return {
         paddingTopLeft: [18, topPad],
@@ -69,7 +87,7 @@ export class TransitMap {
       };
     }
 
-    const leftPad = dock ? Math.round(dock.getBoundingClientRect().right + 18) : 420;
+    const leftPad = dock ? Math.round(dock.getBoundingClientRect().right + 18) : 400;
     return {
       paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.55)), topPad],
       paddingBottomRight: [66, 44]
@@ -86,8 +104,12 @@ export class TransitMap {
         this.map.removeLayer(this.tileLayer);
       }
       this.tileLayer = L.tileLayer(cfg.url, {
+        subdomains: cfg.subdomains || 'abc',
         attribution: cfg.attribution,
-        maxZoom: cfg.maxZoom
+        maxZoom: cfg.maxZoom,
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+        keepBuffer: 2
       }).addTo(this.map);
     }
 
@@ -99,7 +121,7 @@ export class TransitMap {
   }
 
   cycleTileStyle() {
-    const order = ['dark', 'light', 'hot'];
+    const order = ['dark', 'light', 'osm'];
     const next = order[(order.indexOf(this.tileKey) + 1) % order.length];
     return this.setTileStyle(next);
   }
@@ -127,36 +149,46 @@ export class TransitMap {
     this.vectorLayer.clearLayers();
     this.busMarkers.clear();
     this.stopMarker = null;
+    this.activeStopSig = '';
     this.activeStopCoords = null;
     this.selectedBusKey = null;
   }
 
   setActiveStop(stop) {
-    this.stopLayer.clearLayers();
     if (!stop || typeof stop.lat !== 'number' || typeof stop.lng !== 'number') {
+      this.stopLayer.clearLayers();
+      this.stopMarker = null;
+      this.activeStopSig = '';
       this.activeStopCoords = null;
       return;
     }
+
+    const nextSig = `${stop.id}|${stop.lat.toFixed(6)}|${stop.lng.toFixed(6)}|${stop.nombre || ''}`;
+    if (this.activeStopSig === nextSig && this.stopMarker) {
+      return; // Avoid tearing down the stop pin on every 10s poll
+    }
+
+    this.stopLayer.clearLayers();
+    this.activeStopSig = nextSig;
     this.activeStopCoords = { lat: stop.lat, lng: stop.lng };
 
     const icon = L.divIcon({
       className: 'stop-beacon-leaflet',
       html: `
         <div class="stop-beacon-wrap">
-          <span class="stop-beacon-ring"></span>
-          <span class="stop-beacon-ring delay"></span>
+          <span class="stop-beacon-halo"></span>
           <span class="stop-beacon-core"></span>
         </div>
       `,
-      iconSize: [44, 44],
-      iconAnchor: [22, 22]
+      iconSize: [34, 34],
+      iconAnchor: [17, 17]
     });
 
-    this.stopMarker = L.marker([stop.lat, stop.lng], { icon, zIndexOffset: 700 })
+    this.stopMarker = L.marker([stop.lat, stop.lng], { icon, zIndexOffset: 700, keyboard: false })
       .addTo(this.stopLayer)
-      .bindTooltip(`<strong>${stop.id}</strong> · ${stop.nombre}`, {
+      .bindTooltip(`<strong>${stop.id}</strong> · ${stop.nombre || ''}`, {
         direction: 'top',
-        offset: [0, -16]
+        offset: [0, -14]
       });
   }
 
@@ -175,7 +207,7 @@ export class TransitMap {
     );
   }
 
-  _animateMarker(marker, fromLatLng, toLatLng, duration = 1100) {
+  _animateMarker(marker, fromLatLng, toLatLng, duration = 700) {
     const token = (marker._animToken || 0) + 1;
     marker._animToken = token;
     const start = performance.now();
@@ -198,7 +230,7 @@ export class TransitMap {
     const cls = ['bus-marker-wrap'];
     if (selected) cls.push('is-selected');
     if (dimmed) cls.push('is-dimmed');
-    if (bus.isPredicted || bus.gpsLost) cls.push('is-predicted');
+    if ((bus.isPredicted && !bus.nextLapSourceLive) || bus.gpsLost) cls.push('is-predicted');
 
     const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
     const cocheHtml = bus.identificadorCoche
@@ -217,27 +249,37 @@ export class TransitMap {
         <div class="${cls.join(' ')}" style="--bus-color:${color}">
           <div class="bus-pill-marker">
             ${dotHtml}
-            <span>${bus.descripcionLinea}</span>
+            <span class="bus-pill-line">${bus.descripcionLinea}</span>
             ${cocheHtml}
             <span class="bus-pill-eta">${etaShort}</span>
           </div>
           <div class="bus-heading-dot"></div>
         </div>
       `,
-      iconSize: [122, 36],
-      iconAnchor: [61, 34]
+      iconSize: [116, 32],
+      iconAnchor: [58, 30]
     });
   }
 
-  // Zero-lag 30fps position-only update for smooth simulation (no setIcon / no DOM rebuild!)
+  // Zero-waste position update: skips stationary buses and yields during active map pan/zoom!
   moveBusPositionsFast(buses) {
-    for (const bus of buses) {
+    if (this.isInteracting) return;
+    for (let i = 0; i < buses.length; i++) {
+      const bus = buses[i];
+      if (!bus._posChanged) continue;
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       const entry = this.busMarkers.get(bus.key);
       if (!entry) continue;
+      if (Math.abs(bus.lat - entry.lat) < 2e-6 && Math.abs(bus.lng - entry.lng) < 2e-6) {
+        bus._posChanged = false;
+        continue;
+      }
       entry.marker._animToken = (entry.marker._animToken || 0) + 1;
       entry.marker.setLatLng([bus.lat, bus.lng]);
+      entry.lat = bus.lat;
+      entry.lng = bus.lng;
       entry.data = bus;
+      bus._posChanged = false;
     }
   }
 
@@ -245,7 +287,6 @@ export class TransitMap {
     this.selectedBusKey = selectedBusKey;
     const incomingKeys = new Set();
 
-    // STRICT LINE FILTER: When a single line is selected, completely omit all other lines from Leaflet!
     const visibleBuses =
       filterLine === 'ALL' ? buses : buses.filter((b) => b.descripcionLinea === filterLine);
 
@@ -259,17 +300,23 @@ export class TransitMap {
 
       const isSelected = bus.key === selectedBusKey;
       const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
-      const iconSig = `${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${etaShort}|${bus.desvio?.status || ''}|${bus.isPredicted ? 1 : 0}|${bus.gpsLost ? 1 : 0}|${isSelected ? 1 : 0}`;
+      const isPredStyle = (bus.isPredicted && !bus.nextLapSourceLive) || bus.gpsLost ? 1 : 0;
+      const iconSig = `${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${etaShort}|${bus.desvio?.status || ''}|${isPredStyle}|${isSelected ? 1 : 0}`;
 
       const existing = this.busMarkers.get(bus.key);
       if (existing) {
         if (simulateMode) {
-          // Cancel any live-mode tween; BusSimulator already reconciled position continuously with 0 backjumps!
           existing.marker._animToken = (existing.marker._animToken || 0) + 1;
-          existing.marker.setLatLng([bus.lat, bus.lng]);
+          if (Math.abs(bus.lat - existing.lat) >= 1e-6 || Math.abs(bus.lng - existing.lng) >= 1e-6) {
+            existing.marker.setLatLng([bus.lat, bus.lng]);
+            existing.lat = bus.lat;
+            existing.lng = bus.lng;
+          }
         } else {
           const curPos = existing.marker.getLatLng();
-          this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 750);
+          this._animateMarker(existing.marker, curPos, [bus.lat, bus.lng], 650);
+          existing.lat = bus.lat;
+          existing.lng = bus.lng;
         }
         if (existing.iconSig !== iconSig) {
           existing.marker.setIcon(this._buildBusIcon(bus, { selected: isSelected, dimmed: false }));
@@ -281,18 +328,18 @@ export class TransitMap {
         const icon = this._buildBusIcon(bus, { selected: isSelected, dimmed: false });
         const marker = L.marker([bus.lat, bus.lng], {
           icon,
-          zIndexOffset: isSelected ? 1000 : 500
+          zIndexOffset: isSelected ? 1000 : 500,
+          keyboard: false
         }).addTo(this.busLayer);
 
         marker.on('click', () => {
           this.onBusSelect(bus.key);
         });
 
-        this.busMarkers.set(bus.key, { marker, data: bus, iconSig });
+        this.busMarkers.set(bus.key, { marker, lat: bus.lat, lng: bus.lng, data: bus, iconSig });
       }
     }
 
-    // Remove hidden or departed buses completely from the Leaflet layer
     for (const [key, entry] of this.busMarkers.entries()) {
       if (!incomingKeys.has(key)) {
         this.busLayer.removeLayer(entry.marker);
@@ -311,9 +358,10 @@ export class TransitMap {
     }
 
     const fallbackColor = bus.realBanderaColor || getLineColor(bus.descripcionLinea);
-    const segments = Array.isArray(bus.trajectory?.segments) && bus.trajectory.segments.length > 0
-      ? bus.trajectory.segments
-      : null;
+    const segments =
+      Array.isArray(bus.trajectory?.segments) && bus.trajectory.segments.length > 0
+        ? bus.trajectory.segments
+        : null;
 
     let allPts;
     if (segments) {
@@ -323,16 +371,20 @@ export class TransitMap {
         allPts.push(...seg.pts);
         const segColor = seg.color || fallbackColor;
         L.polyline(seg.pts, {
-          color: '#0b1017',
-          weight: idx === 0 ? 6.5 : 5,
-          opacity: 0.45
+          renderer: this.canvasRenderer,
+          color: '#0b0d10',
+          weight: idx === 0 ? 6 : 4.5,
+          opacity: 0.42,
+          interactive: false
         }).addTo(this.vectorLayer);
 
         L.polyline(seg.pts, {
+          renderer: this.canvasRenderer,
           color: segColor,
-          weight: idx === 0 ? 4 : 3,
-          opacity: idx === 0 ? 0.94 : 0.72,
-          dashArray: idx === 0 ? null : '7, 6'
+          weight: idx === 0 ? 3.5 : 2.8,
+          opacity: idx === 0 ? 0.92 : 0.7,
+          dashArray: idx === 0 ? null : '6, 6',
+          interactive: false
         }).addTo(this.vectorLayer);
       });
     } else {
@@ -345,9 +397,11 @@ export class TransitMap {
           ];
 
       L.polyline(allPts, {
+        renderer: this.canvasRenderer,
         color: fallbackColor,
         weight: 3.5,
-        opacity: 0.88
+        opacity: 0.88,
+        interactive: false
       }).addTo(this.vectorLayer);
     }
 
@@ -356,11 +410,12 @@ export class TransitMap {
       const midPt = allPts[Math.floor(allPts.length / 2)];
       L.marker(midPt, {
         interactive: false,
+        keyboard: false,
         icon: L.divIcon({
           className: 'dist-mid-icon',
           html: `<div class="distance-label-pill">${formatDistance(displayDist)}</div>`,
-          iconSize: [78, 24],
-          iconAnchor: [39, 12]
+          iconSize: [74, 22],
+          iconAnchor: [37, 11]
         })
       }).addTo(this.vectorLayer);
     }
@@ -383,8 +438,7 @@ export class TransitMap {
     if (this.activeStopCoords) {
       pts.push([this.activeStopCoords.lat, this.activeStopCoords.lng]);
     }
-    const bounds = L.latLngBounds(pts);
-    this.map.fitBounds(bounds, {
+    this.map.fitBounds(L.latLngBounds(pts), {
       ...this._getPadding(),
       maxZoom: 16,
       animate: true
@@ -429,36 +483,38 @@ export class TransitMap {
 
       if (pts.length > 1) {
         allPts.push(...pts);
-        // Subtle dark casing + distinct solid color per direction (IDA vs VTA)
         L.polyline(pts, {
-          color: '#0b1017',
-          weight: 6.5,
-          opacity: 0.45
+          renderer: this.canvasRenderer,
+          color: '#0b0d10',
+          weight: 6,
+          opacity: 0.4,
+          interactive: false
         }).addTo(this.routeLayer);
 
         L.polyline(pts, {
+          renderer: this.canvasRenderer,
           color: branchColor,
-          weight: 3.8,
-          opacity: 0.9
+          weight: 3.5,
+          opacity: 0.88
         })
           .bindTooltip(`${lineName} · ${rec.abreviaturaBanderaSMP || 'Recorrido'}`, { sticky: true })
           .addTo(this.routeLayer);
       }
 
+      // Render route stops on Canvas via circleMarker (zero DOM bloat -> silky 60fps panning!)
       if (showStops && Array.isArray(rec.paradas)) {
         for (const p of rec.paradas) {
           const la = parseFloat(p.latitudParada);
           const ln = parseFloat(p.longitudParada);
           if (Number.isNaN(la) || Number.isNaN(ln)) continue;
 
-          const dot = L.marker([la, ln], {
-            icon: L.divIcon({
-              className: 'route-stop-leaflet',
-              html: `<div class="route-stop-dot" style="--line-color:${branchColor}"></div>`,
-              iconSize: [12, 12],
-              iconAnchor: [6, 6]
-            }),
-            zIndexOffset: 250
+          const dot = L.circleMarker([la, ln], {
+            renderer: this.canvasRenderer,
+            radius: 4.5,
+            color: branchColor,
+            weight: 2,
+            fillColor: '#ffffff',
+            fillOpacity: 1
           }).addTo(this.routeStopsLayer);
 
           dot.bindTooltip(`<strong>${p.identificador}</strong> · ${p.descripcion}`, {
@@ -497,14 +553,13 @@ export class TransitMap {
       if (Number.isNaN(la) || Number.isNaN(ln)) continue;
       pts.push([la, ln]);
 
-      const marker = L.marker([la, ln], {
-        icon: L.divIcon({
-          className: 'nearby-leaflet',
-          html: `<div class="nearby-pin"></div>`,
-          iconSize: [16, 16],
-          iconAnchor: [8, 8]
-        }),
-        zIndexOffset: 380
+      const marker = L.circleMarker([la, ln], {
+        renderer: this.canvasRenderer,
+        radius: 6.5,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#f59e0b',
+        fillOpacity: 0.96
       }).addTo(this.nearbyLayer);
 
       marker.bindTooltip(`<strong>${s.identificador}</strong> · ${s.descripcion}<br/><small>${s.lineas || ''}</small>`, {
@@ -537,15 +592,18 @@ export class TransitMap {
   setUserLocation(lat, lng, accuracy = 80) {
     this.userLayer.clearLayers();
     L.circle([lat, lng], {
+      renderer: this.canvasRenderer,
       radius: Math.min(accuracy, 250),
       color: '#38bdf8',
       fillColor: '#38bdf8',
-      fillOpacity: 0.14,
-      weight: 1.5
+      fillOpacity: 0.12,
+      weight: 1.5,
+      interactive: false
     }).addTo(this.userLayer);
 
     L.circleMarker([lat, lng], {
-      radius: 7,
+      renderer: this.canvasRenderer,
+      radius: 6.5,
       color: '#ffffff',
       weight: 2.5,
       fillColor: '#0284c7',

@@ -24,6 +24,7 @@ import {
 } from './trajectory.js';
 import {
   buildLineScheduleModel,
+  buildStopTimetableBlocks,
   matchLiveBusesToTrips,
   buildGpsAnchorForTrip,
   parseGpsStampSecOfDay,
@@ -54,6 +55,10 @@ let simLastFrameMs = 0;
 let simLastDomMs = 0;
 let fetchSeq = 0;
 
+// Keyed DOM caches for zero-teardown updates on 10s polls and 1Hz sim ticks
+const arrivalRowCache = new Map(); // busKey -> HTMLElement (with ._refs)
+let filterStripSig = '';
+
 const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
 
@@ -70,6 +75,9 @@ const state = {
   horariosOpen: false,
   horariosLineCode: null,
   horariosTipoDia: getArgentinaTodayTipo(),
+  horariosSelectedBlockId: null,
+  horariosSelectedHora: null,
+  horariosViewCtx: null, // Cached rendered timetable metadata for live in-place updates
   stopLinesList: [], // [{ codigo, descripcion }] for active stop
   dataSource: 'smartmovepro-soap',
   lastSyncAt: null,
@@ -94,6 +102,16 @@ const state = {
   lineas: [],
   quickStops: [],
   hubs: [],
+  flotaSummaryByLine: new Map(), // codLinea -> { cochesHoy, cochesSemana, choferesHoy, choferesSemana, lastSeenAt }
+  flotaSummaryMeta: null,
+  flotaSummaryLastFetchMs: 0,
+  flotaView: {
+    tab: 'coches', // 'coches' | 'choferes'
+    scope: 'semana', // 'semana' | 'hoy'
+    data: null,
+    loading: false,
+    error: null
+  },
   drill: {
     step: 'lineas',
     linea: null,
@@ -137,6 +155,7 @@ const el = {
   stopTitle: document.getElementById('stop-title'),
   stopCoordsLabel: document.getElementById('stop-coords-label'),
   lastSyncLabel: document.getElementById('last-sync-label'),
+  btnRefreshStop: document.getElementById('btn-refresh-stop'),
   btnToggleFav: document.getElementById('btn-toggle-fav'),
   btnShareStop: document.getElementById('btn-share-stop'),
   btnShowRoutes: document.getElementById('btn-show-routes'),
@@ -163,14 +182,18 @@ const el = {
   inspCochePill: document.getElementById('insp-coche-pill'),
   inspDesvioPill: document.getElementById('insp-desvio-pill'),
   inspTurnoPill: document.getElementById('insp-turno-pill'),
+  inspServicePill: document.getElementById('insp-service-pill'),
   inspAccessBadge: document.getElementById('insp-access-badge'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
   inspEta: document.getElementById('insp-eta'),
   inspDist: document.getElementById('insp-dist'),
   inspBlocks: document.getElementById('insp-blocks'),
+  inspNextLapCell: document.getElementById('insp-nextlap-cell'),
+  inspNextLap: document.getElementById('insp-nextlap'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
+  btnInspCenter: document.getElementById('btn-insp-center'),
   btnInspRoute: document.getElementById('btn-insp-route'),
 
   btnMapLocate: document.getElementById('btn-map-locate'),
@@ -187,8 +210,12 @@ const el = {
   btnAliasClose: document.getElementById('btn-alias-close'),
   btnAliasCancel: document.getElementById('btn-alias-cancel'),
 
+  srAnnouncer: document.getElementById('sr-announcer'),
+  srAlert: document.getElementById('sr-alert'),
   toastContainer: document.getElementById('toast-container')
 };
+
+let lastModalTriggerEl = null;
 
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => openBusInspector(busKey),
@@ -196,7 +223,7 @@ const transitMap = new TransitMap('map', {
 });
 
 // ============================================================================
-// Utilities & Toast
+// Utilities, Screen-Reader Announcer & Toast
 // ============================================================================
 function escapeHtml(str = '') {
   return String(str)
@@ -206,11 +233,23 @@ function escapeHtml(str = '') {
     .replace(/"/g, '&quot;');
 }
 
-function showToast(message, type = 'info', duration = 3200) {
+function announce(message, { assertive = false } = {}) {
+  const region = assertive ? el.srAlert : el.srAnnouncer;
+  if (!region || !message) return;
+  region.textContent = '';
+  requestAnimationFrame(() => {
+    region.textContent = String(message);
+  });
+}
+
+function showToast(message, type = 'info', duration = 3200, { silent = false } = {}) {
   const div = document.createElement('div');
   div.className = `toast toast-${type}`;
   div.textContent = message;
   el.toastContainer.appendChild(div);
+  if (!silent) {
+    announce(message, { assertive: type === 'warn' });
+  }
   setTimeout(() => {
     div.style.opacity = '0';
     div.style.transition = 'opacity 0.2s ease';
@@ -227,9 +266,13 @@ function applyTheme(theme) {
   const isLight = theme === 'light';
   el.iconSun.classList.toggle('hidden', isLight);
   el.iconMoon.classList.toggle('hidden', !isLight);
-  el.metaThemeColor.setAttribute('content', isLight ? '#e5ebf2' : '#0f141b');
+  el.btnThemeToggle.setAttribute(
+    'aria-label',
+    isLight ? 'Tema claro activo. Cambiar a tema oscuro' : 'Tema oscuro activo. Cambiar a tema claro'
+  );
+  el.metaThemeColor.setAttribute('content', isLight ? '#f4f5f7' : '#0b0d10');
   setSystemBarsTheme(theme);
-  if (transitMap.tileKey !== 'hot') {
+  if (transitMap.tileKey !== 'osm') {
     transitMap.setTileStyle(isLight ? 'light' : 'dark');
   }
 }
@@ -256,6 +299,9 @@ function saveFavorites() {
   localStorage.setItem(STORAGE_FAVS_KEY, JSON.stringify(state.favorites));
   updateFavStarButton();
   renderFavorites();
+  if (!state.activeStop) {
+    renderRadarWelcome();
+  }
 }
 
 function isFavorite(stopId) {
@@ -263,9 +309,15 @@ function isFavorite(stopId) {
 }
 
 function updateFavStarButton() {
-  const fav = state.activeStop ? isFavorite(state.activeStop.id) : false;
+  const stopId = state.activeStop?.id || '';
+  const fav = stopId ? isFavorite(stopId) : false;
   el.btnToggleFav.classList.toggle('is-fav', fav);
-  el.btnToggleFav.title = fav ? 'Quitar de favoritas' : 'Guardar parada en favoritas';
+  el.btnToggleFav.setAttribute('aria-pressed', String(fav));
+  const label = fav
+    ? `Quitar parada ${stopId} de favoritas`
+    : `Guardar parada ${stopId} en favoritas`;
+  el.btnToggleFav.title = label;
+  el.btnToggleFav.setAttribute('aria-label', label);
 }
 
 function toggleActiveStopFavorite() {
@@ -286,7 +338,7 @@ function renderFavorites() {
   if (state.favorites.length === 0) {
     el.favoritasList.innerHTML = `
       <div class="empty-state">
-        <div class="empty-state-icon">★</div>
+        <div class="empty-state-icon" aria-hidden="true">★</div>
         <h3>Sin paradas favoritas</h3>
         <p>Buscá una parada y tocá la estrella para guardarla acá con acceso directo.</p>
       </div>
@@ -296,7 +348,9 @@ function renderFavorites() {
 
   el.favoritasList.innerHTML = state.favorites
     .map(
-      (f) => `
+      (f) => {
+        const displayLabel = f.alias ? `${f.alias}, ${f.nombre || f.id}` : f.nombre || f.id;
+        return `
       <div class="stop-list-card" data-fav-id="${escapeHtml(f.id)}">
         <div class="stop-card-top">
           <div>
@@ -304,17 +358,18 @@ function renderFavorites() {
             ${f.alias ? `<span class="pilot-tag" style="margin-left:5px">${escapeHtml(f.alias)}</span>` : ''}
           </div>
           <div style="display:flex;gap:4px">
-            <button class="mini-action-btn btn-edit-fav" data-id="${escapeHtml(f.id)}" title="Editar etiqueta">✎</button>
-            <button class="mini-action-btn btn-del-fav" data-id="${escapeHtml(f.id)}" title="Eliminar">✕</button>
+            <button type="button" class="mini-action-btn btn-edit-fav" data-id="${escapeHtml(f.id)}" title="Editar etiqueta" aria-label="Editar etiqueta de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">✎</button>
+            <button type="button" class="mini-action-btn btn-del-fav" data-id="${escapeHtml(f.id)}" title="Eliminar" aria-label="Eliminar parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)} de favoritas">✕</button>
           </div>
         </div>
         <div class="stop-card-name">${escapeHtml(f.nombre)}</div>
         <div class="stop-card-foot">
-          <span class="mono-meta">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
-          <button class="pill-btn btn-open-fav" data-id="${escapeHtml(f.id)}">Abrir radar →</button>
+          <span class="mono-meta" aria-hidden="true">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
+          <button type="button" class="seg-btn seg-btn-xs btn-open-fav" data-id="${escapeHtml(f.id)}" aria-label="Abrir radar de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">Abrir radar →</button>
         </div>
       </div>
-    `
+    `;
+      }
     )
     .join('');
 
@@ -343,6 +398,7 @@ function renderFavorites() {
 
 function openAliasModal(fav) {
   if (!el.aliasModal) return;
+  lastModalTriggerEl = document.activeElement;
   state.editingFavId = fav.id;
   el.aliasModalSub.textContent = `${fav.id} · ${fav.nombre || 'Parada guardada'}`;
   el.aliasModalInput.value = fav.alias || '';
@@ -358,6 +414,10 @@ function closeAliasModal() {
   state.editingFavId = null;
   el.aliasModal.classList.add('hidden');
   el.aliasModalInput.blur();
+  if (lastModalTriggerEl && typeof lastModalTriggerEl.focus === 'function') {
+    lastModalTriggerEl.focus();
+    lastModalTriggerEl = null;
+  }
 }
 
 // ============================================================================
@@ -373,10 +433,16 @@ function switchTab(tabName) {
     const active = t.dataset.tab === tabName;
     t.classList.toggle('active', active);
     t.setAttribute('aria-selected', String(active));
+    t.setAttribute('tabindex', active ? '0' : '-1');
   });
   el.panels.forEach((p) => {
-    p.classList.toggle('active', p.id === `panel-${tabName}`);
+    const active = p.id === `panel-${tabName}`;
+    p.classList.toggle('active', active);
+    p.setAttribute('aria-hidden', String(!active));
   });
+  if (tabName === 'lineas' && !state.isOffline) {
+    loadFlotaResumen(false);
+  }
 }
 
 const SHEET_STATES = ['sheet-peek', 'sheet-half', 'sheet-full'];
@@ -527,12 +593,38 @@ function renderRadarWelcome() {
   el.lineFilterStrip.classList.add('hidden');
   el.horariosPanel.classList.add('hidden');
   el.arribosList.classList.remove('hidden');
+  arrivalRowCache.clear();
+  filterStripSig = '';
+
+  const topFavs = state.favorites.slice(0, 3);
+  const favsHtml =
+    topFavs.length > 0
+      ? `
+      <div class="welcome-favs-block">
+        <span class="micro-heading">Favoritas</span>
+        <div class="welcome-favs-list">
+          ${topFavs
+            .map(
+              (f) => `
+            <button type="button" class="welcome-fav-btn" data-welcome-fav="${escapeHtml(f.id)}">
+              <span class="list-row-main">
+                <span class="list-row-title">${escapeHtml(f.alias || f.nombre || f.id)}</span>
+                ${f.alias && f.nombre ? `<span class="list-row-sub">${escapeHtml(f.nombre)}</span>` : ''}
+              </span>
+              <span class="code-badge">${escapeHtml(f.id)}</span>
+            </button>
+          `
+            )
+            .join('')}
+        </div>
+      </div>
+    `
+      : '';
 
   el.arribosList.innerHTML = `
     <div class="radar-welcome">
-      <span class="welcome-badge">TELEMETRÍA EN VIVO · CORRIENTES</span>
       <h2>Elegí una parada para iniciar</h2>
-      <p>Ingresá el código de parada para consultar arribos en vivo con coche, chofer, legajo, desvío horario (+/-) y horarios programados 24h.</p>
+      <p>Consultá arribos en vivo con coche, chofer, desvío horario, horarios programados 24h y rotaciones de servicio.</p>
 
       <form id="welcome-stop-form" class="welcome-code-form">
         <input
@@ -551,8 +643,10 @@ function renderRadarWelcome() {
         <button id="btn-welcome-cercanas" class="secondary-action-btn">Paradas cercanas</button>
       </div>
 
+      ${favsHtml}
+
       <div class="welcome-tip">
-        Mové el mapa OpenStreetMap sobre cualquier avenida y usá la lupa inferior derecha para detectar paradas en esa zona.
+        Mové el mapa sobre cualquier avenida y usá la lupa inferior derecha para detectar paradas en esa zona.
       </div>
     </div>
   `;
@@ -572,6 +666,12 @@ function renderRadarWelcome() {
 
   document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => switchTab('lineas'));
   document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => switchTab('cercanas'));
+  el.arribosList.querySelectorAll('[data-welcome-fav]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const fav = state.favorites.find((x) => x.id === btn.dataset.welcomeFav);
+      if (fav) openStopRadar(fav, '000');
+    });
+  });
 }
 
 function resetToWelcome() {
@@ -581,10 +681,17 @@ function resetToWelcome() {
   state.filterLine = 'ALL';
   state.routesVisible = false;
   state.horariosOpen = false;
+  state.horariosSelectedBlockId = null;
+  state.horariosSelectedHora = null;
+  state.horariosViewCtx = null;
+  arrivalRowCache.clear();
+  filterStripSig = '';
   stopSimLoop();
   busSimulator.clear();
   el.btnShowRoutes.classList.remove('active');
+  el.btnShowRoutes.setAttribute('aria-pressed', 'false');
   el.btnToggleHorarios.classList.remove('active');
+  el.btnToggleHorarios.setAttribute('aria-pressed', 'false');
   closeBusInspector();
   transitMap.clearActiveStop();
   transitMap.clearRoutes();
@@ -598,6 +705,7 @@ function resetToWelcome() {
   switchTab('radar');
   renderRadarWelcome();
   syncKeepAwake();
+  announce('Inicio de DIRECT GPS. Elegí una parada para iniciar.');
 }
 
 // ============================================================================
@@ -605,13 +713,18 @@ function resetToWelcome() {
 // ============================================================================
 function updateSignalPill() {
   el.btnLiveMode.classList.remove('is-gps', 'is-warn');
+  el.btnLiveMode.setAttribute('aria-pressed', String(state.simulateMode));
   if (state.simulateMode) {
     el.signalLabel.textContent = 'EN VIVO';
-    el.btnLiveMode.title = 'EN VIVO: movimiento continuo y predicción por horarios · Tocá para ver ULT. GPS';
+    const desc = 'Modo EN VIVO activo: seguimiento continuo y predicción por horarios. Tocá para ver último GPS.';
+    el.btnLiveMode.title = desc;
+    el.btnLiveMode.setAttribute('aria-label', desc);
   } else {
     el.btnLiveMode.classList.add('is-gps');
     el.signalLabel.textContent = 'ULT. GPS';
-    el.btnLiveMode.title = 'ULT. GPS: última posición satelital reportada · Tocá para volver a EN VIVO';
+    const desc = 'Modo último GPS activo: posición satelital estática. Tocá para volver a EN VIVO.';
+    el.btnLiveMode.title = desc;
+    el.btnLiveMode.setAttribute('aria-label', desc);
   }
 }
 
@@ -693,6 +806,11 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   state.horariosOpen = false;
   state.horariosLineCode = isAll ? null : Number(rawCode);
   state.horariosTipoDia = getArgentinaTodayTipo();
+  state.horariosSelectedBlockId = null;
+  state.horariosSelectedHora = null;
+  state.horariosViewCtx = null;
+  arrivalRowCache.clear();
+  filterStripSig = '';
   state.stopLinesList = (catStop?.lineas || [])
     .map((cod) => {
       const l = state.catalogo?.lineByCode?.get(Number(cod)) || state.lineas.find((x) => Number(x.codigo) === Number(cod));
@@ -710,7 +828,9 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   busSimulator.clear();
 
   el.btnShowRoutes.classList.remove('active');
+  el.btnShowRoutes.setAttribute('aria-pressed', 'false');
   el.btnToggleHorarios.classList.remove('active');
+  el.btnToggleHorarios.setAttribute('aria-pressed', 'false');
   el.horariosPanel.classList.add('hidden');
   el.arribosList.classList.remove('hidden');
 
@@ -719,13 +839,14 @@ async function openStopRadar(stopInfo, codLinea = '000') {
 
   switchTab('radar');
   updateStopHeaderUI();
+  el.stopTitle?.focus({ preventScroll: true });
 
   if (state.activeStop.lat && state.activeStop.lng) {
     transitMap.setActiveStop(state.activeStop);
     transitMap.focusStop(15);
   }
 
-  await fetchArribos(true);
+  await fetchArribos(true, { announceSummary: true });
 }
 
 async function ensureBranchesLoaded(lineCodes) {
@@ -843,7 +964,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
   const now = Date.now();
 
   // Sort by ascending ETA first so the 1st occurrence (`occ === 1`) of any coche is ALWAYS its earliest arrival,
-  // and any subsequent occurrence (`occ > 1` or `esSiguienteVuelta`) is cleanly linked as `Sig. vuelta`!
+  // and any subsequent occurrence (`occ > 1`) is cleanly linked as `Sig. vuelta`!
   const sortedRaw = [...(rawList || [])].sort(
     (a, b) => (parseEtaMinutes(a.tiempoRestanteArribo).minutes ?? 999) - (parseEtaMinutes(b.tiempoRestanteArribo).minutes ?? 999)
   );
@@ -855,7 +976,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const occ = (seenCounts.get(baseId) || 0) + 1;
     seenCounts.set(baseId, occ);
     const key = occ > 1 ? `${baseId}-${occ}` : baseId;
-    const isLiveNextLap = Boolean(coche && (occ > 1 || a.esSiguienteVuelta));
+    const isLiveNextLap = Boolean(coche && occ > 1);
 
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
@@ -920,6 +1041,10 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       esExtendido: Boolean(a.esExtendido),
       viaParada: a.viaParada || null,
       turnoProgramado: null,
+      serviceNumber: null,
+      lapNumber: null,
+      isCortadoBlock: false,
+      nextLapStopTime: null,
       lat: validPos ? lat : null,
       lng: validPos ? lng : null,
       prevGpsFix,
@@ -936,7 +1061,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       trajectory,
       isPredicted: false,
       isNextLap: isLiveNextLap,
-      nextLapOfKey: isLiveNextLap && occ > 1 ? baseId : null,
+      nextLapOfKey: isLiveNextLap ? baseId : null,
       nextLapSourceLive: isLiveNextLap,
       nextLapExtraMeters,
       isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
@@ -947,26 +1072,44 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
   });
 }
 
-// Smooth ~30fps kinematic simulation loop (zero DOM rebuilds, zero backward jumps!)
+// Smooth ~20fps kinematic simulation loop (zero DOM rebuilds, zero querySelector scans, pauses during map pan!)
 function syncSimCardsDom() {
-  if (!state.horariosOpen) {
-    for (const bus of state.arribos) {
-      const card = el.arribosList.querySelector(`[data-bus-key="${CSS.escape(bus.key)}"]`);
-      if (!card) continue;
-      const etaVal = card.querySelector('[data-eta-val]');
-      const etaUnit = card.querySelector('[data-eta-unit]');
-      const distVal = card.querySelector('[data-dist-val]');
-      const fill = card.querySelector('[data-progress-fill]');
-      const banderaTxt = card.querySelector('[data-bandera-txt]');
-      const banderaDot = card.querySelector('[data-bandera-dot]');
-      if (etaVal) etaVal.textContent = bus.eta.display;
-      if (etaUnit) etaUnit.textContent = bus.eta.unit || 'aprox';
-      if (distVal && bus.routeMeters !== null) {
-        distVal.textContent = `${formatDistance(bus.routeMeters)} · ${formatBlocks(bus.routeMeters)} cuadras`;
+  if (!state.horariosOpen && arrivalRowCache.size > 0) {
+    for (let i = 0; i < state.arribos.length; i++) {
+      const bus = state.arribos[i];
+      const row = arrivalRowCache.get(bus.key);
+      if (!row || !row._refs) continue;
+      const r = row._refs;
+
+      const etaDisp = bus.eta.display;
+      const etaUnit = bus.eta.unit || 'aprox';
+      const etaCls = `eta-block eta-${bus.eta.urgency}`;
+      const etaChanged = r.etaVal.textContent !== etaDisp;
+      if (etaChanged) r.etaVal.textContent = etaDisp;
+      if (r.etaUnit.textContent !== etaUnit) r.etaUnit.textContent = etaUnit;
+      if (r.etaBlock.className !== etaCls) r.etaBlock.className = etaCls;
+
+      const distMeters = bus.routeMeters ?? bus.distanceMeters;
+      if (distMeters !== null && distMeters !== undefined) {
+        const distTxt = `${formatDistance(distMeters)} · ${formatBlocks(distMeters)} c.`;
+        if (r.distVal.textContent !== distTxt) r.distVal.textContent = distTxt;
       }
-      if (fill) fill.style.width = `${bus.proximityPct}%`;
-      if (banderaTxt && bus.realBandera) banderaTxt.textContent = bus.realBandera;
-      if (banderaDot && bus.realBanderaColor) banderaDot.style.background = bus.realBanderaColor;
+
+      if (bus.realBandera && r.banderaTxt.textContent !== bus.realBandera) {
+        r.banderaTxt.textContent = bus.realBandera;
+        r.banderaWrap.title = bus.realBandera;
+      }
+      if (bus.realBanderaColor && r.lastDirColor !== bus.realBanderaColor) {
+        r.banderaDot.style.background = bus.realBanderaColor;
+        r.lastDirColor = bus.realBanderaColor;
+      }
+      if (etaChanged && r.mainBtn) {
+        const spoken = buildArrivalAriaLabel(bus);
+        if (r.lastAriaLabel !== spoken) {
+          r.mainBtn.setAttribute('aria-label', spoken);
+          r.lastAriaLabel = spoken;
+        }
+      }
     }
   }
 
@@ -987,14 +1130,16 @@ function startSimLoop() {
       return;
     }
     const elapsedMs = now - simLastFrameMs;
-    // Target ~30fps (32ms min interval) for buttery smoothness with minimal mobile CPU/battery
-    if (elapsedMs >= 32 && state.arribos.length > 0) {
-      const dtSec = Math.min(0.12, elapsedMs / 1000);
+    // Target ~20fps (50ms interval) for silky motion with minimal mobile CPU/battery
+    if (elapsedMs >= 50 && state.arribos.length > 0) {
+      const dtSec = Math.min(0.15, elapsedMs / 1000);
       simLastFrameMs = now;
 
       const shouldSyncDom = now - simLastDomMs >= 1000;
       busSimulator.step(dtSec, state.arribos, { updateEta: shouldSyncDom });
-      transitMap.moveBusPositionsFast(state.arribos);
+      if (!transitMap.isInteracting) {
+        transitMap.moveBusPositionsFast(state.arribos);
+      }
 
       if (shouldSyncDom) {
         simLastDomMs = now;
@@ -1015,67 +1160,369 @@ function stopSimLoop() {
 }
 
 function renderLineFilters() {
-  // Always keep every known line for this stop selectable in the strip
+  // Always keep every known line for this stop selectable in the strip (preserving horizontal scroll!)
   const lineEntries =
     state.stopLinesList.length > 0
       ? state.stopLinesList
       : Array.from(new Map(state.arribos.map((a) => [a.codigoLinea, { codigo: a.codigoLinea, descripcion: a.descripcionLinea }])).values());
 
-  let html = `
-    <button class="filter-chip ${state.filterLine === 'ALL' ? 'active' : ''}" data-line="ALL" data-cod="000" style="--chip-color:#0284c7">
-      Todas
+  const sig = lineEntries.map((l) => `${l.codigo}:${l.descripcion}`).join('|');
+
+  if (sig !== filterStripSig || el.lineFilterStrip.children.length === 0) {
+    filterStripSig = sig;
+    let html = `
+      <button type="button" class="filter-chip" data-line="ALL" data-cod="000" aria-pressed="true" aria-label="Mostrar todas las líneas" style="--chip-color:#38bdf8">
+        Todas
+      </button>
+    `;
+    for (const item of lineEntries) {
+      const line = item.descripcion;
+      const color = getLineColor(line);
+      html += `
+        <button type="button" class="filter-chip" data-line="${escapeHtml(line)}" data-cod="${item.codigo}" aria-pressed="false" style="--chip-color:${color}">
+          <span class="chip-dot" aria-hidden="true"></span>
+          <span>${escapeHtml(line)}</span>
+          <span class="chip-count"></span>
+        </button>
+      `;
+    }
+    el.lineFilterStrip.innerHTML = html;
+  }
+
+  // Fast in-place count and active-state patch (zero innerHTML teardown, preserves scrollLeft)
+  const countsByLine = new Map();
+  for (const a of state.arribos) {
+    countsByLine.set(a.descripcionLinea, (countsByLine.get(a.descripcionLinea) || 0) + 1);
+  }
+
+  const chips = el.lineFilterStrip.children;
+  for (let i = 0; i < chips.length; i++) {
+    const chip = chips[i];
+    const line = chip.dataset.line;
+    const isActive = state.filterLine === line;
+    chip.classList.toggle('active', isActive);
+    chip.setAttribute('aria-pressed', String(isActive));
+    if (line === 'ALL') {
+      chip.setAttribute(
+        'aria-label',
+        `Mostrar todas las líneas, ${state.arribos.length} ${state.arribos.length === 1 ? 'unidad' : 'unidades'}`
+      );
+    } else {
+      const count = countsByLine.get(line) || 0;
+      const countEl = chip.querySelector('.chip-count');
+      if (countEl) {
+        const txt = (isActive || state.filterLine === 'ALL') && count > 0 ? ` (${count})` : '';
+        if (countEl.textContent !== txt) countEl.textContent = txt;
+      }
+      chip.setAttribute(
+        'aria-label',
+        `Filtrar línea ${line}${count > 0 ? `, ${count} ${count === 1 ? 'unidad' : 'unidades'}` : ''}`
+      );
+    }
+  }
+}
+
+async function handleLineFilterClick(e) {
+  const chip = e.target.closest('.filter-chip');
+  if (!chip || !el.lineFilterStrip.contains(chip)) return;
+
+  const selectedLine = chip.dataset.line;
+  const selectedCod = chip.dataset.cod;
+  if (selectedLine === state.filterLine) return;
+
+  closeBusInspector();
+  state.filterLine = selectedLine;
+  if (selectedLine === 'ALL') {
+    state.focusedLineCode = null;
+    state.codLineaQuery = '000';
+  } else {
+    state.focusedLineCode = Number(selectedCod) || null;
+    state.codLineaQuery = String(selectedCod);
+  }
+
+  updateStopHeaderUI();
+  renderLineFilters();
+
+  // Immediately hide non-selected lines from Leaflet (zero ghost markers!)
+  transitMap.updateBuses(state.arribos, {
+    filterLine: state.filterLine,
+    selectedBusKey: null,
+    simulateMode: state.simulateMode
+  });
+
+  if (state.focusedLineCode) {
+    showToast(`Buscando toda la flota activa de ${selectedLine}...`, 'info', 2000);
+  } else {
+    announce('Mostrando todas las líneas de esta parada.');
+  }
+  await fetchArribos(true, { announceSummary: true });
+}
+
+function buildArrivalAriaLabel(bus) {
+  const parts = [];
+  const currentBandera = bus.realBandera || bus.descripcionBandera;
+  parts.push(`Línea ${bus.descripcionLinea}, hacia ${currentBandera}.`);
+
+  if (bus.eta.minutes === 0) {
+    parts.push('Arribando ahora.');
+  } else if (bus.eta.valid !== false) {
+    parts.push(`Llega en ${bus.eta.minutes === 1 ? '1 minuto' : `${bus.eta.minutes} minutos`}.`);
+  }
+
+  const distMeters = bus.routeMeters ?? bus.distanceMeters;
+  if (distMeters !== null && distMeters !== undefined) {
+    const blocks = formatBlocks(distMeters);
+    parts.push(`A ${formatDistance(distMeters)}, ${blocks === 1 ? '1 cuadra' : `${blocks} cuadras`}.`);
+  }
+
+  if (bus.identificadorCoche) {
+    parts.push(`Coche ${bus.identificadorCoche}.`);
+  }
+
+  if (bus.desvio && bus.desvio.status !== 'none') {
+    if (bus.desvio.status === 'ontime' || bus.desvio.status === 'ok') {
+      parts.push('En hora.');
+    } else {
+      const absMin = Math.round(Math.abs(bus.desvio.seconds || 0) / 60);
+      const minText = absMin <= 1 ? '1 minuto' : `${absMin} minutos`;
+      parts.push(bus.desvio.status === 'late' ? `Atrasado ${minText}.` : `Adelantado ${minText}.`);
+    }
+  }
+
+  if (bus.turnoProgramado) {
+    parts.push(`Horario programado ${bus.turnoProgramado}.`);
+  }
+
+  if (bus.serviceNumber) {
+    const srvDesc = [
+      `Servicio ${bus.serviceNumber}`,
+      bus.lapNumber ? `vuelta ${bus.lapNumber}` : null,
+      bus.isCortadoBlock ? 'horario cortado' : null
+    ]
+      .filter(Boolean)
+      .join(', ');
+    parts.push(`${srvDesc}.`);
+  }
+
+  if (bus.nextLapStopTime) {
+    parts.push(`Próxima vuelta a las ${bus.nextLapStopTime}.`);
+  } else if (bus.serviceNumber && bus.isCortadoBlock) {
+    parts.push('Última vuelta del turno cortado.');
+  }
+
+  if (bus.isNextLap) {
+    parts.push('Siguiente vuelta de la misma unidad.');
+  }
+  if (bus.esAdaptado) {
+    parts.push('Unidad adaptada para silla de ruedas.');
+  }
+  if (bus.choferNombre) {
+    parts.push(`Chofer ${bus.choferNombre}.`);
+  }
+
+  const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
+  if (isOfflineStyled) {
+    parts.push('Estimado por horario programado, sin señal GPS.');
+  }
+
+  return parts.join(' ');
+}
+
+function buildArrivalTagsHtml(bus) {
+  const parts = [];
+  if (bus.identificadorCoche) {
+    parts.push(`<span class="coche-pill" title="Coche">${escapeHtml(bus.identificadorCoche)}</span>`);
+  }
+  if (bus.desvio && bus.desvio.status !== 'none') {
+    parts.push(
+      `<span class="desvio-pill desvio-${bus.desvio.status}" title="Desvío horario">${escapeHtml(bus.desvio.label)}</span>`
+    );
+  }
+  if (bus.turnoProgramado) {
+    parts.push(`<span class="turno-pill" title="Paso programado">${escapeHtml(bus.turnoProgramado)}</span>`);
+  }
+  if (bus.serviceNumber) {
+    const srvLabel = bus.lapNumber ? `S${bus.serviceNumber}·V${bus.lapNumber}` : `S${bus.serviceNumber}`;
+    const srvTip = [
+      `Servicio ${bus.serviceNumber}${bus.lapNumber ? ` · Vuelta ${bus.lapNumber}` : ''}`,
+      bus.isCortadoBlock ? 'Horario cortado' : 'Servicio continuo',
+      bus.nextLapStopTime ? `Sig. vuelta: ${bus.nextLapStopTime}` : null
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    parts.push(`<span class="service-pill" title="${escapeHtml(srvTip)}">${escapeHtml(srvLabel)}</span>`);
+  }
+  if (bus.isNextLap) {
+    parts.push(`<span class="next-lap-pill" title="Misma unidad en su siguiente vuelta">Sig. vuelta</span>`);
+  }
+  if (bus.esAdaptado) {
+    parts.push(`<span class="adapted-icon-badge" title="Unidad adaptada">♿</span>`);
+  }
+  if (bus.esExtendido) {
+    parts.push(
+      `<span class="extended-pill" title="Detectado en parada previa (${escapeHtml(bus.viaParada || '')})">+Flota</span>`
+    );
+  }
+  return parts.join('');
+}
+
+function createArrivalRow(bus) {
+  const row = document.createElement('div');
+  row.className = 'arrival-row';
+  row.dataset.busKey = bus.key;
+  row.setAttribute('role', 'listitem');
+
+  // Non-nested accessible layout: main arrival button + sibling alert toggle button
+  row.innerHTML = `
+    <button type="button" class="arrival-row-main">
+      <div class="arrival-row-top" aria-hidden="true">
+        <div class="line-plate"></div>
+        <div class="arrival-info">
+          <div class="arrival-bandera">
+            <span class="dir-dot"></span>
+            <span class="arrival-bandera-txt"></span>
+          </div>
+          <div class="arrival-tags-row"></div>
+        </div>
+        <div class="eta-block">
+          <span class="eta-value"></span>
+          <span class="eta-unit"></span>
+        </div>
+      </div>
+      <div class="arrival-row-foot" aria-hidden="true">
+        <span class="driver-inline"></span>
+        <span class="arrival-foot-right">
+          <span class="arrival-dist-val"></span>
+          <span class="arrival-gps-val"></span>
+        </span>
+      </div>
+    </button>
+    <button type="button" class="alert-bell-btn" aria-pressed="false">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false">
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+        <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+      </svg>
     </button>
   `;
 
-  for (const item of lineEntries) {
-    const line = item.descripcion;
-    const color = getLineColor(line);
-    const count = state.arribos.filter((a) => a.descripcionLinea === line).length;
-    const countLabel = state.filterLine === line && count > 0 ? ` (${count})` : state.filterLine === 'ALL' && count > 0 ? ` (${count})` : '';
-    html += `
-      <button class="filter-chip ${state.filterLine === line ? 'active' : ''}" data-line="${escapeHtml(
-        line
-      )}" data-cod="${item.codigo}" style="--chip-color:${color}">
-        <span class="chip-dot"></span>
-        ${escapeHtml(line)}${countLabel}
-      </button>
-    `;
+  row._refs = {
+    mainBtn: row.querySelector('.arrival-row-main'),
+    linePlate: row.querySelector('.line-plate'),
+    banderaWrap: row.querySelector('.arrival-bandera'),
+    banderaDot: row.querySelector('.dir-dot'),
+    banderaTxt: row.querySelector('.arrival-bandera-txt'),
+    tagsRow: row.querySelector('.arrival-tags-row'),
+    etaBlock: row.querySelector('.eta-block'),
+    etaVal: row.querySelector('.eta-value'),
+    etaUnit: row.querySelector('.eta-unit'),
+    alertBtn: row.querySelector('.alert-bell-btn'),
+    alertSvg: row.querySelector('.alert-bell-btn svg'),
+    driverInline: row.querySelector('.driver-inline'),
+    distVal: row.querySelector('.arrival-dist-val'),
+    gpsVal: row.querySelector('.arrival-gps-val'),
+    lastColor: '',
+    lastDirColor: '',
+    lastTagsSig: '',
+    lastDriverSig: '',
+    lastGpsSig: '',
+    lastAriaLabel: ''
+  };
+
+  return row;
+}
+
+function patchArrivalRow(row, bus) {
+  const r = row._refs;
+  const color = getLineColor(bus.descripcionLinea);
+  const isSelected = bus.key === state.selectedBusKey;
+  const isArmed = state.armedAlerts.has(bus.descripcionLinea);
+  const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
+
+  row.classList.toggle('is-selected', isSelected);
+  row.classList.toggle('is-predicted', isOfflineStyled);
+
+  if (r.lastColor !== color) {
+    row.style.setProperty('--line-color', color);
+    r.lastColor = color;
+  }
+  if (r.linePlate.textContent !== bus.descripcionLinea) {
+    r.linePlate.textContent = bus.descripcionLinea;
   }
 
-  el.lineFilterStrip.innerHTML = html;
-  el.lineFilterStrip.querySelectorAll('.filter-chip').forEach((chip) => {
-    chip.addEventListener('click', async () => {
-      const selectedLine = chip.dataset.line;
-      const selectedCod = chip.dataset.cod;
-      if (selectedLine === state.filterLine) return;
+  const currentBandera = bus.realBandera || bus.descripcionBandera;
+  const dirColor = bus.realBanderaColor || color;
+  if (r.banderaTxt.textContent !== currentBandera) {
+    r.banderaTxt.textContent = currentBandera;
+    r.banderaWrap.title = currentBandera;
+  }
+  if (r.lastDirColor !== dirColor) {
+    r.banderaDot.style.background = dirColor;
+    r.lastDirColor = dirColor;
+  }
 
-      closeBusInspector();
-      state.filterLine = selectedLine;
-      if (selectedLine === 'ALL') {
-        state.focusedLineCode = null;
-        state.codLineaQuery = '000';
-      } else {
-        state.focusedLineCode = Number(selectedCod) || null;
-        state.codLineaQuery = String(selectedCod);
-      }
+  const tagsSig = `${bus.identificadorCoche}|${bus.desvio?.status || ''}:${bus.desvio?.label || ''}|${bus.turnoProgramado || ''}|${bus.serviceNumber || ''}:${bus.lapNumber || ''}:${bus.isCortadoBlock ? 1 : 0}:${bus.nextLapStopTime || ''}|${bus.isNextLap ? 1 : 0}|${bus.esAdaptado ? 1 : 0}|${bus.esExtendido ? 1 : 0}:${bus.viaParada || ''}`;
+  if (r.lastTagsSig !== tagsSig) {
+    r.tagsRow.innerHTML = buildArrivalTagsHtml(bus);
+    r.lastTagsSig = tagsSig;
+  }
 
-      updateStopHeaderUI();
-      renderLineFilters();
+  const etaCls = `eta-block eta-${bus.eta.urgency}`;
+  const etaDisp = bus.eta.display;
+  const etaUnit = bus.eta.unit || 'aprox';
+  if (r.etaBlock.className !== etaCls) r.etaBlock.className = etaCls;
+  if (r.etaVal.textContent !== etaDisp) r.etaVal.textContent = etaDisp;
+  if (r.etaUnit.textContent !== etaUnit) r.etaUnit.textContent = etaUnit;
 
-      // Immediately hide non-selected lines from Leaflet (zero ghost markers!)
-      transitMap.updateBuses(state.arribos, {
-        filterLine: state.filterLine,
-        selectedBusKey: null,
-        simulateMode: state.simulateMode
-      });
+  r.alertBtn.dataset.alertLine = bus.descripcionLinea;
+  r.alertBtn.classList.toggle('is-armed', isArmed);
+  r.alertBtn.setAttribute('aria-pressed', String(isArmed));
+  const alertDesc = isArmed
+    ? `Desactivar aviso de arribo para línea ${bus.descripcionLinea}`
+    : `Activar aviso sonoro para línea ${bus.descripcionLinea} cuando falten 3 minutos o menos`;
+  r.alertBtn.title = alertDesc;
+  r.alertBtn.setAttribute('aria-label', alertDesc);
+  r.alertSvg.setAttribute('fill', isArmed ? 'currentColor' : 'none');
 
-      // When focusing a single line, automatically fetch its FULL ACTIVE FLEET (> 3 cars) via upstream probe propagation!
-      if (state.focusedLineCode) {
-        showToast(`Buscando toda la flota activa de ${selectedLine}...`, 'info', 2000);
-      }
-      await fetchArribos(true);
-    });
-  });
+  const driverSig = `${bus.choferNombre || ''}|${bus.choferLegajo || ''}`;
+  if (r.lastDriverSig !== driverSig) {
+    r.driverInline.innerHTML = bus.choferNombre
+      ? `<strong>${escapeHtml(bus.choferNombre)}</strong>${
+          bus.choferLegajo ? `<span class="legajo-chip">${escapeHtml(bus.choferLegajo)}</span>` : ''
+        }`
+      : '<span>—</span>';
+    r.lastDriverSig = driverSig;
+  }
+
+  const distMeters = bus.routeMeters ?? bus.distanceMeters;
+  const distTxt =
+    distMeters !== null && distMeters !== undefined
+      ? `${formatDistance(distMeters)} · ${formatBlocks(distMeters)} c.`
+      : '';
+  if (r.distVal.textContent !== distTxt) r.distVal.textContent = distTxt;
+
+  const gpsSig = `${isOfflineStyled ? 1 : 0}|${bus.gpsTimeOnly || ''}`;
+  if (r.lastGpsSig !== gpsSig) {
+    if (isOfflineStyled) {
+      r.gpsVal.className = 'arrival-gps-val pred-meta';
+      r.gpsVal.title = 'Posición estimada por horarios programados';
+      r.gpsVal.textContent = bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario';
+    } else if (bus.gpsTimeOnly) {
+      r.gpsVal.className = 'arrival-gps-val';
+      r.gpsVal.title = 'Último reporte GPS';
+      r.gpsVal.textContent = bus.gpsTimeOnly;
+    } else {
+      r.gpsVal.className = 'arrival-gps-val';
+      r.gpsVal.title = '';
+      r.gpsVal.textContent = '';
+    }
+    r.lastGpsSig = gpsSig;
+  }
+
+  const spoken = buildArrivalAriaLabel(bus);
+  if (r.lastAriaLabel !== spoken) {
+    r.mainBtn.setAttribute('aria-label', spoken);
+    r.lastAriaLabel = spoken;
+  }
 }
 
 function renderArribosList() {
@@ -1090,9 +1537,10 @@ function renderArribosList() {
       : state.arribos.filter((a) => a.descripcionLinea === state.filterLine);
 
   if (visible.length === 0) {
+    arrivalRowCache.clear();
     el.arribosList.innerHTML = `
       <div class="empty-state">
-        <div class="empty-state-icon">◎</div>
+        <div class="empty-state-icon" aria-hidden="true">◎</div>
         <h3>Sin unidades reportando arribos</h3>
         <p>En este momento no hay colectivos en camino hacia <strong>${escapeHtml(
           state.activeStop.id
@@ -1102,143 +1550,71 @@ function renderArribosList() {
     return;
   }
 
-  el.arribosList.innerHTML = visible
-    .map((bus) => {
-      const color = getLineColor(bus.descripcionLinea);
-      const isSelected = bus.key === state.selectedBusKey;
-      const isArmed = state.armedAlerts.has(bus.descripcionLinea);
-      const distMeters = bus.routeMeters ?? bus.distanceMeters;
-      const distLabel =
-        distMeters !== null && distMeters !== undefined
-          ? `${formatDistance(distMeters)} · ${formatBlocks(distMeters)} cuadras`
-          : '';
+  // Remove any non-row placeholder (welcome, skeleton, empty state) before keyed reconciliation
+  if (el.arribosList.firstElementChild && !el.arribosList.firstElementChild.classList.contains('arrival-row')) {
+    el.arribosList.textContent = '';
+    arrivalRowCache.clear();
+  }
 
-      const cocheBadge = bus.identificadorCoche
-        ? `<span class="coche-pill" title="Coche">${escapeHtml(bus.identificadorCoche)}</span>`
-        : '';
+  const activeKeys = new Set();
+  for (let i = 0; i < visible.length; i++) {
+    const bus = visible[i];
+    activeKeys.add(bus.key);
+    let row = arrivalRowCache.get(bus.key);
+    if (!row) {
+      row = createArrivalRow(bus);
+      arrivalRowCache.set(bus.key, row);
+    }
+    patchArrivalRow(row, bus);
 
-      const desvioBadge =
-        bus.desvio && bus.desvio.status !== 'none'
-          ? `<span class="desvio-pill desvio-${bus.desvio.status}" title="Desvío horario">${escapeHtml(
-              bus.desvio.label
-            )}</span>`
-          : '';
+    const currentAtIdx = el.arribosList.children[i];
+    if (currentAtIdx !== row) {
+      el.arribosList.insertBefore(row, currentAtIdx || null);
+    }
+  }
 
-      const turnoBadge = bus.turnoProgramado
-        ? `<span class="turno-pill" title="Turno programado">${escapeHtml(bus.turnoProgramado)}</span>`
-        : '';
+  // Prune rows no longer present
+  for (const [key, row] of arrivalRowCache.entries()) {
+    if (!activeKeys.has(key)) {
+      row.remove();
+      arrivalRowCache.delete(key);
+    }
+  }
+}
 
-      const adaptedBadge = bus.esAdaptado
-        ? `<span class="adapted-icon-badge" title="Unidad adaptada" aria-label="Unidad adaptada">♿</span>`
-        : '';
+function handleArribosListClick(e) {
+  const bellBtn = e.target.closest('.alert-bell-btn');
+  if (bellBtn && el.arribosList.contains(bellBtn)) {
+    e.stopPropagation();
+    const line = bellBtn.dataset.alertLine;
+    if (!line) return;
+    if (state.armedAlerts.has(line)) {
+      state.armedAlerts.delete(line);
+      state.triggeredAlerts.delete(line);
+      showToast(`Alerta desactivada para línea ${line}`, 'info');
+      haptic('light');
+    } else {
+      state.armedAlerts.add(line);
+      state.triggeredAlerts.delete(line);
+      if (state.soundEnabled) playSubtleTick();
+      haptic('medium');
+      showToast(`Aviso activado para línea ${line} cuando falten 3 minutos o menos`, 'success');
+      ensureNotificationPermission().then((ok) => {
+        if (!ok && isNative) {
+          showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la pantalla apagada', 'warn', 4500);
+        }
+      });
+    }
+    syncKeepAwake();
+    renderArribosList();
+    return;
+  }
 
-      const extBadge = bus.esExtendido
-        ? `<span class="extended-pill" title="Detectado en parada previa (${escapeHtml(
-            bus.viaParada || ''
-          )})">+Flota</span>`
-        : '';
-
-      const nextLapBadge = bus.isNextLap
-        ? `<span class="next-lap-pill" title="Misma unidad en su siguiente vuelta">Sig. vuelta</span>`
-        : '';
-
-      const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
-
-      const driverHtml = bus.choferNombre
-        ? `<span class="driver-inline">
-             <strong>${escapeHtml(bus.choferNombre)}</strong>
-             ${bus.choferLegajo ? `<span class="legajo-chip">${escapeHtml(bus.choferLegajo)}</span>` : ''}
-           </span>`
-        : `<span class="driver-inline"><span>—</span></span>`;
-
-      const gpsHtml = isOfflineStyled
-        ? `<span class="pred-meta" title="Posición estimada por horarios programados">${escapeHtml(
-            bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario'
-          )}</span>`
-        : bus.gpsTimeOnly
-          ? `<span class="mono-meta" title="Último reporte GPS">${escapeHtml(bus.gpsTimeOnly)}</span>`
-          : '';
-      const currentBandera = bus.realBandera || bus.descripcionBandera;
-      const dirColor = bus.realBanderaColor || color;
-
-      return `
-        <div class="arrival-card ${isSelected ? 'is-selected' : ''} ${isOfflineStyled ? 'is-predicted' : ''}" data-bus-key="${escapeHtml(
-          bus.key
-        )}" style="--line-color:${color}" role="button" tabindex="0">
-          <div class="arrival-card-main">
-            <div class="line-badge">${escapeHtml(bus.descripcionLinea)}</div>
-            <div class="arrival-info">
-              <div class="arrival-bandera" title="${escapeHtml(currentBandera)}">
-                <span class="dir-dot" data-bandera-dot style="background:${dirColor}"></span>
-                <span class="arrival-bandera-txt" data-bandera-txt>${escapeHtml(currentBandera)}</span>
-              </div>
-              <div class="arrival-sub-row">
-                ${cocheBadge}
-                ${desvioBadge}
-                ${turnoBadge}
-                ${nextLapBadge}
-                ${adaptedBadge}
-                ${extBadge}
-              </div>
-              ${distLabel ? `<div class="arrival-sub-row"><span class="arrival-tag" data-dist-val>${escapeHtml(distLabel)}</span></div>` : ''}
-            </div>
-            <div class="arrival-right">
-              <div class="eta-block eta-${bus.eta.urgency}">
-                <span class="eta-value" data-eta-val>${escapeHtml(bus.eta.display)}</span>
-                <span class="eta-unit" data-eta-unit>${escapeHtml(bus.eta.unit || 'aprox')}</span>
-              </div>
-              <button class="alert-bell-btn ${isArmed ? 'is-armed' : ''}" data-alert-line="${escapeHtml(
-                bus.descripcionLinea
-              )}" title="${isArmed ? 'Quitar alerta' : 'Avisarme cuando falten ≤ 3 min'}">
-                <svg viewBox="0 0 24 24" width="14" height="14" fill="${isArmed ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
-                  <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
-                  <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-                </svg>
-              </button>
-            </div>
-          </div>
-          <div class="arrival-card-telemetry">
-            ${driverHtml}
-            ${gpsHtml}
-          </div>
-          <div class="arrival-progress">
-            <div class="arrival-progress-fill" data-progress-fill style="width:${bus.proximityPct}%"></div>
-          </div>
-        </div>
-      `;
-    })
-    .join('');
-
-  el.arribosList.querySelectorAll('.arrival-card').forEach((card) => {
-    card.addEventListener('click', (e) => {
-      if (e.target.closest('.alert-bell-btn')) return;
-      focusBusOnMap(card.dataset.busKey);
-    });
-  });
-
-  el.arribosList.querySelectorAll('.alert-bell-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const line = btn.dataset.alertLine;
-      if (state.armedAlerts.has(line)) {
-        state.armedAlerts.delete(line);
-        state.triggeredAlerts.delete(line);
-        showToast(`Alerta desactivada para línea ${line}`, 'info');
-        haptic('light');
-      } else {
-        state.armedAlerts.add(line);
-        state.triggeredAlerts.delete(line);
-        if (state.soundEnabled) playSubtleTick();
-        haptic('medium');
-        showToast(`Aviso activado para línea ${line} (≤ 3 min)`, 'success');
-        ensureNotificationPermission().then((ok) => {
-          if (!ok && isNative) showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la pantalla apagada', 'warn', 4500);
-        });
-      }
-      syncKeepAwake();
-      renderArribosList();
-    });
-  });
+  const mainBtn = e.target.closest('.arrival-row-main');
+  const row = mainBtn ? mainBtn.closest('.arrival-row') : null;
+  if (row && el.arribosList.contains(row)) {
+    focusBusOnMap(row.dataset.busKey);
+  }
 }
 
 // Keep the screen on while the user is waiting for an armed arrival alert at an open stop
@@ -1256,8 +1632,11 @@ function checkProximityAlerts() {
     ) {
       state.triggeredAlerts.add(bus.descripcionLinea);
       if (state.soundEnabled) playArrivalChime();
-      const cocheTag = bus.identificadorCoche ? ` (${bus.identificadorCoche})` : '';
-      showToast(`¡Línea ${bus.descripcionLinea}${cocheTag} arribando (${bus.tiempoRaw})!`, 'success', 6000);
+      const cocheTag = bus.identificadorCoche ? `, coche ${bus.identificadorCoche}` : '';
+      const etaTxt = bus.eta.minutes === 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
+      const msg = `Atención: Línea ${bus.descripcionLinea}${cocheTag}, ${etaTxt}.`;
+      showToast(msg, 'success', 6000, { silent: true });
+      announce(msg, { assertive: true });
       notifyArrival({
         title: `Línea ${bus.descripcionLinea} llegando a ${state.activeStop.id}`,
         body: `${bus.tiempoRaw || `${bus.eta.minutes} min`}${cocheTag} · ${state.activeStop.nombre || 'Tu parada'}`,
@@ -1300,6 +1679,20 @@ function updateInspectorFields(bus) {
     el.inspTurnoPill.classList.add('hidden');
   }
 
+  if (el.inspServicePill) {
+    if (bus.serviceNumber) {
+      el.inspServicePill.textContent = bus.lapNumber
+        ? `Srv ${bus.serviceNumber} · Vta ${bus.lapNumber}`
+        : `Srv ${bus.serviceNumber}`;
+      el.inspServicePill.title = bus.isCortadoBlock
+        ? 'Rotación estimada · Horario cortado'
+        : 'Rotación estimada · Servicio continuo';
+      el.inspServicePill.classList.remove('hidden');
+    } else {
+      el.inspServicePill.classList.add('hidden');
+    }
+  }
+
   el.inspAccessBadge.classList.toggle('hidden', !bus.esAdaptado);
 
   const distMeters = bus.routeMeters ?? bus.distanceMeters;
@@ -1313,6 +1706,20 @@ function updateInspectorFields(bus) {
     el.inspLegajo.classList.remove('hidden');
   } else {
     el.inspLegajo.classList.add('hidden');
+  }
+
+  if (el.inspNextLapCell && el.inspNextLap) {
+    const showNextLap = Boolean(bus.nextLapStopTime || (bus.serviceNumber && bus.isCortadoBlock));
+    if (showNextLap) {
+      el.inspNextLap.textContent = bus.nextLapStopTime || 'Fin turno (cortado)';
+      el.inspNextLapCell.classList.remove('hidden');
+    } else {
+      el.inspNextLapCell.classList.add('hidden');
+    }
+    const driverCell = el.inspChofer.closest('.insp-metric');
+    if (driverCell) {
+      driverCell.style.gridColumn = showNextLap ? '' : '1 / -1';
+    }
   }
 
   const gpsParts = [];
@@ -1329,7 +1736,7 @@ function updateInspectorFields(bus) {
   el.btnInspRoute.dataset.lineName = bus.descripcionLinea;
 }
 
-// Tapping an arrival card in the bottom dock: pan & zoom directly to the bus WITHOUT opening the inspector overlay
+// Tapping an arrival row in the dock: pan & zoom visually on map + announce concise summary for screen readers
 function focusBusOnMap(busKey) {
   const bus = state.arribos.find((b) => b.key === busKey);
   if (!bus) return;
@@ -1355,6 +1762,7 @@ function focusBusOnMap(busKey) {
     simulateMode: state.simulateMode
   });
   transitMap.focusBus(mapTarget, 16);
+  announce(`Seleccionado: ${buildArrivalAriaLabel(bus)}`);
 }
 
 // Tapping a bus chip directly on the map: open the ultra-compact inspector card
@@ -1697,6 +2105,10 @@ function reconcileWithSchedulePrediction(
         nearbyUnmatchedLive.turnoProgramado = p.turnoProgramado;
         nearbyUnmatchedLive.scheduledTrip = p.scheduledTrip;
         nearbyUnmatchedLive.stopProj = p.stopProj;
+        nearbyUnmatchedLive.serviceNumber = p.serviceNumber || null;
+        nearbyUnmatchedLive.lapNumber = p.lapNumber || null;
+        nearbyUnmatchedLive.isCortadoBlock = Boolean(p.isCortadoBlock);
+        nearbyUnmatchedLive.nextLapStopTime = p.nextLapStopTime || null;
         matchedTrips.add(p.tripKey);
         if (nearbyUnmatchedLive.identificadorCoche) {
           state.stickyLiveTripByCoche.set(`${cod}:${nearbyUnmatchedLive.identificadorCoche}`, {
@@ -1864,6 +2276,7 @@ async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
   updateSignalPill();
   renderLineFilters();
   if (!state.horariosOpen) renderArribosList();
+  else refreshHorariosLiveTags();
 
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
@@ -1894,13 +2307,37 @@ async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
   }
 }
 
-async function fetchArribos(showSkeleton = false) {
+function announceArrivalsSummary({ isRefresh = false } = {}) {
+  if (!state.activeStop || state.horariosOpen) return;
+  const visible =
+    state.filterLine === 'ALL'
+      ? state.arribos
+      : state.arribos.filter((a) => a.descripcionLinea === state.filterLine);
+  const prefix = isRefresh
+    ? 'Actualizado.'
+    : `Parada ${state.activeStop.id}, ${state.activeStop.nombre || ''}.`;
+
+  if (visible.length === 0) {
+    announce(`${prefix} Sin colectivos reportando arribos en este momento. Podés abrir Horarios 24 horas.`);
+    return;
+  }
+  const first = visible[0];
+  const etaTxt =
+    first.eta.minutes === 0
+      ? 'arribando ahora'
+      : `en ${first.eta.minutes === 1 ? '1 minuto' : `${first.eta.minutes} minutos`}`;
+  const countTxt = visible.length === 1 ? '1 colectivo' : `${visible.length} colectivos`;
+  announce(`${prefix} ${countTxt} en camino. Próximo: línea ${first.descripcionLinea}, ${etaTxt}.`);
+}
+
+async function fetchArribos(showSkeleton = false, { announceSummary = false, isRefresh = false } = {}) {
   if (!state.activeStop) return;
   const mySeq = ++fetchSeq;
   const stopId = state.activeStop.id;
 
   if (showSkeleton && !state.horariosOpen) {
-    el.arribosList.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    arrivalRowCache.clear();
+    el.arribosList.innerHTML = `<div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div>`;
   }
 
   try {
@@ -2039,6 +2476,7 @@ async function fetchArribos(showSkeleton = false) {
     updateSignalPill();
     renderLineFilters();
     if (!state.horariosOpen) renderArribosList();
+    else refreshHorariosLiveTags();
 
     transitMap.updateBuses(state.arribos, {
       filterLine: state.filterLine,
@@ -2069,6 +2507,7 @@ async function fetchArribos(showSkeleton = false) {
     }
 
     checkProximityAlerts();
+    if (announceSummary) announceArrivalsSummary({ isRefresh });
   } catch (err) {
     if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
     const enteringOffline = !state.isOffline;
@@ -2083,6 +2522,7 @@ async function fetchArribos(showSkeleton = false) {
       );
     }
     await renderOfflineOrFallback(showSkeleton, mySeq);
+    if (announceSummary) announceArrivalsSummary({ isRefresh });
   } finally {
     if (mySeq === fetchSeq) {
       state.countdownSec = REFRESH_INTERVAL_SEC;
@@ -2091,18 +2531,245 @@ async function fetchArribos(showSkeleton = false) {
 }
 
 // ============================================================================
-// Horarios Programados 24h — Separado por tipo de día (Lun-Vie / Sábado / Domingo)
-// Nunca mezcla medianoche; cacheado 14 días por tipo de día + cruce con coches en vivo
+// Horarios Programados 24h + Inspector Interactivo de Rotaciones de Servicio
+// Reconstruye vueltas del mismo coche por DP FIFO respetando horarios cortados
 // ============================================================================
+function toServiceMinuteOfDay(minOfDay) {
+  return minOfDay < 180 ? minOfDay + 1440 : minOfDay;
+}
+
+function formatMinuteOfDayHHMM(minOfDay) {
+  const m = ((minOfDay % 1440) + 1440) % 1440;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function lookupSlotBlockMeta(slotMetaByHora, hora, minuteOfDay) {
+  if (!slotMetaByHora || slotMetaByHora.size === 0) return null;
+  if (slotMetaByHora.has(hora)) return slotMetaByHora.get(hora);
+  if (typeof minuteOfDay === 'number') {
+    const prev = formatMinuteOfDayHHMM(minuteOfDay - 1);
+    if (slotMetaByHora.has(prev)) return slotMetaByHora.get(prev);
+    const next = formatMinuteOfDayHHMM(minuteOfDay + 1);
+    if (slotMetaByHora.has(next)) return slotMetaByHora.get(next);
+  }
+  return null;
+}
+
+function computeHorariosLiveMatch(ctx) {
+  const todayTipo = getArgentinaTodayTipo();
+  const isTodayScheme = ctx.tipoDia === todayTipo;
+  const nowArt = getArgentinaNow();
+  const nowRawMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes();
+  const nowSvcMin = toServiceMinuteOfDay(nowRawMin);
+
+  let slotToBus = new Map();
+  if (isTodayScheme && ctx.horarios.length > 0) {
+    const lineBuses = state.arribos.filter((b) => Number(b.codigoLinea) === ctx.codLinea);
+    slotToBus = matchBusesWithHorarios(lineBuses, ctx.horarios);
+  }
+
+  let nextHora = '';
+  if (isTodayScheme && ctx.horarios.length > 0) {
+    let bestSvc = Infinity;
+    for (const h of ctx.horarios) {
+      const sm = toServiceMinuteOfDay(h.minuteOfDay);
+      if (sm >= nowSvcMin && sm < bestSvc) {
+        bestSvc = sm;
+        nextHora = h.hora;
+      }
+    }
+  }
+
+  return { isTodayScheme, nowSvcMin, nextHora, slotToBus };
+}
+
+function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } = {}) {
+  const banner = document.getElementById('horarios-rotation-banner');
+  if (!banner) return;
+
+  const model = ctx?.model;
+  if (!model || !model.blocks?.length) {
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+
+  const selBlockId = state.horariosSelectedBlockId;
+  const selHora = state.horariosSelectedHora;
+  const blockSlots = selBlockId ? ctx.blockData?.blockSlotsById?.get(selBlockId) : null;
+  const blockInfo = selBlockId ? model.blockInfoById?.get(selBlockId) : null;
+
+  if (!selBlockId || !blockSlots || !blockInfo) {
+    const regimeTag = model.isInterprovincial
+      ? '<span class="rotation-tag is-continuo">Interprovincial · continuo</span>'
+      : '<span class="rotation-tag is-cortado">Urbana · horarios cortados</span>';
+    banner.innerHTML = `
+      <div class="rotation-banner-head">
+        <span class="rotation-hint">Tocá un horario para resaltar todas las vueltas del mismo servicio.</span>
+        ${regimeTag}
+      </div>
+    `;
+    return;
+  }
+
+  const tagCls = blockInfo.isCortado ? 'is-cortado' : 'is-continuo';
+  const tagText = blockInfo.isCortado ? 'Horario cortado' : 'Servicio continuo';
+
+  const chainHtml = blockSlots
+    .map((s, idx) => {
+      const delta =
+        idx > 0 && typeof s.deltaPrevMin === 'number'
+          ? `<span class="rotation-lap-delta" aria-hidden="true">+${s.deltaPrevMin}m →</span>`
+          : '';
+      const isCur = s.hora === selHora;
+      return `${delta}<span class="rotation-lap-chip ${isCur ? 'is-current' : ''}">${escapeHtml(s.hora)}</span>`;
+    })
+    .join('');
+
+  // Identify live bus currently serving this block TODAY (never across different days!)
+  let liveBlockBus = null;
+  if (liveInfo.isTodayScheme) {
+    for (const s of blockSlots) {
+      const matched = liveInfo.slotToBus.get(s.hora);
+      if (matched?.identificadorCoche) {
+        liveBlockBus = matched;
+        break;
+      }
+    }
+    if (!liveBlockBus) {
+      liveBlockBus = state.arribos.find(
+        (b) =>
+          Number(b.codigoLinea) === ctx.codLinea &&
+          b.scheduledTrip?.blockId === selBlockId &&
+          b.identificadorCoche
+      );
+    }
+  }
+
+  const liveNote = liveBlockBus
+    ? `Hoy en servicio: <strong>Coche #${escapeHtml(liveBlockBus.identificadorCoche)}</strong>${
+        liveBlockBus.choferNombre ? ` · ${escapeHtml(liveBlockBus.choferNombre)}` : ''
+      } (asignación diaria)`
+    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'} en esta parada · Coche y chofer varían cada día.`;
+
+  banner.innerHTML = `
+    <div class="rotation-banner-head">
+      <div class="rotation-banner-title">
+        <span>Servicio ${blockInfo.serviceNumber}</span>
+        <span class="rotation-tag ${tagCls}">${tagText}</span>
+      </div>
+      <button type="button" class="mini-close-btn" data-clear-rotation aria-label="Limpiar selección de servicio">✕</button>
+    </div>
+    <div class="rotation-laps-chain">${chainHtml}</div>
+    <div class="rotation-hint">${liveNote}</div>
+  `;
+
+  if (speakSelection) {
+    const spokenChain = blockSlots
+      .map((s, idx) => (idx > 0 && typeof s.deltaPrevMin === 'number' ? `${s.hora} a los ${s.deltaPrevMin} minutos` : s.hora))
+      .join(', ');
+    const spokenLive = liveBlockBus
+      ? ` Hoy en servicio: coche ${liveBlockBus.identificadorCoche}.`
+      : ' Coche y chofer rotan cada día.';
+    announce(
+      `Servicio ${blockInfo.serviceNumber}, ${tagText}. ${blockSlots.length} ${
+        blockSlots.length === 1 ? 'vuelta' : 'vueltas'
+      } en esta parada: ${spokenChain}.${spokenLive}`
+    );
+  }
+}
+
+function buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext) {
+  const parts = [hora];
+  if (isNext && !matchedBus) parts.push('próximo paso');
+  if (matchedBus?.identificadorCoche) {
+    parts.push(`coche ${matchedBus.identificadorCoche} en servicio hoy`);
+  }
+  if (slotMeta?.blockInfo?.serviceNumber) {
+    parts.push(
+      `Servicio ${slotMeta.blockInfo.serviceNumber}, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}${
+        slotMeta.blockInfo.isCortado ? ', horario cortado' : ''
+      }`
+    );
+  }
+  return parts.join(', ');
+}
+
+function updateHorariosRotationHighlights({ speakSelection = false } = {}) {
+  const ctx = state.horariosViewCtx;
+  if (!ctx || !state.horariosOpen) return;
+  const selBlockId = state.horariosSelectedBlockId;
+  const selHora = state.horariosSelectedHora;
+  const liveInfo = computeHorariosLiveMatch(ctx);
+
+  el.horariosPanel.querySelectorAll('.hora-pill[data-hora]').forEach((pill) => {
+    const bId = pill.dataset.blockId || '';
+    const hora = pill.dataset.hora || '';
+    const inBlock = Boolean(selBlockId && bId && bId === selBlockId);
+    const isSel = inBlock && hora === selHora;
+    pill.classList.toggle('is-block-active', inBlock);
+    pill.classList.toggle('is-block-selected', isSel);
+    pill.setAttribute('aria-pressed', String(isSel));
+  });
+
+  renderRotationBannerContent(ctx, liveInfo, { speakSelection });
+}
+
+function refreshHorariosLiveTags() {
+  const ctx = state.horariosViewCtx;
+  if (!ctx || !state.horariosOpen) return;
+  if (!state.activeStop || ctx.stopId !== state.activeStop.id) return;
+
+  const liveInfo = computeHorariosLiveMatch(ctx);
+  const { isTodayScheme, nowSvcMin, nextHora, slotToBus } = liveInfo;
+
+  el.horariosPanel.querySelectorAll('.hora-pill[data-hora]').forEach((pill) => {
+    const hora = pill.dataset.hora || '';
+    const minOfDay = Number(pill.dataset.min || 0);
+    const srvNum = pill.dataset.srv || '';
+    const matchedBus = slotToBus.get(hora);
+    const svcMin = toServiceMinuteOfDay(minOfDay);
+    const isNext = !matchedBus && isTodayScheme && hora === nextHora;
+
+    pill.classList.toggle('has-bus', Boolean(matchedBus));
+    pill.classList.toggle('is-next', isNext);
+    pill.classList.toggle('is-past', !matchedBus && isTodayScheme && hora !== nextHora && svcMin < nowSvcMin);
+
+    const slotMeta = lookupSlotBlockMeta(ctx.blockData?.slotMetaByHora, hora, minOfDay);
+    pill.setAttribute('aria-label', buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext));
+
+    const sub = pill.querySelector('[data-hora-sub]');
+    if (sub) {
+      if (matchedBus?.identificadorCoche) {
+        sub.className = 'hora-bus-tag';
+        sub.textContent = `#${matchedBus.identificadorCoche}`;
+      } else if (srvNum) {
+        sub.className = 'hora-srv-tag';
+        sub.textContent = `S${srvNum}`;
+      } else {
+        sub.className = 'hora-srv-tag';
+        sub.textContent = '';
+      }
+    }
+  });
+
+  renderRotationBannerContent(ctx, liveInfo);
+}
+
 async function toggleHorariosView() {
   if (!state.activeStop) return;
   state.horariosOpen = !state.horariosOpen;
   el.btnToggleHorarios.classList.toggle('active', state.horariosOpen);
+  el.btnToggleHorarios.setAttribute('aria-pressed', String(state.horariosOpen));
   el.horariosPanel.classList.toggle('hidden', !state.horariosOpen);
   el.arribosList.classList.toggle('hidden', state.horariosOpen);
   el.lineFilterStrip.classList.toggle('hidden', state.horariosOpen);
 
-  if (!state.horariosOpen) return;
+  if (!state.horariosOpen) {
+    renderArribosList();
+    announce('Volviendo al tablero de arribos en vivo.');
+    return;
+  }
 
   if (state.stopLinesList.length === 0) {
     try {
@@ -2138,7 +2805,11 @@ async function toggleHorariosView() {
 async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) {
   state.horariosLineCode = Number(codLinea);
   state.horariosTipoDia = tipoDia;
+  state.horariosSelectedBlockId = null;
+  state.horariosSelectedHora = null;
+  state.horariosViewCtx = null;
 
+  const stopId = state.activeStop.id;
   const lineObj = state.stopLinesList.find((l) => l.codigo === state.horariosLineCode) || {
     codigo: state.horariosLineCode,
     descripcion: String(state.horariosLineCode)
@@ -2148,23 +2819,25 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
     .map((l) => {
       const color = getLineColor(l.descripcion);
       const active = l.codigo === state.horariosLineCode;
-      return `<button class="filter-chip ${active ? 'active' : ''}" data-hor-line="${l.codigo}" style="--chip-color:${color}">${escapeHtml(
+      return `<button type="button" class="filter-chip ${active ? 'active' : ''}" data-hor-line="${l.codigo}" aria-pressed="${active}" aria-label="Horarios de línea ${escapeHtml(l.descripcion)}" style="--chip-color:${color}">${escapeHtml(
         l.descripcion
       )}</button>`;
     })
     .join('');
 
   const dayTabs = [
-    { key: 'habil', label: 'Lun–Vie' },
-    { key: 'sabado', label: 'Sábado' },
-    { key: 'domingo', label: 'Domingo' }
+    { key: 'habil', label: 'Lun–Vie', spoken: 'Lunes a viernes' },
+    { key: 'sabado', label: 'Sábado', spoken: 'Sábado' },
+    { key: 'domingo', label: 'Domingo', spoken: 'Domingo' }
   ];
   const dayTabsHtml = `
-    <div class="day-type-tabs" role="tablist">
+    <div class="day-type-tabs" role="tablist" aria-label="Tipo de día">
       ${dayTabs
         .map(
-          (d) =>
-            `<button class="day-tab-btn ${state.horariosTipoDia === d.key ? 'active' : ''}" data-hor-day="${d.key}">${d.label}</button>`
+          (d) => {
+            const active = state.horariosTipoDia === d.key;
+            return `<button type="button" role="tab" aria-selected="${active}" aria-label="${d.spoken}" class="day-tab-btn ${active ? 'active' : ''}" data-hor-day="${d.key}">${d.label}</button>`;
+          }
         )
         .join('')}
     </div>
@@ -2173,9 +2846,9 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
   el.horariosPanel.innerHTML = `
     <div class="horarios-head">
       <h3>Horarios programados</h3>
-      <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+      <button type="button" id="btn-close-horarios" class="seg-btn seg-btn-xs" aria-label="Volver a arribos en vivo">← Arribos</button>
     </div>
-    <div class="horarios-line-tabs">${tabsHtml}</div>
+    <div class="horarios-line-tabs" role="group" aria-label="Seleccionar línea">${tabsHtml}</div>
     ${dayTabsHtml}
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
@@ -2183,33 +2856,49 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
   bindHorariosControls();
 
   try {
-    const res = await api.horarios(state.activeStop.id, state.horariosLineCode, state.horariosTipoDia);
+    const [res] = await Promise.all([
+      api.horarios(stopId, state.horariosLineCode, state.horariosTipoDia),
+      ensureScheduleAssetsLoaded([state.horariosLineCode])
+    ]);
+    if (!state.activeStop || state.activeStop.id !== stopId || !state.horariosOpen) return;
+
     const data = res.data || {};
     const horarios = Array.isArray(data.horarios) ? data.horarios : [];
 
-    const todayTipo = getArgentinaTodayTipo();
-    const isTodayScheme = state.horariosTipoDia === todayTipo;
-    const nowArt = getArgentinaNow();
-    const nowMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes();
+    // Reconstruct vehicle rotation blocks for this line & day type (FIFO DP + horarios cortados)
+    const branches = state.routeBranchesCache.get(state.horariosLineCode) || [];
+    const horFile = state.horariosArchiveCache.get(state.horariosLineCode) || null;
+    const stopCoords =
+      typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
+        ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
+        : null;
+    const model =
+      branches.length && horFile
+        ? buildLineScheduleModel(state.horariosLineCode, branches, horFile, state.horariosTipoDia)
+        : null;
+    const blockData = model && stopCoords ? buildStopTimetableBlocks(model, stopId, stopCoords) : null;
 
-    // Cross-match live buses against scheduled slots when viewing today's day type!
-    let slotToBus = new Map();
-    if (isTodayScheme && horarios.length > 0) {
-      state.horariosByLineCache.set(`${state.activeStop.id}:${state.horariosLineCode}:${todayTipo}`, horarios);
-      const lineBuses = state.arribos.filter((b) => Number(b.codigoLinea) === state.horariosLineCode);
-      slotToBus = matchBusesWithHorarios(lineBuses, horarios);
-    }
+    const ctx = {
+      stopId,
+      codLinea: state.horariosLineCode,
+      tipoDia: state.horariosTipoDia,
+      horarios,
+      model,
+      blockData
+    };
+    state.horariosViewCtx = ctx;
 
-    let nextMinute = -1;
+    const liveInfo = computeHorariosLiveMatch(ctx);
+    const { isTodayScheme, nowSvcMin, nextHora, slotToBus } = liveInfo;
+
     if (isTodayScheme && horarios.length > 0) {
-      const nextSlot = horarios.find((h) => h.minuteOfDay >= nowMin);
-      nextMinute = nextSlot ? nextSlot.minuteOfDay : -1;
+      state.horariosByLineCache.set(`${stopId}:${state.horariosLineCode}:${state.horariosTipoDia}`, horarios);
     }
 
     const groups = [
-      { title: 'Madrugada y Mañana (00:00 – 11:59)', items: horarios.filter((h) => h.minuteOfDay < 720) },
+      { title: 'Mañana (03:00 – 11:59)', items: horarios.filter((h) => h.minuteOfDay >= 180 && h.minuteOfDay < 720) },
       { title: 'Tarde (12:00 – 19:59)', items: horarios.filter((h) => h.minuteOfDay >= 720 && h.minuteOfDay < 1200) },
-      { title: 'Noche (20:00 – 23:59)', items: horarios.filter((h) => h.minuteOfDay >= 1200) }
+      { title: 'Noche y Madrugada (20:00 – 02:59)', items: horarios.filter((h) => h.minuteOfDay >= 1200 || h.minuteOfDay < 180) }
     ].filter((g) => g.items.length > 0);
 
     const freqText = data.frecuenciaMin ? `Cada ~${data.frecuenciaMin} min` : `${horarios.length} pasos`;
@@ -2238,6 +2927,7 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
           <span><strong>Línea ${escapeHtml(lineObj.descripcion)}</strong> · ${escapeHtml(freqText)}</span>
           <span class="mono-meta">${escapeHtml(statusTag)}</span>
         </div>
+        <div id="horarios-rotation-banner" class="rotation-banner hidden"></div>
         ${groups
           .map(
             (g) => `
@@ -2247,22 +2937,30 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
                 ${g.items
                   .map((h) => {
                     const matchedBus = slotToBus.get(h.hora);
+                    const slotMeta = lookupSlotBlockMeta(blockData?.slotMetaByHora, h.hora, h.minuteOfDay);
+                    const bId = slotMeta?.blockId || '';
+                    const srvNum = slotMeta?.blockInfo?.serviceNumber || '';
+                    const svcMin = toServiceMinuteOfDay(h.minuteOfDay);
+                    const isNext = !matchedBus && isTodayScheme && h.hora === nextHora;
+
                     const cls = matchedBus
                       ? 'has-bus'
-                      : isTodayScheme && h.minuteOfDay === nextMinute
+                      : isNext
                         ? 'is-next'
-                        : isTodayScheme && h.minuteOfDay < nowMin
+                        : isTodayScheme && svcMin < nowSvcMin
                           ? 'is-past'
                           : '';
-                    const busTag = matchedBus?.identificadorCoche
-                      ? `<span class="hora-bus-tag">#${escapeHtml(matchedBus.identificadorCoche)}</span>`
-                      : '';
-                    const tooltip = matchedBus
-                      ? `${h.hora} · Coche #${matchedBus.identificadorCoche} (${matchedBus.choferNombre || 'En servicio'}, ${matchedBus.desvio?.label || ''})`
-                      : `${h.bandera} · ${h.horaPaso}`;
-                    return `<span class="hora-pill ${cls}" title="${escapeHtml(tooltip)}"><span>${escapeHtml(
+
+                    const subHtml = matchedBus?.identificadorCoche
+                      ? `<span class="hora-bus-tag" data-hora-sub aria-hidden="true">#${escapeHtml(matchedBus.identificadorCoche)}</span>`
+                      : srvNum
+                        ? `<span class="hora-srv-tag" data-hora-sub aria-hidden="true">S${srvNum}</span>`
+                        : `<span class="hora-srv-tag" data-hora-sub aria-hidden="true"></span>`;
+
+                    const ariaLabel = buildHoraPillAriaLabel(h.hora, slotMeta, matchedBus, isNext);
+                    return `<button type="button" class="hora-pill ${cls}" data-hora="${escapeHtml(h.hora)}" data-min="${h.minuteOfDay}" data-block-id="${escapeHtml(bId)}" data-srv="${srvNum}" aria-pressed="false" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}"><span aria-hidden="true">${escapeHtml(
                       h.hora
-                    )}</span>${busTag}</span>`;
+                    )}</span>${subHtml}</button>`;
                   })
                   .join('')}
               </div>
@@ -2276,20 +2974,29 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
     el.horariosPanel.innerHTML = `
       <div class="horarios-head">
         <h3>Horarios programados</h3>
-        <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+        <button type="button" id="btn-close-horarios" class="seg-btn seg-btn-xs" aria-label="Volver a arribos en vivo">← Arribos</button>
       </div>
-      <div class="horarios-line-tabs">${tabsHtml}</div>
+      <div class="horarios-line-tabs" role="group" aria-label="Seleccionar línea">${tabsHtml}</div>
       ${dayTabsHtml}
       ${bodyHtml}
     `;
+    renderRotationBannerContent(ctx, liveInfo);
     bindHorariosControls();
+
+    const daySpoken = dayTabs.find((d) => d.key === state.horariosTipoDia)?.spoken || state.horariosTipoDia;
+    if (!data.available || horarios.length === 0) {
+      announce(`Línea ${lineObj.descripcion}, ${daySpoken}. Programación aún no publicada.`);
+    } else {
+      const nextHint = nextHora ? ` Próximo paso programado: ${nextHora}.` : '';
+      announce(`Horarios de línea ${lineObj.descripcion}, ${daySpoken}. ${horarios.length} pasos programados.${nextHint}`);
+    }
   } catch (err) {
     el.horariosPanel.innerHTML = `
       <div class="horarios-head">
         <h3>Horarios programados</h3>
-        <button id="btn-close-horarios" class="pill-btn">← Arribos</button>
+        <button type="button" id="btn-close-horarios" class="seg-btn seg-btn-xs" aria-label="Volver a arribos en vivo">← Arribos</button>
       </div>
-      <div class="horarios-line-tabs">${tabsHtml}</div>
+      <div class="horarios-line-tabs" role="group" aria-label="Seleccionar línea">${tabsHtml}</div>
       ${dayTabsHtml}
       <div class="empty-state"><h3>Error al cargar horarios</h3><p>${escapeHtml(err.message)}</p></div>
     `;
@@ -2309,6 +3016,38 @@ function bindHorariosControls() {
   });
 }
 
+function handleHorariosPanelClick(e) {
+  if (e.target.closest('[data-clear-rotation]')) {
+    state.horariosSelectedBlockId = null;
+    state.horariosSelectedHora = null;
+    updateHorariosRotationHighlights();
+    announce('Selección de servicio limpiada.');
+    return;
+  }
+
+  const pill = e.target.closest('.hora-pill[data-hora]');
+  if (!pill || !el.horariosPanel.contains(pill)) return;
+  const bId = pill.dataset.blockId || '';
+  const hora = pill.dataset.hora || '';
+  if (!bId) {
+    showToast('Sin datos de rotación disponibles para este horario', 'info', 1800);
+    return;
+  }
+
+  if (state.horariosSelectedBlockId === bId && state.horariosSelectedHora === hora) {
+    state.horariosSelectedBlockId = null;
+    state.horariosSelectedHora = null;
+    haptic('light');
+    updateHorariosRotationHighlights();
+    announce('Selección de servicio limpiada.');
+  } else {
+    state.horariosSelectedBlockId = bId;
+    state.horariosSelectedHora = hora;
+    haptic('light');
+    updateHorariosRotationHighlights({ speakSelection: true });
+  }
+}
+
 // ============================================================================
 // Route Polylines Overlay
 // ============================================================================
@@ -2326,6 +3065,7 @@ async function loadRouteForLine(codLinea, lineName, { clearExisting = true, fit 
     transitMap.drawRouteCollection(list, lineName, { showStops: true, fit });
     state.routesVisible = true;
     el.btnShowRoutes.classList.add('active');
+    el.btnShowRoutes.setAttribute('aria-pressed', 'true');
     showToast(`Recorrido ${lineName} dibujado (${list.length} ramales)`, 'success');
   } catch (err) {
     showToast(err.message || `No se pudo cargar el recorrido de ${lineName}`, 'warn');
@@ -2337,16 +3077,35 @@ async function toggleActiveStopRoutes() {
     transitMap.clearRoutes();
     state.routesVisible = false;
     el.btnShowRoutes.classList.remove('active');
+    el.btnShowRoutes.setAttribute('aria-pressed', 'false');
+    announce('Recorridos ocultados del mapa.');
     return;
   }
 
   const unique = [];
-  for (const a of state.arribos) {
-    if (!unique.some((u) => u.codigoLinea === a.codigoLinea)) {
-      unique.push({ codigoLinea: a.codigoLinea, lineName: a.descripcionLinea });
+  if (state.focusedLineCode) {
+    const focused =
+      state.stopLinesList.find((l) => Number(l.codigo) === state.focusedLineCode) ||
+      state.lineas.find((l) => Number(l.codigo) === state.focusedLineCode);
+    unique.push({
+      codigoLinea: state.focusedLineCode,
+      lineName: focused?.descripcion || state.filterLine || String(state.focusedLineCode)
+    });
+  } else {
+    for (const a of state.arribos) {
+      if (!unique.some((u) => u.codigoLinea === a.codigoLinea)) {
+        unique.push({ codigoLinea: a.codigoLinea, lineName: a.descripcionLinea });
+      }
+      if (unique.length >= 3) break;
     }
-    if (unique.length >= 3) break;
+    if (unique.length === 0) {
+      for (const l of state.stopLinesList) {
+        unique.push({ codigoLinea: l.codigo, lineName: l.descripcion });
+        if (unique.length >= 3) break;
+      }
+    }
   }
+
   if (unique.length === 0) {
     showToast('Seleccioná una línea en la pestaña Líneas para trazar su recorrido', 'info');
     return;
@@ -2362,34 +3121,146 @@ async function toggleActiveStopRoutes() {
 }
 
 // ============================================================================
-// TAB 2: Líneas -> Calles -> Intersecciones -> Paradas
+// TAB 2: Líneas -> Calles -> Intersecciones -> Paradas | Flota y Choferes
 // ============================================================================
+function formatRosterClockArt(tsMs) {
+  if (!tsMs || !Number.isFinite(Number(tsMs))) return '';
+  const d = new Date(Number(tsMs) - 3 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+function formatRosterSeenInfo(tsMs, lastDayKey, todayDayKey) {
+  const clock = formatRosterClockArt(tsMs);
+  if (lastDayKey && todayDayKey && lastDayKey === todayDayKey) {
+    return {
+      isToday: true,
+      badge: 'Hoy',
+      whenShort: clock ? `Hoy ${clock}` : 'Hoy',
+      whenSpoken: clock ? `hoy a las ${clock}` : 'hoy'
+    };
+  }
+  const d = tsMs ? new Date(Number(tsMs) - 3 * 3600 * 1000) : null;
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateStr = d ? `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}` : lastDayKey || '';
+
+  let daysAgo = null;
+  if (lastDayKey && todayDayKey) {
+    const t1 = Date.parse(`${todayDayKey}T12:00:00Z`);
+    const t2 = Date.parse(`${lastDayKey}T12:00:00Z`);
+    if (Number.isFinite(t1) && Number.isFinite(t2)) {
+      daysAgo = Math.max(1, Math.round((t1 - t2) / 86400000));
+    }
+  }
+  if (daysAgo === null && tsMs) {
+    daysAgo = Math.max(1, Math.round((Date.now() - Number(tsMs)) / 86400000));
+  }
+
+  if (daysAgo === 1) {
+    return {
+      isToday: false,
+      badge: 'Ayer',
+      whenShort: clock ? `Ayer ${clock}` : 'Ayer',
+      whenSpoken: clock ? `ayer a las ${clock}` : 'ayer'
+    };
+  }
+  return {
+    isToday: false,
+    badge: daysAgo ? `Hace ${daysAgo}d` : dateStr || 'Reciente',
+    whenShort: dateStr && clock ? `${dateStr} ${clock}` : dateStr || 'Reciente',
+    whenSpoken: dateStr && clock ? `el ${dateStr} a las ${clock}` : dateStr || 'recientemente'
+  };
+}
+
+let flotaResumenInFlight = false;
+async function loadFlotaResumen(force = false) {
+  if (flotaResumenInFlight || state.isOffline) return;
+  const now = Date.now();
+  if (!force && now - state.flotaSummaryLastFetchMs < 45000) return;
+  flotaResumenInFlight = true;
+  try {
+    const res = await api.flotaResumen();
+    const data = res?.data;
+    if (data && Array.isArray(data.lineas)) {
+      const nextMap = new Map();
+      for (const item of data.lineas) {
+        nextMap.set(Number(item.codigoLinea), item);
+      }
+      state.flotaSummaryByLine = nextMap;
+      state.flotaSummaryMeta = data.meta || null;
+      state.flotaSummaryLastFetchMs = Date.now();
+      if (state.drill.step === 'lineas') {
+        renderDrilldown();
+      }
+    }
+  } catch {
+    // Non-fatal: keep UI responsive even if backend summary is temporarily unavailable
+  } finally {
+    flotaResumenInFlight = false;
+  }
+}
+
+function syncLineasFilterPlaceholder() {
+  const { step, linea } = state.drill;
+  if (step === 'flota') {
+    el.lineasFilterInput.placeholder = 'Filtrar por coche o chofer...';
+    el.lineasFilterInput.setAttribute(
+      'aria-label',
+      `Filtrar coches o choferes de línea ${linea?.descripcion || ''}`.trim()
+    );
+  } else if (step === 'calles') {
+    el.lineasFilterInput.placeholder = 'Filtrar calle...';
+    el.lineasFilterInput.setAttribute('aria-label', 'Filtrar calles de la línea');
+  } else if (step === 'intersecciones') {
+    el.lineasFilterInput.placeholder = 'Filtrar intersección...';
+    el.lineasFilterInput.setAttribute('aria-label', 'Filtrar intersecciones');
+  } else if (step === 'paradas') {
+    el.lineasFilterInput.placeholder = 'Filtrar parada...';
+    el.lineasFilterInput.setAttribute('aria-label', 'Filtrar paradas');
+  } else {
+    el.lineasFilterInput.placeholder = 'Filtrar línea...';
+    el.lineasFilterInput.setAttribute('aria-label', 'Filtrar lista de líneas');
+  }
+}
+
 function renderLineasBreadcrumb() {
   const { step, linea, calle, interseccion } = state.drill;
+  syncLineasFilterPlaceholder();
+
   if (step === 'lineas') {
     el.lineasBreadcrumb.innerHTML = `<span class="crumb-current">Todas las líneas · Corrientes (${state.lineas.length})</span>`;
     return;
   }
 
-  const parts = [`<button class="crumb-btn" data-back="lineas">← Líneas</button>`];
+  const parts = [`<button type="button" class="crumb-btn" data-back="lineas">← Líneas</button>`];
   if (linea) {
-    if (step === 'calles') {
-      parts.push(`<span class="crumb-sep">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Calles</span>`);
+    if (step === 'flota') {
+      parts.push(
+        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Flota y choferes</span>`
+      );
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="calles" aria-label="Ver calles y paradas de línea ${escapeHtml(linea.descripcion)}">Calles</button>`
+      );
+    } else if (step === 'calles') {
+      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Calles</span>`);
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="flota" aria-label="Ver flota de coches y choferes de línea ${escapeHtml(linea.descripcion)}">Flota</button>`
+      );
     } else {
-      parts.push(`<span class="crumb-sep">/</span><button class="crumb-btn" data-back="calles">${escapeHtml(linea.descripcion)}</button>`);
+      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><button type="button" class="crumb-btn" data-back="calles">${escapeHtml(linea.descripcion)}</button>`);
     }
   }
-  if (calle) {
+  if (calle && step !== 'flota') {
     const shortCalle = calle.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
     if (step === 'intersecciones') {
-      parts.push(`<span class="crumb-sep">/</span><span class="crumb-current">${escapeHtml(shortCalle)}</span>`);
+      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">${escapeHtml(shortCalle)}</span>`);
     } else {
-      parts.push(`<span class="crumb-sep">/</span><button class="crumb-btn" data-back="intersecciones">${escapeHtml(shortCalle)}</button>`);
+      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><button type="button" class="crumb-btn" data-back="intersecciones">${escapeHtml(shortCalle)}</button>`);
     }
   }
   if (interseccion && step === 'paradas') {
     const shortInt = interseccion.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
-    parts.push(`<span class="crumb-sep">/</span><span class="crumb-current">${escapeHtml(shortInt)}</span>`);
+    parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">${escapeHtml(shortInt)}</span>`);
   }
 
   el.lineasBreadcrumb.innerHTML = parts.join('');
@@ -2400,8 +3271,11 @@ function renderLineasBreadcrumb() {
       if (target === 'lineas') {
         state.drill = { step: 'lineas', linea: null, calle: null, interseccion: null, items: state.lineas };
         renderDrilldown();
+        loadFlotaResumen(false);
       } else if (target === 'calles' && state.drill.linea) {
         openLineCalles(state.drill.linea);
+      } else if (target === 'flota' && state.drill.linea) {
+        openLineFlota(state.drill.linea);
       } else if (target === 'intersecciones' && state.drill.linea && state.drill.calle) {
         openCalleIntersecciones(state.drill.calle);
       }
@@ -2409,10 +3283,322 @@ function renderLineasBreadcrumb() {
   });
 }
 
+function renderLineFlotaView() {
+  const linea = state.drill.linea;
+  if (!linea) return;
+  const fv = state.flotaView;
+  const color = getLineColor(linea.descripcion);
+
+  if (fv.loading) {
+    el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    return;
+  }
+
+  if (fv.error) {
+    el.lineasContent.innerHTML = `
+      <div class="empty-state">
+        <h3>No se pudo consultar la flota</h3>
+        <p>${escapeHtml(fv.error)}</p>
+        <button type="button" id="btn-flota-retry" class="secondary-action-btn">Reintentar</button>
+      </div>
+    `;
+    document.getElementById('btn-flota-retry')?.addEventListener('click', () => openLineFlota(linea, { force: true }));
+    return;
+  }
+
+  const data = fv.data || { coches: [], choferes: [], dayKey: getArgentinaDayKey(), retentionDays: 7, meta: {} };
+  const todayKey = data.dayKey || getArgentinaDayKey();
+  const retentionDays = data.retentionDays || 7;
+  const meta = data.meta || {};
+  const allCoches = Array.isArray(data.coches) ? data.coches : [];
+  const allChoferes = Array.isArray(data.choferes) ? data.choferes : [];
+
+  const scopeCoches = fv.scope === 'hoy' ? allCoches.filter((c) => c.vistoHoy) : allCoches;
+  const scopeChoferes = fv.scope === 'hoy' ? allChoferes.filter((d) => d.vistoHoy) : allChoferes;
+
+  const query = el.lineasFilterInput.value.trim().toLowerCase();
+  const visibleCoches = query
+    ? scopeCoches.filter((c) =>
+        `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${c.lastBandera || ''}`
+          .toLowerCase()
+          .includes(query)
+      )
+    : scopeCoches;
+  const visibleChoferes = query
+    ? scopeChoferes.filter((d) =>
+        `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${d.lastBandera || ''}`
+          .toLowerCase()
+          .includes(query)
+      )
+    : scopeChoferes;
+
+  const lastScanClock = formatRosterClockArt(meta.lastCronAt || meta.lastCycleAt);
+  const autoMetaText = lastScanClock
+    ? `Sistema · Act. auto ${lastScanClock} · Renovación ${retentionDays}d`
+    : `Sistema · Escaneo automático cada ${meta.scanIntervalMin || 5} min · Renovación ${retentionDays}d`;
+
+  const hoyCochesCount = allCoches.filter((c) => c.vistoHoy).length;
+  const hoyChoferesCount = allChoferes.filter((d) => d.vistoHoy).length;
+  const activeCount = fv.tab === 'coches' ? visibleCoches.length : visibleChoferes.length;
+  const activeScopeTotal = fv.tab === 'coches' ? scopeCoches.length : scopeChoferes.length;
+
+  let listHtml = '';
+  if (fv.tab === 'coches') {
+    if (visibleCoches.length === 0) {
+      listHtml = `
+        <div class="empty-state">
+          <h3>${query ? 'Sin coches coincidentes' : fv.scope === 'hoy' ? 'Sin coches registrados hoy' : 'Sin coches registrados todavía'}</h3>
+          <p>${
+            query
+              ? 'Probá con otro número de coche o apellido de chofer.'
+              : fv.scope === 'hoy' && allCoches.length > 0
+                ? `Hoy todavía no se detectaron unidades activas. Cambiá a Últimos ${retentionDays} días para ver los ${allCoches.length} coches recientes de la línea.`
+                : 'El sistema escanea automáticamente todas las líneas cada pocos minutos y guarda la flota en el servidor.'
+          }</p>
+        </div>
+      `;
+    } else {
+      listHtml = `
+        <ul class="flota-list" role="list" aria-label="Flota de coches de línea ${escapeHtml(linea.descripcion)}">
+          ${visibleCoches
+            .map((c) => {
+              const seen = formatRosterSeenInfo(c.lastSeenAt, c.lastDayKey, todayKey);
+              const driverTxt = c.lastChoferNombre
+                ? `${c.lastChoferNombre}${c.lastChoferLegajo ? ` (${c.lastChoferLegajo})` : ''}`
+                : '';
+              const srParts = [
+                `Coche ${c.coche}${c.esAdaptado ? ', unidad adaptada' : ''}`,
+                seen.isToday ? `en servicio hoy, visto ${seen.whenSpoken}` : `visto por última vez ${seen.whenSpoken}`,
+                driverTxt
+                  ? `último chofer: ${c.lastChoferNombre}${c.lastChoferLegajo ? `, legajo ${c.lastChoferLegajo}` : ''}`
+                  : 'chofer sin datos',
+                c.lastBandera ? `ramal ${c.lastBandera}` : ''
+              ].filter(Boolean);
+              return `
+                <li class="flota-row ${seen.isToday ? 'is-today' : 'is-recent'}" style="--line-color:${color}">
+                  <span class="sr-only">${escapeHtml(srParts.join('. '))}.</span>
+                  <div class="flota-row-visual" aria-hidden="true">
+                    <div class="flota-row-head">
+                      <div class="flota-row-primary">
+                        <span class="flota-coche-title">#${escapeHtml(c.coche)}</span>
+                        ${c.esAdaptado ? `<span class="adapted-icon-badge" title="Unidad adaptada">♿</span>` : ''}
+                      </div>
+                      <span class="flota-status-pill ${seen.isToday ? 'is-today' : 'is-recent'}">${escapeHtml(seen.badge)}</span>
+                    </div>
+                    <div class="flota-row-sub">
+                      <span>${driverTxt ? `Últ. chofer: <strong>${escapeHtml(c.lastChoferNombre)}</strong>${c.lastChoferLegajo ? ` <span class="legajo-chip">${escapeHtml(c.lastChoferLegajo)}</span>` : ''}` : 'Chofer s/d'}</span>
+                    </div>
+                    <div class="flota-row-foot">
+                      <span class="flota-bandera-txt">${escapeHtml(c.lastBandera || `Línea ${linea.descripcion}`)}</span>
+                      <span>${escapeHtml(seen.whenShort)}</span>
+                    </div>
+                  </div>
+                </li>
+              `;
+            })
+            .join('')}
+        </ul>
+      `;
+    }
+  } else {
+    if (visibleChoferes.length === 0) {
+      listHtml = `
+        <div class="empty-state">
+          <h3>${query ? 'Sin choferes coincidentes' : fv.scope === 'hoy' ? 'Sin choferes registrados hoy' : 'Sin choferes registrados todavía'}</h3>
+          <p>${
+            query
+              ? 'Probá con otro nombre, legajo o número de coche.'
+              : fv.scope === 'hoy' && allChoferes.length > 0
+                ? `Hoy todavía no se detectaron choferes activos. Cambiá a Últimos ${retentionDays} días para ver los ${allChoferes.length} choferes recientes de la línea.`
+                : 'El sistema registra automáticamente a cada chofer y el último coche en el que fue visto en el servidor.'
+          }</p>
+        </div>
+      `;
+    } else {
+      listHtml = `
+        <ul class="flota-list" role="list" aria-label="Choferes de línea ${escapeHtml(linea.descripcion)}">
+          ${visibleChoferes
+            .map((d) => {
+              const seen = formatRosterSeenInfo(d.lastSeenAt, d.lastDayKey, todayKey);
+              const srParts = [
+                `Chofer ${d.choferNombre}${d.choferLegajo ? `, legajo ${d.choferLegajo}` : ''}`,
+                d.lastCoche
+                  ? `visto por última vez en el coche ${d.lastCoche}${d.lastEsAdaptado ? ', unidad adaptada' : ''}`
+                  : 'último coche sin datos',
+                seen.whenSpoken,
+                d.lastBandera ? `ramal ${d.lastBandera}` : ''
+              ].filter(Boolean);
+              return `
+                <li class="flota-row ${seen.isToday ? 'is-today' : 'is-recent'}" style="--line-color:${color}">
+                  <span class="sr-only">${escapeHtml(srParts.join('. '))}.</span>
+                  <div class="flota-row-visual" aria-hidden="true">
+                    <div class="flota-row-head">
+                      <div class="flota-row-primary">
+                        <span class="flota-driver-title">${escapeHtml(d.choferNombre)}</span>
+                        ${d.choferLegajo ? `<span class="legajo-chip">${escapeHtml(d.choferLegajo)}</span>` : ''}
+                      </div>
+                      <span class="flota-status-pill ${seen.isToday ? 'is-today' : 'is-recent'}">${escapeHtml(seen.badge)}</span>
+                    </div>
+                    <div class="flota-row-sub">
+                      <span class="flota-last-coche">Último coche: <strong>#${escapeHtml(d.lastCoche || '—')}</strong>${d.lastEsAdaptado ? ' <span class="adapted-icon-badge">♿</span>' : ''}</span>
+                    </div>
+                    <div class="flota-row-foot">
+                      <span class="flota-bandera-txt">${escapeHtml(d.lastBandera || `Línea ${linea.descripcion}`)}</span>
+                      <span>${escapeHtml(seen.whenShort)}</span>
+                    </div>
+                  </div>
+                </li>
+              `;
+            })
+            .join('')}
+        </ul>
+      `;
+    }
+  }
+
+  el.lineasContent.innerHTML = `
+    <div class="flota-view">
+      <div class="flota-system-bar">
+        <div class="flota-system-info">
+          <div class="flota-system-title">
+            <span class="line-tile-swatch" style="background:${color}" aria-hidden="true"></span>
+            <span>Línea ${escapeHtml(linea.descripcion)}</span>
+          </div>
+          <span class="flota-system-meta">${escapeHtml(autoMetaText)}</span>
+        </div>
+        <button type="button" id="btn-flota-refresh" class="mini-action-btn" title="Actualizar lista desde el servidor" aria-label="Actualizar lista de coches y choferes de línea ${escapeHtml(linea.descripcion)} desde el servidor">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <polyline points="21 3 21 9 15 9"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="flota-tabs-bar" role="tablist" aria-label="Ver coches o choferes">
+        <button type="button" class="flota-tab-btn ${fv.tab === 'coches' ? 'active' : ''}" data-flota-tab="coches" role="tab" aria-selected="${fv.tab === 'coches'}" tabindex="${fv.tab === 'coches' ? '0' : '-1'}">Coches (${scopeCoches.length})</button>
+        <button type="button" class="flota-tab-btn ${fv.tab === 'choferes' ? 'active' : ''}" data-flota-tab="choferes" role="tab" aria-selected="${fv.tab === 'choferes'}" tabindex="${fv.tab === 'choferes' ? '0' : '-1'}">Choferes (${scopeChoferes.length})</button>
+      </div>
+
+      <div class="flota-scope-bar">
+        <div class="flota-scope-group" role="group" aria-label="Período de la lista">
+          <button type="button" class="seg-btn seg-btn-xs ${fv.scope === 'semana' ? 'active' : ''}" data-flota-scope="semana" aria-pressed="${fv.scope === 'semana'}">Últimos ${retentionDays} días</button>
+          <button type="button" class="seg-btn seg-btn-xs ${fv.scope === 'hoy' ? 'active' : ''}" data-flota-scope="hoy" aria-pressed="${fv.scope === 'hoy'}">Hoy (${fv.tab === 'coches' ? hoyCochesCount : hoyChoferesCount})</button>
+        </div>
+        <span class="mono-meta">${query ? `${activeCount} de ${activeScopeTotal}` : `${activeCount} reg.`}</span>
+      </div>
+
+      ${listHtml}
+    </div>
+  `;
+
+  document.getElementById('btn-flota-refresh')?.addEventListener('click', () => {
+    haptic('light');
+    openLineFlota(linea, { force: true, announceLoad: true });
+  });
+
+  const subTabs = Array.from(el.lineasContent.querySelectorAll('[data-flota-tab]'));
+  subTabs.forEach((btn, idx) => {
+    btn.addEventListener('click', () => {
+      const next = btn.dataset.flotaTab;
+      if (state.flotaView.tab === next) return;
+      state.flotaView.tab = next;
+      haptic('light');
+      renderLineFlotaView();
+      const count = next === 'coches' ? scopeCoches.length : scopeChoferes.length;
+      announce(
+        next === 'coches'
+          ? `Lista de coches de línea ${linea.descripcion}: ${count} ${count === 1 ? 'coche' : 'coches'}.`
+          : `Lista de choferes de línea ${linea.descripcion}: ${count} ${count === 1 ? 'chofer' : 'choferes'}.`
+      );
+    });
+    btn.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+        e.preventDefault();
+        const nextBtn = subTabs[(idx + 1) % subTabs.length];
+        nextBtn?.click();
+        el.lineasContent.querySelector(`[data-flota-tab="${state.flotaView.tab}"]`)?.focus();
+      }
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-flota-scope]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const next = btn.dataset.flotaScope;
+      if (state.flotaView.scope === next) return;
+      state.flotaView.scope = next;
+      haptic('light');
+      renderLineFlotaView();
+      const label = next === 'hoy' ? 'de hoy' : `de los últimos ${retentionDays} días`;
+      const cCount = next === 'hoy' ? hoyCochesCount : allCoches.length;
+      const dCount = next === 'hoy' ? hoyChoferesCount : allChoferes.length;
+      announce(`Mostrando registros ${label}: ${cCount} coches y ${dCount} choferes.`);
+    });
+  });
+}
+
+async function openLineFlota(linea, { force = true, announceLoad = true } = {}) {
+  el.lineasFilterInput.value = '';
+  const sameLine = state.drill.step === 'flota' && state.drill.linea?.codigo === linea.codigo;
+  state.drill = { step: 'flota', linea, calle: null, interseccion: null, items: [] };
+  if (!sameLine) {
+    state.flotaView = { tab: 'coches', scope: 'semana', data: null, loading: true, error: null };
+  } else if (force) {
+    state.flotaView.loading = true;
+    state.flotaView.error = null;
+  }
+  renderLineasBreadcrumb();
+  renderLineFlotaView();
+
+  try {
+    const res = await api.flotaLinea(linea.codigo);
+    const data = res?.data;
+    if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+    state.flotaView.data = data || { coches: [], choferes: [], retentionDays: 7, meta: {} };
+    state.flotaView.loading = false;
+    state.flotaView.error = null;
+
+    // Keep summary badge in sync with freshly fetched line roster
+    if (data) {
+      state.flotaSummaryByLine.set(Number(linea.codigo), {
+        codigoLinea: Number(linea.codigo),
+        descripcionLinea: data.descripcionLinea || linea.descripcion,
+        cochesHoy: (data.coches || []).filter((c) => c.vistoHoy).length,
+        cochesSemana: (data.coches || []).length,
+        choferesHoy: (data.choferes || []).filter((d) => d.vistoHoy).length,
+        choferesSemana: (data.choferes || []).length,
+        lastSeenAt: Date.now()
+      });
+    }
+
+    renderLineFlotaView();
+    if (announceLoad) {
+      const cTotal = (data?.coches || []).length;
+      const cHoy = (data?.coches || []).filter((c) => c.vistoHoy).length;
+      const dTotal = (data?.choferes || []).length;
+      announce(
+        `Flota de línea ${linea.descripcion}: ${cTotal} ${cTotal === 1 ? 'coche' : 'coches'} (${cHoy} hoy) y ${dTotal} ${dTotal === 1 ? 'chofer' : 'choferes'} registrados en el sistema.`
+      );
+    }
+  } catch (err) {
+    if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+    state.flotaView.loading = false;
+    state.flotaView.error = err?.isOffline
+      ? 'Conectate a internet para consultar la lista actualizada de coches y choferes del sistema.'
+      : err.message || 'No se pudo conectar con el servidor.';
+    renderLineFlotaView();
+    announce(state.flotaView.error);
+  }
+}
+
 function renderDrilldown() {
   renderLineasBreadcrumb();
   const query = el.lineasFilterInput.value.trim().toLowerCase();
   const { step, items } = state.drill;
+
+  if (step === 'flota') {
+    renderLineFlotaView();
+    return;
+  }
 
   if (step === 'lineas') {
     const filtered = state.lineas.filter((l) => l.descripcion.toLowerCase().includes(query));
@@ -2421,12 +3607,28 @@ function renderDrilldown() {
         ${filtered
           .map((l) => {
             const color = getLineColor(l.descripcion);
+            const sum = state.flotaSummaryByLine.get(Number(l.codigo));
+            const countBadge =
+              sum && sum.cochesSemana > 0
+                ? `<span class="line-tile-count" aria-hidden="true" title="${sum.cochesHoy} coches hoy · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${sum.cochesHoy > 0 ? `${sum.cochesHoy}/${sum.cochesSemana}` : `${sum.cochesSemana}`} c.</span>`
+                : '';
+            const flotaAria =
+              sum && sum.cochesSemana > 0
+                ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${sum.cochesHoy} coches hoy, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
+                : `Ver flota de coches y choferes de línea ${l.descripcion}`;
             return `
               <div class="line-tile" style="--line-color:${color}">
-                <span class="line-tile-pill">${escapeHtml(l.descripcion)}</span>
+                <div class="line-tile-head">
+                  <div class="line-tile-title">
+                    <span class="line-tile-swatch" aria-hidden="true"></span>
+                    <span class="line-tile-name">${escapeHtml(l.descripcion)}</span>
+                  </div>
+                  ${countBadge}
+                </div>
                 <div class="line-tile-actions">
-                  <button class="tile-mini-btn primary btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}">Calles</button>
-                  <button class="tile-mini-btn btn-line-map" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}">Mapa</button>
+                  <button type="button" class="tile-mini-btn primary btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver calles y paradas de línea ${escapeHtml(l.descripcion)}">Calles</button>
+                  <button type="button" class="tile-mini-btn btn-line-flota" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="${escapeHtml(flotaAria)}">Flota</button>
+                  <button type="button" class="tile-mini-btn btn-line-map" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver recorrido de línea ${escapeHtml(l.descripcion)} en el mapa">Mapa</button>
                 </div>
               </div>
             `;
@@ -2437,6 +3639,9 @@ function renderDrilldown() {
 
     el.lineasContent.querySelectorAll('.btn-line-calles').forEach((btn) => {
       btn.addEventListener('click', () => openLineCalles({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
+    });
+    el.lineasContent.querySelectorAll('.btn-line-flota').forEach((btn) => {
+      btn.addEventListener('click', () => openLineFlota({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
     el.lineasContent.querySelectorAll('.btn-line-map').forEach((btn) => {
       btn.addEventListener('click', () => loadRouteForLine(btn.dataset.cod, btn.dataset.desc, { clearExisting: true, fit: true }));
@@ -2454,12 +3659,12 @@ function renderDrilldown() {
     el.lineasContent.innerHTML = filtered
       .map(
         (c) => `
-        <button class="list-row-btn" data-cod="${c.codigo}" data-desc="${escapeHtml(c.descripcion)}">
+        <button type="button" class="list-row-btn" data-cod="${c.codigo}" data-desc="${escapeHtml(c.descripcion)}">
           <div class="list-row-main">
             <span class="list-row-title">${escapeHtml(c.descripcion.replace(/\s*-\s*CORRIENTES$/i, ''))}</span>
             <span class="list-row-sub">Seleccionar intersección</span>
           </div>
-          <span class="row-chevron">›</span>
+          <span class="row-chevron" aria-hidden="true">›</span>
         </button>
       `
       )
@@ -2474,12 +3679,12 @@ function renderDrilldown() {
     el.lineasContent.innerHTML = filtered
       .map(
         (i) => `
-        <button class="list-row-btn" data-cod="${i.codigo}" data-desc="${escapeHtml(i.descripcion)}">
+        <button type="button" class="list-row-btn" data-cod="${i.codigo}" data-desc="${escapeHtml(i.descripcion)}">
           <div class="list-row-main">
             <span class="list-row-title">${escapeHtml(i.descripcion.replace(/\s*-\s*CORRIENTES$/i, ''))}</span>
             <span class="list-row-sub">Ver paradas en esta esquina</span>
           </div>
-          <span class="row-chevron">›</span>
+          <span class="row-chevron" aria-hidden="true">›</span>
         </button>
       `
       )
@@ -2500,8 +3705,8 @@ function renderDrilldown() {
           </div>
           <div class="stop-card-name">${escapeHtml(p.descripcion)}</div>
           <div class="stop-card-foot">
-            <button class="pill-btn btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Todas las líneas</button>
-            <button class="pill-btn pill-btn-ghost btn-open-only" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}">Solo ${escapeHtml(state.drill.linea.descripcion)}</button>
+            <button type="button" class="seg-btn seg-btn-xs active btn-open-all" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}" aria-label="Abrir parada ${escapeHtml(p.identificador)}, ${escapeHtml(p.descripcion)}, todas las líneas">Todas las líneas</button>
+            <button type="button" class="seg-btn seg-btn-xs btn-open-only" data-id="${escapeHtml(p.identificador)}" data-name="${escapeHtml(p.descripcion)}" aria-label="Abrir parada ${escapeHtml(p.identificador)}, ${escapeHtml(p.descripcion)}, solo línea ${escapeHtml(state.drill.linea.descripcion)}">Solo ${escapeHtml(state.drill.linea.descripcion)}</button>
           </div>
         </div>
       `
@@ -2528,6 +3733,7 @@ async function openLineCalles(linea) {
     const res = await api.calles(linea.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
     renderDrilldown();
+    announce(`Línea ${linea.descripcion}: ${state.drill.items.length} calles disponibles.`);
   } catch (err) {
     el.lineasContent.innerHTML = `<div class="empty-state"><h3>Error</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
@@ -2542,6 +3748,7 @@ async function openCalleIntersecciones(calle) {
     const res = await api.intersecciones(state.drill.linea.codigo, calle.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
     renderDrilldown();
+    announce(`${state.drill.items.length} intersecciones disponibles.`);
   } catch (err) {
     el.lineasContent.innerHTML = `<div class="empty-state"><h3>Error</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
@@ -2556,6 +3763,7 @@ async function openInterseccionParadas(interseccion) {
     const res = await api.paradas(state.drill.linea.codigo, state.drill.calle.codigo, interseccion.codigo);
     state.drill.items = Array.isArray(res.data) ? res.data : [];
     renderDrilldown();
+    announce(`${state.drill.items.length} ${state.drill.items.length === 1 ? 'parada encontrada' : 'paradas encontradas'}.`);
   } catch (err) {
     el.lineasContent.innerHTML = `<div class="empty-state"><h3>Error</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
@@ -2566,7 +3774,7 @@ async function openInterseccionParadas(interseccion) {
 // ============================================================================
 function renderHubs() {
   el.hubsChips.innerHTML = state.hubs
-    .map((h, idx) => `<button class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name.replace(/\s*\(Piloto\)/i, ''))}</button>`)
+    .map((h, idx) => `<button type="button" class="hub-chip" data-hub-idx="${idx}">${escapeHtml(h.name.replace(/\s*\(Piloto\)/i, ''))}</button>`)
     .join('');
 
   el.hubsChips.querySelectorAll('.hub-chip').forEach((chip) => {
@@ -2578,7 +3786,7 @@ function renderHubs() {
 
   el.cercanasList.innerHTML = `
     <div class="empty-state">
-      <div class="empty-state-icon">◎</div>
+      <div class="empty-state-icon" aria-hidden="true">◎</div>
       <h3>Buscá paradas a tu alrededor</h3>
       <p>Usá tu GPS, tocá el centro del mapa o elegí una zona de Corrientes.</p>
     </div>
@@ -2596,6 +3804,7 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
 
     if (stops.length === 0) {
       el.cercanasList.innerHTML = `<div class="empty-state"><h3>Sin paradas cercanas</h3><p>No encontramos paradas cerca de ${escapeHtml(label)}.</p></div>`;
+      announce(`No se encontraron paradas cerca de ${label}.`);
       return;
     }
 
@@ -2606,6 +3815,9 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
         const sLat = parseFloat(s.latitud);
         const sLng = parseFloat(s.longitud);
         const dist = distanceMeters(lat, lng, sLat, sLng);
+        const openAria = `Abrir radar de parada ${s.identificador}, ${s.descripcion}, a ${formatDistance(dist)}${
+          s.lineas ? `, líneas ${s.lineas}` : ''
+        }`;
         return `
           <div class="stop-list-card">
             <div class="stop-card-top">
@@ -2616,9 +3828,9 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
             <div class="stop-card-lines">${escapeHtml(s.lineas || '')}</div>
             <div class="stop-card-foot">
               <span class="mono-meta">${escapeHtml(s.callePrincipal || '')}</span>
-              <button class="pill-btn btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
+              <button type="button" class="seg-btn seg-btn-xs btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
                 s.descripcion
-              )}" data-lat="${sLat}" data-lng="${sLng}">Abrir radar →</button>
+              )}" data-lat="${sLat}" data-lng="${sLng}" aria-label="${escapeHtml(openAria)}">Abrir radar →</button>
             </div>
           </div>
         `;
@@ -2633,6 +3845,8 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
         );
       });
     });
+
+    announce(`Se encontraron ${stops.length} paradas cerca de ${label}.`);
   } catch (err) {
     el.cercanasList.innerHTML = `<div class="empty-state"><h3>Error</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
@@ -2658,12 +3872,17 @@ async function locateUserGps() {
 }
 
 // ============================================================================
-// Global Search
+// Global Search (Accessible Combobox)
 // ============================================================================
+function closeSearchDropdown() {
+  el.searchDropdown.classList.add('hidden');
+  el.globalSearch.setAttribute('aria-expanded', 'false');
+}
+
 function renderGlobalSearchResults(rawQuery) {
   const q = rawQuery.trim();
   if (!q) {
-    el.searchDropdown.classList.add('hidden');
+    closeSearchDropdown();
     return;
   }
 
@@ -2737,13 +3956,13 @@ function renderGlobalSearchResults(rawQuery) {
   }
 
   if (results.length === 0) {
-    el.searchDropdown.innerHTML = `<div class="search-item"><div class="search-item-main"><span class="search-item-title">Sin coincidencias</span><span class="search-item-sub">Ingresá un código como CT31498 o una línea como 106A</span></div></div>`;
+    el.searchDropdown.innerHTML = `<div class="search-item" role="option" aria-disabled="true"><div class="search-item-main"><span class="search-item-title">Sin coincidencias</span><span class="search-item-sub">Ingresá un código como CT31498 o una línea como 106A</span></div></div>`;
   } else {
     el.searchDropdown.innerHTML = results
       .slice(0, 8)
       .map(
         (r, i) => `
-        <button class="search-item" data-res-idx="${i}">
+        <button type="button" class="search-item" role="option" data-res-idx="${i}">
           <div class="search-item-main">
             <span class="search-item-title">${escapeHtml(r.title)}</span>
             <span class="search-item-sub">${escapeHtml(r.sub)}</span>
@@ -2754,36 +3973,65 @@ function renderGlobalSearchResults(rawQuery) {
       )
       .join('');
 
-    el.searchDropdown.querySelectorAll('.search-item').forEach((item) => {
+    el.searchDropdown.querySelectorAll('.search-item[data-res-idx]').forEach((item) => {
       item.addEventListener('click', () => {
         const res = results[Number(item.dataset.resIdx)];
-        el.searchDropdown.classList.add('hidden');
+        closeSearchDropdown();
         el.globalSearch.value = '';
         res?.action();
       });
     });
   }
   el.searchDropdown.classList.remove('hidden');
+  el.globalSearch.setAttribute('aria-expanded', 'true');
 }
 
 // ============================================================================
 // Events & Clean Init
 // ============================================================================
 function bindEvents() {
-  el.tabs.forEach((tab) => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+  const tabArr = Array.from(el.tabs);
+  tabArr.forEach((tab, idx) => {
+    tab.addEventListener('click', () => {
+      switchTab(tab.dataset.tab);
+      announce(`Sección ${tab.textContent.trim()}.`);
+    });
+    tab.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+        e.preventDefault();
+        const nextIdx = (idx + (e.key === 'ArrowRight' ? 1 : -1) + tabArr.length) % tabArr.length;
+        const nextTab = tabArr[nextIdx];
+        switchTab(nextTab.dataset.tab);
+        nextTab.focus();
+      }
+    });
+  });
+
   el.btnBrandHome.addEventListener('click', resetToWelcome);
+
+  // Single delegated listeners for high-frequency panels (zero listener leaks/churn)
+  el.lineFilterStrip.addEventListener('click', handleLineFilterClick);
+  el.arribosList.addEventListener('click', handleArribosListClick);
+  el.horariosPanel.addEventListener('click', handleHorariosPanelClick);
 
   el.btnThemeToggle.addEventListener('click', () => {
     const cur = document.documentElement.getAttribute('data-theme');
-    applyTheme(cur === 'dark' ? 'light' : 'dark');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    announce(next === 'light' ? 'Tema claro activado.' : 'Tema oscuro activado.');
   });
 
   el.btnSoundToggle.addEventListener('click', () => {
     state.soundEnabled = !state.soundEnabled;
     el.btnSoundToggle.setAttribute('aria-pressed', String(state.soundEnabled));
+    el.btnSoundToggle.setAttribute(
+      'aria-label',
+      state.soundEnabled ? 'Alertas sonoras activadas' : 'Alertas sonoras desactivadas'
+    );
     el.iconSoundOn.classList.toggle('hidden', !state.soundEnabled);
     el.iconSoundOff.classList.toggle('hidden', state.soundEnabled);
     if (state.soundEnabled) playSubtleTick();
+    announce(state.soundEnabled ? 'Alertas sonoras activadas.' : 'Alertas sonoras desactivadas.');
   });
 
   el.btnLiveMode.addEventListener('click', async () => {
@@ -2810,6 +4058,18 @@ function bindEvents() {
     }
   });
 
+  el.btnRefreshStop?.addEventListener('click', async () => {
+    if (!state.activeStop) return;
+    haptic('light');
+    state.countdownSec = REFRESH_INTERVAL_SEC;
+    el.btnRefreshStop.classList.add('is-spinning');
+    try {
+      await fetchArribos(false, { announceSummary: true, isRefresh: true });
+    } finally {
+      el.btnRefreshStop.classList.remove('is-spinning');
+    }
+  });
+
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
   el.btnShareStop.addEventListener('click', async () => {
     if (!state.activeStop) return;
@@ -2833,6 +4093,13 @@ function bindEvents() {
   });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
+  el.btnInspCenter?.addEventListener('click', () => {
+    const bus = state.arribos.find((b) => b.key === state.selectedBusKey);
+    if (bus) {
+      haptic('light');
+      transitMap.focusBus(bus, 16);
+    }
+  });
   el.btnInspRoute.addEventListener('click', () => {
     const cod = el.btnInspRoute.dataset.codLinea;
     const name = el.btnInspRoute.dataset.lineName;
@@ -2862,7 +4129,7 @@ function bindEvents() {
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
   });
 
-  // Alias modal (replaces legacy window.prompt)
+  // Alias modal (replaces legacy window.prompt, includes Tab focus trap)
   el.aliasModalForm?.addEventListener('submit', (e) => {
     e.preventDefault();
     const fav = state.favorites.find((x) => x.id === state.editingFavId);
@@ -2886,17 +4153,60 @@ function bindEvents() {
     if (e.key === 'Enter') {
       const first = el.searchDropdown.querySelector('.search-item[data-res-idx="0"]');
       if (first) first.click();
+    } else if (e.key === 'ArrowDown') {
+      const first = el.searchDropdown.querySelector('.search-item[data-res-idx="0"]');
+      if (first) {
+        e.preventDefault();
+        first.focus();
+      }
     } else if (e.key === 'Escape') {
-      el.searchDropdown.classList.add('hidden');
+      closeSearchDropdown();
     }
   });
+  el.searchDropdown.addEventListener('keydown', (e) => {
+    const opts = Array.from(el.searchDropdown.querySelectorAll('.search-item[data-res-idx]'));
+    const idx = opts.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown' && opts.length > 0) {
+      e.preventDefault();
+      opts[(idx + 1) % opts.length].focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (idx <= 0) el.globalSearch.focus();
+      else opts[idx - 1].focus();
+    } else if (e.key === 'Escape') {
+      closeSearchDropdown();
+      el.globalSearch.focus();
+    }
+  });
+
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
-      closeAliasModal();
+    if (el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeAliasModal();
+        return;
+      }
+      if (e.key === 'Tab') {
+        const focusables = Array.from(
+          el.aliasModal.querySelectorAll('button, input, [tabindex]:not([tabindex="-1"])')
+        );
+        if (focusables.length > 0) {
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      }
+    } else if (e.key === 'Escape' && state.inspectorOpen) {
+      closeBusInspector();
     }
   });
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('.quick-search-wrap')) el.searchDropdown.classList.add('hidden');
+    if (!e.target.closest('.quick-search-wrap')) closeSearchDropdown();
   });
 
   window.addEventListener('offline', () => {
@@ -2919,7 +4229,7 @@ function bindEvents() {
     }
   });
 
-  // Pause 60fps simulation when tab/app is hidden to save battery
+  // Pause kinematic simulation and animations when tab/app is hidden to save battery
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) pauseRealtime();
     else resumeRealtime();
@@ -2930,6 +4240,7 @@ function bindEvents() {
 
 function pauseRealtime() {
   stopSimLoop();
+  document.body.classList.add('app-paused');
   if (state.armedAlerts.size === 0) {
     state.isAppPaused = true;
   }
@@ -2938,6 +4249,7 @@ function pauseRealtime() {
 function resumeRealtime() {
   const wasPaused = state.isAppPaused;
   state.isAppPaused = false;
+  document.body.classList.remove('app-paused');
   transitMap.invalidateSize();
   if (state.activeStop) {
     if (wasPaused) {
@@ -2957,7 +4269,7 @@ async function handleNativeBack() {
     return true;
   }
   if (!el.searchDropdown.classList.contains('hidden')) {
-    el.searchDropdown.classList.add('hidden');
+    closeSearchDropdown();
     el.globalSearch.blur();
     return true;
   }
@@ -3071,9 +4383,9 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // On web, warm routes + schedules into Service Worker cache; on Android they're already bundled inside the APK
+  // On web, warm routes + schedules gently in idle time after initial load; on Android they're bundled inside the APK
   if (!isNative) {
-    setTimeout(() => warmOfflineArchive(), 3500);
+    setTimeout(() => warmOfflineArchive(), 8000);
   }
 
   const params = new URLSearchParams(window.location.search);

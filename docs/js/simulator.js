@@ -813,9 +813,20 @@ export class BusSimulator {
     const sample = sampleTrajectory(st.activeTraj, st.walkedMeters);
     if (!sample) return;
 
+    const prevLat = bus.lat;
+    const prevLng = bus.lng;
+    const moved =
+      typeof prevLat !== 'number' ||
+      typeof prevLng !== 'number' ||
+      Math.abs(sample.lat - prevLat) > 1.5e-6 ||
+      Math.abs(sample.lng - prevLng) > 1.5e-6;
+
+    bus._posChanged = moved;
     bus.trajectory = st.activeTraj;
-    bus.lat = sample.lat;
-    bus.lng = sample.lng;
+    if (moved) {
+      bus.lat = sample.lat;
+      bus.lng = sample.lng;
+    }
     bus.routeMeters = sample.remainingMeters;
     bus.isOppositeLeg = sample.inOppositeLeg;
     bus.isNextCycle = Boolean(sample.inNextCycle);
