@@ -15,10 +15,11 @@ import {
   getArgentinaTodayTipo,
   matchBusesWithHorarios
 } from './api.js';
-import { parseRouteBranches, resolveBusTrajectory } from './trajectory.js';
+import { parseRouteBranches, resolveBusTrajectory, pickStopBranches, projectOnPolyline } from './trajectory.js';
 import {
   buildLineScheduleModel,
   matchLiveBusesToTrips,
+  detectAlreadyPassedTrips,
   predictLineBusesForStop,
   getArgentinaSecOfDay,
   getArgentinaDayKey
@@ -66,6 +67,7 @@ const state = {
   sessionObservedTrips: new Map(), // `${codLinea}:${tripKey}` -> latest online observation
   stickyLiveTripByCoche: new Map(), // `${codLinea}:${coche}` -> { tripKey, dayKey, updatedAt }
   completedTripsByStop: new Map(), // `${dayKey}:${stopId}` -> Set<`${codLinea}:${tripKey}`>
+  downstreamProbeCache: new Map(), // `${codLinea}:${terminalStopId}` -> { ts, arribos }
 
   // Catalog & Drilldown
   lineas: [],
@@ -1119,7 +1121,13 @@ function getMergedFleetMemory() {
  *  3) Transfers BusSimulator kinematic state across `predicted <-> gps` handoffs (0 m jump!).
  *  4) In EN VIVO mode, predicts positions along street polylines for offline / no-GPS / lost-GPS turns.
  */
-function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLineCodes, { isOffline = false } = {}) {
+function reconcileWithSchedulePrediction(
+  liveBuses,
+  stopId,
+  stopCoords,
+  targetLineCodes,
+  { isOffline = false, skipReport = false } = {}
+) {
   const prevArribos = state.arribos || [];
   const prevByTripKey = new Map();
   const prevByCoche = new Map();
@@ -1244,7 +1252,7 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
     }
   }
 
-  if (seenReports.length > 0 && !isOffline) {
+  if (seenReports.length > 0 && !isOffline && !skipReport) {
     api.reportFleetSeen(seenReports, todayDayKey);
   }
 
@@ -1276,6 +1284,32 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
     const matchedTrips = liveMatchedTripKeysByLine.get(cod) || new Set();
     const matchedCoches = liveMatchedCochesByLine.get(cod) || new Set();
     const lineLive = liveByLine.get(cod) || [];
+
+    // Gather any fresh (< 90 s) downstream terminal probe results for this line
+    const downstreamBuses = [];
+    for (const [k, entry] of state.downstreamProbeCache.entries()) {
+      if (k.startsWith(`${cod}:`) && nowMs - entry.ts <= 90000 && Array.isArray(entry.arribos)) {
+        downstreamBuses.push(...entry.arribos);
+      }
+    }
+
+    // Detect trips that ALREADY PASSED `stopId` (e.g. a bus running 5+ min ahead of schedule) via:
+    //  1) live full_cycle buses past stopId, 2) downstream terminal probes, 3) FleetMemory units/trips
+    const alreadyPassed = detectAlreadyPassedTrips({
+      codLinea: cod,
+      stopId,
+      stopCoords,
+      branches,
+      horariosFile: horFile,
+      tipoDia: todayTipo,
+      liveBuses: lineLive,
+      downstreamBuses,
+      fleetMemory: fleetMem,
+      nowSec
+    });
+    for (const tk of alreadyPassed) {
+      completedSet.add(`${cod}:${tk}`);
+    }
 
     const preds = predictLineBusesForStop({
       codLinea: cod,
@@ -1350,6 +1384,57 @@ function reconcileWithSchedulePrediction(liveBuses, stopId, stopCoords, targetLi
   return [...liveBuses, ...predictedAll].sort(
     (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
   );
+}
+
+/**
+ * When online and an imminent (<= 14 min) unmatched scheduled turn has no live GPS or FleetMemory
+ * record yet, performs a fast cached (75 s) check on the branch's terminal stop to verify whether
+ * a live GPS bus ALREADY passed `stopId` early (e.g. 5 min ahead) — eliminating ghost arrivals!
+ */
+async function probeDownstreamForImminentGhosts(buses, stopId, stopCoords) {
+  if (state.isOffline || !stopCoords || !Array.isArray(buses) || buses.length === 0) return false;
+  const nowMs = Date.now();
+  const toProbe = [];
+  const seenProbe = new Set();
+
+  for (const b of buses) {
+    if (!b.isPredicted || b.predictionReason !== 'schedule') continue;
+    if ((b.etaSecondsRemaining ?? 99999) > 14 * 60) continue;
+    const cod = Number(b.codigoLinea);
+    const branches = state.routeBranchesCache.get(cod) || [];
+    const sbs = pickStopBranches(branches, stopId, stopCoords);
+    for (const sb of sbs) {
+      if (!sb.orderedStops?.length) continue;
+      const stopProj = projectOnPolyline(sb.pts, sb.cum, stopCoords.lat, stopCoords.lng);
+      const lastStop = sb.orderedStops[sb.orderedStops.length - 1];
+      if (!lastStop || lastStop.id === stopId) continue;
+      if (stopProj && lastStop.along <= stopProj.along + 350) continue;
+      const pKey = `${cod}:${lastStop.id}`;
+      if (seenProbe.has(pKey)) continue;
+      const cached = state.downstreamProbeCache.get(pKey);
+      if (cached && nowMs - cached.ts < 75000) continue;
+      seenProbe.add(pKey);
+      toProbe.push({ cod, termStopId: lastStop.id, pKey });
+    }
+    if (toProbe.length >= 3) break;
+  }
+
+  if (toProbe.length === 0) return false;
+
+  let anyFresh = false;
+  await Promise.all(
+    toProbe.map(async ({ cod, termStopId, pKey }) => {
+      try {
+        const res = await api.arribos(termStopId, String(cod));
+        const arribos = Array.isArray(res?.data?.arribos) ? res.data.arribos : [];
+        state.downstreamProbeCache.set(pKey, { ts: Date.now(), arribos });
+        if (arribos.length > 0) anyFresh = true;
+      } catch {
+        state.downstreamProbeCache.set(pKey, { ts: Date.now(), arribos: [] });
+      }
+    })
+  );
+  return anyFresh;
 }
 
 async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
@@ -1534,13 +1619,29 @@ async function fetchArribos(showSkeleton = false) {
         : payload.stopCoords || null;
 
     const liveBuses = normalizeArrivals(rawArribos, stopId, stopCoords);
-    state.arribos = reconcileWithSchedulePrediction(
+    let reconciled = reconcileWithSchedulePrediction(
       liveBuses,
       stopId,
       stopCoords,
       targetLineCodes,
       { isOffline: false }
     );
+
+    if (state.simulateMode) {
+      const probed = await probeDownstreamForImminentGhosts(reconciled, stopId, stopCoords);
+      if (mySeq !== fetchSeq || !state.activeStop || state.activeStop.id !== stopId) return;
+      if (probed) {
+        reconciled = reconcileWithSchedulePrediction(
+          liveBuses,
+          stopId,
+          stopCoords,
+          targetLineCodes,
+          { isOffline: false, skipReport: true }
+        );
+      }
+    }
+
+    state.arribos = reconciled;
 
     // Always learn real speeds & stopped states from fresh GPS fixes; apply smooth non-backjumping motion in EN VIVO
     busSimulator.reconcile(state.arribos, { applyPositions: state.simulateMode, stopId });
