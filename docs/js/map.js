@@ -10,7 +10,13 @@ export class TransitMap {
       center: [CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng],
       zoom: CORRIENTES_CENTER.zoom,
       zoomControl: false,
-      attributionControl: true
+      attributionControl: true,
+      preferCanvas: true,
+      zoomSnap: 0.5,
+      zoomDelta: 0.5,
+      inertia: true,
+      inertiaDeceleration: 2800,
+      bounceAtZoomLimits: false
     });
 
     this.tileKey = 'dark';
@@ -30,23 +36,43 @@ export class TransitMap {
     this.stopMarker = null;
     this.activeStopCoords = null;
     this.selectedBusKey = null;
+
+    // Keep tiles & projection aligned on rotation, Android split-screen, or soft keyboard
+    const container = this.map.getContainer();
+    if (typeof ResizeObserver !== 'undefined' && container) {
+      let resizeRaf = 0;
+      this._resizeObserver = new ResizeObserver(() => {
+        if (resizeRaf) cancelAnimationFrame(resizeRaf);
+        resizeRaf = requestAnimationFrame(() => this.map.invalidateSize({ animate: false }));
+      });
+      this._resizeObserver.observe(container);
+    }
+  }
+
+  invalidateSize() {
+    this.map.invalidateSize({ animate: false });
   }
 
   _getPadding() {
-    const isMobile = window.innerWidth <= 860;
-    if (isMobile) {
-      const dock = document.getElementById('transit-dock');
-      const bottomPad = dock?.classList.contains('sheet-peek')
-        ? 180
-        : Math.round(window.innerHeight * 0.5);
+    const header = document.querySelector('.top-bar');
+    const dock = document.getElementById('transit-dock');
+    const topPad = header ? Math.max(64, Math.round(header.getBoundingClientRect().bottom + 14)) : 72;
+    const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
+    const isBottomSheet = window.innerWidth <= 860 && !isLandscapeRail;
+
+    if (isBottomSheet) {
+      const dockH = dock ? Math.round(dock.getBoundingClientRect().height) : Math.round(window.innerHeight * 0.48);
+      const bottomPad = Math.min(dockH + 18, Math.round(window.innerHeight * 0.65));
       return {
-        paddingTopLeft: [20, 72],
-        paddingBottomRight: [20, bottomPad]
+        paddingTopLeft: [18, topPad],
+        paddingBottomRight: [56, bottomPad]
       };
     }
+
+    const leftPad = dock ? Math.round(dock.getBoundingClientRect().right + 18) : 420;
     return {
-      paddingTopLeft: [430, 84],
-      paddingBottomRight: [68, 52]
+      paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.55)), topPad],
+      paddingBottomRight: [66, 44]
     };
   }
 

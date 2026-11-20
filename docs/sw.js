@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v27';
+const CACHE_NAME = 'direct-gps-v28';
 const DATA_CACHE = 'direct-gps-data-v1';
 const TILE_CACHE = 'direct-gps-tiles-v1';
 const MAX_TILES = 750;
@@ -11,7 +11,9 @@ const SHELL_ASSETS = [
   './css/styles.css',
   './vendor/leaflet/leaflet.css',
   './vendor/leaflet/leaflet.js',
+  './vendor/capacitor/core.js',
   './js/config.js',
+  './js/native.js',
   './js/audio.js',
   './js/static-data.js',
   './js/api.js',

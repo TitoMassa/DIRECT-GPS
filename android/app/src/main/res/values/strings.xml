@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DIRECT GPS</string>
+    <string name="title_activity_main">DIRECT GPS</string>
+    <string name="package_name">ar.corrientes.directgps</string>
+    <string name="custom_url_scheme">directgps</string>
+
+    <!-- Launcher shortcuts -->
+    <string name="shortcut_nearby_short">Cercanas</string>
+    <string name="shortcut_nearby_long">Paradas cercanas (GPS)</string>
+    <string name="shortcut_favs_short">Favoritas</string>
+    <string name="shortcut_favs_long">Paradas favoritas</string>
+    <string name="shortcut_lines_short">Líneas</string>
+    <string name="shortcut_lines_long">Explorar líneas</string>
+</resources>

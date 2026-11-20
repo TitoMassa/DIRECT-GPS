@@ -35,6 +35,18 @@ import {
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
+import {
+  isNative,
+  initNative,
+  hideSplash,
+  setSystemBarsTheme,
+  setKeepAwake,
+  getCurrentPosition,
+  shareStop,
+  haptic,
+  ensureNotificationPermission,
+  notifyArrival
+} from './native.js';
 
 const busSimulator = new BusSimulator();
 let simRafId = null;
@@ -91,6 +103,8 @@ const state = {
   },
 
   soundEnabled: true,
+  isAppPaused: false,
+  editingFavId: null,
   armedAlerts: new Set(),
   triggeredAlerts: new Set(),
   favorites: [],
@@ -98,6 +112,7 @@ const state = {
 };
 
 const el = {
+  appShell: document.getElementById('app-shell'),
   dock: document.getElementById('transit-dock'),
   sheetHandle: document.getElementById('sheet-handle'),
   tabs: document.querySelectorAll('.dock-tab'),
@@ -158,11 +173,19 @@ const el = {
   btnCloseInspector: document.getElementById('btn-close-inspector'),
   btnInspRoute: document.getElementById('btn-insp-route'),
 
+  btnMapLocate: document.getElementById('btn-map-locate'),
   btnMapStyle: document.getElementById('btn-map-style'),
   btnMapCenterStop: document.getElementById('btn-map-center-stop'),
   btnMapScanArea: document.getElementById('btn-map-scan-area'),
   btnZoomIn: document.getElementById('btn-zoom-in'),
   btnZoomOut: document.getElementById('btn-zoom-out'),
+
+  aliasModal: document.getElementById('alias-modal'),
+  aliasModalForm: document.getElementById('alias-modal-form'),
+  aliasModalSub: document.getElementById('alias-modal-sub'),
+  aliasModalInput: document.getElementById('alias-modal-input'),
+  btnAliasClose: document.getElementById('btn-alias-close'),
+  btnAliasCancel: document.getElementById('btn-alias-cancel'),
 
   toastContainer: document.getElementById('toast-container')
 };
@@ -205,6 +228,7 @@ function applyTheme(theme) {
   el.iconSun.classList.toggle('hidden', isLight);
   el.iconMoon.classList.toggle('hidden', !isLight);
   el.metaThemeColor.setAttribute('content', isLight ? '#e5ebf2' : '#0f141b');
+  setSystemBarsTheme(theme);
   if (transitMap.tileKey !== 'hot') {
     transitMap.setTileStyle(isLight ? 'light' : 'dark');
   }
@@ -254,6 +278,7 @@ function toggleActiveStopFavorite() {
     state.favorites.unshift({ id: s.id, nombre: s.nombre, alias: '', lat: s.lat, lng: s.lng });
     showToast(`Parada ${s.id} guardada en favoritas`, 'success');
   }
+  haptic('medium');
   saveFavorites();
 }
 
@@ -311,19 +336,38 @@ function renderFavorites() {
   el.favoritasList.querySelectorAll('.btn-edit-fav').forEach((btn) => {
     btn.addEventListener('click', () => {
       const fav = state.favorites.find((x) => x.id === btn.dataset.id);
-      if (!fav) return;
-      const alias = window.prompt('Etiqueta para esta parada (ej. Casa, Trabajo, Facultad):', fav.alias || '');
-      if (alias !== null) {
-        fav.alias = alias.trim();
-        saveFavorites();
-      }
+      if (fav) openAliasModal(fav);
     });
   });
 }
 
+function openAliasModal(fav) {
+  if (!el.aliasModal) return;
+  state.editingFavId = fav.id;
+  el.aliasModalSub.textContent = `${fav.id} · ${fav.nombre || 'Parada guardada'}`;
+  el.aliasModalInput.value = fav.alias || '';
+  el.aliasModal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    el.aliasModalInput.focus();
+    el.aliasModalInput.select();
+  });
+}
+
+function closeAliasModal() {
+  if (!el.aliasModal) return;
+  state.editingFavId = null;
+  el.aliasModal.classList.add('hidden');
+  el.aliasModalInput.blur();
+}
+
 // ============================================================================
-// Tabs & Mobile Bottom Sheet
+// Tabs & Fluid Interactive Mobile Bottom Sheet
 // ============================================================================
+function getActiveTab() {
+  const active = Array.from(el.tabs).find((t) => t.classList.contains('active'));
+  return active ? active.dataset.tab : 'radar';
+}
+
 function switchTab(tabName) {
   el.tabs.forEach((t) => {
     const active = t.dataset.tab === tabName;
@@ -335,28 +379,144 @@ function switchTab(tabName) {
   });
 }
 
-function setupMobileSheet() {
-  const states = ['sheet-peek', 'sheet-half', 'sheet-full'];
-  let idx = 1;
-  let startY = 0;
+const SHEET_STATES = ['sheet-peek', 'sheet-half', 'sheet-full'];
 
-  const setSheet = (newIdx) => {
-    idx = Math.max(0, Math.min(2, newIdx));
-    states.forEach((s) => el.dock.classList.remove(s));
-    el.dock.classList.add(states[idx]);
+function getSheetIndex() {
+  const found = SHEET_STATES.findIndex((s) => el.dock.classList.contains(s));
+  return found === -1 ? 1 : found;
+}
+
+// Matches CSS breakpoints: bottom sheet on <= 860px except wide-landscape side-rail
+function isBottomSheetLayout() {
+  const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
+  return window.innerWidth <= 860 && !isLandscapeRail;
+}
+
+function getSheetSnapHeights() {
+  const vh = window.innerHeight;
+  const header = document.querySelector('.top-bar');
+  const topClearance = header ? Math.ceil(header.getBoundingClientRect().bottom + 10) : 64;
+  return [
+    Math.min(170, Math.round(vh * 0.24)),
+    Math.round(vh * 0.47),
+    Math.max(300, vh - topClearance)
+  ];
+}
+
+function clearSheetInlineSize() {
+  el.dock.style.height = '';
+  el.dock.classList.remove('is-dragging');
+  el.appShell?.style.removeProperty('--sheet-h');
+}
+
+function setSheetIndex(newIdx, { silent = false } = {}) {
+  const idx = Math.max(0, Math.min(SHEET_STATES.length - 1, newIdx));
+  const changed = idx !== getSheetIndex();
+  clearSheetInlineSize();
+  SHEET_STATES.forEach((s) => el.dock.classList.remove(s));
+  el.dock.classList.add(SHEET_STATES[idx]);
+  if (changed && !silent) haptic('light');
+}
+
+function setupMobileSheet() {
+  let dragging = false;
+  let moved = false;
+  let startY = 0;
+  let startH = 0;
+  let lastY = 0;
+  let lastT = 0;
+  let velocity = 0; // px/ms (positive = dragging down)
+
+  el.sheetHandle.addEventListener('click', () => {
+    if (moved) return;
+    setSheetIndex((getSheetIndex() + 1) % SHEET_STATES.length);
+  });
+
+  const onStart = (e) => {
+    if (!isBottomSheetLayout() || e.touches.length !== 1) return;
+    dragging = true;
+    moved = false;
+    startY = e.touches[0].clientY;
+    lastY = startY;
+    lastT = performance.now();
+    velocity = 0;
+    startH = el.dock.getBoundingClientRect().height;
   };
 
-  el.sheetHandle.addEventListener('click', () => setSheet((idx + 1) % 3));
-  el.sheetHandle.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; }, { passive: true });
-  el.sheetHandle.addEventListener(
-    'touchend',
-    (e) => {
-      const dy = e.changedTouches[0].clientY - startY;
-      if (dy < -32) setSheet(idx + 1);
-      else if (dy > 32) setSheet(idx - 1);
-    },
-    { passive: true }
-  );
+  const onMove = (e) => {
+    if (!dragging || !isBottomSheetLayout()) return;
+    const y = e.touches[0].clientY;
+    const dy = y - startY;
+    if (!moved && Math.abs(dy) < 6) return;
+
+    if (!moved) {
+      moved = true;
+      el.dock.classList.add('is-dragging');
+    }
+
+    const now = performance.now();
+    const dt = Math.max(1, now - lastT);
+    velocity = 0.6 * velocity + 0.4 * ((y - lastY) / dt);
+    lastY = y;
+    lastT = now;
+
+    const [minH, , maxH] = getSheetSnapHeights();
+    // Gentle rubber-band resistance outside bounds
+    let nextH = startH - dy;
+    if (nextH < minH) nextH = minH - (minH - nextH) * 0.22;
+    else if (nextH > maxH) nextH = maxH + (nextH - maxH) * 0.18;
+
+    const px = Math.round(nextH);
+    el.dock.style.height = `${px}px`;
+    el.appShell?.style.setProperty('--sheet-h', `${px}px`);
+    if (e.cancelable) e.preventDefault();
+  };
+
+  const onEnd = () => {
+    if (!dragging) return;
+    dragging = false;
+    if (!moved) return;
+
+    const curH = el.dock.getBoundingClientRect().height;
+    const snaps = getSheetSnapHeights();
+    const curIdx = getSheetIndex();
+
+    let targetIdx;
+    if (velocity < -0.45) {
+      // Fast flick upward -> expand one stop (or to full if already past half)
+      targetIdx = curH > snaps[1] ? 2 : Math.min(2, curIdx + 1);
+    } else if (velocity > 0.45) {
+      // Fast flick downward -> collapse one stop
+      targetIdx = curH < snaps[1] ? 0 : Math.max(0, curIdx - 1);
+    } else {
+      // Nearest snap point
+      let bestDist = Infinity;
+      targetIdx = 1;
+      snaps.forEach((h, i) => {
+        const d = Math.abs(curH - h);
+        if (d < bestDist) {
+          bestDist = d;
+          targetIdx = i;
+        }
+      });
+    }
+
+    setSheetIndex(targetIdx);
+    setTimeout(() => {
+      moved = false;
+    }, 60);
+  };
+
+  [el.sheetHandle, document.querySelector('.dock-tabs')].filter(Boolean).forEach((target) => {
+    target.addEventListener('touchstart', onStart, { passive: true });
+    target.addEventListener('touchmove', onMove, { passive: false });
+    target.addEventListener('touchend', onEnd, { passive: true });
+    target.addEventListener('touchcancel', onEnd, { passive: true });
+  });
+
+  window.addEventListener('resize', () => {
+    if (!isBottomSheetLayout()) clearSheetInlineSize();
+  });
 }
 
 // ============================================================================
@@ -437,6 +597,7 @@ function resetToWelcome() {
 
   switchTab('radar');
   renderRadarWelcome();
+  syncKeepAwake();
 }
 
 // ============================================================================
@@ -524,6 +685,7 @@ async function openStopRadar(stopInfo, codLinea = '000') {
     lng: bestLng
   };
   state.codLineaQuery = isAll ? '000' : rawCode;
+  syncKeepAwake();
   state.focusedLineCode = isAll ? null : Number(rawCode);
   state.filterLine = lineObj ? lineObj.descripcion : 'ALL';
   state.selectedBusKey = null;
@@ -1062,15 +1224,26 @@ function renderArribosList() {
         state.armedAlerts.delete(line);
         state.triggeredAlerts.delete(line);
         showToast(`Alerta desactivada para línea ${line}`, 'info');
+        haptic('light');
       } else {
         state.armedAlerts.add(line);
         state.triggeredAlerts.delete(line);
         if (state.soundEnabled) playSubtleTick();
+        haptic('medium');
         showToast(`Aviso activado para línea ${line} (≤ 3 min)`, 'success');
+        ensureNotificationPermission().then((ok) => {
+          if (!ok && isNative) showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la pantalla apagada', 'warn', 4500);
+        });
       }
+      syncKeepAwake();
       renderArribosList();
     });
   });
+}
+
+// Keep the screen on while the user is waiting for an armed arrival alert at an open stop
+function syncKeepAwake() {
+  setKeepAwake(Boolean(state.activeStop) && state.armedAlerts.size > 0);
 }
 
 function checkProximityAlerts() {
@@ -1085,6 +1258,11 @@ function checkProximityAlerts() {
       if (state.soundEnabled) playArrivalChime();
       const cocheTag = bus.identificadorCoche ? ` (${bus.identificadorCoche})` : '';
       showToast(`¡Línea ${bus.descripcionLinea}${cocheTag} arribando (${bus.tiempoRaw})!`, 'success', 6000);
+      notifyArrival({
+        title: `Línea ${bus.descripcionLinea} llegando a ${state.activeStop.id}`,
+        body: `${bus.tiempoRaw || `${bus.eta.minutes} min`}${cocheTag} · ${state.activeStop.nombre || 'Tu parada'}`,
+        stopId: state.activeStop.id
+      });
     }
   }
 }
@@ -1166,9 +1344,9 @@ function focusBusOnMap(busKey) {
 
   // If mobile bottom sheet is expanded full-screen, bring it to half so the map is visible
   if (el.dock.classList.contains('sheet-full')) {
-    el.dock.classList.remove('sheet-full');
-    el.dock.classList.add('sheet-half');
+    setSheetIndex(1, { silent: true });
   }
+  haptic('light');
 
   if (!state.horariosOpen) renderArribosList();
   transitMap.updateBuses(state.arribos, {
@@ -2460,25 +2638,23 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
   }
 }
 
-function locateUserGps() {
-  if (!navigator.geolocation) {
-    const c = transitMap.getCenter();
-    searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
-    return;
-  }
+async function locateUserGps() {
   showToast('Obteniendo ubicación GPS...', 'info', 1800);
-  navigator.geolocation.getCurrentPosition(
-    (pos) => {
-      const { latitude, longitude, accuracy } = pos.coords;
-      transitMap.setUserLocation(latitude, longitude, accuracy);
-      searchNearbyStops(latitude, longitude, 'tu ubicación');
-    },
-    () => {
-      showToast('Sin permiso GPS. Mostrando paradas en el centro de Corrientes.', 'warn');
-      searchNearbyStops(CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng, 'Centro de Corrientes');
-    },
-    { enableHighAccuracy: true, timeout: 7000 }
-  );
+  try {
+    const { latitude, longitude, accuracy } = await getCurrentPosition({ enableHighAccuracy: true, timeout: 9000 });
+    haptic('light');
+    transitMap.setUserLocation(latitude, longitude, accuracy);
+    searchNearbyStops(latitude, longitude, 'tu ubicación');
+  } catch (err) {
+    const denied = err?.code === 1 || /denied|permiso/i.test(String(err?.message || ''));
+    showToast(
+      denied
+        ? 'Sin permiso de ubicación. Mostrando paradas en el centro de Corrientes.'
+        : 'No se pudo obtener tu ubicación. Mostrando el centro de Corrientes.',
+      'warn'
+    );
+    searchNearbyStops(CORRIENTES_CENTER.lat, CORRIENTES_CENTER.lng, 'Centro de Corrientes');
+  }
 }
 
 // ============================================================================
@@ -2637,12 +2813,13 @@ function bindEvents() {
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
   el.btnShareStop.addEventListener('click', async () => {
     if (!state.activeStop) return;
-    try {
-      await navigator.clipboard.writeText(window.location.href);
-      showToast(`Enlace copiado para ${state.activeStop.id}`, 'success');
-    } catch {
-      showToast(`Parada actual: ${state.activeStop.id}`, 'info');
-    }
+    const result = await shareStop({
+      id: state.activeStop.id,
+      nombre: state.activeStop.nombre,
+      codLinea: state.codLineaQuery
+    });
+    if (result === 'copied') showToast(`Enlace copiado para ${state.activeStop.id}`, 'success');
+    else if (result === 'failed') showToast(`Parada actual: ${state.activeStop.id}`, 'info');
   });
 
   el.btnShowRoutes.addEventListener('click', toggleActiveStopRoutes);
@@ -2662,11 +2839,16 @@ function bindEvents() {
     if (cod) loadRouteForLine(cod, name, { clearExisting: true, fit: true });
   });
 
+  el.btnMapLocate?.addEventListener('click', () => {
+    haptic('light');
+    locateUserGps();
+  });
   el.btnZoomIn.addEventListener('click', () => transitMap.zoomIn());
   el.btnZoomOut.addEventListener('click', () => transitMap.zoomOut());
   el.btnMapCenterStop.addEventListener('click', () => transitMap.focusStop(16));
   el.btnMapStyle.addEventListener('click', () => {
     const cfg = transitMap.cycleTileStyle();
+    haptic('light');
     showToast(`Mapa: ${cfg.label}`, 'info', 1500);
   });
   el.btnMapScanArea.addEventListener('click', () => {
@@ -2680,6 +2862,24 @@ function bindEvents() {
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');
   });
 
+  // Alias modal (replaces legacy window.prompt)
+  el.aliasModalForm?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fav = state.favorites.find((x) => x.id === state.editingFavId);
+    if (fav) {
+      fav.alias = el.aliasModalInput.value.trim();
+      saveFavorites();
+      haptic('light');
+      showToast(fav.alias ? `Etiqueta guardada: ${fav.alias}` : 'Etiqueta eliminada', 'success', 2000);
+    }
+    closeAliasModal();
+  });
+  el.btnAliasClose?.addEventListener('click', closeAliasModal);
+  el.btnAliasCancel?.addEventListener('click', closeAliasModal);
+  el.aliasModal?.addEventListener('click', (e) => {
+    if (e.target === el.aliasModal) closeAliasModal();
+  });
+
   el.lineasFilterInput.addEventListener('input', renderDrilldown);
   el.globalSearch.addEventListener('input', (e) => renderGlobalSearchResults(e.target.value));
   el.globalSearch.addEventListener('keydown', (e) => {
@@ -2688,6 +2888,11 @@ function bindEvents() {
       if (first) first.click();
     } else if (e.key === 'Escape') {
       el.searchDropdown.classList.add('hidden');
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
+      closeAliasModal();
     }
   });
   document.addEventListener('click', (e) => {
@@ -2708,23 +2913,148 @@ function bindEvents() {
 
   window.addEventListener('online', () => {
     if (state.isOffline) {
+      state.isOffline = false;
       showToast('Conexión recuperada · Sincronizando GPS...', 'success', 2200);
       if (state.activeStop) fetchArribos(false);
     }
   });
 
+  // Pause 60fps simulation when tab/app is hidden to save battery
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseRealtime();
+    else resumeRealtime();
+  });
+
   setupMobileSheet();
 }
 
+function pauseRealtime() {
+  stopSimLoop();
+  if (state.armedAlerts.size === 0) {
+    state.isAppPaused = true;
+  }
+}
+
+function resumeRealtime() {
+  const wasPaused = state.isAppPaused;
+  state.isAppPaused = false;
+  transitMap.invalidateSize();
+  if (state.activeStop) {
+    if (wasPaused) {
+      state.countdownSec = REFRESH_INTERVAL_SEC;
+      fetchArribos(false);
+    }
+    if (state.simulateMode && state.arribos.length > 0) {
+      startSimLoop();
+    }
+  }
+}
+
+// Android system back button / swipe-back layered navigation
+async function handleNativeBack() {
+  if (el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
+    closeAliasModal();
+    return true;
+  }
+  if (!el.searchDropdown.classList.contains('hidden')) {
+    el.searchDropdown.classList.add('hidden');
+    el.globalSearch.blur();
+    return true;
+  }
+  if (state.inspectorOpen) {
+    closeBusInspector();
+    return true;
+  }
+  if (state.horariosOpen) {
+    await toggleHorariosView();
+    return true;
+  }
+  if (isBottomSheetLayout() && getSheetIndex() === 2) {
+    setSheetIndex(1);
+    return true;
+  }
+
+  const activeTab = getActiveTab();
+  if (activeTab === 'lineas' && state.drill.step !== 'lineas') {
+    el.lineasFilterInput.value = '';
+    if (state.drill.step === 'paradas' && state.drill.calle) {
+      await openCalleIntersecciones(state.drill.calle);
+    } else if (state.drill.step === 'intersecciones' && state.drill.linea) {
+      await openLineCalles(state.drill.linea);
+    } else {
+      state.drill = { step: 'lineas', linea: null, calle: null, interseccion: null, items: state.lineas };
+      renderDrilldown();
+    }
+    return true;
+  }
+  if (activeTab !== 'radar') {
+    switchTab('radar');
+    return true;
+  }
+  if (state.activeStop) {
+    resetToWelcome();
+    return true;
+  }
+  return false;
+}
+
+async function openStopById(stopId, codLinea = '000') {
+  const id = String(stopId || '').trim().toUpperCase();
+  if (!id) return;
+  const known =
+    state.quickStops.find((s) => s.id === id) ||
+    state.favorites.find((f) => f.id === id) ||
+    state.catalogo?.stopById?.get(id) || {
+      id,
+      nombre: `Parada ${id}`
+    };
+  await openStopRadar(known, codLinea || '000');
+}
+
+async function handleDeepLink(link) {
+  if (!link) return;
+  if (link.stopId) {
+    await openStopById(link.stopId, link.codLinea);
+    return;
+  }
+  if (link.action === 'locate') {
+    switchTab('cercanas');
+    locateUserGps();
+    return;
+  }
+  if (link.tab && ['radar', 'lineas', 'cercanas', 'favoritas'].includes(link.tab)) {
+    switchTab(link.tab);
+  }
+}
+
 async function init() {
-  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || 'dark';
+  const prefersLight =
+    typeof window !== 'undefined' &&
+    window.matchMedia?.('(prefers-color-scheme: light)').matches;
+  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || (prefersLight ? 'light' : 'dark');
   applyTheme(savedTheme);
+
+  const launchLink = await initNative({
+    onBack: handleNativeBack,
+    onPause: pauseRealtime,
+    onResume: resumeRealtime,
+    onDeepLink: (link) => handleDeepLink(link),
+    onKeyboard: (open) => {
+      if (open && isBottomSheetLayout() && document.activeElement === el.globalSearch) {
+        setSheetIndex(0, { silent: true });
+      }
+      setTimeout(() => transitMap.invalidateSize(), 180);
+    }
+  });
+
+  // Re-apply system bar colors after native bridge init
+  setSystemBarsTheme(savedTheme);
 
   loadFavorites();
   bindEvents();
   updateSignalPill();
 
-  if ('serviceWorker' in navigator) {
+  if (!isNative && 'serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
@@ -2741,28 +3071,32 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // Gently warm all 33 routes + 24h schedules into Service Worker cache in background when online
-  setTimeout(() => warmOfflineArchive(), 3500);
+  // On web, warm routes + schedules into Service Worker cache; on Android they're already bundled inside the APK
+  if (!isNative) {
+    setTimeout(() => warmOfflineArchive(), 3500);
+  }
 
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
   const paramCodLinea = params.get('codLinea') || '000';
 
-  if (paramStopId) {
-    const known =
-      state.quickStops.find((s) => s.id === paramStopId) ||
-      state.favorites.find((f) => f.id === paramStopId) ||
-      state.catalogo?.stopById?.get(paramStopId) || {
-        id: paramStopId,
-        nombre: `Parada ${paramStopId}`
-      };
-    await openStopRadar(known, paramCodLinea);
+  if (launchLink) {
+    await handleDeepLink(launchLink);
+    if (!state.activeStop) renderRadarWelcome();
+  } else if (paramStopId) {
+    await openStopById(paramStopId, paramCodLinea);
   } else {
     renderRadarWelcome();
   }
 
+  // Reveal the native WebView cleanly once initial content is ready
+  requestAnimationFrame(() => {
+    transitMap.invalidateSize();
+    hideSplash();
+  });
+
   setInterval(() => {
-    if (!state.activeStop) return;
+    if (!state.activeStop || state.isAppPaused) return;
 
     state.countdownSec -= 1;
     if (state.countdownSec <= 0) {

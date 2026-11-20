@@ -6,6 +6,11 @@
   <title>DIRECT GPS · Transporte en Vivo — Corrientes</title>
   <meta name="description" content="DIRECT GPS: Seguimiento en tiempo real de colectivos de Corrientes Capital sobre OpenStreetMap con Leaflet. Desvío horario, coche, chofer, horarios programados y recorridos." />
   <meta name="theme-color" content="#0f141b" id="meta-theme-color" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="format-detection" content="telephone=no" />
   <link rel="icon" type="image/svg+xml" href="./icon.svg" />
   <link rel="manifest" href="./manifest.json" />
 
@@ -51,7 +56,7 @@
             id="global-search-input"
             type="search"
             class="quick-search-input"
-            placeholder="Parada (ej. CT31498) o línea (106A, 102B)..."
+            placeholder="Buscar parada o línea..."
             autocomplete="off"
             aria-label="Buscar parada por código o línea"
           />
@@ -257,20 +262,26 @@
 
     <!-- Floating Map Controls (Bottom Right) -->
     <div class="map-controls" role="group" aria-label="Controles de mapa">
-      <button id="btn-map-style" class="map-ctrl-btn" title="Cambiar estilo de mapa Leaflet (OSM Nocturno / OSM Clásico / OSM Urbano)">
+      <button id="btn-map-locate" class="map-ctrl-btn" title="Ir a mi ubicación GPS" aria-label="Mi ubicación GPS">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+        </svg>
+      </button>
+      <button id="btn-map-style" class="map-ctrl-btn" title="Cambiar estilo de mapa Leaflet (OSM Nocturno / OSM Clásico / OSM Urbano)" aria-label="Estilo de mapa">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="12 2 2 7 12 12 22 7 12 2"/>
           <polyline points="2 17 12 22 22 17"/>
           <polyline points="2 12 12 17 22 12"/>
         </svg>
       </button>
-      <button id="btn-map-center-stop" class="map-ctrl-btn" title="Centrar en parada activa">
+      <button id="btn-map-center-stop" class="map-ctrl-btn" title="Centrar en parada activa" aria-label="Centrar en parada">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
           <circle cx="12" cy="10" r="3"/>
         </svg>
       </button>
-      <button id="btn-map-scan-area" class="map-ctrl-btn" title="Buscar paradas en esta zona del mapa">
+      <button id="btn-map-scan-area" class="map-ctrl-btn" title="Buscar paradas en esta zona del mapa" aria-label="Buscar paradas en esta zona">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/><path d="M11 8v6M8 11h6"/>
         </svg>
@@ -279,6 +290,22 @@
         <button id="btn-zoom-in" class="map-ctrl-btn" title="Acercar mapa" aria-label="Acercar">+</button>
         <button id="btn-zoom-out" class="map-ctrl-btn" title="Alejar mapa" aria-label="Alejar">−</button>
       </div>
+    </div>
+
+    <!-- Clean Native-Style Modal for Favorite Alias Editing -->
+    <div id="alias-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="alias-modal-title">
+      <form id="alias-modal-form" class="modal-card">
+        <div class="modal-head">
+          <h3 id="alias-modal-title">Etiqueta de parada</h3>
+          <button type="button" id="btn-alias-close" class="mini-close-btn" aria-label="Cerrar">✕</button>
+        </div>
+        <p id="alias-modal-sub" class="modal-sub">Ej.: Casa, Trabajo, Facultad</p>
+        <input id="alias-modal-input" type="text" class="modal-input" maxlength="32" placeholder="Nombre corto..." autocomplete="off" />
+        <div class="modal-actions">
+          <button type="button" id="btn-alias-cancel" class="secondary-action-btn">Cancelar</button>
+          <button type="submit" class="primary-action-btn">Guardar</button>
+        </div>
+      </form>
     </div>
 
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
