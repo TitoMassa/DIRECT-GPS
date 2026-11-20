@@ -677,6 +677,7 @@ export function evaluateTripState(
         const sample = sampleBranchAtAlong(termBranch, curAlong);
         if (!sample) return null;
         const remainingMeters = Math.max(0, totalDist - travelled);
+        const spd = Math.min(25.0, ev.speedMps * scale);
         return {
           activeBranch: termBranch,
           activeAlong: curAlong,
@@ -686,8 +687,8 @@ export function evaluateTripState(
           lng: sample.lng,
           remainingMeters,
           etaSec: Math.max(0, etaSec),
-          speedMps: Math.min(25.0, ev.speedMps * scale),
-          isAtTerminal: travelled <= 25 && effNow <= trip.startSec + 10,
+          speedMps: spd,
+          isAtTerminal: spd <= 0.05,
           inOppositeLeg: true,
           inNextCycle: false,
           realBandera: termBranch.bandera,
@@ -700,6 +701,7 @@ export function evaluateTripState(
       const sample = sampleBranchAtAlong(stopBranch, along);
       if (!sample) return null;
       const remainingMeters = Math.max(0, stopProj.along - along);
+      const spd = remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale);
       return {
         activeBranch: stopBranch,
         activeAlong: along,
@@ -709,7 +711,7 @@ export function evaluateTripState(
         lng: sample.lng,
         remainingMeters,
         etaSec: Math.max(0, etaSec),
-        speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale),
+        speedMps: spd,
         isAtTerminal: false,
         inOppositeLeg: false,
         inNextCycle: false,
@@ -727,6 +729,7 @@ export function evaluateTripState(
     if (!sample) return null;
     const remainingMeters = Math.max(0, stopProj.along - along);
     const scale = span / Math.max(1, stopProj.along);
+    const spd = remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale);
     return {
       activeBranch: stopBranch,
       activeAlong: along,
@@ -736,8 +739,8 @@ export function evaluateTripState(
       lng: sample.lng,
       remainingMeters,
       etaSec: Math.max(0, etaSec),
-      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * scale),
-      isAtTerminal: along <= startAlong + 20 && effNow <= trip.startSec + 10,
+      speedMps: spd,
+      isAtTerminal: spd <= 0.05,
       inOppositeLeg: false,
       inNextCycle: false,
       realBandera: stopBranch.bandera,
@@ -807,6 +810,7 @@ export function evaluateTripState(
     const sample = sampleBranchAtAlong(stopBranch, along);
     if (!sample) return null;
     const remainingMeters = Math.max(0, stopProj.along - along);
+    const spd = remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * speedFactorTrip);
     return {
       activeBranch: stopBranch,
       activeAlong: along,
@@ -816,8 +820,8 @@ export function evaluateTripState(
       lng: sample.lng,
       remainingMeters,
       etaSec: Math.max(0, etaSec),
-      speedMps: remainingMeters <= 5 ? 0 : Math.min(25.0, ev.speedMps * speedFactorTrip),
-      isAtTerminal: along <= 120 && tEffTrip <= trip.startSec + 20,
+      speedMps: spd,
+      isAtTerminal: spd <= 0.05 && along <= 30,
       inOppositeLeg: false,
       inNextCycle: false,
       realBandera: stopBranch.bandera,
@@ -891,6 +895,7 @@ export function evaluateTripState(
       if (!sample) return null;
       const oppRem = Math.max(0, prev.branch.totalLen - ev.along);
       const remainingMeters = oppRem + stopProj.along;
+      const spd = oppRem <= 3 ? 0 : Math.min(25.0, ev.speedMps * speedFactorPrev);
       return {
         activeBranch: prev.branch,
         activeAlong: ev.along,
@@ -900,8 +905,8 @@ export function evaluateTripState(
         lng: sample.lng,
         remainingMeters,
         etaSec: Math.max(0, etaSec),
-        speedMps: Math.min(25.0, ev.speedMps * speedFactorPrev),
-        isAtTerminal: oppRem <= 120,
+        speedMps: spd,
+        isAtTerminal: spd <= 0.05,
         inOppositeLeg: true,
         inNextCycle: false,
         realBandera: prev.branch.bandera,
@@ -944,6 +949,7 @@ export function evaluateTripState(
         if (!sample) return null;
         const ppRem = Math.max(0, pp.branch.totalLen - ev.along);
         const remainingMeters = ppRem + prev.branch.totalLen + stopProj.along;
+        const spd = ppRem <= 3 ? 0 : Math.min(25.0, ev.speedMps * speedFactorPP);
         return {
           activeBranch: pp.branch,
           activeAlong: ev.along,
@@ -953,8 +959,8 @@ export function evaluateTripState(
           lng: sample.lng,
           remainingMeters,
           etaSec: Math.max(0, etaSec),
-          speedMps: Math.min(25.0, ev.speedMps * speedFactorPP),
-          isAtTerminal: ppRem <= 120,
+          speedMps: spd,
+          isAtTerminal: spd <= 0.05,
           inOppositeLeg: false,
           inNextCycle: true,
           realBandera: pp.branch.bandera,
