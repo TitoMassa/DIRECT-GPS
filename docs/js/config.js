@@ -66,26 +66,8 @@ export function getDirectionColor(branchIndex = 0) {
   return DIRECTION_COLORS[idx % DIRECTION_COLORS.length];
 }
 
-// 100% libres, sin API key, teselas nativas (cero filtro CSS invert que lagea en móvil)
+// Mapa único: OpenStreetMap detalle (100% libre, sin API key)
 export const MAP_TILES = {
-  dark: {
-    id: 'dark',
-    label: 'Grafito Nocturno',
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    subdomains: 'abcd',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> · <a href="https://carto.com/attributions">CARTO</a>',
-    maxZoom: 20,
-    darkFilter: false
-  },
-  light: {
-    id: 'light',
-    label: 'Mapa Claro',
-    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-    subdomains: 'abcd',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> · <a href="https://carto.com/attributions">CARTO</a>',
-    maxZoom: 20,
-    darkFilter: false
-  },
   osm: {
     id: 'osm',
     label: 'OSM Detalle',

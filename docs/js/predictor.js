@@ -52,6 +52,46 @@ export function formatSecHHMM(sec) {
   return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
 }
 
+export function formatLapNumber(lap) {
+  const val = Number(lap);
+  if (!Number.isFinite(val) || val <= 0) return '';
+  const whole = Math.floor(val);
+  const hasHalf = Math.abs(val - whole - 0.5) < 0.01;
+  if (hasHalf) return whole === 0 ? '½' : `${whole}½`;
+  return String(whole);
+}
+
+export function formatLapSpoken(lap) {
+  const val = Number(lap);
+  if (!Number.isFinite(val) || val <= 0) return '';
+  const whole = Math.floor(val);
+  const hasHalf = Math.abs(val - whole - 0.5) < 0.01;
+  if (hasHalf) return whole === 0 ? 'media' : `${whole} y media`;
+  return String(whole);
+}
+
+export function formatShiftLaps(laps) {
+  const val = Number(laps);
+  if (!Number.isFinite(val) || val <= 0) return '';
+  const whole = Math.floor(val);
+  const hasHalf = Math.abs(val - whole - 0.5) < 0.01;
+  if (hasHalf) {
+    return whole === 0 ? '½ vuelta' : `${whole}½ vueltas`;
+  }
+  return `${whole} ${whole === 1 ? 'vuelta' : 'vueltas'}`;
+}
+
+export function formatShiftLapsSpoken(laps) {
+  const val = Number(laps);
+  if (!Number.isFinite(val) || val <= 0) return '';
+  const whole = Math.floor(val);
+  const hasHalf = Math.abs(val - whole - 0.5) < 0.01;
+  if (hasHalf) {
+    return whole === 0 ? 'media vuelta' : `${whole} y media vueltas`;
+  }
+  return `${whole} ${whole === 1 ? 'vuelta' : 'vueltas'}`;
+}
+
 export function formatDesvioFromSec(sec = 0) {
   const s = Math.round(sec || 0);
   if (Math.abs(s) < 10) return '00:00';
@@ -859,7 +899,92 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     }
   }
 
-  // 3d) Finalize blockInfo objects with true serviceNumber (1..N), turnoIndex, and sibling turnos
+  // 3d) Split continuous multi-driver "relevo en línea" runs (> 10.2h) into ~8h driver shifts
+  // so lap numbering ALWAYS resets to Vuelta 1 at every shift change (preserving trip.prevTrip/nextTrip
+  // for seamless physical bus tracking across the relevo).
+  const singleShiftDurs = blockMeta
+    .filter((b) => b.durSec >= 6.0 * 3600 && b.durSec <= 9.8 * 3600)
+    .map((b) => b.durSec)
+    .sort((a, b) => a - b);
+  const singleShiftLegsList = blockMeta
+    .filter((b) => b.durSec >= 6.0 * 3600 && b.durSec <= 9.8 * 3600)
+    .map((b) => b.trips.length)
+    .sort((a, b) => a - b);
+  const typicalShiftSec = singleShiftDurs.length
+    ? Math.max(7.0 * 3600, Math.min(8.4 * 3600, singleShiftDurs[Math.floor(singleShiftDurs.length / 2)]))
+    : 8.0 * 3600;
+  const typicalShiftLegs = singleShiftLegsList.length
+    ? singleShiftLegsList[Math.floor(singleShiftLegsList.length / 2)]
+    : null;
+
+  const splitContinuousShift = (p) => {
+    const out = [];
+    let curTrips = p.trips;
+    const isPeak = peakServiceBms.has(p);
+
+    while (curTrips.length >= 4) {
+      const s0 = curTrips[0].startSec;
+      const eLast = curTrips[curTrips.length - 1].endSec;
+      const remDur = eLast - s0;
+      if (remDur <= 10.2 * 3600) break;
+
+      const targetDur =
+        remDur <= 17.2 * 3600
+          ? Math.min(typicalShiftSec, Math.max(7.2 * 3600, remDur * 0.5))
+          : typicalShiftSec;
+      const minRightLegs = curTrips.length >= 4 ? 2 : 1;
+      let bestIdx = -1;
+      let bestScore = Infinity;
+
+      for (let i = 2; i <= curTrips.length - minRightLegs; i++) {
+        const t1End = curTrips[i - 1].endSec;
+        const t2Start = curTrips[i].startSec;
+        const t1Dur = t1End - s0;
+        if (t1Dur < 5.0 * 3600 || t1Dur > 10.0 * 3600) continue;
+        const midElapsed = (t1End + t2Start) * 0.5 - s0;
+        let score = Math.abs(midElapsed - targetDur);
+        if (typicalShiftLegs && i === typicalShiftLegs) score -= 900;
+        if (remDur <= 17.2 * 3600 && i === Math.floor(curTrips.length / 2)) score -= 300;
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx < 0) break;
+
+      const head = curTrips.slice(0, bestIdx);
+      out.push({
+        trips: head,
+        startSec: head[0].startSec,
+        endSec: head[head.length - 1].endSec,
+        durSec: Math.max(0, head[head.length - 1].endSec - head[0].startSec),
+        isCortado: false,
+        isRelevoEnLinea: true,
+        relevoFromPrev: out.length > 0,
+        relevoToNext: true,
+        isPeak
+      });
+      curTrips = curTrips.slice(bestIdx);
+    }
+
+    const tailDur = Math.max(0, curTrips[curTrips.length - 1].endSec - curTrips[0].startSec);
+    const cameFromRelevo = out.length > 0;
+    out.push({
+      trips: curTrips,
+      startSec: curTrips[0].startSec,
+      endSec: curTrips[curTrips.length - 1].endSec,
+      durSec: tailDur,
+      // A trailing night relief right after a relevo en línea is a continuation shift, NOT a morning cortado
+      isCortado: cameFromRelevo ? false : !isInterprovincial && tailDur < 5.5 * 3600,
+      isRelevoEnLinea: cameFromRelevo,
+      relevoFromPrev: cameFromRelevo,
+      relevoToNext: false,
+      isPeak
+    });
+    return out;
+  };
+
+  // 3e) Finalize blockInfo objects with true serviceNumber (1..N), per-shift turnoIndex, and per-shift laps
   const blockInfos = [];
   const blockInfoById = new Map();
   const fleetServices = [];
@@ -868,9 +993,10 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
   let relevoEnLineaCount = 0;
 
   for (let s = 1; s <= totalServices; s++) {
-    const parts = (serviceBlocksMap.get(s) || []).sort((a, b) => a.startSec - b.startSec);
-    if (!parts.length) continue;
+    const rawParts = (serviceBlocksMap.get(s) || []).sort((a, b) => a.startSec - b.startSec);
+    if (!rawParts.length) continue;
 
+    const parts = rawParts.flatMap((p) => splitContinuousShift(p));
     const firstPart = parts[0];
     const hasRelevo = parts.some((p) => p.isRelevoEnLinea);
     if (firstPart.isCortado) cortadosCount++;
@@ -885,7 +1011,10 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       durationSec: p.durSec,
       isCortado: p.isCortado,
       isRelevoEnLinea: p.isRelevoEnLinea,
-      legCount: p.trips.length
+      relevoFromPrev: Boolean(p.relevoFromPrev),
+      relevoToNext: Boolean(p.relevoToNext),
+      legCount: p.trips.length,
+      shiftLaps: p.trips.length / 2
     }));
 
     fleetServices.push({
@@ -898,37 +1027,43 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     parts.forEach((p, idx) => {
       const turnoIndex = idx + 1;
       const blockId = serviceTurnos[idx].blockId;
-      const branchLapCounts = new Map();
+      const shiftLaps = p.trips.length / 2;
       const info = {
         blockId,
         serviceNumber: s,
         turnoIndex,
         serviceTurnosCount: parts.length,
         serviceTurnos,
-        isPeakService: peakServiceBms.has(p),
+        isPeakService: Boolean(p.isPeak),
         isCortado: p.isCortado,
         isRelevoEnLinea: p.isRelevoEnLinea,
+        relevoFromPrev: Boolean(p.relevoFromPrev),
+        relevoToNext: Boolean(p.relevoToNext),
         isInterprovincial,
         startSec: p.startSec,
         endSec: p.endSec,
         durationSec: p.durSec,
         legCount: p.trips.length,
+        shiftLaps,
         trips: p.trips
       };
 
-      for (const t of p.trips) {
-        const bk = getBranchKey(t.branch);
-        const lap = (branchLapCounts.get(bk) || 0) + 1;
-        branchLapCounts.set(bk, lap);
+      // Per-shift lap numbering: strictly resets to Vuelta 1 on every new turno / relevo en línea!
+      // Handles whole-lap (e.g. 5 vueltas = 10 legs) and half-lap (e.g. 4½ = 9 legs, 3½ = 7 legs) shifts accurately.
+      p.trips.forEach((t, legIdx) => {
+        const isHalfLap = p.trips.length % 2 === 1 && legIdx === p.trips.length - 1;
+        const lap = isHalfLap ? Math.floor(legIdx / 2) + 0.5 : Math.floor(legIdx / 2) + 1;
         t.blockId = blockId;
         t.serviceNumber = s;
         t.turnoIndex = turnoIndex;
         t.serviceTurnosCount = parts.length;
         t.lapNumber = lap;
+        t.shiftLaps = shiftLaps;
+        t.isHalfLap = isHalfLap;
         t.isCortadoBlock = p.isCortado;
         t.isRelevoEnLinea = p.isRelevoEnLinea;
         t.blockInfo = info;
-      }
+      });
 
       blockInfos.push(info);
       blockInfoById.set(blockId, info);
@@ -1866,6 +2001,8 @@ export function matchLiveBusesToTrips(
       bus.turnoIndex = bestItem.trip.turnoIndex || 1;
       bus.serviceTurnosCount = bestItem.trip.serviceTurnosCount || 1;
       bus.lapNumber = bestItem.trip.lapNumber || null;
+      bus.shiftLaps = bestItem.trip.shiftLaps || null;
+      bus.isHalfLap = Boolean(bestItem.trip.isHalfLap);
       bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
       bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
       bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
@@ -2694,6 +2831,8 @@ export function predictLineBusesForStop({
       turnoIndex: trip.turnoIndex || 1,
       serviceTurnosCount: trip.serviceTurnosCount || 1,
       lapNumber: trip.lapNumber || null,
+      shiftLaps: trip.shiftLaps || null,
+      isHalfLap: Boolean(trip.isHalfLap),
       isCortadoBlock: Boolean(trip.isCortadoBlock),
       isRelevoEnLinea: Boolean(trip.isRelevoEnLinea),
       nextLapStopTime: findNextSameBranchPassTime(trip, stopId, stopProj?.along ?? 0),

@@ -1,6 +1,6 @@
-const CACHE_NAME = 'direct-gps-v32';
+const CACHE_NAME = 'direct-gps-v33';
 const DATA_CACHE = 'direct-gps-data-v1';
-const TILE_CACHE = 'direct-gps-tiles-v1';
+const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 750;
 
 const SHELL_ASSETS = [
@@ -26,7 +26,7 @@ const SHELL_ASSETS = [
   './data/horarios/index.json'
 ];
 
-const TILE_HOSTS = ['basemaps.cartocdn.com', 'tile.openstreetmap.org', 'tile.openstreetmap.fr'];
+const TILE_HOSTS = ['tile.openstreetmap.org'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

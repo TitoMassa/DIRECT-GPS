@@ -32,7 +32,11 @@ import {
   predictLineBusesForStop,
   getArgentinaSecOfDay,
   getArgentinaDayKey,
-  formatSecHHMM
+  formatSecHHMM,
+  formatLapNumber,
+  formatLapSpoken,
+  formatShiftLaps,
+  formatShiftLapsSpoken
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -199,7 +203,6 @@ const el = {
   btnInspRoute: document.getElementById('btn-insp-route'),
 
   btnMapLocate: document.getElementById('btn-map-locate'),
-  btnMapStyle: document.getElementById('btn-map-style'),
   btnMapCenterStop: document.getElementById('btn-map-center-stop'),
   btnMapScanArea: document.getElementById('btn-map-scan-area'),
   btnZoomIn: document.getElementById('btn-zoom-in'),
@@ -274,9 +277,6 @@ function applyTheme(theme) {
   );
   el.metaThemeColor.setAttribute('content', isLight ? '#f4f5f7' : '#0b0d10');
   setSystemBarsTheme(theme);
-  if (transitMap.tileKey !== 'osm') {
-    transitMap.setTileStyle(isLight ? 'light' : 'dark');
-  }
 }
 
 // ============================================================================
@@ -1296,14 +1296,19 @@ function buildArrivalAriaLabel(bus) {
   }
 
   if (bus.serviceNumber) {
+    const shiftLapsSpoken = bus.shiftLaps ? formatShiftLapsSpoken(bus.shiftLaps) : '';
+    const lapSpoken = bus.lapNumber ? formatLapSpoken(bus.lapNumber) : '';
+    const lapPhrase = lapSpoken
+      ? `vuelta ${lapSpoken}${shiftLapsSpoken ? ` de ${shiftLapsSpoken} del turno` : ' del turno'}`
+      : null;
     const srvDesc = [
       `Servicio ${bus.serviceNumber}`,
       bus.serviceTurnosCount > 1 ? `turno ${bus.turnoIndex || 1}` : null,
-      bus.lapNumber ? `vuelta ${bus.lapNumber}` : null,
+      lapPhrase,
       bus.isCortadoBlock
         ? 'horario cortado'
         : bus.isRelevoEnLinea
-          ? 'servicio continuo con relevo en línea'
+          ? 'relevo en línea'
           : null
     ]
       .filter(Boolean)
@@ -1349,15 +1354,17 @@ function buildArrivalTagsHtml(bus) {
     parts.push(`<span class="turno-pill" title="Paso programado">${escapeHtml(bus.turnoProgramado)}</span>`);
   }
   if (bus.serviceNumber) {
-    const srvLabel = bus.lapNumber ? `S${bus.serviceNumber}·V${bus.lapNumber}` : `S${bus.serviceNumber}`;
+    const lapTxt = bus.lapNumber ? formatLapNumber(bus.lapNumber) : '';
+    const srvLabel = lapTxt ? `S${bus.serviceNumber}·V${lapTxt}` : `S${bus.serviceNumber}`;
     const turnoTag = bus.serviceTurnosCount > 1 ? ` · Turno ${bus.turnoIndex || 1}/${bus.serviceTurnosCount}` : '';
+    const shiftLapsTxt = bus.shiftLaps ? ` (${formatShiftLaps(bus.shiftLaps)})` : '';
     const regimeTag = bus.isCortadoBlock
       ? 'Horario cortado'
       : bus.isRelevoEnLinea
-        ? 'Continuo (relevo en línea)'
+        ? 'Relevo en línea'
         : 'Turno corrido';
     const srvTip = [
-      `Servicio ${bus.serviceNumber}${turnoTag}${bus.lapNumber ? ` · Vuelta ${bus.lapNumber}` : ''}`,
+      `Servicio ${bus.serviceNumber}${turnoTag}${lapTxt ? ` · Vuelta ${lapTxt} del turno` : ''}${shiftLapsTxt}`,
       regimeTag,
       bus.nextLapStopTime ? `Sig. vuelta: ${bus.nextLapStopTime}` : null
     ]
@@ -1694,16 +1701,19 @@ function updateInspectorFields(bus) {
 
   if (el.inspServicePill) {
     if (bus.serviceNumber) {
-      el.inspServicePill.textContent = bus.lapNumber
-        ? `Srv ${bus.serviceNumber} · Vta ${bus.lapNumber}`
+      const lapTxt = bus.lapNumber ? formatLapNumber(bus.lapNumber) : '';
+      const shiftLapsTxt = bus.shiftLaps ? ` (${formatShiftLaps(bus.shiftLaps)})` : '';
+      el.inspServicePill.textContent = lapTxt
+        ? `Srv ${bus.serviceNumber} · Vta ${lapTxt}`
         : `Srv ${bus.serviceNumber}`;
-      el.inspServicePill.title = bus.isCortadoBlock
-        ? 'Rotación estimada · Horario cortado'
+      const regimeDesc = bus.isCortadoBlock
+        ? 'Horario cortado'
         : bus.isRelevoEnLinea
-          ? 'Rotación estimada · Continuo (relevo en línea)'
+          ? 'Relevo en línea'
           : bus.serviceTurnosCount > 1
-            ? `Rotación estimada · Turno ${bus.turnoIndex || 1} de ${bus.serviceTurnosCount}`
-            : 'Rotación estimada · Turno corrido';
+            ? `Turno ${bus.turnoIndex || 1} de ${bus.serviceTurnosCount}`
+            : 'Turno corrido';
+      el.inspServicePill.title = `Rotación estimada · ${regimeDesc}${shiftLapsTxt}`;
       el.inspServicePill.classList.remove('hidden');
     } else {
       el.inspServicePill.classList.add('hidden');
@@ -2126,6 +2136,8 @@ function reconcileWithSchedulePrediction(
         nearbyUnmatchedLive.turnoIndex = p.turnoIndex || 1;
         nearbyUnmatchedLive.serviceTurnosCount = p.serviceTurnosCount || 1;
         nearbyUnmatchedLive.lapNumber = p.lapNumber || null;
+        nearbyUnmatchedLive.shiftLaps = p.shiftLaps || null;
+        nearbyUnmatchedLive.isHalfLap = Boolean(p.isHalfLap);
         nearbyUnmatchedLive.isCortadoBlock = Boolean(p.isCortadoBlock);
         nearbyUnmatchedLive.isRelevoEnLinea = Boolean(p.isRelevoEnLinea);
         nearbyUnmatchedLive.nextLapStopTime = p.nextLapStopTime || null;
@@ -2676,23 +2688,34 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
   let continuitySpoken = '';
   const allTurnos = Array.isArray(blockInfo.serviceTurnos) ? blockInfo.serviceTurnos : [];
   if (allTurnos.length > 1) {
-    const descParts = allTurnos.map((tr) => {
+    const descPieces = [];
+    allTurnos.forEach((tr, idx) => {
       const span = `${formatSecHHMM(tr.startSec)}–${formatSecHHMM(tr.endSec)}`;
-      const kind = tr.isCortado ? ' cortado' : tr.isRelevoEnLinea ? ' relevo' : '';
-      const label = `T${tr.turnoIndex} ${span}${kind}`;
-      return tr.blockId === blockInfo.blockId ? `<strong>${escapeHtml(label)}</strong>` : escapeHtml(label);
+      const lapsTxt = tr.shiftLaps ? formatShiftLaps(tr.shiftLaps) : '';
+      const detail = [lapsTxt, tr.isCortado ? 'cortado' : null].filter(Boolean).join(', ');
+      const label = `T${tr.turnoIndex} ${span}${detail ? ` (${detail})` : ''}`;
+      descPieces.push(tr.blockId === blockInfo.blockId ? `<strong>${escapeHtml(label)}</strong>` : escapeHtml(label));
+      if (idx < allTurnos.length - 1) {
+        descPieces.push(tr.relevoToNext ? ' → relevo · ' : ' · ');
+      }
     });
-    continuityHtml = `<div class="rotation-continuity">Mismo Servicio ${blockInfo.serviceNumber}: ${descParts.join(' · ')}</div>`;
+    continuityHtml = `<div class="rotation-continuity">Mismo Servicio ${blockInfo.serviceNumber}: ${descPieces.join('')}</div>`;
     const otherTurnos = allTurnos.filter((tr) => tr.blockId !== blockInfo.blockId);
     continuitySpoken =
       ' ' +
       otherTurnos
-        .map(
-          (tr) =>
-            `Mismo Servicio ${blockInfo.serviceNumber} ${
-              tr.turnoIndex > blockInfo.turnoIndex ? 'retoma' : 'salió antes'
-            } en turno ${tr.turnoIndex} de ${formatSecHHMM(tr.startSec)} a ${formatSecHHMM(tr.endSec)}.`
-        )
+        .map((tr) => {
+          const lapsSpoken = tr.shiftLaps ? ` de ${formatShiftLapsSpoken(tr.shiftLaps)}` : '';
+          const relPhrase =
+            tr.turnoIndex === blockInfo.turnoIndex + 1 && blockInfo.relevoToNext
+              ? 'continúa por relevo en línea'
+              : tr.turnoIndex > blockInfo.turnoIndex
+                ? 'retoma'
+                : 'salió antes';
+          return `Mismo Servicio ${blockInfo.serviceNumber} ${relPhrase} en turno ${tr.turnoIndex}${lapsSpoken}, de ${formatSecHHMM(
+            tr.startSec
+          )} a ${formatSecHHMM(tr.endSec)}.`;
+        })
         .join(' ');
   } else if (blockInfo.isRelevoEnLinea) {
     const span = `${formatSecHHMM(blockInfo.startSec)}–${formatSecHHMM(blockInfo.endSec)}`;
@@ -2720,11 +2743,22 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
     }
   }
 
+  const shiftLapsVisual = blockInfo.shiftLaps
+    ? formatShiftLaps(blockInfo.shiftLaps)
+    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'}`;
+  const shiftLapsSpoken = blockInfo.shiftLaps
+    ? formatShiftLapsSpoken(blockInfo.shiftLaps)
+    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'}`;
+  const stopPassesNote =
+    blockInfo.shiftLaps && Math.abs(blockSlots.length - blockInfo.shiftLaps) > 0.01
+      ? ` · ${blockSlots.length} ${blockSlots.length === 1 ? 'paso' : 'pasos'} por esta parada`
+      : '';
+
   const liveNote = liveBlockBus
-    ? `Hoy en servicio: <strong>Coche #${escapeHtml(liveBlockBus.identificadorCoche)}</strong>${
+    ? `Turno de ${escapeHtml(shiftLapsVisual)} · Hoy en servicio: <strong>Coche #${escapeHtml(liveBlockBus.identificadorCoche)}</strong>${
         liveBlockBus.choferNombre ? ` · ${escapeHtml(liveBlockBus.choferNombre)}` : ''
       } (asignación diaria)`
-    : `${blockSlots.length} ${blockSlots.length === 1 ? 'vuelta' : 'vueltas'} en este turno · Coche y chofer rotan cada día.`;
+    : `Turno de ${escapeHtml(shiftLapsVisual)}${stopPassesNote} · Coche y chofer rotan cada día.`;
 
   banner.innerHTML = `
     <div class="rotation-banner-head">
@@ -2747,9 +2781,9 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
       ? ` Hoy en servicio: coche ${liveBlockBus.identificadorCoche}.`
       : ' Coche y chofer rotan cada día.';
     announce(
-      `${turnoLabel}, ${tagText}. ${blockSlots.length} ${
-        blockSlots.length === 1 ? 'vuelta' : 'vueltas'
-      } en esta parada: ${spokenChain}.${continuitySpoken}${spokenLive}`
+      `${turnoLabel}, ${tagText}, turno de ${shiftLapsSpoken}. ${blockSlots.length} ${
+        blockSlots.length === 1 ? 'paso' : 'pasos'
+      } por esta parada: ${spokenChain}.${continuitySpoken}${spokenLive}`
     );
   }
 }
@@ -2764,9 +2798,13 @@ function buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext) {
     const bi = slotMeta.blockInfo;
     const turnoPart = bi.serviceTurnosCount > 1 ? `, turno ${bi.turnoIndex} de ${bi.serviceTurnosCount}` : '';
     const kindPart = bi.isCortado ? ', horario cortado' : bi.isRelevoEnLinea ? ', relevo en línea' : '';
-    parts.push(
-      `Servicio ${bi.serviceNumber}${turnoPart}, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}${kindPart}`
-    );
+    const tripLap = slotMeta.trip?.lapNumber;
+    const lapPart = tripLap
+      ? `, vuelta ${formatLapSpoken(tripLap)}${
+          bi.shiftLaps ? ` de ${formatShiftLapsSpoken(bi.shiftLaps)} del turno` : ' del turno'
+        }`
+      : `, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}`;
+    parts.push(`Servicio ${bi.serviceNumber}${turnoPart}${lapPart}${kindPart}`);
   }
   return parts.join(', ');
 }
@@ -4270,11 +4308,6 @@ function bindEvents() {
   el.btnZoomIn.addEventListener('click', () => transitMap.zoomIn());
   el.btnZoomOut.addEventListener('click', () => transitMap.zoomOut());
   el.btnMapCenterStop.addEventListener('click', () => transitMap.focusStop(16));
-  el.btnMapStyle.addEventListener('click', () => {
-    const cfg = transitMap.cycleTileStyle();
-    haptic('light');
-    showToast(`Mapa: ${cfg.label}`, 'info', 1500);
-  });
   el.btnMapScanArea.addEventListener('click', () => {
     const c = transitMap.getCenter();
     searchNearbyStops(c.lat, c.lng, 'el centro del mapa');

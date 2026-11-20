@@ -32,9 +32,9 @@ export class TransitMap {
       this.isInteracting = false;
     });
 
-    this.tileKey = 'dark';
+    this.tileKey = 'osm';
     this.tileLayer = null;
-    this.setTileStyle('dark');
+    this.setTileStyle('osm');
 
     // Layers
     this.routeLayer = L.layerGroup().addTo(this.map);
@@ -94,8 +94,8 @@ export class TransitMap {
     };
   }
 
-  setTileStyle(styleKey) {
-    const cfg = MAP_TILES[styleKey] || MAP_TILES.dark;
+  setTileStyle() {
+    const cfg = MAP_TILES.osm;
     const prevUrl = this.tileLayer ? this.tileLayer._url : null;
     this.tileKey = cfg.id;
 
@@ -115,15 +115,9 @@ export class TransitMap {
 
     const tilePane = this.map.getPane('tilePane');
     if (tilePane) {
-      tilePane.classList.toggle('osm-dark-filter', Boolean(cfg.darkFilter));
+      tilePane.classList.remove('osm-dark-filter');
     }
     return cfg;
-  }
-
-  cycleTileStyle() {
-    const order = ['dark', 'light', 'osm'];
-    const next = order[(order.indexOf(this.tileKey) + 1) % order.length];
-    return this.setTileStyle(next);
   }
 
   zoomIn() {
