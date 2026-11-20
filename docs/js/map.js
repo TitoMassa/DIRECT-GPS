@@ -79,11 +79,11 @@ export class TransitMap {
     const isBottomSheet = window.innerWidth <= 860 && !isLandscapeRail;
 
     if (isBottomSheet) {
-      const dockH = dock ? Math.round(dock.getBoundingClientRect().height) : Math.round(window.innerHeight * 0.45);
-      const bottomPad = Math.min(dockH + 18, Math.round(window.innerHeight * 0.65));
+      // On mobile portrait, .map-canvas occupies the fixed top 50% (bottom: 50dvh),
+      // so the dock no longer overlaps the map container.
       return {
         paddingTopLeft: [18, topPad],
-        paddingBottomRight: [56, bottomPad]
+        paddingBottomRight: [56, 22]
       };
     }
 

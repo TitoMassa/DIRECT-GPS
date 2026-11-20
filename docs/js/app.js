@@ -484,113 +484,17 @@ function clearSheetInlineSize() {
   el.appShell?.style.removeProperty('--sheet-h');
 }
 
-function setSheetIndex(newIdx, { silent = false } = {}) {
-  const idx = Math.max(0, Math.min(SHEET_STATES.length - 1, newIdx));
-  const changed = idx !== getSheetIndex();
+function setSheetIndex() {
+  // Bottom panel is permanently fixed at 50% on mobile (no expand/collapse)
   clearSheetInlineSize();
   SHEET_STATES.forEach((s) => el.dock.classList.remove(s));
-  el.dock.classList.add(SHEET_STATES[idx]);
-  if (changed && !silent) haptic('light');
+  el.dock.classList.add('sheet-half');
 }
 
 function setupMobileSheet() {
-  let dragging = false;
-  let moved = false;
-  let startY = 0;
-  let startH = 0;
-  let lastY = 0;
-  let lastT = 0;
-  let velocity = 0; // px/ms (positive = dragging down)
-
-  el.sheetHandle.addEventListener('click', () => {
-    if (moved) return;
-    setSheetIndex((getSheetIndex() + 1) % SHEET_STATES.length);
-  });
-
-  const onStart = (e) => {
-    if (!isBottomSheetLayout() || e.touches.length !== 1) return;
-    dragging = true;
-    moved = false;
-    startY = e.touches[0].clientY;
-    lastY = startY;
-    lastT = performance.now();
-    velocity = 0;
-    startH = el.dock.getBoundingClientRect().height;
-  };
-
-  const onMove = (e) => {
-    if (!dragging || !isBottomSheetLayout()) return;
-    const y = e.touches[0].clientY;
-    const dy = y - startY;
-    if (!moved && Math.abs(dy) < 6) return;
-
-    if (!moved) {
-      moved = true;
-      el.dock.classList.add('is-dragging');
-    }
-
-    const now = performance.now();
-    const dt = Math.max(1, now - lastT);
-    velocity = 0.6 * velocity + 0.4 * ((y - lastY) / dt);
-    lastY = y;
-    lastT = now;
-
-    const [minH, , maxH] = getSheetSnapHeights();
-    // Gentle rubber-band resistance outside bounds
-    let nextH = startH - dy;
-    if (nextH < minH) nextH = minH - (minH - nextH) * 0.22;
-    else if (nextH > maxH) nextH = maxH + (nextH - maxH) * 0.18;
-
-    const px = Math.round(nextH);
-    el.dock.style.height = `${px}px`;
-    el.appShell?.style.setProperty('--sheet-h', `${px}px`);
-    if (e.cancelable) e.preventDefault();
-  };
-
-  const onEnd = () => {
-    if (!dragging) return;
-    dragging = false;
-    if (!moved) return;
-
-    const curH = el.dock.getBoundingClientRect().height;
-    const snaps = getSheetSnapHeights();
-    const curIdx = getSheetIndex();
-
-    let targetIdx;
-    if (velocity < -0.45) {
-      // Fast flick upward -> expand one stop (or to full if already past half)
-      targetIdx = curH > snaps[1] ? 2 : Math.min(2, curIdx + 1);
-    } else if (velocity > 0.45) {
-      // Fast flick downward -> collapse one stop
-      targetIdx = curH < snaps[1] ? 0 : Math.max(0, curIdx - 1);
-    } else {
-      // Nearest snap point
-      let bestDist = Infinity;
-      targetIdx = 1;
-      snaps.forEach((h, i) => {
-        const d = Math.abs(curH - h);
-        if (d < bestDist) {
-          bestDist = d;
-          targetIdx = i;
-        }
-      });
-    }
-
-    setSheetIndex(targetIdx);
-    setTimeout(() => {
-      moved = false;
-    }, 60);
-  };
-
-  [el.sheetHandle, document.querySelector('.dock-tabs')].filter(Boolean).forEach((target) => {
-    target.addEventListener('touchstart', onStart, { passive: true });
-    target.addEventListener('touchmove', onMove, { passive: false });
-    target.addEventListener('touchend', onEnd, { passive: true });
-    target.addEventListener('touchcancel', onEnd, { passive: true });
-  });
-
+  setSheetIndex();
   window.addEventListener('resize', () => {
-    if (!isBottomSheetLayout()) clearSheetInlineSize();
+    clearSheetInlineSize();
   });
 }
 

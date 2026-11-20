@@ -2773,22 +2773,30 @@ input:focus-visible,
     height: 32px;
   }
 
+  .map-canvas {
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 50dvh;
+  }
+
   .transit-dock {
-    top: auto;
+    top: 50dvh;
     left: 0;
     right: 0;
     bottom: 0;
     width: 100%;
+    height: 50dvh !important;
     padding-left: 0;
     border-right: none;
     border-top: 1px solid var(--border-strong);
-    border-radius: 16px 16px 0 0;
-    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.32);
-    transition: height 0.24s var(--ease);
+    border-radius: 0;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.22);
+    transition: none;
   }
 
   .sheet-handle {
-    display: flex;
+    display: none !important;
   }
 
   .dock-tabs {
@@ -2807,16 +2815,10 @@ input:focus-visible,
     right: 16px;
   }
 
-  .transit-dock.sheet-peek {
-    height: min(calc(160px + var(--safe-bottom)), 36dvh);
-  }
-
-  .transit-dock.sheet-half {
-    height: 46dvh;
-  }
-
+  .transit-dock.sheet-peek,
+  .transit-dock.sheet-half,
   .transit-dock.sheet-full {
-    height: calc(100dvh - var(--safe-top) - 62px);
+    height: 50dvh !important;
   }
 
   .arrival-row-foot {
@@ -2825,21 +2827,8 @@ input:focus-visible,
 
   .map-controls {
     right: calc(10px + var(--safe-right));
-    bottom: calc(46dvh + 12px);
+    bottom: calc(50dvh + 10px);
     gap: 5px;
-  }
-
-  .transit-dock.sheet-peek ~ .map-controls {
-    bottom: calc(172px + var(--safe-bottom));
-  }
-
-  .transit-dock.sheet-full ~ .map-controls {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .transit-dock.is-dragging ~ .map-controls {
-    bottom: calc(var(--sheet-h, 46dvh) + 12px);
   }
 
   .bus-inspector {
@@ -2847,20 +2836,8 @@ input:focus-visible,
     right: calc(56px + var(--safe-right));
     width: auto;
     max-width: none;
-    bottom: calc(46dvh + 10px);
+    bottom: calc(50dvh + 10px);
     padding: 9px 10px;
-  }
-
-  .transit-dock.sheet-peek ~ .bus-inspector {
-    bottom: calc(170px + var(--safe-bottom));
-  }
-
-  .transit-dock.sheet-full ~ .bus-inspector {
-    display: none;
-  }
-
-  .transit-dock.is-dragging ~ .bus-inspector {
-    bottom: calc(var(--sheet-h, 46dvh) + 10px);
   }
 
   .toast-container {
@@ -2933,6 +2910,10 @@ input:focus-visible,
 
   .quick-search-input {
     height: 30px;
+  }
+
+  .map-canvas {
+    inset: 0;
   }
 
   .transit-dock {
