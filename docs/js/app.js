@@ -4204,82 +4204,30 @@ function renderLineFlotaView() {
   const carByNum = new Map();
   for (const c of allCoches) carByNum.set(c.coche, c);
 
-  const resolveCarMeta = (c) =>
+  const resolveRawCarMeta = (c) =>
     (c.enLineaAhora ? liveMatchByCoche.get(c.coche) : null) || resolveUnitScheduleMeta(model, c, nowSec);
 
-  const resolveDriverMeta = (d) => {
-    if (d.enLineaAhora && d.lastCoche && liveMatchByCoche.has(d.lastCoche)) {
-      return liveMatchByCoche.get(d.lastCoche);
-    }
-    const direct = resolveUnitScheduleMeta(model, d, nowSec);
-    if (direct) return direct;
-    // Check todayTrips for this driver
-    const dLeg = String(d.choferLegajo || '').trim();
-    const dName = String(d.choferNombre || '').trim().toUpperCase();
-    const tripHit = todayTrips.find(
-      (t) =>
-        (dLeg && t.choferLegajo && t.choferLegajo === dLeg) ||
-        (dName && t.choferNombre && t.choferNombre.toUpperCase() === dName)
-    );
-    if (tripHit && model?.tripByKey?.has(tripHit.tripKey)) {
-      return resolveUnitScheduleMeta(model, { tripKey: tripHit.tripKey }, nowSec);
-    }
-    return null;
+  const normDriverName = (name) =>
+    String(name || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/\.+$/, '')
+      .toUpperCase();
+
+  const isSameDriver = (legA, nameA, legB, nameB) => {
+    const lA = String(legA || '').trim().toUpperCase();
+    const lB = String(legB || '').trim().toUpperCase();
+    if (lA && lB) return lA === lB;
+    const nA = normDriverName(nameA);
+    const nB = normDriverName(nameB);
+    return Boolean(nA && nB && nA === nB);
   };
 
-  const formatServiceLineHtml = (srvMeta, isLiveNow, isHistorical = false) => {
-    if (!srvMeta?.serviceNumber) return '';
-    const srvLabel = `Servicio ${srvMeta.serviceNumber}`;
-    const turnoPart = srvMeta.serviceTurnosCount > 1 ? ` · T${srvMeta.turnoIndex}/${srvMeta.serviceTurnosCount}` : '';
-    const lapPart =
-      isLiveNow && srvMeta.lapNumber
-        ? ` · Vta ${formatLapNumber(srvMeta.lapNumber)}${srvMeta.shiftLaps ? `/${formatLapNumber(srvMeta.shiftLaps)}` : ''}`
-        : srvMeta.shiftLaps
-          ? ` · ${formatShiftLaps(srvMeta.shiftLaps)}`
-          : '';
-    const spanPart = srvMeta.startHHMM && srvMeta.endHHMM ? ` · ${srvMeta.startHHMM}–${srvMeta.endHHMM}` : '';
-    const prefix = isHistorical && !isLiveNow ? 'Hizo ' : '';
-    return `<div class="flota-service-line"><span class="flota-srv-pill">${escapeHtml(prefix + srvLabel + turnoPart)}</span><span class="flota-srv-meta">${escapeHtml((lapPart + spanPart).replace(/^\s*·\s*/, ''))}</span></div>`;
-  };
-
-  const formatServiceSpoken = (srvMeta, isLiveNow) => {
-    if (!srvMeta?.serviceNumber) return '';
-    const parts = [`Servicio ${srvMeta.serviceNumber}`];
-    if (srvMeta.serviceTurnosCount > 1) parts.push(`turno ${srvMeta.turnoIndex} de ${srvMeta.serviceTurnosCount}`);
-    if (isLiveNow && srvMeta.lapNumber) {
-      parts.push(`vuelta ${formatLapSpoken(srvMeta.lapNumber)}${srvMeta.shiftLaps ? ` de ${formatLapSpoken(srvMeta.shiftLaps)}` : ''}`);
-    }
-    if (srvMeta.startHHMM && srvMeta.endHHMM) parts.push(`de ${srvMeta.startHHMM} a ${srvMeta.endHHMM}`);
-    return parts.join(', ');
-  };
-
-  const scopeCoches = fv.scope === 'hoy' ? allCoches.filter((c) => c.vistoHoy) : allCoches;
-  const scopeChoferes = fv.scope === 'hoy' ? allChoferes.filter((d) => d.vistoHoy) : allChoferes;
-
-  const query = el.lineasFilterInput.value.trim().toLowerCase();
-  const visibleCoches = query
-    ? scopeCoches.filter((c) => {
-        const m = resolveCarMeta(c);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
-        return `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${c.lastBandera || ''} ${srvTxt}`
-          .toLowerCase()
-          .includes(query);
-      })
-    : scopeCoches;
-  const visibleChoferes = query
-    ? scopeChoferes.filter((d) => {
-        const m = resolveDriverMeta(d);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
-        return `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${d.lastBandera || ''} ${srvTxt}`
-          .toLowerCase()
-          .includes(query);
-      })
-    : scopeChoferes;
-
-  // Build map of blockId -> best today car/driver observation for the Servicios tab
-  // Enforces three physical invariants:
+  // Build map of blockId -> best today car/driver observation FIRST as the single source of truth
+  // shared across Servicios, Choferes, and Coches tabs. Enforces three physical invariants:
   //  1) A turno is marked "En línea" ONLY if that car is currently matched to THAT turno (never on finished morning turnos!).
-  //  2) The same physical car cannot be assigned to two time-overlapping turnos on the same day (while non-overlapping T1/T2 relevos are preserved!).
+  //  2) The same physical car cannot be assigned to two truly simultaneous turnos on the same day, while preserving
+  //     relevos and brief cross-service boundary handoffs between DIFFERENT drivers (e.g. T1 ending 14:09 / T2 starting 13:58).
   //  3) Driver attribution is strictly scoped per turno (using driver votes from trips & fleet_drivers observed inside THAT turno's window),
   //     so a T2 relevo driver (e.g. GOMEZ R. on #3093) NEVER overwrites T1's driver (e.g. ROMERO L. on #3093)!
   const blockAssignMap = new Map();
@@ -4294,6 +4242,16 @@ function renderLineFlotaView() {
         const art = new Date(tsMs - 3 * 3600 * 1000);
         const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
         return s < 3 * 3600 ? s + 86400 : s;
+      }
+      return null;
+    };
+
+    const findPrevTurnoInfo = (bi) => {
+      if (!bi || !bi.serviceNumber || (bi.turnoIndex || 1) <= 1) return null;
+      for (const other of model.blockInfoById?.values() || []) {
+        if (other.serviceNumber === bi.serviceNumber && other.turnoIndex === bi.turnoIndex - 1) {
+          return other;
+        }
       }
       return null;
     };
@@ -4321,7 +4279,7 @@ function renderLineFlotaView() {
       const dName = String(entry.choferNombre || '').trim();
       const dLeg = String(entry.choferLegajo || '').trim();
       if (dName) {
-        const dKey = dLeg ? `leg:${dLeg.toUpperCase()}` : `name:${dName.toUpperCase()}`;
+        const dKey = dLeg ? `leg:${dLeg.toUpperCase()}` : `name:${normDriverName(dName)}`;
         const prevVote = driverVotes.get(dKey) || { nombre: dName, legajo: dLeg, weight: 0, latestAt: 0 };
         prevVote.weight += entry.driverWeight || 1;
         prevVote.latestAt = Math.max(prevVote.latestAt, entry.updatedAt || 0);
@@ -4394,19 +4352,40 @@ function renderLineFlotaView() {
 
     // 2) Ingest today's drivers directly from fleet_drivers (captures finished T1 relevo drivers even if same car is now on T2!)
     for (const d of allChoferes.filter((x) => x.vistoHoy && x.lastCoche)) {
-      const dMeta = resolveUnitScheduleMeta(model, d, nowSec);
-      const bId = dMeta?.blockInfo?.blockId;
+      const dMeta =
+        (d.enLineaAhora && liveMatchByCoche.has(d.lastCoche) ? liveMatchByCoche.get(d.lastCoche) : null) ||
+        resolveUnitScheduleMeta(model, d, nowSec);
+      let bId = dMeta?.blockInfo?.blockId;
       if (!bId) continue;
-      const bi = model.blockInfoById?.get(bId);
+      let bi = model.blockInfoById?.get(bId);
       const dObsSec = obsSecFromRecord(d.lastGps, d.lastSeenAt);
-      if (bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 30 * 60)) {
+      if (bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 35 * 60)) {
         continue;
+      }
+      let reassignedToPrev = false;
+      // Guard against a stray end-of-morning-shift ping (e.g. 14:08) falsely claiming an ongoing afternoon turno (13:58-21:55).
+      // If that ping lands right after the same service's previous turno (e.g. T1 ending 13:45), re-attribute it to T1 instead!
+      if (!d.enLineaAhora && bi && dObsSec !== null && dObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
+        const hasTripsInBlock = todayTrips.some((t) => {
+          const tr = model.tripByKey?.get(t.tripKey);
+          return tr?.blockId === bId && isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre);
+        });
+        if (!hasTripsInBlock) {
+          const prevBi = findPrevTurnoInfo(bi);
+          if (prevBi && dObsSec >= prevBi.endSec - 20 * 60 && dObsSec <= prevBi.endSec + 35 * 60) {
+            bId = prevBi.blockId;
+            bi = prevBi;
+            reassignedToPrev = true;
+          } else {
+            continue;
+          }
+        }
       }
       const carRec = carByNum.get(d.lastCoche);
       addCandidate(bId, d.lastCoche, {
         choferNombre: d.choferNombre || '',
         choferLegajo: d.choferLegajo || '',
-        driverWeight: d.enLineaAhora ? 3 : 2,
+        driverWeight: d.enLineaAhora ? 3 : reassignedToPrev ? 1 : 2,
         esAdaptado: Boolean(d.lastEsAdaptado || carRec?.esAdaptado),
         carEnLinea: Boolean(d.enLineaAhora && carRec?.enLineaAhora),
         lat: d.lastLat ?? carRec?.lastLat ?? null,
@@ -4414,8 +4393,8 @@ function renderLineFlotaView() {
         lastGps: d.lastGps || '',
         lastStopId: d.lastStopId || '',
         bandera: d.lastBandera || '',
-        lapNumber: dMeta.lapNumber,
-        shiftLaps: dMeta.shiftLaps,
+        lapNumber: reassignedToPrev ? null : dMeta.lapNumber,
+        shiftLaps: bi?.shiftLaps || dMeta.shiftLaps,
         desvioRaw: d.lastDesvioRaw || '',
         desvioSec: d.lastDesvioSec || 0,
         tripDelta: d.enLineaAhora ? 2 : 1,
@@ -4425,9 +4404,28 @@ function renderLineFlotaView() {
 
     // 3) Ingest today's cars (matching their current / latest position to its exact turno)
     for (const c of allCoches.filter((x) => x.vistoHoy)) {
-      const m = resolveCarMeta(c);
-      const bId = m?.blockInfo?.blockId;
+      const m = resolveRawCarMeta(c);
+      let bId = m?.blockInfo?.blockId;
       if (!bId) continue;
+      let bi = model.blockInfoById?.get(bId);
+      const cObsSec = obsSecFromRecord(c.lastGps, c.lastSeenAt);
+      let reassignedToPrev = false;
+      if (!c.enLineaAhora && bi && cObsSec !== null && cObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
+        const hasTripsInBlock = todayTrips.some((t) => {
+          const tr = model.tripByKey?.get(t.tripKey);
+          return tr?.blockId === bId && t.coche === c.coche;
+        });
+        if (!hasTripsInBlock) {
+          const prevBi = findPrevTurnoInfo(bi);
+          if (prevBi && cObsSec >= prevBi.endSec - 20 * 60 && cObsSec <= prevBi.endSec + 35 * 60) {
+            bId = prevBi.blockId;
+            bi = prevBi;
+            reassignedToPrev = true;
+          } else {
+            continue;
+          }
+        }
+      }
       addCandidate(bId, c.coche, {
         choferNombre: c.lastChoferNombre || '',
         choferLegajo: c.lastChoferLegajo || '',
@@ -4439,8 +4437,8 @@ function renderLineFlotaView() {
         lastGps: c.lastGps,
         lastStopId: c.lastStopId,
         bandera: c.lastBandera,
-        lapNumber: m.lapNumber,
-        shiftLaps: m.shiftLaps,
+        lapNumber: reassignedToPrev ? null : m.lapNumber,
+        shiftLaps: bi?.shiftLaps || m.shiftLaps,
         desvioRaw: c.lastDesvioRaw || '',
         desvioSec: c.lastDesvioSec || 0,
         tripDelta: c.enLineaAhora ? 3 : 1,
@@ -4449,7 +4447,7 @@ function renderLineFlotaView() {
     }
 
     // Flatten and resolve globally: highest-confidence (live on block -> most trips -> freshest) claims its block;
-    // reject any overlapping turno claim by the same physical car (while keeping non-overlapping T1/T2 relevos!).
+    // reject truly simultaneous turno claims by the same car or same driver while allowing brief boundary handoffs.
     const allCands = [];
     for (const byCar of candidatesByBlock.values()) {
       for (const cand of byCar.values()) allCands.push(cand);
@@ -4460,21 +4458,47 @@ function renderLineFlotaView() {
       return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
 
-    const claimedWindowsByCoche = new Map(); // coche -> Array<{ startSec, endSec }>
+    const claimedWindowsByCoche = new Map(); // coche -> Array<{ startSec, endSec, choferLegajo, choferNombre }>
+    const claimedWindowsByDriver = []; // Array<{ startSec, endSec, choferLegajo, choferNombre }>
     for (const cand of allCands) {
       if (blockAssignMap.has(cand.blockId)) continue;
       const used = claimedWindowsByCoche.get(cand.coche) || [];
-      const overlaps = used.some(
-        (w) => cand.startSec < w.endSec - 600 && w.startSec < cand.endSec - 600
-      );
-      if (overlaps) continue;
+      const carOverlaps = used.some((w) => {
+        const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
+        const sameDrv = isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre);
+        const maxAllowedOverlapSec = sameDrv || (!cand.choferNombre && !w.choferNombre) ? 20 * 60 : 45 * 60;
+        return overlapSec > maxAllowedOverlapSec;
+      });
+      if (carOverlaps) continue;
+      const driverOverlaps =
+        cand.choferLegajo || cand.choferNombre
+          ? claimedWindowsByDriver.some((w) => {
+              if (!isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre)) return false;
+              const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
+              return overlapSec > 25 * 60;
+            })
+          : false;
+      if (driverOverlaps) continue;
       blockAssignMap.set(cand.blockId, cand);
-      used.push({ startSec: cand.startSec, endSec: cand.endSec });
+      used.push({
+        startSec: cand.startSec,
+        endSec: cand.endSec,
+        choferLegajo: cand.choferLegajo,
+        choferNombre: cand.choferNombre
+      });
       claimedWindowsByCoche.set(cand.coche, used);
+      if (cand.choferLegajo || cand.choferNombre) {
+        claimedWindowsByDriver.push({
+          startSec: cand.startSec,
+          endSec: cand.endSec,
+          choferLegajo: cand.choferLegajo,
+          choferNombre: cand.choferNombre
+        });
+      }
     }
 
     // 4) Same-car driver-change relevo clue: if a service's T2 is assigned to car #X with Driver B,
-    // and T1 (relevo en línea) has no assignment yet, check if another driver A was seen today on #X during T1!
+    // and T1 (relevo en línea) has no assignment yet, check if another unassigned driver A was seen today on #X during T1!
     for (const srv of fv.schedSummary?.services || []) {
       const turnos = srv.turnos || [];
       for (let ti = 1; ti < turnos.length; ti++) {
@@ -4483,11 +4507,16 @@ function renderLineFlotaView() {
         if (!curT.relevoFromPrev) continue;
         const curAssign = blockAssignMap.get(curT.blockId);
         if (!curAssign?.coche || blockAssignMap.has(prevT.blockId)) continue;
-        const curDrvKey = (curAssign.choferLegajo || curAssign.choferNombre || '').toUpperCase();
         const priorDriver = allChoferes.find((d) => {
           if (!d.vistoHoy || d.lastCoche !== curAssign.coche) return false;
-          const dKey = (d.choferLegajo || d.choferNombre || '').toUpperCase();
-          if (!dKey || dKey === curDrvKey) return false;
+          if (!d.choferLegajo && !d.choferNombre) return false;
+          if (isSameDriver(d.choferLegajo, d.choferNombre, curAssign.choferLegajo, curAssign.choferNombre)) return false;
+          const alreadyClaimed = claimedWindowsByDriver.some((w) => {
+            if (!isSameDriver(d.choferLegajo, d.choferNombre, w.choferLegajo, w.choferNombre)) return false;
+            const overlapSec = Math.min(prevT.endSec, w.endSec) - Math.max(prevT.startSec, w.startSec);
+            return overlapSec > 25 * 60;
+          });
+          if (alreadyClaimed) return false;
           const dObs = obsSecFromRecord(d.lastGps, d.lastSeenAt);
           return dObs !== null && dObs >= prevT.startSec - 15 * 60 && dObs <= prevT.endSec + 35 * 60;
         });
@@ -4513,10 +4542,207 @@ function renderLineFlotaView() {
             tripCount: 1,
             updatedAt: priorDriver.lastSeenAt || 0
           });
+          claimedWindowsByDriver.push({
+            startSec: prevT.startSec,
+            endSec: prevT.endSec,
+            choferLegajo: priorDriver.choferLegajo || '',
+            choferNombre: priorDriver.choferNombre || ''
+          });
         }
       }
     }
   }
+
+  const packBlockAssignMeta = (assign) => {
+    const bi = assign?.blockId ? model?.blockInfoById?.get(assign.blockId) : null;
+    if (!bi) return null;
+    return {
+      trip: null,
+      blockInfo: bi,
+      tripKey: '',
+      serviceNumber: bi.serviceNumber,
+      turnoIndex: bi.turnoIndex,
+      serviceTurnosCount: bi.serviceTurnosCount,
+      lapNumber: assign.lapNumber || null,
+      shiftLaps: bi.shiftLaps || assign.shiftLaps || null,
+      isHalfLap: false,
+      isCortado: Boolean(bi.isCortado),
+      isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+      startSec: bi.startSec,
+      endSec: bi.endSec,
+      startHHMM: formatSecHHMM(bi.startSec),
+      endHHMM: formatSecHHMM(bi.endSec)
+    };
+  };
+
+  const resolveCarMeta = (c) => {
+    if (c.enLineaAhora && liveMatchByCoche.has(c.coche)) {
+      return liveMatchByCoche.get(c.coche);
+    }
+    if (c.vistoHoy && blockAssignMap.size > 0) {
+      let bestAssign = null;
+      for (const assign of blockAssignMap.values()) {
+        if (assign.coche !== c.coche) continue;
+        const matchesLastDrv = isSameDriver(
+          c.lastChoferLegajo,
+          c.lastChoferNombre,
+          assign.choferLegajo,
+          assign.choferNombre
+        );
+        const prevMatchesLastDrv = bestAssign
+          ? isSameDriver(c.lastChoferLegajo, c.lastChoferNombre, bestAssign.choferLegajo, bestAssign.choferNombre)
+          : false;
+        if (
+          !bestAssign ||
+          (assign.enLineaAhora && !bestAssign.enLineaAhora) ||
+          (assign.enLineaAhora === bestAssign.enLineaAhora && matchesLastDrv && !prevMatchesLastDrv) ||
+          (assign.enLineaAhora === bestAssign.enLineaAhora &&
+            matchesLastDrv === prevMatchesLastDrv &&
+            (assign.endSec || 0) > (bestAssign.endSec || 0))
+        ) {
+          bestAssign = assign;
+        }
+      }
+      if (bestAssign) {
+        const packed = packBlockAssignMeta(bestAssign);
+        if (packed) return packed;
+      }
+    }
+    const direct = resolveUnitScheduleMeta(model, c, nowSec);
+    if (direct) {
+      const bId = direct.blockInfo?.blockId;
+      if (c.vistoHoy && bId && blockAssignMap.has(bId)) {
+        const claimed = blockAssignMap.get(bId);
+        if (claimed.coche && claimed.coche !== c.coche) return null;
+      }
+      return direct;
+    }
+    return null;
+  };
+
+  const resolveDriverMeta = (d) => {
+    if (d.enLineaAhora && d.lastCoche && liveMatchByCoche.has(d.lastCoche)) {
+      return liveMatchByCoche.get(d.lastCoche);
+    }
+    // 1) For today's drivers, consult the unified blockAssignMap first so Choferes & Servicios always agree
+    if (d.vistoHoy && blockAssignMap.size > 0) {
+      let bestAssign = null;
+      for (const assign of blockAssignMap.values()) {
+        if (!isSameDriver(d.choferLegajo, d.choferNombre, assign.choferLegajo, assign.choferNombre)) continue;
+        if (
+          !bestAssign ||
+          (assign.enLineaAhora && !bestAssign.enLineaAhora) ||
+          (assign.enLineaAhora === bestAssign.enLineaAhora && (assign.updatedAt || 0) > (bestAssign.updatedAt || 0))
+        ) {
+          bestAssign = assign;
+        }
+      }
+      if (bestAssign) {
+        const packed = packBlockAssignMeta(bestAssign);
+        if (packed) return packed;
+      }
+    }
+    // 2) Majority block across today's recorded trips for this driver (beats a single noisy terminal ping)
+    if (d.vistoHoy && model?.tripByKey && todayTrips.length > 0) {
+      const blockCounts = new Map();
+      for (const t of todayTrips) {
+        if (!isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre)) continue;
+        const tr = model.tripByKey.get(t.tripKey);
+        if (!tr?.blockId) continue;
+        const cur = blockCounts.get(tr.blockId) || { count: 0, latestAt: 0, tripKey: t.tripKey };
+        cur.count += 1;
+        if ((t.updatedAt || 0) >= cur.latestAt) {
+          cur.latestAt = t.updatedAt || 0;
+          cur.tripKey = t.tripKey;
+        }
+        blockCounts.set(tr.blockId, cur);
+      }
+      let bestBlk = null;
+      for (const [bId, info] of blockCounts.entries()) {
+        const claimed = blockAssignMap.get(bId);
+        if (
+          claimed &&
+          (claimed.choferLegajo || claimed.choferNombre) &&
+          !isSameDriver(d.choferLegajo, d.choferNombre, claimed.choferLegajo, claimed.choferNombre) &&
+          info.count < 2
+        ) {
+          continue;
+        }
+        if (!bestBlk || info.count > bestBlk.count || (info.count === bestBlk.count && info.latestAt > bestBlk.latestAt)) {
+          bestBlk = { bId, ...info };
+        }
+      }
+      if (bestBlk) {
+        const meta = resolveUnitScheduleMeta(model, { tripKey: bestBlk.tripKey }, nowSec);
+        if (meta) return meta;
+      }
+    }
+    // 3) Single-ping spatial-temporal / persisted fallback (never claim a today turno already owned by a different driver)
+    const direct = resolveUnitScheduleMeta(model, d, nowSec);
+    if (direct) {
+      const bId = direct.blockInfo?.blockId;
+      if (d.vistoHoy && bId && blockAssignMap.has(bId)) {
+        const claimed = blockAssignMap.get(bId);
+        if (
+          (claimed.choferLegajo || claimed.choferNombre) &&
+          !isSameDriver(d.choferLegajo, d.choferNombre, claimed.choferLegajo, claimed.choferNombre)
+        ) {
+          return null;
+        }
+      }
+      return direct;
+    }
+    return null;
+  };
+
+  const formatServiceLineHtml = (srvMeta, isLiveNow, isHistorical = false) => {
+    if (!srvMeta?.serviceNumber) return '';
+    const srvLabel = `Servicio ${srvMeta.serviceNumber}`;
+    const turnoPart = srvMeta.serviceTurnosCount > 1 ? ` · T${srvMeta.turnoIndex}/${srvMeta.serviceTurnosCount}` : '';
+    const lapPart =
+      isLiveNow && srvMeta.lapNumber
+        ? ` · Vta ${formatLapNumber(srvMeta.lapNumber)}${srvMeta.shiftLaps ? `/${formatLapNumber(srvMeta.shiftLaps)}` : ''}`
+        : srvMeta.shiftLaps
+          ? ` · ${formatShiftLaps(srvMeta.shiftLaps)}`
+          : '';
+    const spanPart = srvMeta.startHHMM && srvMeta.endHHMM ? ` · ${srvMeta.startHHMM}–${srvMeta.endHHMM}` : '';
+    const prefix = isHistorical && !isLiveNow ? 'Hizo ' : '';
+    return `<div class="flota-service-line"><span class="flota-srv-pill">${escapeHtml(prefix + srvLabel + turnoPart)}</span><span class="flota-srv-meta">${escapeHtml((lapPart + spanPart).replace(/^\s*·\s*/, ''))}</span></div>`;
+  };
+
+  const formatServiceSpoken = (srvMeta, isLiveNow) => {
+    if (!srvMeta?.serviceNumber) return '';
+    const parts = [`Servicio ${srvMeta.serviceNumber}`];
+    if (srvMeta.serviceTurnosCount > 1) parts.push(`turno ${srvMeta.turnoIndex} de ${srvMeta.serviceTurnosCount}`);
+    if (isLiveNow && srvMeta.lapNumber) {
+      parts.push(`vuelta ${formatLapSpoken(srvMeta.lapNumber)}${srvMeta.shiftLaps ? ` de ${formatLapSpoken(srvMeta.shiftLaps)}` : ''}`);
+    }
+    if (srvMeta.startHHMM && srvMeta.endHHMM) parts.push(`de ${srvMeta.startHHMM} a ${srvMeta.endHHMM}`);
+    return parts.join(', ');
+  };
+
+  const scopeCoches = fv.scope === 'hoy' ? allCoches.filter((c) => c.vistoHoy) : allCoches;
+  const scopeChoferes = fv.scope === 'hoy' ? allChoferes.filter((d) => d.vistoHoy) : allChoferes;
+
+  const query = el.lineasFilterInput.value.trim().toLowerCase();
+  const visibleCoches = query
+    ? scopeCoches.filter((c) => {
+        const m = resolveCarMeta(c);
+        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        return `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${c.lastBandera || ''} ${srvTxt}`
+          .toLowerCase()
+          .includes(query);
+      })
+    : scopeCoches;
+  const visibleChoferes = query
+    ? scopeChoferes.filter((d) => {
+        const m = resolveDriverMeta(d);
+        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        return `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${d.lastBandera || ''} ${srvTxt}`
+          .toLowerCase()
+          .includes(query);
+      })
+    : scopeChoferes;
 
   const allServices = Array.isArray(fv.schedSummary?.services) ? fv.schedSummary.services : [];
   const visibleServices = query
