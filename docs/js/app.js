@@ -26,6 +26,7 @@ import {
 import {
   buildLineScheduleModel,
   buildStopTimetableBlocks,
+  getTripStopSec,
   matchLiveBusesToTrips,
   buildGpsAnchorForTrip,
   parseGpsStampSecOfDay,
@@ -38,7 +39,6 @@ import {
   formatLapSpoken,
   formatShiftLaps,
   formatShiftLapsSpoken,
-  ingestLearnedShiftTransitions,
   resolveUnitScheduleMeta,
   matchFreeFleetUnitsToModel
 } from './predictor.js';
@@ -93,6 +93,13 @@ const state = {
   countdownSec: REFRESH_INTERVAL_SEC,
   routesVisible: false,
 
+  // Optional citywide circulating buses overlay (all lines)
+  allFleetMode: false,
+  allFleetBuses: [],
+  allFleetLoading: false,
+  allFleetTimerId: null,
+  dockExpanded: false,
+
   // Offline archives & system FleetMemory caches
   catalogo: null,
   routeBranchesCache: new Map(),
@@ -124,9 +131,21 @@ const state = {
     loading: false,
     error: null
   },
+  recorridoView: {
+    tipoDia: getArgentinaTodayTipo(),
+    branchIdx: 0,
+    viewMode: 'grilla', // 'grilla' | 'paradas'
+    serviceFilter: 'ALL',
+    expandedStopId: null,
+    model: null,
+    branches: [],
+    horFile: null,
+    loading: false,
+    error: null
+  },
   trackedUnit: null, // { codLinea, lineName, coche, choferNombre, choferLegajo, timerId, bus, buses, seq }
   drill: {
-    step: 'lineas',
+    step: 'lineas', // 'lineas' | 'recorrido' | 'flota' | 'calles' | 'intersecciones' | 'paradas'
     linea: null,
     calle: null,
     interseccion: null,
@@ -145,7 +164,8 @@ const state = {
 const el = {
   appShell: document.getElementById('app-shell'),
   dock: document.getElementById('transit-dock'),
-  sheetHandle: document.getElementById('sheet-handle'),
+  btnDockSize: document.getElementById('btn-dock-size'),
+  dockSizeLabel: document.getElementById('dock-size-label'),
   tabs: document.querySelectorAll('.dock-tab'),
   panels: document.querySelectorAll('.dock-panel'),
 
@@ -206,9 +226,12 @@ const el = {
   inspNextLap: document.getElementById('insp-nextlap'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
+  btnInspTrack: document.getElementById('btn-insp-track'),
   btnInspCenter: document.getElementById('btn-insp-center'),
   btnInspRoute: document.getElementById('btn-insp-route'),
 
+  btnAllBuses: document.getElementById('btn-all-buses'),
+  allBusesCount: document.getElementById('all-buses-count'),
   btnMapLocate: document.getElementById('btn-map-locate'),
   btnMapCenterStop: document.getElementById('btn-map-center-stop'),
   btnMapScanArea: document.getElementById('btn-map-scan-area'),
@@ -231,6 +254,7 @@ let lastModalTriggerEl = null;
 
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => openBusInspector(busKey),
+  onAllFleetBusSelect: (busKey) => openAllFleetBusInspector(busKey),
   onStopPick: (stop) => openStopRadar(stop, '000')
 });
 
@@ -484,17 +508,32 @@ function clearSheetInlineSize() {
   el.appShell?.style.removeProperty('--sheet-h');
 }
 
-function setSheetIndex() {
-  // Bottom panel is permanently fixed at 50% on mobile (no expand/collapse)
+function setSheetIndex(idx = 1, { silent = false } = {}) {
   clearSheetInlineSize();
+  const expanded = idx >= 2;
+  state.dockExpanded = expanded;
   SHEET_STATES.forEach((s) => el.dock.classList.remove(s));
-  el.dock.classList.add('sheet-half');
+  el.dock.classList.add(expanded ? 'sheet-full' : 'sheet-half');
+  el.appShell?.classList.toggle('dock-expanded', expanded);
+  if (el.btnDockSize) {
+    el.btnDockSize.setAttribute('aria-pressed', String(expanded));
+    el.btnDockSize.setAttribute('aria-label', expanded ? 'Volver a vista dividida con mapa' : 'Ampliar panel');
+  }
+  if (el.dockSizeLabel) {
+    el.dockSizeLabel.textContent = expanded ? 'Ver mapa' : 'Ampliar';
+  }
+  requestAnimationFrame(() => transitMap.invalidateSize());
+  if (!silent) haptic('light');
 }
 
 function setupMobileSheet() {
-  setSheetIndex();
+  setSheetIndex(1, { silent: true });
+  el.btnDockSize?.addEventListener('click', () => {
+    setSheetIndex(state.dockExpanded ? 1 : 2);
+  });
   window.addEventListener('resize', () => {
     clearSheetInlineSize();
+    requestAnimationFrame(() => transitMap.invalidateSize());
   });
 }
 
@@ -805,18 +844,6 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
   const mem = await api.getFleetMemory(lineCodes, stopId).catch(() => null);
   if (mem) {
     state.fleetMemory = mem;
-    if (Array.isArray(mem.learnedTransitions) && mem.learnedTransitions.length > 0) {
-      const byLine = new Map();
-      for (const tr of mem.learnedTransitions) {
-        const cod = Number(tr.codigoLinea);
-        if (!cod) continue;
-        if (!byLine.has(cod)) byLine.set(cod, []);
-        byLine.get(cod).push(tr);
-      }
-      for (const [cod, list] of byLine.entries()) {
-        ingestLearnedShiftTransitions(cod, list);
-      }
-    }
   }
   return state.fleetMemory;
 }
@@ -1825,6 +1852,11 @@ function updateInspectorFields(bus) {
 
   el.btnInspRoute.dataset.codLinea = bus.codigoLinea;
   el.btnInspRoute.dataset.lineName = bus.descripcionLinea;
+  if (el.btnInspTrack) {
+    const showTrackBtn = Boolean(bus.isCityFleet);
+    el.btnInspTrack.classList.toggle('hidden', !showTrackBtn);
+    el.btnInspTrack.dataset.busKey = bus.key || '';
+  }
 }
 
 // Tapping an arrival row in the dock: pan & zoom visually on map + announce concise summary for screen readers
@@ -1840,8 +1872,8 @@ function focusBusOnMap(busKey) {
   state.inspectorOpen = false;
   el.busInspector.classList.add('hidden');
 
-  // If mobile bottom sheet is expanded full-screen, bring it to half so the map is visible
-  if (el.dock.classList.contains('sheet-full')) {
+  // If mobile bottom panel is expanded, return to 50/50 split so the map is clearly visible
+  if (state.dockExpanded) {
     setSheetIndex(1, { silent: true });
   }
   haptic('light');
@@ -1862,7 +1894,9 @@ function openBusInspector(busKey) {
   const bus =
     state.arribos.find((b) => b.key === busKey) ||
     trackedPool.find((b) => b.key === busKey) ||
-    (state.trackedUnit?.bus?.key === busKey ? state.trackedUnit.bus : null);
+    (state.trackedUnit?.bus?.key === busKey ? state.trackedUnit.bus : null) ||
+    state.allFleetBuses.find((b) => b.key === busKey) ||
+    null;
   if (!bus) {
     closeBusInspector();
     return;
@@ -1876,13 +1910,16 @@ function openBusInspector(busKey) {
   }
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
-  if (!bus.isFreeTracked && !state.horariosOpen) renderArribosList();
+  if (!bus.isFreeTracked && !bus.isCityFleet && !state.horariosOpen) renderArribosList();
   const displayList = bus.isFreeTracked && trackedPool.length > 0 ? trackedPool : state.arribos;
   transitMap.updateBuses(displayList, {
     filterLine: bus.isFreeTracked ? 'ALL' : state.filterLine,
     selectedBusKey: state.selectedBusKey,
     simulateMode: state.simulateMode
   });
+  if (state.allFleetMode) {
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+  }
 }
 
 function stopTrackedUnit() {
@@ -1904,10 +1941,284 @@ function closeBusInspector() {
     selectedBusKey: null,
     simulateMode: state.simulateMode
   });
+  if (state.allFleetMode) {
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: null });
+  }
   if (wasFreeTracked && !state.activeStop) {
     transitMap.clearRoutes();
   }
   if (state.activeStop && !state.horariosOpen) renderArribosList();
+}
+
+// ============================================================================
+// Optional Citywide Circulating Fleet ("Todos los colectivos" across all lines)
+// ============================================================================
+function updateAllFleetButtonUi() {
+  if (!el.btnAllBuses) return;
+  el.btnAllBuses.setAttribute('aria-pressed', String(state.allFleetMode));
+  el.btnAllBuses.classList.toggle('is-active', state.allFleetMode);
+  el.btnAllBuses.classList.toggle('is-loading', state.allFleetLoading);
+  if (el.allBusesCount) {
+    const n = state.allFleetBuses.length;
+    el.allBusesCount.textContent = String(n);
+    el.allBusesCount.classList.toggle('hidden', !state.allFleetMode || n === 0);
+  }
+}
+
+function buildCityFleetBusObject(u) {
+  const numCod = Number(u.codigoLinea);
+  const lineName =
+    String(u.descripcionLinea || '').trim() ||
+    state.lineas.find((l) => Number(l.codigo) === numCod)?.descripcion ||
+    state.catalogo?.lineByCode?.get(numCod)?.descripcion ||
+    `L${numCod}`;
+  const coche = String(u.coche || u.identificadorCoche || '').trim();
+  const parsedDesv =
+    u.desvioRaw || u.desvioHorario
+      ? parseDesvioHorario(u.desvioRaw || u.desvioHorario)
+      : Number.isFinite(Number(u.desvioSec)) && Number(u.desvioSec) !== 0
+        ? parseDesvioHorario(
+            `${Number(u.desvioSec) >= 0 ? '+' : '-'}${String(Math.floor(Math.abs(Number(u.desvioSec)) / 60)).padStart(2, '0')}:${String(Math.abs(Number(u.desvioSec)) % 60).padStart(2, '0')}`
+          )
+        : { status: 'none', label: '', seconds: 0, raw: '' };
+  const gpsRaw = String(u.ultimaGps || u.ultimaFechaHoraGPS || '').trim();
+  const startHH = String(u.lastTurnoStart || '').trim();
+  const endHH = String(u.lastTurnoEnd || '').trim();
+  return {
+    key: `city:${numCod}:${coche}`,
+    codigoLinea: numCod,
+    descripcionLinea: lineName,
+    descripcionBandera: u.bandera || u.descripcionBandera || `Línea ${lineName}`,
+    realBandera: u.bandera || u.descripcionBandera || `Línea ${lineName}`,
+    realBanderaColor: getLineColor(lineName),
+    identificadorCoche: coche,
+    choferNombre: u.choferNombre || '',
+    choferLegajo: u.choferLegajo || '',
+    esAdaptado: Boolean(u.esAdaptado),
+    desvio: parsedDesv,
+    eta: { minutes: 0, display: '—' },
+    distanceMeters: 0,
+    routeMeters: 0,
+    lat: Number(u.lat),
+    lng: Number(u.lng),
+    ultimaFechaHoraGPS: gpsRaw,
+    gpsTimeOnly: formatGpsTimeOnly(gpsRaw),
+    lastStopId: u.lastStopId || '',
+    lastTripKey: u.lastTripKey || '',
+    lastSeenAt: u.lastSeenAt || Date.now(),
+    serviceNumber: Number(u.lastServiceNum) || null,
+    turnoIndex: Number(u.lastTurnoIdx) || 1,
+    serviceTurnosCount: 1,
+    lapNumber: Number(u.lastLapNum) || null,
+    shiftLaps: Number(u.lastShiftLaps) || null,
+    turnoStart: startHH,
+    turnoEnd: endHH,
+    serviceSpan: startHH && endHH ? `${startHH}–${endHH}` : '',
+    enLineaAhora: true,
+    isFreeTracked: true,
+    isCityFleet: true,
+    isPredicted: false
+  };
+}
+
+let allFleetFetchSeq = 0;
+async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
+  if (!state.allFleetMode) return;
+  const seq = ++allFleetFetchSeq;
+  state.allFleetLoading = true;
+  updateAllFleetButtonUi();
+  try {
+    const res = await api.flotaActiva();
+    if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
+    const rawUnits = Array.isArray(res?.data?.units) ? res.data.units : [];
+    const byKey = new Map();
+    for (const u of rawUnits) {
+      if (!u.codigoLinea || !u.coche) continue;
+      if (!Number.isFinite(Number(u.lat)) || !Number.isFinite(Number(u.lng))) continue;
+      const obj = buildCityFleetBusObject(u);
+      byKey.set(obj.key, obj);
+    }
+    // Also merge any fresh live buses currently seen at the active stop or corridor radar
+    for (const b of [...(state.arribos || []), ...(state.corridorFleet || [])]) {
+      if (b.isPredicted || b.gpsLost) continue;
+      const cod = Number(b.codigoLinea);
+      const coche = String(b.identificadorCoche || b.coche || '').trim();
+      const la = typeof b.lat === 'number' ? b.lat : parseFloat(b.latitud);
+      const ln = typeof b.lng === 'number' ? b.lng : parseFloat(b.longitud);
+      if (!cod || !coche || Number.isNaN(la) || Number.isNaN(ln) || (la === 0 && ln === 0)) continue;
+      const key = `city:${cod}:${coche}`;
+      if (!byKey.has(key)) {
+        byKey.set(
+          key,
+          buildCityFleetBusObject({
+            codigoLinea: cod,
+            descripcionLinea: b.descripcionLinea,
+            coche,
+            choferNombre: b.choferNombre,
+            choferLegajo: b.choferLegajo,
+            esAdaptado: b.esAdaptado,
+            bandera: b.realBandera || b.descripcionBandera,
+            lat: la,
+            lng: ln,
+            desvioRaw: b.desvio?.raw || b.desvioHorario || '',
+            desvioSec: b.desvio?.seconds || 0,
+            ultimaGps: b.ultimaFechaHoraGPS || ''
+          })
+        );
+      }
+    }
+
+    // Enrich with cached immutable schedule models immediately when already loaded
+    const nowSec = getArgentinaSecOfDay();
+    const todayTipo = getArgentinaTodayTipo();
+    for (const bus of byKey.values()) {
+      const branches = state.routeBranchesCache.get(bus.codigoLinea);
+      const horFile = state.horariosArchiveCache.get(bus.codigoLinea);
+      if (branches?.length && horFile) {
+        const model = buildLineScheduleModel(bus.codigoLinea, branches, horFile, todayTipo);
+        const meta = resolveUnitScheduleMeta(model, {
+          lat: bus.lat,
+          lng: bus.lng,
+          bandera: bus.descripcionBandera,
+          lastGps: bus.ultimaFechaHoraGPS,
+          desvioSec: bus.desvio?.seconds || 0,
+          desvioRaw: bus.desvio?.raw || '',
+          lastSeenAt: bus.lastSeenAt
+        }, nowSec);
+        if (meta) {
+          bus.serviceNumber = meta.serviceNumber;
+          bus.turnoIndex = meta.turnoIndex;
+          bus.serviceTurnosCount = meta.serviceTurnosCount;
+          bus.lapNumber = meta.lapNumber;
+          bus.shiftLaps = meta.shiftLaps;
+          bus.isCortadoBlock = meta.isCortado;
+          bus.isRelevoEnLinea = meta.isRelevoEnLinea;
+          bus.turnoStart = meta.startHHMM;
+          bus.turnoEnd = meta.endHHMM;
+          bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
+        }
+      }
+    }
+
+    state.allFleetBuses = Array.from(byKey.values());
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+
+    // If user currently has a city-fleet bus open in inspector, refresh its fields seamlessly
+    if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
+      const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
+      if (refreshed) updateInspectorFields(refreshed);
+    }
+
+    if (fit && state.allFleetBuses.length > 0 && !state.activeStop) {
+      transitMap.fitFleet(state.allFleetBuses);
+    }
+    if (!silent) {
+      showToast(
+        state.allFleetBuses.length > 0
+          ? `${state.allFleetBuses.length} colectivos circulando en todas las líneas`
+          : 'No se detectaron colectivos activos en este momento',
+        state.allFleetBuses.length > 0 ? 'success' : 'info',
+        2600
+      );
+      announce(
+        `${state.allFleetBuses.length} colectivos circulando visibles en el mapa. Tocá cualquier unidad para ver sus datos.`
+      );
+    }
+  } catch {
+    if (!silent) {
+      showToast('No se pudo consultar la flota general en este momento', 'warn', 2600);
+    }
+  } finally {
+    if (seq === allFleetFetchSeq) {
+      state.allFleetLoading = false;
+      updateAllFleetButtonUi();
+    }
+  }
+}
+
+async function openAllFleetBusInspector(busKey) {
+  const bus = state.allFleetBuses.find((b) => b.key === busKey);
+  if (!bus) return;
+
+  if (state.dockExpanded) {
+    setSheetIndex(1, { silent: true });
+  }
+  haptic('light');
+  state.selectedBusKey = bus.key;
+  state.inspectorOpen = true;
+  updateInspectorFields(bus);
+  el.busInspector.classList.remove('hidden');
+  transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: bus.key });
+  transitMap.focusBus(bus, Math.max(15, transitMap.map.getZoom()));
+
+  // Resolve exact immutable Service / Turno / Vuelta asynchronously if that line's archive wasn't loaded yet
+  await ensureScheduleAssetsLoaded([bus.codigoLinea]);
+  const branches = state.routeBranchesCache.get(bus.codigoLinea) || [];
+  const horFile = state.horariosArchiveCache.get(bus.codigoLinea) || null;
+  if (branches.length && horFile) {
+    const model = buildLineScheduleModel(bus.codigoLinea, branches, horFile, getArgentinaTodayTipo());
+    const meta = resolveUnitScheduleMeta(
+      model,
+      {
+        lat: bus.lat,
+        lng: bus.lng,
+        bandera: bus.descripcionBandera,
+        lastGps: bus.ultimaFechaHoraGPS,
+        desvioSec: bus.desvio?.seconds || 0,
+        desvioRaw: bus.desvio?.raw || '',
+        lastSeenAt: bus.lastSeenAt
+      },
+      getArgentinaSecOfDay()
+    );
+    if (meta) {
+      bus.serviceNumber = meta.serviceNumber;
+      bus.turnoIndex = meta.turnoIndex;
+      bus.serviceTurnosCount = meta.serviceTurnosCount;
+      bus.lapNumber = meta.lapNumber;
+      bus.shiftLaps = meta.shiftLaps;
+      bus.isCortadoBlock = meta.isCortado;
+      bus.isRelevoEnLinea = meta.isRelevoEnLinea;
+      bus.turnoStart = meta.startHHMM;
+      bus.turnoEnd = meta.endHHMM;
+      bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
+      if (state.inspectorOpen && state.selectedBusKey === bus.key) {
+        updateInspectorFields(bus);
+      }
+    }
+  }
+}
+
+function toggleAllFleetMode(forceState = null) {
+  const next = typeof forceState === 'boolean' ? forceState : !state.allFleetMode;
+  state.allFleetMode = next;
+  if (state.allFleetTimerId) {
+    clearInterval(state.allFleetTimerId);
+    state.allFleetTimerId = null;
+  }
+  haptic('light');
+  if (!next) {
+    state.allFleetBuses = [];
+    state.allFleetLoading = false;
+    transitMap.clearAllFleetBuses();
+    if (state.selectedBusKey?.startsWith('city:')) {
+      closeBusInspector();
+    }
+    updateAllFleetButtonUi();
+    showToast('Capa de todos los colectivos ocultada', 'info', 1800);
+    announce('Capa de todos los colectivos desactivada.');
+    return;
+  }
+
+  if (state.dockExpanded) {
+    setSheetIndex(1, { silent: true });
+  }
+  updateAllFleetButtonUi();
+  refreshAllFleetBuses({ fit: !state.activeStop, silent: false });
+  state.allFleetTimerId = setInterval(() => {
+    if (!state.isAppPaused && state.allFleetMode) {
+      refreshAllFleetBuses({ fit: false, silent: true });
+    }
+  }, 15000);
 }
 
 /**
@@ -3741,11 +4052,17 @@ async function loadFlotaResumen(force = false) {
 
 function syncLineasFilterPlaceholder() {
   const { step, linea } = state.drill;
-  if (step === 'flota') {
-    el.lineasFilterInput.placeholder = 'Filtrar por coche o chofer...';
+  if (step === 'recorrido') {
+    el.lineasFilterInput.placeholder = 'Filtrar parada por calle o código...';
     el.lineasFilterInput.setAttribute(
       'aria-label',
-      `Filtrar coches o choferes de línea ${linea?.descripcion || ''}`.trim()
+      `Filtrar paradas en orden de recorrido de línea ${linea?.descripcion || ''}`.trim()
+    );
+  } else if (step === 'flota') {
+    el.lineasFilterInput.placeholder = 'Filtrar por coche, chofer o servicio...';
+    el.lineasFilterInput.setAttribute(
+      'aria-label',
+      `Filtrar coches, choferes o servicios de línea ${linea?.descripcion || ''}`.trim()
     );
   } else if (step === 'calles') {
     el.lineasFilterInput.placeholder = 'Filtrar calle...';
@@ -3773,9 +4090,25 @@ function renderLineasBreadcrumb() {
 
   const parts = [`<button type="button" class="crumb-btn" data-back="lineas">← Líneas</button>`];
   if (linea) {
-    if (step === 'flota') {
+    if (step === 'recorrido') {
       parts.push(
-        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Flota y choferes</span>`
+        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Horarios</span>`
+      );
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="servicios" aria-label="Ver servicios de línea ${escapeHtml(linea.descripcion)}">Servicios</button>`
+      );
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="flota" aria-label="Ver flota de línea ${escapeHtml(linea.descripcion)}">Flota</button>`
+      );
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="calles" aria-label="Ver calles de línea ${escapeHtml(linea.descripcion)}">Calles</button>`
+      );
+    } else if (step === 'flota') {
+      parts.push(
+        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Flota</span>`
+      );
+      parts.push(
+        `<button type="button" class="crumb-btn" data-back="recorrido" aria-label="Ver paradas y horarios de línea ${escapeHtml(linea.descripcion)}">Horarios</button>`
       );
       parts.push(
         `<button type="button" class="crumb-btn" data-back="calles" aria-label="Ver calles y paradas de línea ${escapeHtml(linea.descripcion)}">Calles</button>`
@@ -3783,13 +4116,16 @@ function renderLineasBreadcrumb() {
     } else if (step === 'calles') {
       parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Calles</span>`);
       parts.push(
+        `<button type="button" class="crumb-btn" data-back="recorrido" aria-label="Ver paradas y horarios de línea ${escapeHtml(linea.descripcion)}">Horarios</button>`
+      );
+      parts.push(
         `<button type="button" class="crumb-btn" data-back="flota" aria-label="Ver flota de coches y choferes de línea ${escapeHtml(linea.descripcion)}">Flota</button>`
       );
     } else {
       parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><button type="button" class="crumb-btn" data-back="calles">${escapeHtml(linea.descripcion)}</button>`);
     }
   }
-  if (calle && step !== 'flota') {
+  if (calle && step !== 'flota' && step !== 'recorrido') {
     const shortCalle = calle.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
     if (step === 'intersecciones') {
       parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">${escapeHtml(shortCalle)}</span>`);
@@ -3811,6 +4147,10 @@ function renderLineasBreadcrumb() {
         state.drill = { step: 'lineas', linea: null, calle: null, interseccion: null, items: state.lineas };
         renderDrilldown();
         loadFlotaResumen(false);
+      } else if (target === 'recorrido' && state.drill.linea) {
+        openLineRecorrido(state.drill.linea);
+      } else if (target === 'servicios' && state.drill.linea) {
+        openLineFlota(state.drill.linea, { initialTab: 'servicios' });
       } else if (target === 'calles' && state.drill.linea) {
         openLineCalles(state.drill.linea);
       } else if (target === 'flota' && state.drill.linea) {
@@ -3937,13 +4277,26 @@ function renderLineFlotaView() {
     : scopeChoferes;
 
   // Build map of blockId -> best today car/driver observation for the Servicios tab
-  // Enforces two physical invariants:
+  // Enforces three physical invariants:
   //  1) A turno is marked "En línea" ONLY if that car is currently matched to THAT turno (never on finished morning turnos!).
-  //  2) The same physical car cannot be assigned to two time-overlapping turnos on the same day (stale misassignments are pruned!).
+  //  2) The same physical car cannot be assigned to two time-overlapping turnos on the same day (while non-overlapping T1/T2 relevos are preserved!).
+  //  3) Driver attribution is strictly scoped per turno (using driver votes from trips & fleet_drivers observed inside THAT turno's window),
+  //     so a T2 relevo driver (e.g. GOMEZ R. on #3093) NEVER overwrites T1's driver (e.g. ROMERO L. on #3093)!
   const blockAssignMap = new Map();
   if (model) {
     const nowSvcSec = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
     const candidatesByBlock = new Map(); // blockId -> Map<coche, candidate>
+
+    const obsSecFromRecord = (gpsStr, tsMs) => {
+      const parsed = parseGpsStampSecOfDay(gpsStr);
+      if (parsed !== null) return parsed < 3 * 3600 ? parsed + 86400 : parsed;
+      if (typeof tsMs === 'number' && tsMs > 0) {
+        const art = new Date(tsMs - 3 * 3600 * 1000);
+        const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+        return s < 3 * 3600 ? s + 86400 : s;
+      }
+      return null;
+    };
 
     const addCandidate = (blockId, coche, entry) => {
       if (!blockId || !coche) return;
@@ -3962,13 +4315,34 @@ function renderLineFlotaView() {
       const isLiveOnBlock = Boolean(
         entry.carEnLinea && (liveBlockId ? liveBlockId === blockId : inTurnoWindow)
       );
+
+      // Per-turno driver voting so a late-login or relevo never overwrites the real driver of this turno
+      const driverVotes = prev?.driverVotes ? new Map(prev.driverVotes) : new Map();
+      const dName = String(entry.choferNombre || '').trim();
+      const dLeg = String(entry.choferLegajo || '').trim();
+      if (dName) {
+        const dKey = dLeg ? `leg:${dLeg.toUpperCase()}` : `name:${dName.toUpperCase()}`;
+        const prevVote = driverVotes.get(dKey) || { nombre: dName, legajo: dLeg, weight: 0, latestAt: 0 };
+        prevVote.weight += entry.driverWeight || 1;
+        prevVote.latestAt = Math.max(prevVote.latestAt, entry.updatedAt || 0);
+        if (!prevVote.legajo && dLeg) prevVote.legajo = dLeg;
+        driverVotes.set(dKey, prevVote);
+      }
+      let bestDriver = null;
+      for (const v of driverVotes.values()) {
+        if (!bestDriver || v.weight > bestDriver.weight || (v.weight === bestDriver.weight && v.latestAt > bestDriver.latestAt)) {
+          bestDriver = v;
+        }
+      }
+
       const next = {
         blockId,
         startSec: bi.startSec,
         endSec: bi.endSec,
         coche,
-        choferNombre: entry.choferNombre || prev?.choferNombre || '',
-        choferLegajo: entry.choferLegajo || prev?.choferLegajo || '',
+        driverVotes,
+        choferNombre: bestDriver?.nombre || prev?.choferNombre || '',
+        choferLegajo: bestDriver?.legajo || prev?.choferLegajo || '',
         esAdaptado: Boolean(entry.esAdaptado || prev?.esAdaptado),
         enLineaAhora: isLiveOnBlock,
         lat: entry.lat ?? prev?.lat ?? null,
@@ -3988,29 +4362,68 @@ function renderLineFlotaView() {
       byCar.set(coche, next);
     };
 
+    // 1) Ingest today's trip_assignments (strictly keeping each trip's OWN driver, never carRec's later relevo driver!)
     for (const t of todayTrips) {
       const tr = model.tripByKey?.get(t.tripKey);
       if (!tr?.blockId || !t.coche) continue;
+      const bi = model.blockInfoById?.get(tr.blockId);
       const carRec = carByNum.get(t.coche);
+      const carObsSec = carRec ? obsSecFromRecord(carRec.lastGps, carRec.lastSeenAt) : null;
+      const carInThisBlock = Boolean(
+        bi && carObsSec !== null && carObsSec >= bi.startSec - 15 * 60 && carObsSec <= bi.endSec + 20 * 60
+      );
       addCandidate(tr.blockId, t.coche, {
-        choferNombre: t.choferNombre || carRec?.lastChoferNombre || '',
-        choferLegajo: t.choferLegajo || carRec?.lastChoferLegajo || '',
+        choferNombre: t.choferNombre || (carInThisBlock ? carRec?.lastChoferNombre || '' : ''),
+        choferLegajo: t.choferLegajo || (carInThisBlock ? carRec?.lastChoferLegajo || '' : ''),
+        driverWeight: t.choferNombre ? 2 : 1,
         esAdaptado: Boolean(t.esAdaptado || carRec?.esAdaptado),
         carEnLinea: Boolean(carRec?.enLineaAhora),
-        lat: carRec?.lastLat ?? t.lat ?? null,
-        lng: carRec?.lastLng ?? t.lng ?? null,
-        lastGps: carRec?.lastGps || t.ultimaGps || '',
-        lastStopId: carRec?.lastStopId || t.stopId || '',
-        bandera: carRec?.lastBandera || tr.branch?.bandera || '',
+        lat: carInThisBlock ? (carRec?.lastLat ?? t.lat ?? null) : (t.lat ?? carRec?.lastLat ?? null),
+        lng: carInThisBlock ? (carRec?.lastLng ?? t.lng ?? null) : (t.lng ?? carRec?.lastLng ?? null),
+        lastGps: carInThisBlock ? (carRec?.lastGps || t.ultimaGps || '') : (t.ultimaGps || carRec?.lastGps || ''),
+        lastStopId: carInThisBlock ? (carRec?.lastStopId || t.stopId || '') : (t.stopId || carRec?.lastStopId || ''),
+        bandera: carInThisBlock ? (carRec?.lastBandera || tr.branch?.bandera || '') : (tr.branch?.bandera || carRec?.lastBandera || ''),
         lapNumber: tr.lapNumber,
         shiftLaps: tr.shiftLaps,
-        desvioRaw: carRec?.lastDesvioRaw || t.desvioRaw || '',
-        desvioSec: carRec?.lastDesvioSec ?? t.desvioSec ?? 0,
+        desvioRaw: carInThisBlock ? (carRec?.lastDesvioRaw || t.desvioRaw || '') : (t.desvioRaw || ''),
+        desvioSec: carInThisBlock ? (carRec?.lastDesvioSec ?? t.desvioSec ?? 0) : (t.desvioSec ?? 0),
         tripDelta: 1,
         updatedAt: t.updatedAt || 0
       });
     }
 
+    // 2) Ingest today's drivers directly from fleet_drivers (captures finished T1 relevo drivers even if same car is now on T2!)
+    for (const d of allChoferes.filter((x) => x.vistoHoy && x.lastCoche)) {
+      const dMeta = resolveUnitScheduleMeta(model, d, nowSec);
+      const bId = dMeta?.blockInfo?.blockId;
+      if (!bId) continue;
+      const bi = model.blockInfoById?.get(bId);
+      const dObsSec = obsSecFromRecord(d.lastGps, d.lastSeenAt);
+      if (bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 30 * 60)) {
+        continue;
+      }
+      const carRec = carByNum.get(d.lastCoche);
+      addCandidate(bId, d.lastCoche, {
+        choferNombre: d.choferNombre || '',
+        choferLegajo: d.choferLegajo || '',
+        driverWeight: d.enLineaAhora ? 3 : 2,
+        esAdaptado: Boolean(d.lastEsAdaptado || carRec?.esAdaptado),
+        carEnLinea: Boolean(d.enLineaAhora && carRec?.enLineaAhora),
+        lat: d.lastLat ?? carRec?.lastLat ?? null,
+        lng: d.lastLng ?? carRec?.lastLng ?? null,
+        lastGps: d.lastGps || '',
+        lastStopId: d.lastStopId || '',
+        bandera: d.lastBandera || '',
+        lapNumber: dMeta.lapNumber,
+        shiftLaps: dMeta.shiftLaps,
+        desvioRaw: d.lastDesvioRaw || '',
+        desvioSec: d.lastDesvioSec || 0,
+        tripDelta: d.enLineaAhora ? 2 : 1,
+        updatedAt: d.lastSeenAt || 0
+      });
+    }
+
+    // 3) Ingest today's cars (matching their current / latest position to its exact turno)
     for (const c of allCoches.filter((x) => x.vistoHoy)) {
       const m = resolveCarMeta(c);
       const bId = m?.blockInfo?.blockId;
@@ -4018,6 +4431,7 @@ function renderLineFlotaView() {
       addCandidate(bId, c.coche, {
         choferNombre: c.lastChoferNombre || '',
         choferLegajo: c.lastChoferLegajo || '',
+        driverWeight: c.enLineaAhora ? 3 : 1,
         esAdaptado: Boolean(c.esAdaptado),
         carEnLinea: Boolean(c.enLineaAhora),
         lat: c.lastLat,
@@ -4057,6 +4471,50 @@ function renderLineFlotaView() {
       blockAssignMap.set(cand.blockId, cand);
       used.push({ startSec: cand.startSec, endSec: cand.endSec });
       claimedWindowsByCoche.set(cand.coche, used);
+    }
+
+    // 4) Same-car driver-change relevo clue: if a service's T2 is assigned to car #X with Driver B,
+    // and T1 (relevo en línea) has no assignment yet, check if another driver A was seen today on #X during T1!
+    for (const srv of fv.schedSummary?.services || []) {
+      const turnos = srv.turnos || [];
+      for (let ti = 1; ti < turnos.length; ti++) {
+        const curT = turnos[ti];
+        const prevT = turnos[ti - 1];
+        if (!curT.relevoFromPrev) continue;
+        const curAssign = blockAssignMap.get(curT.blockId);
+        if (!curAssign?.coche || blockAssignMap.has(prevT.blockId)) continue;
+        const curDrvKey = (curAssign.choferLegajo || curAssign.choferNombre || '').toUpperCase();
+        const priorDriver = allChoferes.find((d) => {
+          if (!d.vistoHoy || d.lastCoche !== curAssign.coche) return false;
+          const dKey = (d.choferLegajo || d.choferNombre || '').toUpperCase();
+          if (!dKey || dKey === curDrvKey) return false;
+          const dObs = obsSecFromRecord(d.lastGps, d.lastSeenAt);
+          return dObs !== null && dObs >= prevT.startSec - 15 * 60 && dObs <= prevT.endSec + 35 * 60;
+        });
+        if (priorDriver) {
+          blockAssignMap.set(prevT.blockId, {
+            blockId: prevT.blockId,
+            startSec: prevT.startSec,
+            endSec: prevT.endSec,
+            coche: curAssign.coche,
+            choferNombre: priorDriver.choferNombre || '',
+            choferLegajo: priorDriver.choferLegajo || '',
+            esAdaptado: Boolean(priorDriver.lastEsAdaptado || curAssign.esAdaptado),
+            enLineaAhora: false,
+            lat: priorDriver.lastLat ?? curAssign.lat ?? null,
+            lng: priorDriver.lastLng ?? curAssign.lng ?? null,
+            lastGps: priorDriver.lastGps || '',
+            lastStopId: priorDriver.lastStopId || '',
+            bandera: priorDriver.lastBandera || curAssign.bandera || '',
+            lapNumber: null,
+            shiftLaps: prevT.shiftLaps,
+            desvioRaw: priorDriver.lastDesvioRaw || '',
+            desvioSec: priorDriver.lastDesvioSec || 0,
+            tripCount: 1,
+            updatedAt: priorDriver.lastSeenAt || 0
+          });
+        }
+      }
     }
   }
 
@@ -4592,31 +5050,36 @@ async function computeLineScheduledFleetSummary(codLinea) {
   }
 }
 
-async function openLineFlota(linea, { force = true, announceLoad = true } = {}) {
+async function openLineFlota(linea, { force = true, announceLoad = true, initialTab = null } = {}) {
   el.lineasFilterInput.value = '';
   const sameLine = state.drill.step === 'flota' && state.drill.linea?.codigo === linea.codigo;
   state.drill = { step: 'flota', linea, calle: null, interseccion: null, items: [] };
   if (!sameLine) {
-    state.flotaView = { tab: 'coches', scope: 'semana', data: null, schedSummary: null, model: null, loading: true, error: null };
-  } else if (force) {
-    state.flotaView.loading = true;
-    state.flotaView.error = null;
+    state.flotaView = {
+      tab: initialTab || 'coches',
+      scope: 'semana',
+      data: null,
+      schedSummary: null,
+      model: null,
+      loading: true,
+      error: null
+    };
+  } else {
+    if (initialTab) state.flotaView.tab = initialTab;
+    if (force) {
+      state.flotaView.loading = true;
+      state.flotaView.error = null;
+    }
   }
   renderLineasBreadcrumb();
   renderLineFlotaView();
 
   try {
-    const [res, initialSchedSummary] = await Promise.all([
+    const [res, schedSummary] = await Promise.all([
       api.flotaLinea(linea.codigo),
       computeLineScheduledFleetSummary(linea.codigo)
     ]);
     const data = res?.data;
-    let schedSummary = initialSchedSummary;
-    if (Array.isArray(data?.learnedTransitions) && data.learnedTransitions.length > 0) {
-      if (ingestLearnedShiftTransitions(linea.codigo, data.learnedTransitions)) {
-        schedSummary = (await computeLineScheduledFleetSummary(linea.codigo)) || schedSummary;
-      }
-    }
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], retentionDays: 7, meta: {} };
     state.flotaView.schedSummary = schedSummary;
@@ -4676,10 +5139,492 @@ async function openLineFlota(linea, { force = true, announceLoad = true } = {}) 
   }
 }
 
+// ============================================================================
+// Ordered Stops & Glanceable Full Timetable Matrix per Line (Líneas -> Horarios)
+// ============================================================================
+async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {}) {
+  el.lineasFilterInput.value = '';
+  const sameLine = state.drill.step === 'recorrido' && state.drill.linea?.codigo === linea.codigo;
+  state.drill = { step: 'recorrido', linea, calle: null, interseccion: null, items: [] };
+  const targetTipo = tipoDia || (sameLine ? state.recorridoView.tipoDia : getArgentinaTodayTipo());
+  state.recorridoView = {
+    tipoDia: targetTipo,
+    branchIdx: sameLine ? state.recorridoView.branchIdx : 0,
+    viewMode: sameLine ? state.recorridoView.viewMode : 'grilla',
+    serviceFilter: sameLine ? state.recorridoView.serviceFilter : 'ALL',
+    expandedStopId: null,
+    model: null,
+    branches: [],
+    horFile: null,
+    loading: true,
+    error: null
+  };
+  renderLineasBreadcrumb();
+  renderLineRecorridoView();
+
+  try {
+    const num = Number(linea.codigo);
+    await ensureScheduleAssetsLoaded([num]);
+    const recRes = await api.recorridos(num).catch(() => null);
+    if (state.drill.step !== 'recorrido' || state.drill.linea?.codigo !== linea.codigo) return;
+
+    const recorridos = Array.isArray(recRes?.data) ? recRes.data : [];
+    let branches = state.routeBranchesCache.get(num) || [];
+    if (!branches.length && recorridos.length > 0) {
+      branches = parseRouteBranches(recorridos);
+      state.routeBranchesCache.set(num, branches);
+    }
+    const horFile = state.horariosArchiveCache.get(num) || (await api.horariosLineArchive(num).catch(() => null));
+    if (horFile) state.horariosArchiveCache.set(num, horFile);
+
+    if (drawOnMap && recorridos.length > 0) {
+      transitMap.clearRoutes();
+      transitMap.drawRouteCollection(recorridos, linea.descripcion, { showStops: true, fit: !state.activeStop });
+      state.routesVisible = true;
+    }
+
+    const model = branches.length && horFile ? buildLineScheduleModel(num, branches, horFile, targetTipo) : null;
+    state.recorridoView.branches = branches;
+    state.recorridoView.horFile = horFile;
+    state.recorridoView.model = model;
+    if (state.recorridoView.branchIdx >= branches.length) state.recorridoView.branchIdx = 0;
+    state.recorridoView.loading = false;
+    state.recorridoView.error = null;
+    renderLineRecorridoView();
+    announce(
+      `Línea ${linea.descripcion}: recorrido ordenado y horarios programados (${branches.length} ${
+        branches.length === 1 ? 'sentido' : 'sentidos'
+      }).`
+    );
+  } catch (err) {
+    if (state.drill.step !== 'recorrido' || state.drill.linea?.codigo !== linea.codigo) return;
+    state.recorridoView.loading = false;
+    state.recorridoView.error = err?.message || 'No se pudo cargar el recorrido y los horarios.';
+    renderLineRecorridoView();
+  }
+}
+
+function renderLineRecorridoView() {
+  const linea = state.drill.linea;
+  if (!linea) return;
+  const rv = state.recorridoView;
+  const color = getLineColor(linea.descripcion);
+
+  if (rv.loading) {
+    el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    return;
+  }
+  if (rv.error) {
+    el.lineasContent.innerHTML = `
+      <div class="empty-state">
+        <h3>Error al cargar horarios</h3>
+        <p>${escapeHtml(rv.error)}</p>
+        <button type="button" id="btn-rec-retry" class="secondary-action-btn">Reintentar</button>
+      </div>
+    `;
+    document.getElementById('btn-rec-retry')?.addEventListener('click', () => openLineRecorrido(linea));
+    return;
+  }
+
+  const branches = rv.branches || [];
+  if (!branches.length) {
+    el.lineasContent.innerHTML = `
+      <div class="empty-state">
+        <h3>Sin recorrido archivado</h3>
+        <p>Esta línea no tiene paradas ni recorridos publicados en el catálogo.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const horFile = rv.horFile;
+  const checkTipoAvailable = (tipo) => {
+    if (!horFile?.paradas) return false;
+    for (const entry of Object.values(horFile.paradas)) {
+      if (Array.isArray(entry?.[tipo]) && entry[tipo].length > 0) return true;
+    }
+    return false;
+  };
+  const tipoOpts = [
+    { key: 'habil', label: 'Lun–Vie', avail: checkTipoAvailable('habil') },
+    { key: 'sabado', label: 'Sábado', avail: checkTipoAvailable('sabado') },
+    { key: 'domingo', label: 'Domingo', avail: checkTipoAvailable('domingo') }
+  ];
+
+  const activeBranch = branches[rv.branchIdx] || branches[0];
+  const branchColor = activeBranch.color || color;
+  const model =
+    rv.model && rv.model.tipoDia === rv.tipoDia
+      ? rv.model
+      : horFile
+        ? buildLineScheduleModel(linea.codigo, branches, horFile, rv.tipoDia)
+        : null;
+  rv.model = model;
+
+  const isExactTipo = Boolean(model && model.tipoDia === rv.tipoDia && model.exactTipo);
+  const allBranchTrips = isExactTipo && model ? model.getTripsForBranch(activeBranch) || [] : [];
+
+  // Available services on this branch for quick service isolation
+  const serviceNums = Array.from(
+    new Set(allBranchTrips.map((t) => t.serviceNumber).filter((n) => Number.isFinite(n) && n > 0))
+  ).sort((a, b) => a - b);
+
+  if (rv.serviceFilter !== 'ALL' && !serviceNums.includes(Number(rv.serviceFilter))) {
+    rv.serviceFilter = 'ALL';
+  }
+  const filteredTrips =
+    rv.serviceFilter === 'ALL'
+      ? allBranchTrips
+      : allBranchTrips.filter((t) => String(t.serviceNumber) === String(rv.serviceFilter));
+
+  // Deduplicate ordered stops while preserving exact route sequence (cabecera -> destino)
+  const orderedStops = [];
+  const seenStop = new Set();
+  for (const st of activeBranch.orderedStops || []) {
+    if (!st.id || seenStop.has(st.id)) continue;
+    seenStop.add(st.id);
+    orderedStops.push(st);
+  }
+
+  const query = el.lineasFilterInput.value.trim().toLowerCase();
+  const visibleStops = query
+    ? orderedStops.filter((st) => `${st.id} ${st.descripcion}`.toLowerCase().includes(query))
+    : orderedStops;
+
+  const nowSecRaw = getArgentinaSecOfDay();
+  const nowSvcSec = nowSecRaw < 3 * 3600 ? nowSecRaw + 86400 : nowSecRaw;
+  const isTodayTipo = rv.tipoDia === getArgentinaTodayTipo();
+
+  // Identify current/next trip index for instant highlighting and "Ir a ahora" scroll
+  let currentTripIdx = -1;
+  if (filteredTrips.length > 0) {
+    currentTripIdx = filteredTrips.findIndex((tr) => tr.endSec >= nowSvcSec - 120);
+    if (currentTripIdx < 0) currentTripIdx = filteredTrips.length - 1;
+  }
+
+  const dayTabsHtml = tipoOpts
+    .map(
+      (opt) => `
+      <button type="button" class="seg-btn seg-btn-xs rec-tipo-btn ${rv.tipoDia === opt.key ? 'active' : ''}" data-rec-tipo="${opt.key}" aria-pressed="${rv.tipoDia === opt.key}" ${!opt.avail ? 'title="Sin servicio programado este día"' : ''}>
+        ${opt.label}${!opt.avail ? ' · s/d' : ''}
+      </button>
+    `
+    )
+    .join('');
+
+  const branchTabsHtml = branches
+    .map((b, i) => {
+      const shortName = String(b.bandera || `Ramal ${i + 1}`).trim();
+      return `
+        <button type="button" class="rec-branch-pill ${i === rv.branchIdx ? 'active' : ''}" data-rec-branch="${i}" style="--branch-color:${b.color || color}" aria-pressed="${i === rv.branchIdx}">
+          <span class="dir-dot" style="background:${b.color || color}" aria-hidden="true"></span>
+          <span>${escapeHtml(shortName)}</span>
+        </button>
+      `;
+    })
+    .join('');
+
+  const srvFilterHtml =
+    serviceNums.length > 1
+      ? `
+      <div class="rec-srv-strip" role="group" aria-label="Filtrar vueltas por servicio">
+        <button type="button" class="rec-srv-chip ${rv.serviceFilter === 'ALL' ? 'active' : ''}" data-rec-srv="ALL">Todos (${allBranchTrips.length})</button>
+        ${serviceNums
+          .map(
+            (s) =>
+              `<button type="button" class="rec-srv-chip ${String(rv.serviceFilter) === String(s) ? 'active' : ''}" data-rec-srv="${s}">Srv ${s}</button>`
+          )
+          .join('')}
+      </div>
+    `
+      : '';
+
+  let bodyHtml = '';
+  if (!isExactTipo || allBranchTrips.length === 0) {
+    // Still render ordered stops list even if a line has no scheduled trips for that day type (e.g. 109B on Sunday)
+    bodyHtml = `
+      <div class="rec-notice-bar">
+        <span>Sin horarios programados publicados para <strong>${
+          rv.tipoDia === 'domingo' ? 'Domingo' : rv.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie'
+        }</strong> en este sentido. Se muestran las ${visibleStops.length} paradas en orden de recorrido.</span>
+      </div>
+      <div class="rec-stops-timeline" style="--branch-color:${branchColor}">
+        ${visibleStops
+          .map((st, idx) => {
+            const origIdx = orderedStops.indexOf(st) + 1;
+            return `
+              <div class="rec-stop-item">
+                <div class="rec-stop-rail" aria-hidden="true">
+                  <span class="rec-stop-dot ${origIdx === 1 || origIdx === orderedStops.length ? 'is-terminal' : ''}"></span>
+                </div>
+                <button type="button" class="rec-stop-card" data-open-stop="${escapeHtml(st.id)}" data-stop-name="${escapeHtml(st.descripcion)}" data-stop-lat="${st.lat}" data-stop-lng="${st.lng}">
+                  <div class="rec-stop-head">
+                    <span class="rec-stop-num">#${origIdx}</span>
+                    <span class="rec-stop-name">${escapeHtml(st.descripcion)}</span>
+                    <span class="code-badge">${escapeHtml(st.id)}</span>
+                  </div>
+                </button>
+              </div>
+            `;
+          })
+          .join('')}
+      </div>
+    `;
+  } else if (rv.viewMode === 'grilla') {
+    // GLANCEABLE TIMETABLE MATRIX (Ordered Stops × All Scheduled Vueltas)
+    const headerCells = filteredTrips
+      .map((tr, cIdx) => {
+        const isCurrent = isTodayTipo && cIdx === currentTripIdx;
+        const depHH = formatSecHHMM(tr.startSec);
+        const srvTag = tr.serviceNumber ? `S${tr.serviceNumber}` : `V${cIdx + 1}`;
+        const lapTag = tr.lapNumber ? `·V${formatLapNumber(tr.lapNumber)}` : '';
+        return `
+          <th scope="col" class="rec-th-trip ${isCurrent ? 'is-now-col' : ''}" data-trip-col="${cIdx}" title="Salida ${depHH} · Servicio ${tr.serviceNumber || '—'}${tr.lapNumber ? ` · Vuelta ${formatLapNumber(tr.lapNumber)}` : ''}">
+            <span class="rec-th-time">${depHH}</span>
+            <span class="rec-th-srv">${escapeHtml(srvTag + lapTag)}</span>
+          </th>
+        `;
+      })
+      .join('');
+
+    const rowsHtml = visibleStops
+      .map((st) => {
+        const origIdx = orderedStops.indexOf(st) + 1;
+        const isTerminal = origIdx === 1 || origIdx === orderedStops.length;
+        const cells = filteredTrips
+          .map((tr, cIdx) => {
+            const sec = getTripStopSec(tr, st.id, st.along);
+            const isCurrent = isTodayTipo && cIdx === currentTripIdx;
+            const isPassed = isTodayTipo && sec !== null && sec < nowSvcSec - 60;
+            return `<td class="rec-td-time ${isCurrent ? 'is-now-col' : ''} ${isPassed ? 'is-passed' : ''}">${
+              sec !== null ? formatSecHHMM(sec) : '—'
+            }</td>`;
+          })
+          .join('');
+        return `
+          <tr class="${isTerminal ? 'is-terminal-row' : ''}">
+            <th scope="row" class="rec-td-stop">
+              <button type="button" class="rec-stop-inline-btn" data-open-stop="${escapeHtml(st.id)}" data-stop-name="${escapeHtml(st.descripcion)}" data-stop-lat="${st.lat}" data-stop-lng="${st.lng}" title="Abrir radar en vivo de ${escapeHtml(st.descripcion)} (${escapeHtml(st.id)})">
+                <span class="rec-stop-seq ${isTerminal ? 'is-terminal' : ''}" style="--branch-color:${branchColor}">${origIdx}</span>
+                <span class="rec-stop-txt">
+                  <span class="rec-stop-label">${escapeHtml(st.descripcion)}</span>
+                  <span class="rec-stop-code">${escapeHtml(st.id)}</span>
+                </span>
+              </button>
+            </th>
+            ${cells}
+          </tr>
+        `;
+      })
+      .join('');
+
+    bodyHtml = `
+      <div class="rec-matrix-toolbar">
+        <span class="mono-meta">${visibleStops.length} paradas en orden · ${filteredTrips.length} vueltas</span>
+        ${
+          isTodayTipo && currentTripIdx >= 0
+            ? `<button type="button" id="btn-rec-scroll-now" class="seg-btn seg-btn-xs active">Ir a ahora</button>`
+            : ''
+        }
+      </div>
+      <div id="rec-matrix-scroll" class="rec-matrix-wrap" role="region" aria-label="Grilla completa de horarios por parada en orden de recorrido">
+        <table class="rec-matrix-table">
+          <thead>
+            <tr>
+              <th scope="col" class="rec-th-stop">Parada (orden recorrido)</th>
+              ${headerCells}
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } else {
+    // ORDERED STOPS TIMELINE VIEW (with quick upcoming times + tap to expand all pass times)
+    bodyHtml = `
+      <div class="rec-matrix-toolbar">
+        <span class="mono-meta">${visibleStops.length} paradas en orden · ${filteredTrips.length} vueltas</span>
+        <span class="mono-meta">Tocá una parada para ver todas sus horas</span>
+      </div>
+      <div class="rec-stops-timeline" style="--branch-color:${branchColor}">
+        ${visibleStops
+          .map((st) => {
+            const origIdx = orderedStops.indexOf(st) + 1;
+            const isTerminal = origIdx === 1 || origIdx === orderedStops.length;
+            const passTimes = filteredTrips
+              .map((tr) => ({
+                sec: getTripStopSec(tr, st.id, st.along),
+                srv: tr.serviceNumber,
+                lap: tr.lapNumber
+              }))
+              .filter((p) => p.sec !== null);
+            const upcoming = isTodayTipo ? passTimes.filter((p) => p.sec >= nowSvcSec - 60) : passTimes;
+            const previewList = (upcoming.length ? upcoming : passTimes).slice(0, 5);
+            const isExpanded = rv.expandedStopId === st.id;
+            const previewHtml = previewList
+              .map(
+                (p, idx) =>
+                  `<span class="rec-time-chip ${isTodayTipo && idx === 0 && upcoming.length ? 'is-next' : ''}">${formatSecHHMM(p.sec)}</span>`
+              )
+              .join('');
+            const allTimesHtml = isExpanded
+              ? `
+                <div class="rec-stop-all-times">
+                  ${passTimes
+                    .map((p) => {
+                      const passed = isTodayTipo && p.sec < nowSvcSec - 60;
+                      const isNext = isTodayTipo && upcoming.length && p === upcoming[0];
+                      return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}" title="${
+                        p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
+                      }">${formatSecHHMM(p.sec)}${p.srv ? `<small>S${p.srv}</small>` : ''}</span>`;
+                    })
+                    .join('')}
+                </div>
+              `
+              : '';
+
+            return `
+              <div class="rec-stop-item ${isExpanded ? 'is-expanded' : ''}">
+                <div class="rec-stop-rail" aria-hidden="true">
+                  <span class="rec-stop-dot ${isTerminal ? 'is-terminal' : ''}"></span>
+                </div>
+                <div class="rec-stop-card">
+                  <div class="rec-stop-head">
+                    <button type="button" class="rec-stop-toggle-btn" data-toggle-stop="${escapeHtml(st.id)}" aria-expanded="${isExpanded}">
+                      <span class="rec-stop-num">#${origIdx}</span>
+                      <span class="rec-stop-name">${escapeHtml(st.descripcion)}</span>
+                    </button>
+                    <button type="button" class="seg-btn seg-btn-xs rec-stop-radar-btn" data-open-stop="${escapeHtml(st.id)}" data-stop-name="${escapeHtml(st.descripcion)}" data-stop-lat="${st.lat}" data-stop-lng="${st.lng}" aria-label="Abrir radar en parada ${escapeHtml(st.descripcion)}">Radar</button>
+                  </div>
+                  <div class="rec-stop-preview-row">
+                    <span class="code-badge">${escapeHtml(st.id)}</span>
+                    <div class="rec-preview-chips">${previewHtml || '<span class="mono-meta">Sin horarios</span>'}</div>
+                  </div>
+                  ${allTimesHtml}
+                </div>
+              </div>
+            `;
+          })
+          .join('')}
+      </div>
+    `;
+  }
+
+  el.lineasContent.innerHTML = `
+    <div class="rec-view">
+      <div class="rec-controls-card">
+        <div class="rec-controls-row">
+          <div class="rec-day-group" role="group" aria-label="Tipo de día">
+            ${dayTabsHtml}
+          </div>
+          <div class="rec-mode-group" role="group" aria-label="Modo de visualización">
+            <button type="button" class="seg-btn seg-btn-xs ${rv.viewMode === 'grilla' ? 'active' : ''}" data-rec-mode="grilla" aria-pressed="${rv.viewMode === 'grilla'}">Grilla</button>
+            <button type="button" class="seg-btn seg-btn-xs ${rv.viewMode === 'paradas' ? 'active' : ''}" data-rec-mode="paradas" aria-pressed="${rv.viewMode === 'paradas'}">Paradas</button>
+          </div>
+        </div>
+        <div class="rec-branches-row" role="group" aria-label="Sentido o ramal">
+          ${branchTabsHtml}
+        </div>
+        ${srvFilterHtml}
+      </div>
+      ${bodyHtml}
+    </div>
+  `;
+
+  // Bind controls
+  el.lineasContent.querySelectorAll('[data-rec-tipo]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextTipo = btn.dataset.recTipo;
+      if (state.recorridoView.tipoDia === nextTipo) return;
+      state.recorridoView.tipoDia = nextTipo;
+      state.recorridoView.model = null;
+      state.recorridoView.serviceFilter = 'ALL';
+      haptic('light');
+      renderLineRecorridoView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-rec-branch]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextIdx = Number(btn.dataset.recBranch);
+      if (state.recorridoView.branchIdx === nextIdx) return;
+      state.recorridoView.branchIdx = nextIdx;
+      state.recorridoView.expandedStopId = null;
+      haptic('light');
+      renderLineRecorridoView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-rec-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextMode = btn.dataset.recMode;
+      if (state.recorridoView.viewMode === nextMode) return;
+      state.recorridoView.viewMode = nextMode;
+      haptic('light');
+      renderLineRecorridoView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-rec-srv]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextSrv = btn.dataset.recSrv;
+      if (String(state.recorridoView.serviceFilter) === String(nextSrv)) return;
+      state.recorridoView.serviceFilter = nextSrv;
+      haptic('light');
+      renderLineRecorridoView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-toggle-stop]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const sid = btn.dataset.toggleStop;
+      state.recorridoView.expandedStopId = state.recorridoView.expandedStopId === sid ? null : sid;
+      haptic('light');
+      renderLineRecorridoView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('[data-open-stop]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const stop = {
+        id: btn.dataset.openStop,
+        nombre: btn.dataset.stopName || btn.dataset.openStop,
+        lat: parseFloat(btn.dataset.stopLat),
+        lng: parseFloat(btn.dataset.stopLng)
+      };
+      openStopRadar(stop, String(linea.codigo));
+    });
+  });
+
+  const scrollNowCol = (smooth = false) => {
+    const wrap = document.getElementById('rec-matrix-scroll');
+    const nowTh = wrap?.querySelector('.rec-th-trip.is-now-col');
+    if (wrap && nowTh) {
+      const stopColW = wrap.querySelector('.rec-th-stop')?.offsetWidth || 150;
+      const targetLeft = Math.max(0, nowTh.offsetLeft - stopColW - 8);
+      wrap.scrollTo({ left: targetLeft, behavior: smooth ? 'smooth' : 'auto' });
+    }
+  };
+  document.getElementById('btn-rec-scroll-now')?.addEventListener('click', () => {
+    haptic('light');
+    scrollNowCol(true);
+  });
+  if (rv.viewMode === 'grilla' && isTodayTipo && currentTripIdx >= 0) {
+    requestAnimationFrame(() => scrollNowCol(false));
+  }
+}
+
 function renderDrilldown() {
   renderLineasBreadcrumb();
   const query = el.lineasFilterInput.value.trim().toLowerCase();
   const { step, items } = state.drill;
+
+  if (step === 'recorrido') {
+    renderLineRecorridoView();
+    return;
+  }
 
   if (step === 'flota') {
     renderLineFlotaView();
@@ -4714,16 +5659,17 @@ function renderDrilldown() {
             return `
               <div class="line-tile" style="--line-color:${color}">
                 <div class="line-tile-head">
-                  <div class="line-tile-title">
+                  <button type="button" class="line-tile-title-btn btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas en orden de recorrido y horarios de línea ${escapeHtml(l.descripcion)}">
                     <span class="line-tile-swatch" aria-hidden="true"></span>
                     <span class="line-tile-name">${escapeHtml(l.descripcion)}</span>
-                  </div>
+                  </button>
                   ${countBadge}
                 </div>
-                <div class="line-tile-actions">
-                  <button type="button" class="tile-mini-btn primary btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver calles y paradas de línea ${escapeHtml(l.descripcion)}">Calles</button>
+                <div class="line-tile-actions line-tile-actions-4">
+                  <button type="button" class="tile-mini-btn primary btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas ordenadas y horarios de línea ${escapeHtml(l.descripcion)}">Horarios</button>
+                  <button type="button" class="tile-mini-btn btn-line-servicios" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver servicios y turnos de línea ${escapeHtml(l.descripcion)}">Servicios</button>
                   <button type="button" class="tile-mini-btn btn-line-flota" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="${escapeHtml(flotaAria)}">Flota</button>
-                  <button type="button" class="tile-mini-btn btn-line-map" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver recorrido de línea ${escapeHtml(l.descripcion)} en el mapa">Mapa</button>
+                  <button type="button" class="tile-mini-btn btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver calles y paradas de línea ${escapeHtml(l.descripcion)}">Calles</button>
                 </div>
               </div>
             `;
@@ -4732,14 +5678,19 @@ function renderDrilldown() {
       </div>
     `;
 
-    el.lineasContent.querySelectorAll('.btn-line-calles').forEach((btn) => {
-      btn.addEventListener('click', () => openLineCalles({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
+    el.lineasContent.querySelectorAll('.btn-line-recorrido').forEach((btn) => {
+      btn.addEventListener('click', () => openLineRecorrido({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
+    });
+    el.lineasContent.querySelectorAll('.btn-line-servicios').forEach((btn) => {
+      btn.addEventListener('click', () =>
+        openLineFlota({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }, { initialTab: 'servicios' })
+      );
     });
     el.lineasContent.querySelectorAll('.btn-line-flota').forEach((btn) => {
       btn.addEventListener('click', () => openLineFlota({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
-    el.lineasContent.querySelectorAll('.btn-line-map').forEach((btn) => {
-      btn.addEventListener('click', () => loadRouteForLine(btn.dataset.cod, btn.dataset.desc, { clearExisting: true, fit: true }));
+    el.lineasContent.querySelectorAll('.btn-line-calles').forEach((btn) => {
+      btn.addEventListener('click', () => openLineCalles({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
     });
     return;
   }
@@ -5058,12 +6009,12 @@ function renderGlobalSearchResults(rawQuery) {
     if (l.descripcion.toUpperCase().includes(upper)) {
       baseResults.push({
         title: `Línea ${l.descripcion}`,
-        sub: 'Calles, paradas y recorrido',
+        sub: 'Paradas en orden, horarios, servicios y flota',
         badge: l.descripcion,
         color: getLineColor(l.descripcion),
         action: () => {
           switchTab('lineas');
-          openLineCalles(l);
+          openLineRecorrido(l);
         }
       });
     }
@@ -5284,11 +6235,46 @@ function bindEvents() {
   });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
+  el.btnInspTrack?.addEventListener('click', () => {
+    const key = el.btnInspTrack.dataset.busKey || state.selectedBusKey;
+    const bus = state.allFleetBuses.find((b) => b.key === key);
+    if (!bus) return;
+    locateFleetUnitOnMap({
+      codLinea: bus.codigoLinea,
+      lineName: bus.descripcionLinea,
+      coche: bus.identificadorCoche,
+      choferNombre: bus.choferNombre,
+      choferLegajo: bus.choferLegajo,
+      esAdaptado: bus.esAdaptado,
+      lat: bus.lat,
+      lng: bus.lng,
+      bandera: bus.descripcionBandera,
+      lastGps: bus.ultimaFechaHoraGPS,
+      lastStopId: bus.lastStopId,
+      desvioRaw: bus.desvio?.raw || '',
+      desvioSec: bus.desvio?.seconds || 0,
+      enLineaAhora: true,
+      serviceMeta: bus.serviceNumber
+        ? {
+            serviceNumber: bus.serviceNumber,
+            turnoIndex: bus.turnoIndex || 1,
+            serviceTurnosCount: bus.serviceTurnosCount || 1,
+            lapNumber: bus.lapNumber,
+            shiftLaps: bus.shiftLaps,
+            isCortado: bus.isCortadoBlock,
+            isRelevoEnLinea: bus.isRelevoEnLinea,
+            startHHMM: bus.turnoStart,
+            endHHMM: bus.turnoEnd
+          }
+        : null
+    });
+  });
   el.btnInspCenter?.addEventListener('click', () => {
     const bus =
       state.arribos.find((b) => b.key === state.selectedBusKey) ||
       state.trackedUnit?.buses?.find((b) => b.key === state.selectedBusKey) ||
       state.trackedUnit?.bus ||
+      state.allFleetBuses.find((b) => b.key === state.selectedBusKey) ||
       null;
     if (bus) {
       haptic('light');
@@ -5301,6 +6287,7 @@ function bindEvents() {
     if (cod) loadRouteForLine(cod, name, { clearExisting: true, fit: true });
   });
 
+  el.btnAllBuses?.addEventListener('click', () => toggleAllFleetMode());
   el.btnMapLocate?.addEventListener('click', () => {
     haptic('light');
     locateUserGps();

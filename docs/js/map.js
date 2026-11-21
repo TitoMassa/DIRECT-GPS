@@ -2,9 +2,10 @@ import { CORRIENTES_CENTER, MAP_TILES, getLineColor, getDirectionColor } from '.
 import { formatDistance } from './api.js';
 
 export class TransitMap {
-  constructor(containerId, { onBusSelect, onStopPick } = {}) {
+  constructor(containerId, { onBusSelect, onStopPick, onAllFleetBusSelect } = {}) {
     this.onBusSelect = onBusSelect || (() => {});
     this.onStopPick = onStopPick || (() => {});
+    this.onAllFleetBusSelect = onAllFleetBusSelect || this.onBusSelect;
 
     this.canvasRenderer = L.canvas({ padding: 0.35 });
 
@@ -41,11 +42,13 @@ export class TransitMap {
     this.routeStopsLayer = L.layerGroup().addTo(this.map);
     this.nearbyLayer = L.layerGroup().addTo(this.map);
     this.vectorLayer = L.layerGroup().addTo(this.map);
+    this.allFleetLayer = L.layerGroup().addTo(this.map);
     this.stopLayer = L.layerGroup().addTo(this.map);
     this.busLayer = L.layerGroup().addTo(this.map);
     this.userLayer = L.layerGroup().addTo(this.map);
 
     this.busMarkers = new Map(); // busKey -> { marker, lat, lng, data, iconSig }
+    this.allFleetMarkers = new Map(); // allKey -> { marker, lat, lng, data, iconSig }
     this.stopMarker = null;
     this.activeStopSig = '';
     this.activeStopCoords = null;
@@ -343,6 +346,93 @@ export class TransitMap {
 
     const focused = selectedBusKey ? this.busMarkers.get(selectedBusKey)?.data : null;
     this.drawFocusVector(focused);
+  }
+
+  _buildAllFleetIcon(bus, { selected }) {
+    const color = getLineColor(bus.descripcionLinea);
+    const cls = ['bus-marker-wrap', 'is-city-fleet'];
+    if (selected) cls.push('is-selected');
+    const cocheHtml = bus.identificadorCoche
+      ? `<span class="bus-pill-coche">${bus.identificadorCoche}</span>`
+      : '';
+    const dotHtml =
+      bus.desvio && bus.desvio.status !== 'none'
+        ? `<span class="bus-desvio-dot ${bus.desvio.status}"></span>`
+        : `<span class="bus-desvio-dot ok"></span>`;
+    return L.divIcon({
+      className: 'bus-leaflet-icon',
+      html: `
+        <div class="${cls.join(' ')}" style="--bus-color:${color}">
+          <div class="bus-pill-marker bus-pill-city">
+            ${dotHtml}
+            <span class="bus-pill-line">${bus.descripcionLinea}</span>
+            ${cocheHtml}
+          </div>
+          <div class="bus-heading-dot"></div>
+        </div>
+      `,
+      iconSize: [96, 28],
+      iconAnchor: [48, 26]
+    });
+  }
+
+  clearAllFleetBuses() {
+    this.allFleetLayer.clearLayers();
+    this.allFleetMarkers.clear();
+  }
+
+  updateAllFleetBuses(buses = [], { selectedBusKey = null } = {}) {
+    const activeStopUnits = new Set();
+    for (const entry of this.busMarkers.values()) {
+      const b = entry.data;
+      if (b?.codigoLinea && b?.identificadorCoche) {
+        activeStopUnits.add(`${b.codigoLinea}:${b.identificadorCoche}`);
+      }
+    }
+
+    const incomingKeys = new Set();
+    for (const bus of buses) {
+      if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+      // Avoid duplicating a bus already plotted on the active stop/tracked busLayer
+      const uKey = `${bus.codigoLinea}:${bus.identificadorCoche}`;
+      if (activeStopUnits.has(uKey) && bus.key !== selectedBusKey) continue;
+
+      incomingKeys.add(bus.key);
+      const isSelected = bus.key === selectedBusKey;
+      const iconSig = `city|${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${bus.desvio?.status || ''}|${isSelected ? 1 : 0}`;
+      const existing = this.allFleetMarkers.get(bus.key);
+      if (existing) {
+        if (Math.abs(bus.lat - existing.lat) >= 1e-6 || Math.abs(bus.lng - existing.lng) >= 1e-6) {
+          this._animateMarker(existing.marker, existing.marker.getLatLng(), [bus.lat, bus.lng], 650);
+          existing.lat = bus.lat;
+          existing.lng = bus.lng;
+        }
+        if (existing.iconSig !== iconSig) {
+          existing.marker.setIcon(this._buildAllFleetIcon(bus, { selected: isSelected }));
+          existing.iconSig = iconSig;
+        }
+        existing.marker.setZIndexOffset(isSelected ? 980 : 320);
+        existing.data = bus;
+      } else {
+        const icon = this._buildAllFleetIcon(bus, { selected: isSelected });
+        const marker = L.marker([bus.lat, bus.lng], {
+          icon,
+          zIndexOffset: isSelected ? 980 : 320,
+          keyboard: false
+        }).addTo(this.allFleetLayer);
+        marker.on('click', () => {
+          this.onAllFleetBusSelect(bus.key);
+        });
+        this.allFleetMarkers.set(bus.key, { marker, lat: bus.lat, lng: bus.lng, data: bus, iconSig });
+      }
+    }
+
+    for (const [key, entry] of this.allFleetMarkers.entries()) {
+      if (!incomingKeys.has(key)) {
+        this.allFleetLayer.removeLayer(entry.marker);
+        this.allFleetMarkers.delete(key);
+      }
+    }
   }
 
   drawFocusVector(bus) {
