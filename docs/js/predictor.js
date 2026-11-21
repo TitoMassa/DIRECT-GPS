@@ -2258,27 +2258,52 @@ function scoreBusAgainstCandidate(
  * Allows a real Service 2 spotted elsewhere on the corridor to claim Service 2 in the global
  * matrix and immediately auto-correct a misassigned bus approaching the active stop!
  */
-function scoreCorridorPeerAgainstService(unit, serviceTrips, model, nowSec, unitHist) {
-  const uLat = parseFloat(unit.latitud ?? unit.lat);
-  const uLng = parseFloat(unit.longitud ?? unit.lng);
+function scoreCorridorPeerAgainstService(
+  unit,
+  serviceTrips,
+  model,
+  nowSec,
+  unitHist,
+  { maxAgeSec = 6 * 60, allowWithoutDesvio = false, maxPerp = 150, maxRawSec = 14 * 60 } = {}
+) {
+  const uLat = parseFloat(unit.latitud ?? unit.lat ?? unit.lastLat);
+  const uLng = parseFloat(unit.longitud ?? unit.lng ?? unit.lastLng);
   if (Number.isNaN(uLat) || Number.isNaN(uLng) || (uLat === 0 && uLng === 0)) return null;
 
-  const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || '').trim();
-  const parsedDesvio =
-    typeof unit.desvioSec === 'number'
-      ? { seconds: unit.desvioSec, status: 'ok' }
-      : parseDesvioHorario(unit.desvioHorario || '');
-  const hasDesvio = parsedDesvio && parsedDesvio.status !== 'none';
-  const desvioSec = parsedDesvio?.seconds || 0;
+  const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || unit.lastGps || '').trim();
+  let parsedDesvio = null;
+  if (typeof unit.desvioSec === 'number') {
+    parsedDesvio = { seconds: unit.desvioSec, status: 'ok' };
+  } else if (unit.desvioHorario) {
+    parsedDesvio = parseDesvioHorario(unit.desvioHorario);
+  } else if (unit.lastDesvioRaw) {
+    parsedDesvio = parseDesvioHorario(unit.lastDesvioRaw);
+    if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof unit.lastDesvioSec === 'number') {
+      parsedDesvio = { seconds: unit.lastDesvioSec, status: 'ok' };
+    }
+  } else if (typeof unit.lastDesvioSec === 'number' && unit.lastDesvioSec !== 0) {
+    parsedDesvio = { seconds: unit.lastDesvioSec, status: 'ok' };
+  }
+  const hasDesvio = Boolean(parsedDesvio && parsedDesvio.status !== 'none');
+  const rawDesvioSec = parsedDesvio?.seconds || 0;
+  // Clamp/ignore absurd terminal-wait desvios (e.g. +135:00 while parked between shifts)
+  const desvioSec = Math.abs(rawDesvioSec) <= 40 * 60 ? rawDesvioSec : 0;
 
   const effNow = toServiceSec(nowSec);
   const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
-  const uClock = uClockRaw !== null ? toServiceSec(uClockRaw) : effNow;
-  // Ignore stale corridor fixes older than 6 minutes
-  if (Math.abs(effNow - uClock) > 6 * 60 && Math.abs(effNow - uClock) < 20 * 3600) return null;
+  const fallbackClock =
+    typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0
+      ? (() => {
+          const art = new Date(unit.lastSeenAt - 3 * 3600 * 1000);
+          return art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+        })()
+      : null;
+  const uClock = uClockRaw !== null ? toServiceSec(uClockRaw) : fallbackClock !== null ? toServiceSec(fallbackClock) : effNow;
+  // Ignore stale fixes older than maxAgeSec
+  if (Math.abs(effNow - uClock) > maxAgeSec && Math.abs(effNow - uClock) < 20 * 3600) return null;
 
   const tEff = uClock + desvioSec;
-  const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || '');
+  const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
 
   // Resolve direction from multi-point GPS trail!
   const trailDir = unitHist
@@ -2286,7 +2311,7 @@ function scoreCorridorPeerAgainstService(unit, serviceTrips, model, nowSec, unit
         currentFix: { lat: uLat, lng: uLng, ts: Date.now() }
       })
     : null;
-  if (!hasDesvio && !trailDir) return null;
+  if (!hasDesvio && !trailDir && !allowWithoutDesvio) return null;
 
   const projByBranch = new Map();
   const getProj = (b) => {
@@ -2295,13 +2320,13 @@ function scoreCorridorPeerAgainstService(unit, serviceTrips, model, nowSec, unit
   };
 
   let bestTrip = null;
-  let bestRaw = 14 * 60;
+  let bestRaw = maxRawSec;
 
   for (const tr of serviceTrips) {
     // Skip trips far outside the current time window
-    if (tEff < tr.startSec - 16 * 60 || tEff > tr.endSec + 16 * 60) continue;
+    if (tEff < tr.startSec - 18 * 60 || tEff > tr.endSec + 18 * 60) continue;
     const proj = getProj(tr.branch);
-    if (!proj || proj.perp > 150) continue;
+    if (!proj || proj.perp > maxPerp) continue;
 
     const sched = getTripSecAtAlong(tr, proj.along);
     if (sched === null) continue;
@@ -3523,82 +3548,134 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
     };
   };
 
-  // 1) Exact tripKey lookup
+  const uLat = parseFloat(unit.lat ?? unit.lastLat ?? unit.latitud);
+  const uLng = parseFloat(unit.lng ?? unit.lastLng ?? unit.longitud);
+  const hasCoords = !Number.isNaN(uLat) && !Number.isNaN(uLng) && (uLat !== 0 || uLng !== 0);
+  const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || unit.lastGps || '').trim();
+  const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
+  const hasOwnTime = uClockRaw !== null || (typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0);
+  const fallbackSec =
+    typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0
+      ? (() => {
+          const art = new Date(unit.lastSeenAt - 3 * 3600 * 1000);
+          return art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+        })()
+      : nowSec;
+  const uClock = toServiceSec(uClockRaw !== null ? uClockRaw : fallbackSec);
+  const effNow = toServiceSec(nowSec);
+
   const tk = String(unit.tripKey || unit.lastTripKey || '').trim();
-  if (tk && model?.tripByKey?.has(tk)) {
+
+  // 1) Pure tripKey lookup (when caller passes { tripKey } without GPS coordinates/timestamp)
+  if (tk && !hasCoords && !hasOwnTime && model?.tripByKey?.has(tk)) {
     const packed = packTrip(model.tripByKey.get(tk));
     if (packed) return packed;
   }
 
-  // 2) Spatial-temporal matching against all trips in model (works for BOTH live and historical timestamps!)
-  if (model && Array.isArray(model.branches) && model.branches.length > 0) {
-    const uLat = parseFloat(unit.lat ?? unit.lastLat ?? unit.latitud);
-    const uLng = parseFloat(unit.lng ?? unit.lastLng ?? unit.longitud);
-    const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || unit.lastGps || '').trim();
-    const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
-    const fallbackSec =
-      typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0
-        ? (() => {
-            const art = new Date(unit.lastSeenAt - 3 * 3600 * 1000);
-            return art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
-          })()
-        : nowSec;
-    const uClock = toServiceSec(uClockRaw !== null ? uClockRaw : fallbackSec);
-    const parsedDesvio =
-      typeof unit.desvioSec === 'number'
-        ? { seconds: unit.desvioSec }
-        : typeof unit.lastDesvioSec === 'number'
-          ? { seconds: unit.lastDesvioSec }
-          : parseDesvioHorario(unit.desvioHorario || unit.lastDesvioRaw || '');
-    const tEff = uClock + (parsedDesvio?.seconds || 0);
-    const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
-    const hasCoords = !Number.isNaN(uLat) && !Number.isNaN(uLng) && (uLat !== 0 || uLng !== 0);
-
-    let bestTrip = null;
-    let bestScore = Infinity;
-
-    for (const b of model.branches) {
-      const trips = model.getTripsForBranch(b) || [];
-      if (!trips.length) continue;
-      let proj = null;
-      if (hasCoords) {
-        proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
-        if (!proj || proj.perp > 450) continue;
+  // 2) Spatial-temporal matching against all trips in model (authoritative whenever GPS coords exist!)
+  if (model && Array.isArray(model.branches) && model.branches.length > 0 && (hasCoords || hasOwnTime)) {
+    let parsedDesvio = null;
+    if (typeof unit.desvioSec === 'number') {
+      parsedDesvio = { seconds: unit.desvioSec };
+    } else if (unit.desvioHorario) {
+      parsedDesvio = parseDesvioHorario(unit.desvioHorario);
+    } else if (unit.lastDesvioRaw) {
+      parsedDesvio = parseDesvioHorario(unit.lastDesvioRaw);
+      if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof unit.lastDesvioSec === 'number') {
+        parsedDesvio = { seconds: unit.lastDesvioSec };
       }
-      const bNorm = normalizeBandera(b.bandera || '');
-      const banderaMatch =
-        uNormBandera && bNorm && (bNorm.includes(uNormBandera) || uNormBandera.includes(bNorm));
-      const banderaPenalty = uNormBandera && !banderaMatch ? 240 : 0;
-      const distPenalty = proj ? proj.perp * 0.45 : 0;
+    } else if (typeof unit.lastDesvioSec === 'number' && unit.lastDesvioSec !== 0) {
+      parsedDesvio = { seconds: unit.lastDesvioSec };
+    }
+    const rawDesvioSec = parsedDesvio?.seconds || 0;
+    // Ignore absurd terminal-wait desvios (e.g. +135:00 while parked between morning and afternoon shifts)
+    const safeDesvioSec = Math.abs(rawDesvioSec) <= 40 * 60 ? rawDesvioSec : 0;
+    const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
 
-      for (const tr of trips) {
-        if (tEff < tr.startSec - 20 * 60 || tEff > tr.endSec + 25 * 60) continue;
-        let schedSec;
-        if (proj) {
-          schedSec = getTripSecAtAlong(tr, proj.along);
-        } else {
-          schedSec = (tr.startSec + tr.endSec) * 0.5;
+    const findBestSpatialTrip = (evalClockSec) => {
+      let bestTrip = null;
+      let bestScore = Infinity;
+
+      for (const b of model.branches) {
+        const trips = model.getTripsForBranch(b) || [];
+        if (!trips.length) continue;
+        let proj = null;
+        if (hasCoords) {
+          proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+          if (!proj || proj.perp > 450) continue;
         }
-        if (schedSec === null) continue;
-        const timeErr = Math.abs(tEff - schedSec);
-        if (timeErr > 28 * 60) continue;
-        const score = timeErr + banderaPenalty + distPenalty;
-        if (score < bestScore) {
-          bestScore = score;
-          bestTrip = tr;
+        const bNorm = normalizeBandera(b.bandera || '');
+        const banderaMatch =
+          uNormBandera && bNorm && (bNorm.includes(uNormBandera) || uNormBandera.includes(bNorm));
+        const nearTerminal = proj
+          ? proj.along <= 600 || Math.max(0, (b.totalLen || 0) - proj.along) <= 600
+          : false;
+        // Near terminals, SmartMovePro often labels a finishing bus with the next outbound bandera
+        const banderaPenalty = uNormBandera && !banderaMatch ? (nearTerminal ? 40 : 180) : 0;
+        const distPenalty = proj ? proj.perp * 0.45 : 0;
+
+        for (const tr of trips) {
+          if (evalClockSec < tr.startSec - 20 * 60 || evalClockSec > tr.endSec + 25 * 60) continue;
+          let schedSec;
+          if (proj) {
+            schedSec = getTripSecAtAlong(tr, proj.along);
+          } else {
+            schedSec = (tr.startSec + tr.endSec) * 0.5;
+          }
+          if (schedSec === null) continue;
+          const timeErr = Math.abs(evalClockSec - schedSec);
+          if (timeErr > 28 * 60) continue;
+          const score = timeErr + banderaPenalty + distPenalty;
+          if (score < bestScore) {
+            bestScore = score;
+            bestTrip = tr;
+          }
         }
+      }
+
+      return bestTrip && bestScore <= 22 * 60 ? { trip: bestTrip, score: bestScore } : null;
+    };
+
+    const tEff = uClock + safeDesvioSec;
+    let picked = findBestSpatialTrip(tEff);
+
+    // For offline/finished drivers parked at terminal with positive wait desvio (e.g. +13:07 for the next T2 shift),
+    // check if raw GPS clock uClock cleanly matches the end of the T1 shift they just finished!
+    if (!unit.enLineaAhora && safeDesvioSec >= 8 * 60) {
+      const rawPick = findBestSpatialTrip(uClock);
+      if (rawPick && picked && rawPick.trip.blockId !== picked.trip.blockId) {
+        const pickedBi = picked.trip.blockInfo || model.blockInfoById?.get(picked.trip.blockId);
+        const rawBi = rawPick.trip.blockInfo || model.blockInfoById?.get(rawPick.trip.blockId);
+        const pickedJustStarting = pickedBi && uClock <= pickedBi.startSec + 10 * 60 && effNow >= pickedBi.startSec + 45 * 60;
+        const rawJustEnding = rawBi && uClock >= rawBi.endSec - 20 * 60 && uClock <= rawBi.endSec + 25 * 60;
+        if (pickedJustStarting && rawJustEnding) {
+          picked = rawPick;
+        }
+      } else if (!picked && rawPick) {
+        picked = rawPick;
       }
     }
 
-    if (bestTrip && bestScore <= 22 * 60) {
-      const packed = packTrip(bestTrip);
+    if (picked?.trip) {
+      const packed = packTrip(picked.trip);
       if (packed) return packed;
     }
   }
 
-  // 3) Fallback to server-persisted service metadata (e.g. historical driver from another dayType)
+  // 3) Validated tripKey fallback (only if trip's time window is consistent with the unit's GPS clock)
+  if (tk && model?.tripByKey?.has(tk)) {
+    const tr = model.tripByKey.get(tk);
+    const fitsOwnClock = !hasOwnTime || (uClock >= tr.startSec - 20 * 60 && uClock <= tr.endSec + 30 * 60);
+    const fitsLiveNow = !unit.enLineaAhora || (effNow >= tr.startSec - 20 * 60 && effNow <= tr.endSec + 30 * 60);
+    if (fitsOwnClock && fitsLiveNow) {
+      const packed = packTrip(tr);
+      if (packed) return packed;
+    }
+  }
+
+  // 4) Fallback to server-persisted service metadata ONLY for historical non-today records (never stale today cars!)
   const sNum = Number(unit.lastServiceNum ?? unit.serviceNumber) || 0;
-  if (sNum > 0) {
+  if (sNum > 0 && !unit.enLineaAhora && !unit.vistoHoy) {
     return {
       trip: null,
       blockInfo: null,
@@ -3653,11 +3730,19 @@ export function matchFreeFleetUnitsToModel(model, units = [], nowSec = getArgent
 
   for (const u of validUnits) {
     const c = String(u.coche || u.identificadorCoche || '').trim();
-    const hist = gpsHistoryByUnit?.get(`${model.codLinea}:${c}`) || null;
+    const hist =
+      gpsHistoryByUnit?.get(`${model.codLinea}-c${c}`) ||
+      gpsHistoryByUnit?.get(`${model.codLinea}:${c}`) ||
+      null;
     const rowCosts = [];
     const rowTrips = [];
     for (const sNum of serviceNums) {
-      const scored = scoreCorridorPeerAgainstService(u, tripsByService.get(sNum) || [], model, nowSec, hist);
+      const scored = scoreCorridorPeerAgainstService(u, tripsByService.get(sNum) || [], model, nowSec, hist, {
+        maxAgeSec: 25 * 60,
+        allowWithoutDesvio: true,
+        maxPerp: 350,
+        maxRawSec: 22 * 60
+      });
       if (scored && scored.effScore <= 22 * 60) {
         rowCosts.push(scored.effScore);
         rowTrips.push(scored.trip);

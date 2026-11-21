@@ -917,13 +917,62 @@ export class FleetMemory {
         last_lng = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_cars.last_lng, excluded.last_lng) END,
         last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_cars.last_desvio_sec END,
         last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_cars.last_desvio_raw END,
-        last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_cars.last_trip_key END,
-        last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_cars.last_service_num END,
-        last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_cars.last_turno_idx END,
-        last_turno_start = CASE WHEN excluded.last_turno_start != '' THEN excluded.last_turno_start ELSE fleet_cars.last_turno_start END,
-        last_turno_end = CASE WHEN excluded.last_turno_end != '' THEN excluded.last_turno_end ELSE fleet_cars.last_turno_end END,
-        last_lap_num = CASE WHEN excluded.last_lap_num > 0 THEN excluded.last_lap_num ELSE fleet_cars.last_lap_num END,
-        last_shift_laps = CASE WHEN excluded.last_shift_laps > 0 THEN excluded.last_shift_laps ELSE fleet_cars.last_shift_laps END,
+        last_trip_key = CASE
+          WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN ''
+          ELSE fleet_cars.last_trip_key
+        END,
+        last_service_num = CASE
+          WHEN excluded.last_service_num > 0 THEN excluded.last_service_num
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN 0
+          ELSE fleet_cars.last_service_num
+        END,
+        last_turno_idx = CASE
+          WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN 0
+          ELSE fleet_cars.last_turno_idx
+        END,
+        last_turno_start = CASE
+          WHEN excluded.last_turno_start != '' THEN excluded.last_turno_start
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN ''
+          ELSE fleet_cars.last_turno_start
+        END,
+        last_turno_end = CASE
+          WHEN excluded.last_turno_end != '' THEN excluded.last_turno_end
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN ''
+          ELSE fleet_cars.last_turno_end
+        END,
+        last_lap_num = CASE
+          WHEN excluded.last_lap_num > 0 THEN excluded.last_lap_num
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN 0
+          ELSE fleet_cars.last_lap_num
+        END,
+        last_shift_laps = CASE
+          WHEN excluded.last_shift_laps > 0 THEN excluded.last_shift_laps
+          WHEN excluded.last_seen_at >= fleet_cars.last_seen_at AND (
+            excluded.last_day_key != fleet_cars.last_day_key OR
+            (excluded.last_chofer_nombre != '' AND fleet_cars.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+          ) THEN 0
+          ELSE fleet_cars.last_shift_laps
+        END,
         first_seen_at = MIN(fleet_cars.first_seen_at, excluded.first_seen_at),
         last_day_key = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at THEN excluded.last_day_key ELSE fleet_cars.last_day_key END,
         last_seen_at = MAX(fleet_cars.last_seen_at, excluded.last_seen_at),
@@ -1611,15 +1660,30 @@ export class FleetMemory {
         )
         .toArray();
 
+      const sameDriverLoose = (legA, nameA, legB, nameB) => {
+        const lA = String(legA || '').trim().toUpperCase();
+        const lB = String(legB || '').trim().toUpperCase();
+        if (lA && lB) return lA === lB;
+        const nA = String(nameA || '').trim().replace(/\.+$/, '').toUpperCase();
+        const nB = String(nameB || '').trim().replace(/\.+$/, '').toUpperCase();
+        return !nA || !nB || nA === nB;
+      };
+
       const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
       const coches = carRows
         .map((r) => {
           const u = unitByCoche.get(r.coche) || null;
-          const lat = r.last_lat ?? u?.lat ?? null;
-          const lng = r.last_lng ?? u?.lng ?? null;
-          const tripKey = r.last_trip_key || (u?.day_key === r.last_day_key ? u.trip_key : '') || '';
-          const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec || 0;
-          const desvioRaw = r.last_desvio_raw || u?.desvio_raw || '';
+          const uFreshForCar = Boolean(
+            u &&
+              u.day_key === r.last_day_key &&
+              Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 25 * 60 * 1000 &&
+              sameDriverLoose(u.chofer_legajo, u.chofer_nombre, r.last_chofer_legajo, r.last_chofer_nombre)
+          );
+          const lat = r.last_lat ?? (uFreshForCar ? u?.lat : null) ?? null;
+          const lng = r.last_lng ?? (uFreshForCar ? u?.lng : null) ?? null;
+          const tripKey = r.last_trip_key || (uFreshForCar ? u.trip_key : '') || '';
+          const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : uFreshForCar ? u?.desvio_sec || 0 : 0;
+          const desvioRaw = r.last_desvio_raw || (uFreshForCar ? u?.desvio_raw : '') || '';
           return {
             coche: r.coche,
             esAdaptado: Boolean(r.es_adaptado),
@@ -1658,7 +1722,12 @@ export class FleetMemory {
       const choferes = drvRows
         .map((r) => {
           const u = r.last_coche ? unitByCoche.get(r.last_coche) : null;
-          const isSameCarFresh = Boolean(u && u.day_key === r.last_day_key && Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 45 * 60 * 1000);
+          const isSameCarFresh = Boolean(
+            u &&
+              u.day_key === r.last_day_key &&
+              Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 25 * 60 * 1000 &&
+              sameDriverLoose(u.chofer_legajo, u.chofer_nombre, r.chofer_legajo, r.chofer_nombre)
+          );
           const lat = r.last_lat ?? (isSameCarFresh ? u?.lat : null) ?? null;
           const lng = r.last_lng ?? (isSameCarFresh ? u?.lng : null) ?? null;
           const tripKey = r.last_trip_key || (isSameCarFresh ? u?.trip_key : '') || '';

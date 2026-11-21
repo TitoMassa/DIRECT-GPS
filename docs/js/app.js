@@ -2716,12 +2716,30 @@ function reconcileWithSchedulePrediction(
             : [];
           const dirBandera =
             b.confirmedDirectionBandera || unitHist?.confirmedDir?.bandera || '';
+
+          // Resolve the trip the bus is PHYSICALLY driving right now (not a future leg / next-turno trip approaching stopId!)
+          const gpsClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec;
+          const gpsSvcSec = gpsClock < 3 * 3600 ? gpsClock + 86400 : gpsClock;
+          let recTrip = m.trip;
+          if (m.trip && typeof b.lat === 'number' && typeof b.lng === 'number') {
+            const safeDesvio = Math.abs(b.desvio?.seconds || 0) <= 40 * 60 ? (b.desvio?.seconds || 0) : 0;
+            const curAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, safeDesvio);
+            if (curAnchor?.trip && curAnchor.legDepth >= 1) {
+              recTrip = curAnchor.trip;
+            }
+          }
+          const recBi = recTrip?.blockInfo || (recTrip?.blockId ? model.blockInfoById?.get(recTrip.blockId) : null);
+          const recTripKey = recTrip?.tripKey || m.tripKey;
+          const recInWindow = Boolean(
+            recTrip && gpsSvcSec >= recTrip.startSec - 20 * 60 && gpsSvcSec <= recTrip.endSec + 30 * 60
+          );
+
           const rec = {
             dayKey: todayDayKey,
             codigoLinea: cod,
-            tripKey: m.tripKey,
-            supersededTripKey: m.supersededTripKey || '',
-            turnoHora: m.turnoHora,
+            tripKey: recTripKey,
+            supersededTripKey: recTripKey === m.tripKey ? (m.supersededTripKey || '') : '',
+            turnoHora: recTripKey === m.tripKey ? m.turnoHora : formatSecHHMM(recTrip?.startSec ?? 0),
             coche: b.identificadorCoche,
             choferNombre: b.choferNombre || '',
             choferLegajo: b.choferLegajo || '',
@@ -2738,16 +2756,19 @@ function reconcileWithSchedulePrediction(
             lat: b.lat,
             lng: b.lng,
             stopId,
-            serviceNumber: b.serviceNumber || 0,
-            turnoIndex: b.turnoIndex || 0,
-            turnoStart: b.scheduledTrip?.blockInfo ? formatSecHHMM(b.scheduledTrip.blockInfo.startSec) : '',
-            turnoEnd: b.scheduledTrip?.blockInfo ? formatSecHHMM(b.scheduledTrip.blockInfo.endSec) : '',
-            lapNumber: b.lapNumber || 0,
-            shiftLaps: b.shiftLaps || 0,
+            serviceNumber: recBi?.serviceNumber || b.serviceNumber || 0,
+            turnoIndex: recBi?.turnoIndex || b.turnoIndex || 0,
+            turnoStart: recBi ? formatSecHHMM(recBi.startSec) : '',
+            turnoEnd: recBi ? formatSecHHMM(recBi.endSec) : '',
+            lapNumber: recTrip?.lapNumber || b.lapNumber || 0,
+            shiftLaps: recBi?.shiftLaps || b.shiftLaps || 0,
             updatedAt: nowMs
           };
-          state.sessionObservedTrips.set(`${cod}:${m.tripKey}`, rec);
-          seenReports.push(rec);
+          state.sessionObservedTrips.set(`${cod}:${m.tripKey}`, { ...rec, tripKey: m.tripKey, turnoHora: m.turnoHora });
+          if (recInWindow) {
+            state.sessionObservedTrips.set(`${cod}:${recTripKey}`, rec);
+            seenReports.push(rec);
+          }
         }
       }
     }
@@ -4230,21 +4251,35 @@ function renderLineFlotaView() {
   //     relevos and brief cross-service boundary handoffs between DIFFERENT drivers (e.g. T1 ending 14:09 / T2 starting 13:58).
   //  3) Driver attribution is strictly scoped per turno (using driver votes from trips & fleet_drivers observed inside THAT turno's window),
   //     so a T2 relevo driver (e.g. GOMEZ R. on #3093) NEVER overwrites T1's driver (e.g. ROMERO L. on #3093)!
+  const obsSecFromRecord = (gpsStr, tsMs) => {
+    const parsed = parseGpsStampSecOfDay(gpsStr);
+    if (parsed !== null) return parsed < 3 * 3600 ? parsed + 86400 : parsed;
+    if (typeof tsMs === 'number' && tsMs > 0) {
+      const art = new Date(tsMs - 3 * 3600 * 1000);
+      const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+      return s < 3 * 3600 ? s + 86400 : s;
+    }
+    return null;
+  };
+
+  // Filter out stale/future trip_assignments recorded outside the trip's actual active window
+  // (e.g. a morning driver near terminal accidentally linked to an upcoming T2 departure 60-90m later).
+  const validTodayTrips = model?.tripByKey
+    ? todayTrips.filter((t) => {
+        const tr = model.tripByKey.get(t.tripKey);
+        if (!tr?.blockId || !t.coche) return false;
+        const tObsSec = obsSecFromRecord(t.ultimaGps, t.updatedAt);
+        if (tObsSec !== null && (tObsSec < tr.startSec - 25 * 60 || tObsSec > tr.endSec + 35 * 60)) {
+          return false;
+        }
+        return true;
+      })
+    : [];
+
   const blockAssignMap = new Map();
   if (model) {
     const nowSvcSec = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
     const candidatesByBlock = new Map(); // blockId -> Map<coche, candidate>
-
-    const obsSecFromRecord = (gpsStr, tsMs) => {
-      const parsed = parseGpsStampSecOfDay(gpsStr);
-      if (parsed !== null) return parsed < 3 * 3600 ? parsed + 86400 : parsed;
-      if (typeof tsMs === 'number' && tsMs > 0) {
-        const art = new Date(tsMs - 3 * 3600 * 1000);
-        const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
-        return s < 3 * 3600 ? s + 86400 : s;
-      }
-      return null;
-    };
 
     const findPrevTurnoInfo = (bi) => {
       if (!bi || !bi.serviceNumber || (bi.turnoIndex || 1) <= 1) return null;
@@ -4320,8 +4355,15 @@ function renderLineFlotaView() {
       byCar.set(coche, next);
     };
 
-    // 1) Ingest today's trip_assignments (strictly keeping each trip's OWN driver, never carRec's later relevo driver!)
-    for (const t of todayTrips) {
+    // 1) Ingest validated today's trip_assignments (strictly keeping each trip's OWN driver, never carRec's later relevo driver!)
+    const driverValidatedBlockMap = new Map(); // driverKey -> Map<blockId, { count, latestAt }>
+    const getDriverKey = (leg, name) => {
+      const l = String(leg || '').trim().toUpperCase();
+      if (l) return `leg:${l}`;
+      const n = normDriverName(name);
+      return n ? `name:${n}` : '';
+    };
+    for (const t of validTodayTrips) {
       const tr = model.tripByKey?.get(t.tripKey);
       if (!tr?.blockId || !t.coche) continue;
       const bi = model.blockInfoById?.get(tr.blockId);
@@ -4330,6 +4372,18 @@ function renderLineFlotaView() {
       const carInThisBlock = Boolean(
         bi && carObsSec !== null && carObsSec >= bi.startSec - 15 * 60 && carObsSec <= bi.endSec + 20 * 60
       );
+      const dk = getDriverKey(t.choferLegajo, t.choferNombre);
+      if (dk) {
+        let byBlk = driverValidatedBlockMap.get(dk);
+        if (!byBlk) {
+          byBlk = new Map();
+          driverValidatedBlockMap.set(dk, byBlk);
+        }
+        const prevB = byBlk.get(tr.blockId) || { count: 0, latestAt: 0 };
+        prevB.count += 1;
+        prevB.latestAt = Math.max(prevB.latestAt, t.updatedAt || 0);
+        byBlk.set(tr.blockId, prevB);
+      }
       addCandidate(tr.blockId, t.coche, {
         choferNombre: t.choferNombre || (carInThisBlock ? carRec?.lastChoferNombre || '' : ''),
         choferLegajo: t.choferLegajo || (carInThisBlock ? carRec?.lastChoferLegajo || '' : ''),
@@ -4352,21 +4406,40 @@ function renderLineFlotaView() {
 
     // 2) Ingest today's drivers directly from fleet_drivers (captures finished T1 relevo drivers even if same car is now on T2!)
     for (const d of allChoferes.filter((x) => x.vistoHoy && x.lastCoche)) {
-      const dMeta =
-        (d.enLineaAhora && liveMatchByCoche.has(d.lastCoche) ? liveMatchByCoche.get(d.lastCoche) : null) ||
-        resolveUnitScheduleMeta(model, d, nowSec);
-      let bId = dMeta?.blockInfo?.blockId;
+      const dk = getDriverKey(d.choferLegajo, d.choferNombre);
+      const valByBlk = !d.enLineaAhora && dk ? driverValidatedBlockMap.get(dk) : null;
+      let bId = '';
+      let dMeta = null;
+      let fromValidatedTrips = false;
+      if (valByBlk && valByBlk.size > 0) {
+        let bestB = null;
+        for (const [blkId, info] of valByBlk.entries()) {
+          if (!bestB || info.count > bestB.count || (info.count === bestB.count && info.latestAt > bestB.latestAt)) {
+            bestB = { blkId, ...info };
+          }
+        }
+        if (bestB) {
+          bId = bestB.blkId;
+          fromValidatedTrips = true;
+        }
+      }
+      if (!bId) {
+        dMeta =
+          (d.enLineaAhora && liveMatchByCoche.has(d.lastCoche) ? liveMatchByCoche.get(d.lastCoche) : null) ||
+          resolveUnitScheduleMeta(model, d, nowSec);
+        bId = dMeta?.blockInfo?.blockId || '';
+      }
       if (!bId) continue;
       let bi = model.blockInfoById?.get(bId);
       const dObsSec = obsSecFromRecord(d.lastGps, d.lastSeenAt);
-      if (bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 35 * 60)) {
+      if (!fromValidatedTrips && bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 35 * 60)) {
         continue;
       }
       let reassignedToPrev = false;
       // Guard against a stray end-of-morning-shift ping (e.g. 14:08) falsely claiming an ongoing afternoon turno (13:58-21:55).
       // If that ping lands right after the same service's previous turno (e.g. T1 ending 13:45), re-attribute it to T1 instead!
-      if (!d.enLineaAhora && bi && dObsSec !== null && dObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
-        const hasTripsInBlock = todayTrips.some((t) => {
+      if (!fromValidatedTrips && !d.enLineaAhora && bi && dObsSec !== null && dObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
+        const hasTripsInBlock = validTodayTrips.some((t) => {
           const tr = model.tripByKey?.get(t.tripKey);
           return tr?.blockId === bId && isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre);
         });
@@ -4393,8 +4466,8 @@ function renderLineFlotaView() {
         lastGps: d.lastGps || '',
         lastStopId: d.lastStopId || '',
         bandera: d.lastBandera || '',
-        lapNumber: reassignedToPrev ? null : dMeta.lapNumber,
-        shiftLaps: bi?.shiftLaps || dMeta.shiftLaps,
+        lapNumber: reassignedToPrev ? null : dMeta?.lapNumber || null,
+        shiftLaps: bi?.shiftLaps || dMeta?.shiftLaps || null,
         desvioRaw: d.lastDesvioRaw || '',
         desvioSec: d.lastDesvioSec || 0,
         tripDelta: d.enLineaAhora ? 2 : 1,
@@ -4411,7 +4484,7 @@ function renderLineFlotaView() {
       const cObsSec = obsSecFromRecord(c.lastGps, c.lastSeenAt);
       let reassignedToPrev = false;
       if (!c.enLineaAhora && bi && cObsSec !== null && cObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
-        const hasTripsInBlock = todayTrips.some((t) => {
+        const hasTripsInBlock = validTodayTrips.some((t) => {
           const tr = model.tripByKey?.get(t.tripKey);
           return tr?.blockId === bId && t.coche === c.coche;
         });
@@ -4498,13 +4571,12 @@ function renderLineFlotaView() {
     }
 
     // 4) Same-car driver-change relevo clue: if a service's T2 is assigned to car #X with Driver B,
-    // and T1 (relevo en línea) has no assignment yet, check if another unassigned driver A was seen today on #X during T1!
+    // and T1 has no assignment yet, check if another unassigned driver A was seen today on #X during T1!
     for (const srv of fv.schedSummary?.services || []) {
       const turnos = srv.turnos || [];
       for (let ti = 1; ti < turnos.length; ti++) {
         const curT = turnos[ti];
         const prevT = turnos[ti - 1];
-        if (!curT.relevoFromPrev) continue;
         const curAssign = blockAssignMap.get(curT.blockId);
         if (!curAssign?.coche || blockAssignMap.has(prevT.blockId)) continue;
         const priorDriver = allChoferes.find((d) => {
@@ -4642,10 +4714,10 @@ function renderLineFlotaView() {
         if (packed) return packed;
       }
     }
-    // 2) Majority block across today's recorded trips for this driver (beats a single noisy terminal ping)
-    if (d.vistoHoy && model?.tripByKey && todayTrips.length > 0) {
+    // 2) Majority block across validated today's recorded trips for this driver (beats a single noisy terminal ping)
+    if (d.vistoHoy && model?.tripByKey && validTodayTrips.length > 0) {
       const blockCounts = new Map();
-      for (const t of todayTrips) {
+      for (const t of validTodayTrips) {
         if (!isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre)) continue;
         const tr = model.tripByKey.get(t.tripKey);
         if (!tr?.blockId) continue;
