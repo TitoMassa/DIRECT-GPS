@@ -2292,15 +2292,17 @@ input:focus-visible,
 
 .bus-inspector-foot {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px 8px;
 }
 
 .insp-foot-actions {
   display: flex;
   align-items: center;
   gap: 5px;
+  margin-left: auto;
 }
 
 .mini-close-btn {

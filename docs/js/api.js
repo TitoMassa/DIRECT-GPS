@@ -658,9 +658,10 @@ export const api = {
 
   flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000),
 
-  flotaActiva: async () => {
+  flotaActiva: async ({ live = true } = {}) => {
     try {
-      const res = await apiGet('/api/flota-activa', null, 7500);
+      const qs = live ? '?live=1' : '?live=0';
+      const res = await apiGet(`/api/flota-activa${qs}`, null, 10000);
       if (Array.isArray(res?.data?.units)) return res;
     } catch {
       // Seamless fallback to /api/fleet-memory (all lines) if Worker doesn't expose /api/flota-activa yet

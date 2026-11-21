@@ -381,6 +381,27 @@ export class TransitMap {
     this.allFleetMarkers.clear();
   }
 
+  moveAllFleetPositionsFast(buses = []) {
+    if (this.isInteracting) return;
+    for (let i = 0; i < buses.length; i++) {
+      const bus = buses[i];
+      if (!bus._posChanged) continue;
+      if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
+      const entry = this.allFleetMarkers.get(bus.key);
+      if (!entry) continue;
+      if (Math.abs(bus.lat - entry.lat) < 2e-6 && Math.abs(bus.lng - entry.lng) < 2e-6) {
+        bus._posChanged = false;
+        continue;
+      }
+      entry.marker._animToken = (entry.marker._animToken || 0) + 1;
+      entry.marker.setLatLng([bus.lat, bus.lng]);
+      entry.lat = bus.lat;
+      entry.lng = bus.lng;
+      entry.data = bus;
+      bus._posChanged = false;
+    }
+  }
+
   updateAllFleetBuses(buses = [], { selectedBusKey = null } = {}) {
     const activeStopUnits = new Set();
     for (const entry of this.busMarkers.values()) {

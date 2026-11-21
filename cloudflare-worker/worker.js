@@ -1877,6 +1877,25 @@ export class FleetMemory {
       });
     }
 
+    if (request.method === 'POST' && url.pathname === '/live-city-ingest') {
+      const body = await request.json().catch(() => ({}));
+      const units = Array.isArray(body.units) ? body.units : [];
+      const touchedLines = new Set();
+      let count = 0;
+      for (const u of units) {
+        const cod = Number(u.codigoLinea);
+        const coche = String(u.coche || '').trim();
+        if (!cod || !coche) continue;
+        this._upsertRosterUnit(u, nowMs);
+        touchedLines.add(cod);
+        count++;
+      }
+      if (touchedLines.size > 0) {
+        this._updateLiveCapacity(nowMs, todayKey, Array.from(touchedLines));
+      }
+      return Response.json({ ok: true, count });
+    }
+
     if (request.method === 'GET' && url.pathname === '/flota-buscar') {
       const rawQ = String(url.searchParams.get('q') || '').trim();
       const normQ = normalizeDriverNameKey(rawQ);
@@ -2620,6 +2639,101 @@ export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn
   };
 }
 
+// 16 directed multi-line hub stops (codLinea='000') covering all Corrientes + Chaco-Corrientes
+// lines in BOTH directions in ~650 ms (< 20 subrequests, safely under Cloudflare Workers Free cap).
+const LIVE_CITY_HUB_STOPS = [
+  'CT31218', 'CT31213', 'CT31604', 'CT31338',
+  'CT1398', 'CT313032', 'CT31337', 'CT31475',
+  'CT31368', 'CT31610', 'CT31831', 'L9041027',
+  'L9041046', 'CH469', 'CH1018', 'CH115'
+];
+const LIVE_CITY_SWEEP_TTL_MS = 10 * 1000;
+let liveCitySweepCache = { ts: 0, units: [] };
+let liveCitySweepInFlight = null;
+
+export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchStopFn = fetchOneStop) {
+  if (nowMs - liveCitySweepCache.ts < LIVE_CITY_SWEEP_TTL_MS && liveCitySweepCache.units.length > 0) {
+    return liveCitySweepCache.units;
+  }
+  if (liveCitySweepInFlight) return liveCitySweepInFlight;
+
+  liveCitySweepInFlight = (async () => {
+    const byUnit = new Map();
+    const waveSize = 8;
+    for (let i = 0; i < LIVE_CITY_HUB_STOPS.length; i += waveSize) {
+      const wave = LIVE_CITY_HUB_STOPS.slice(i, i + waveSize);
+      const waveRes = await Promise.all(
+        wave.map((stopId) =>
+          fetchStopFn(stopId, '000')
+            .then((r) => ({ ok: true, stopId, arribos: r?.arribos || [] }))
+            .catch(() => ({ ok: false, stopId, arribos: [] }))
+        )
+      );
+      for (const r of waveRes) {
+        for (const a of r.arribos) {
+          const cod = Number(a.codigoLinea);
+          const coche = String(a.identificadorCoche || '').trim();
+          const lat = parseFloat(a.latitud);
+          const lng = parseFloat(a.longitud);
+          if (!cod || !coche || Number.isNaN(lat) || Number.isNaN(lng) || (lat === 0 && lng === 0)) continue;
+          const key = `${cod}:${coche}`;
+          const gpsMs = parseGpsStampMs(a.ultimaFechaHoraGPS);
+          const prev = byUnit.get(key);
+          const hasChofer = Boolean(String(a.choferNombre || a.choferLegajo || a.identificadorChofer || '').trim());
+          const prevHasChofer = Boolean(prev && (prev.choferNombre || prev.choferLegajo || prev.choferRaw));
+          if (!prev || gpsMs > prev._gpsMs || (gpsMs === prev._gpsMs && hasChofer && !prevHasChofer)) {
+            byUnit.set(key, {
+              codigoLinea: cod,
+              descripcionLinea: String(a.descripcionLinea || LINE_NAMES_BY_CODE[cod] || `L${cod}`).trim(),
+              coche,
+              choferNombre: a.choferNombre || prev?.choferNombre || '',
+              choferLegajo: a.choferLegajo || prev?.choferLegajo || '',
+              choferRaw: a.identificadorChofer || prev?.choferRaw || '',
+              esAdaptado: Boolean(a.esAdaptado || prev?.esAdaptado),
+              desvioSec: parseDesvioSeconds(a.desvioHorario),
+              desvioRaw: a.desvioHorario || prev?.desvioRaw || '',
+              bandera: a.descripcionBandera || prev?.bandera || '',
+              ultimaGps: a.ultimaFechaHoraGPS || prev?.ultimaGps || '',
+              lat,
+              lng,
+              stopId: r.stopId,
+              lastStopId: r.stopId,
+              lastSeenAt: gpsMs || Date.now(),
+              enLineaAhora: true,
+              _gpsMs: gpsMs || 0
+            });
+          }
+        }
+      }
+    }
+
+    const doneMs = Date.now();
+    const units = Array.from(byUnit.values()).map(({ _gpsMs, ...clean }) => clean);
+    if (units.length > 0) {
+      liveCitySweepCache = { ts: doneMs, units };
+      for (const u of units) upsertFallbackRosterUnit(u, doneMs);
+      const stub = getFleetStub(env);
+      if (stub) {
+        const ingestPromise = stub
+          .fetch('https://fleet-memory/live-city-ingest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ units })
+          })
+          .catch(() => {});
+        if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(ingestPromise);
+      }
+    }
+    return units;
+  })();
+
+  try {
+    return await liveCitySweepInFlight;
+  } finally {
+    liveCitySweepInFlight = null;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
@@ -2794,47 +2908,90 @@ export default {
       }
 
       if (pathname === '/api/flota-activa' && request.method === 'GET') {
-        const stub = getFleetStub(env);
-        if (stub) {
-          try {
-            const doRes = await stub.fetch('https://fleet-memory/flota-activa');
-            const data = await doRes.json();
-            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
-          } catch {
-            // Fall through to in-memory fallback
-          }
-        }
         const nowMs = Date.now();
         const todayKey = getArgentinaDayKey(nowMs);
-        const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
-        const units = [];
-        for (const u of fallbackUnits.values()) {
-          if ((u.updatedAt || 0) < activeCutoff) continue;
-          const lat = Number(u.lat);
-          const lng = Number(u.lng);
-          if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
-          units.push({
-            codigoLinea: Number(u.codigoLinea),
-            descripcionLinea: u.descripcionLinea || LINE_NAMES_BY_CODE[u.codigoLinea] || `L${u.codigoLinea}`,
-            coche: u.coche,
-            choferNombre: u.choferNombre || '',
-            choferLegajo: u.choferLegajo || '',
-            esAdaptado: Boolean(u.esAdaptado),
-            bandera: u.bandera || '',
-            lat,
-            lng,
-            desvioSec: Number(u.desvioSec) || 0,
-            desvioRaw: u.desvioRaw || '',
-            ultimaGps: u.ultimaGps || '',
-            lastStopId: u.stopId || '',
-            lastSeenAt: u.updatedAt || nowMs,
-            enLineaAhora: true
-          });
+        const wantLive = searchParams.get('live') !== '0';
+        const stub = getFleetStub(env);
+
+        const [liveUnits, doData] = await Promise.all([
+          wantLive ? runLiveCityHubSweep(env, ctx, nowMs).catch(() => []) : Promise.resolve([]),
+          stub
+            ? stub
+                .fetch('https://fleet-memory/flota-activa')
+                .then((r) => (r.ok ? r.json() : null))
+                .catch(() => null)
+            : Promise.resolve(null)
+        ]);
+
+        const mergedByKey = new Map();
+        const baseUnits = Array.isArray(doData?.units) ? doData.units : [];
+        for (const u of baseUnits) {
+          if (!u?.codigoLinea || !u?.coche) continue;
+          mergedByKey.set(`${u.codigoLinea}:${u.coche}`, u);
         }
+
+        // In-memory fallback if DO was unavailable
+        if (baseUnits.length === 0 && !doData) {
+          const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+          for (const u of fallbackUnits.values()) {
+            if ((u.updatedAt || 0) < activeCutoff) continue;
+            const lat = Number(u.lat);
+            const lng = Number(u.lng);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+            mergedByKey.set(`${u.codigoLinea}:${u.coche}`, {
+              codigoLinea: Number(u.codigoLinea),
+              descripcionLinea: u.descripcionLinea || LINE_NAMES_BY_CODE[u.codigoLinea] || `L${u.codigoLinea}`,
+              coche: u.coche,
+              choferNombre: u.choferNombre || '',
+              choferLegajo: u.choferLegajo || '',
+              esAdaptado: Boolean(u.esAdaptado),
+              bandera: u.bandera || '',
+              lat,
+              lng,
+              desvioSec: Number(u.desvioSec) || 0,
+              desvioRaw: u.desvioRaw || '',
+              ultimaGps: u.ultimaGps || '',
+              lastStopId: u.stopId || '',
+              lastSeenAt: u.updatedAt || nowMs,
+              enLineaAhora: true
+            });
+          }
+        }
+
+        // Overlay brand-new live hub SOAP positions (keeping fresher GPS timestamp per unit!)
+        for (const lu of liveUnits) {
+          const k = `${lu.codigoLinea}:${lu.coche}`;
+          const prev = mergedByKey.get(k);
+          const luGpsMs = parseGpsStampMs(lu.ultimaGps) || lu.lastSeenAt || 0;
+          const prevGpsMs = prev ? parseGpsStampMs(prev.ultimaGps) || prev.lastSeenAt || 0 : 0;
+          if (!prev || luGpsMs >= prevGpsMs) {
+            mergedByKey.set(k, {
+              ...(prev || {}),
+              ...lu,
+              choferNombre: lu.choferNombre || prev?.choferNombre || '',
+              choferLegajo: lu.choferLegajo || prev?.choferLegajo || '',
+              esAdaptado: Boolean(lu.esAdaptado || prev?.esAdaptado),
+              bandera: lu.bandera || prev?.bandera || '',
+              desvioRaw: lu.desvioRaw || prev?.desvioRaw || '',
+              desvioSec: lu.desvioRaw ? lu.desvioSec : prev?.desvioSec || 0,
+              liveFresh: true
+            });
+          }
+        }
+
+        const units = Array.from(mergedByKey.values()).sort(
+          (a, b) => a.codigoLinea - b.codigoLinea || (b.lastSeenAt || 0) - (a.lastSeenAt || 0)
+        );
         return jsonResponse({
-          data: { dayKey: todayKey, activeWindowMin: Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000), units },
-          source: 'fleet-memory-mem',
-          savedAt: nowMs
+          data: {
+            dayKey: doData?.dayKey || todayKey,
+            activeWindowMin: doData?.activeWindowMin || Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000),
+            meta: doData?.meta || null,
+            liveFreshCount: liveUnits.length,
+            units
+          },
+          source: liveUnits.length > 0 ? (doData ? 'live-hubs+do' : 'live-hubs') : doData ? 'fleet-memory-do' : 'fleet-memory-mem',
+          savedAt: Date.now()
         });
       }
 

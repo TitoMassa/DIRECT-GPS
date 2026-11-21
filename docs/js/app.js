@@ -21,7 +21,8 @@ import {
   resolveTrailDirection,
   buildTrajectoryFromBranchAlong,
   pickStopBranches,
-  projectOnPolyline
+  projectOnPolyline,
+  sampleBranchAtAlong
 } from './trajectory.js';
 import {
   buildLineScheduleModel,
@@ -1181,25 +1182,35 @@ function startSimLoop() {
   simLastDomMs = simLastFrameMs;
 
   const frame = (now) => {
-    if (!state.simulateMode || !state.activeStop) {
+    const hasStopWork = Boolean(state.activeStop && state.arribos.length > 0);
+    const hasCityWork = Boolean(state.allFleetMode && state.allFleetBuses.length > 0);
+    if (!state.simulateMode || (!state.activeStop && !state.allFleetMode)) {
       simRafId = null;
       return;
     }
     const elapsedMs = now - simLastFrameMs;
     // Target ~20fps (50ms interval) for silky motion with minimal mobile CPU/battery
-    if (elapsedMs >= 50 && state.arribos.length > 0) {
+    if (elapsedMs >= 50 && (hasStopWork || hasCityWork)) {
       const dtSec = Math.min(0.15, elapsedMs / 1000);
       simLastFrameMs = now;
 
       const shouldSyncDom = now - simLastDomMs >= 1000;
-      busSimulator.step(dtSec, state.arribos, { updateEta: shouldSyncDom });
-      if (!transitMap.isInteracting) {
-        transitMap.moveBusPositionsFast(state.arribos);
+      if (hasStopWork) {
+        busSimulator.step(dtSec, state.arribos, { updateEta: shouldSyncDom });
+        if (!transitMap.isInteracting) {
+          transitMap.moveBusPositionsFast(state.arribos);
+        }
+      }
+      if (hasCityWork) {
+        stepCityFleetSim(dtSec);
+        if (!transitMap.isInteracting) {
+          transitMap.moveAllFleetPositionsFast(state.allFleetBuses);
+        }
       }
 
       if (shouldSyncDom) {
         simLastDomMs = now;
-        syncSimCardsDom();
+        if (hasStopWork) syncSimCardsDom();
       }
     }
     simRafId = requestAnimationFrame(frame);
@@ -2001,6 +2012,8 @@ function buildCityFleetBusObject(u) {
     routeMeters: 0,
     lat: Number(u.lat),
     lng: Number(u.lng),
+    rawLat: Number(u.lat),
+    rawLng: Number(u.lng),
     ultimaFechaHoraGPS: gpsRaw,
     gpsTimeOnly: formatGpsTimeOnly(gpsRaw),
     lastStopId: u.lastStopId || '',
@@ -2021,6 +2034,168 @@ function buildCityFleetBusObject(u) {
   };
 }
 
+// Lightweight 20fps street-following kinematics for citywide Modo Libre (allFleetBuses)
+const cityFleetSim = new Map(); // bus.key -> { branch, along, gpsAlong, maxAlong, speedMps, lastGpsMs, isStopped }
+
+function pickCityBusBranch(bus, branches, confirmedDir) {
+  if (!Array.isArray(branches) || branches.length === 0) return null;
+  const lat = bus.rawLat ?? bus.lat;
+  const lng = bus.rawLng ?? bus.lng;
+  if (typeof lat !== 'number' || typeof lng !== 'number') return null;
+
+  // 1) Confirmed multi-point GPS trail direction wins when bus is near that branch
+  if (confirmedDir && typeof confirmedDir.branchIndex === 'number' && branches[confirmedDir.branchIndex]) {
+    const cb = branches[confirmedDir.branchIndex];
+    const cp = projectOnPolyline(cb.pts, cb.cum, lat, lng);
+    if (cp && cp.perp <= 260) return { branch: cb, proj: cp };
+  }
+
+  // 2) Matched schedule trip branch
+  if (bus._matchedBranch && branches.includes(bus._matchedBranch)) {
+    const mp = projectOnPolyline(bus._matchedBranch.pts, bus._matchedBranch.cum, lat, lng);
+    if (mp && mp.perp <= 260) return { branch: bus._matchedBranch, proj: mp };
+  }
+
+  // 3) Closest branch with bandera tie-breaker
+  const normB = String(bus.realBandera || bus.descripcionBandera || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+  let best = null;
+  let bestScore = Infinity;
+  for (const b of branches) {
+    const proj = projectOnPolyline(b.pts, b.cum, lat, lng);
+    if (!proj || proj.perp > 320) continue;
+    const bn = String(b.bandera || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, ' ')
+      .trim();
+    const matchBand = normB && bn && (bn.includes(normB) || normB.includes(bn));
+    const score = proj.perp + (normB && !matchBand ? 140 : 0);
+    if (score < bestScore) {
+      bestScore = score;
+      best = { branch: b, proj };
+    }
+  }
+  return best;
+}
+
+function reconcileCityFleetSim(buses = []) {
+  const nowMs = Date.now();
+  const seenKeys = new Set();
+
+  for (const bus of buses) {
+    const rawLat = typeof bus.rawLat === 'number' ? bus.rawLat : bus.lat;
+    const rawLng = typeof bus.rawLng === 'number' ? bus.rawLng : bus.lng;
+    if (typeof rawLat !== 'number' || typeof rawLng !== 'number') continue;
+    seenKeys.add(bus.key);
+
+    const baseId = `${bus.codigoLinea}-c${bus.identificadorCoche}`;
+    const rec = recordUnitGpsFix(baseId, bus.codigoLinea, bus.identificadorCoche, rawLat, rawLng, bus.ultimaFechaHoraGPS, nowMs);
+    const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
+    const gpsAgeSec = gpsMs ? Math.max(0, (nowMs - gpsMs) / 1000) : 999;
+
+    const branches = state.routeBranchesCache.get(bus.codigoLinea) || [];
+    const picked = pickCityBusBranch(bus, branches, rec?.confirmedDir);
+    if (!picked) {
+      cityFleetSim.delete(bus.key);
+      continue;
+    }
+
+    const { branch, proj } = picked;
+    const gpsAlong = proj.along;
+    const nearTerminal = gpsAlong <= 140 || (branch.totalLen || 0) - gpsAlong <= 140;
+
+    // Learn real speed from penultimate -> latest GPS fix
+    let speedMps = 5.4;
+    let isStopped = gpsAgeSec > 180 || nearTerminal;
+    const prevFix = rec?.prevGpsFix;
+    if (!isStopped && prevFix && gpsMs && prevFix.gpsMs) {
+      const dtPrev = (gpsMs - prevFix.gpsMs) / 1000;
+      if (dtPrev >= 4 && dtPrev <= 180) {
+        const moved = distanceMeters(prevFix.lat, prevFix.lng, rawLat, rawLng) ?? 0;
+        if (moved < 16 && dtPrev >= 10) {
+          isStopped = true;
+          speedMps = 0;
+        } else if (moved >= 16 && moved < Math.max(2000, dtPrev * 30)) {
+          speedMps = Math.max(2.2, Math.min(18.5, (moved * 1.03) / dtPrev));
+        }
+      }
+    }
+
+    // Advance initial along slightly to account for small GPS reporting lag (capped at 22s)
+    const initialLead = !isStopped && gpsAgeSec <= 45 ? Math.min(22, gpsAgeSec) * speedMps * 0.75 : 0;
+    const targetAlong = Math.min(Math.max(0, branch.totalLen - 15), gpsAlong + initialLead);
+    const maxAlong = isStopped
+      ? gpsAlong
+      : Math.min(Math.max(0, branch.totalLen - 15), gpsAlong + Math.max(180, speedMps * 42));
+
+    const prevSim = cityFleetSim.get(bus.key);
+    let curAlong = targetAlong;
+    if (prevSim && prevSim.branch === branch) {
+      const diff = targetAlong - prevSim.along;
+      if (diff >= -220 && diff <= 420) {
+        // Zero-backjump continuity: keep simulated position if slightly ahead, gently pull forward if behind
+        curAlong = diff < 0 ? prevSim.along : prevSim.along + diff * 0.45;
+      }
+    }
+    curAlong = Math.max(0, Math.min(branch.totalLen, curAlong));
+
+    cityFleetSim.set(bus.key, {
+      branch,
+      along: curAlong,
+      gpsAlong,
+      targetAlong,
+      maxAlong,
+      speedMps: isStopped ? 0 : speedMps,
+      lastGpsMs: gpsMs,
+      isStopped
+    });
+
+    if (state.simulateMode) {
+      const pt = sampleBranchAtAlong(branch, curAlong);
+      if (pt) {
+        bus.lat = pt.lat;
+        bus.lng = pt.lng;
+      }
+    } else {
+      bus.lat = rawLat;
+      bus.lng = rawLng;
+    }
+  }
+
+  for (const k of cityFleetSim.keys()) {
+    if (!seenKeys.has(k)) cityFleetSim.delete(k);
+  }
+}
+
+function stepCityFleetSim(dtSec) {
+  if (!state.simulateMode || !state.allFleetMode) return;
+  for (let i = 0; i < state.allFleetBuses.length; i++) {
+    const bus = state.allFleetBuses[i];
+    const sim = cityFleetSim.get(bus.key);
+    if (!sim || sim.isStopped || sim.speedMps <= 0.1 || !sim.branch) continue;
+
+    // Gentle speed bleed if slightly ahead of targetAlong, smooth catch-up if behind
+    let effSpeed = sim.speedMps;
+    if (sim.along > sim.targetAlong + 45) {
+      effSpeed *= 0.45;
+    } else if (sim.along < sim.targetAlong - 20) {
+      effSpeed *= 1.35;
+    }
+
+    const nextAlong = Math.min(sim.maxAlong, sim.along + effSpeed * dtSec);
+    if (nextAlong - sim.along < 0.08) continue;
+    sim.along = nextAlong;
+    const pt = sampleBranchAtAlong(sim.branch, sim.along);
+    if (pt) {
+      bus.lat = pt.lat;
+      bus.lng = pt.lng;
+      bus._posChanged = true;
+    }
+  }
+}
+
 let allFleetFetchSeq = 0;
 async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
   if (!state.allFleetMode) return;
@@ -2028,7 +2203,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
   state.allFleetLoading = true;
   updateAllFleetButtonUi();
   try {
-    const res = await api.flotaActiva();
+    const res = await api.flotaActiva({ live: true });
     if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
     const rawUnits = Array.isArray(res?.data?.units) ? res.data.units : [];
     const byKey = new Map();
@@ -2047,22 +2222,25 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
       const ln = typeof b.lng === 'number' ? b.lng : parseFloat(b.longitud);
       if (!cod || !coche || Number.isNaN(la) || Number.isNaN(ln) || (la === 0 && ln === 0)) continue;
       const key = `city:${cod}:${coche}`;
-      if (!byKey.has(key)) {
+      const existing = byKey.get(key);
+      const bMs = parseGpsTimestampMs(b.ultimaFechaHoraGPS) || 0;
+      const exMs = existing ? parseGpsTimestampMs(existing.ultimaFechaHoraGPS) || 0 : 0;
+      if (!existing || bMs > exMs) {
         byKey.set(
           key,
           buildCityFleetBusObject({
             codigoLinea: cod,
             descripcionLinea: b.descripcionLinea,
             coche,
-            choferNombre: b.choferNombre,
-            choferLegajo: b.choferLegajo,
-            esAdaptado: b.esAdaptado,
-            bandera: b.realBandera || b.descripcionBandera,
+            choferNombre: b.choferNombre || existing?.choferNombre,
+            choferLegajo: b.choferLegajo || existing?.choferLegajo,
+            esAdaptado: b.esAdaptado || existing?.esAdaptado,
+            bandera: b.realBandera || b.descripcionBandera || existing?.descripcionBandera,
             lat: la,
             lng: ln,
-            desvioRaw: b.desvio?.raw || b.desvioHorario || '',
-            desvioSec: b.desvio?.seconds || 0,
-            ultimaGps: b.ultimaFechaHoraGPS || ''
+            desvioRaw: b.desvio?.raw || b.desvioHorario || existing?.desvio?.raw || '',
+            desvioSec: b.desvio?.seconds || existing?.desvio?.seconds || 0,
+            ultimaGps: b.ultimaFechaHoraGPS || existing?.ultimaFechaHoraGPS || ''
           })
         );
       }
@@ -2071,21 +2249,31 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     // Enrich with cached immutable schedule models immediately when already loaded
     const nowSec = getArgentinaSecOfDay();
     const todayTipo = getArgentinaTodayTipo();
+    const missingRouteLines = [];
     for (const bus of byKey.values()) {
       const branches = state.routeBranchesCache.get(bus.codigoLinea);
+      if (!branches?.length && !missingRouteLines.includes(bus.codigoLinea)) {
+        missingRouteLines.push(bus.codigoLinea);
+      }
       const horFile = state.horariosArchiveCache.get(bus.codigoLinea);
       if (branches?.length && horFile) {
         const model = buildLineScheduleModel(bus.codigoLinea, branches, horFile, todayTipo);
-        const meta = resolveUnitScheduleMeta(model, {
-          lat: bus.lat,
-          lng: bus.lng,
-          bandera: bus.descripcionBandera,
-          lastGps: bus.ultimaFechaHoraGPS,
-          desvioSec: bus.desvio?.seconds || 0,
-          desvioRaw: bus.desvio?.raw || '',
-          lastSeenAt: bus.lastSeenAt
-        }, nowSec);
+        const meta = resolveUnitScheduleMeta(
+          model,
+          {
+            lat: bus.rawLat,
+            lng: bus.rawLng,
+            bandera: bus.descripcionBandera,
+            lastGps: bus.ultimaFechaHoraGPS,
+            desvioSec: bus.desvio?.seconds || 0,
+            desvioRaw: bus.desvio?.raw || '',
+            lastSeenAt: bus.lastSeenAt,
+            enLineaAhora: true
+          },
+          nowSec
+        );
         if (meta) {
+          bus._matchedBranch = meta.trip?.branch || null;
           bus.serviceNumber = meta.serviceNumber;
           bus.turnoIndex = meta.turnoIndex;
           bus.serviceTurnosCount = meta.serviceTurnosCount;
@@ -2101,7 +2289,24 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     }
 
     state.allFleetBuses = Array.from(byKey.values());
+    reconcileCityFleetSim(state.allFleetBuses);
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+    if (state.simulateMode && state.allFleetBuses.length > 0) {
+      startSimLoop();
+    }
+
+    // Load street polylines for active lines in the background (cached forever) so EN VIVO moves every bus along its streets
+    if (missingRouteLines.length > 0) {
+      ensureBranchesLoaded(missingRouteLines)
+        .then(() => {
+          if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
+          reconcileCityFleetSim(state.allFleetBuses);
+          if (state.simulateMode && state.allFleetBuses.length > 0) {
+            startSimLoop();
+          }
+        })
+        .catch(() => {});
+    }
 
     // If user currently has a city-fleet bus open in inspector, refresh its fields seamlessly
     if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
@@ -2160,17 +2365,19 @@ async function openAllFleetBusInspector(busKey) {
     const meta = resolveUnitScheduleMeta(
       model,
       {
-        lat: bus.lat,
-        lng: bus.lng,
+        lat: bus.rawLat ?? bus.lat,
+        lng: bus.rawLng ?? bus.lng,
         bandera: bus.descripcionBandera,
         lastGps: bus.ultimaFechaHoraGPS,
         desvioSec: bus.desvio?.seconds || 0,
         desvioRaw: bus.desvio?.raw || '',
-        lastSeenAt: bus.lastSeenAt
+        lastSeenAt: bus.lastSeenAt,
+        enLineaAhora: true
       },
       getArgentinaSecOfDay()
     );
     if (meta) {
+      bus._matchedBranch = meta.trip?.branch || null;
       bus.serviceNumber = meta.serviceNumber;
       bus.turnoIndex = meta.turnoIndex;
       bus.serviceTurnosCount = meta.serviceTurnosCount;
@@ -2199,6 +2406,8 @@ function toggleAllFleetMode(forceState = null) {
   if (!next) {
     state.allFleetBuses = [];
     state.allFleetLoading = false;
+    cityFleetSim.clear();
+    if (!state.activeStop) stopSimLoop();
     transitMap.clearAllFleetBuses();
     if (state.selectedBusKey?.startsWith('city:')) {
       closeBusInspector();
@@ -2218,7 +2427,7 @@ function toggleAllFleetMode(forceState = null) {
     if (!state.isAppPaused && state.allFleetMode) {
       refreshAllFleetBuses({ fit: false, silent: true });
     }
-  }, 15000);
+  }, 12000);
 }
 
 /**
@@ -6483,9 +6692,14 @@ function bindEvents() {
         await fetchArribos(false);
         if (state.arribos.length > 0) startSimLoop();
       }
+      if (state.allFleetMode && state.allFleetBuses.length > 0) {
+        reconcileCityFleetSim(state.allFleetBuses);
+        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+        startSimLoop();
+      }
     } else {
       stopSimLoop();
-      showToast('ULT. GPS: última actualización satelital estática', 'info');
+      showToast('ULT. GPS: última actualización satelital real', 'info');
       if (state.activeStop) {
         if (state.isOffline) {
           // Drop schedule-only synthetic buses when viewing static ULT. GPS offline
@@ -6494,6 +6708,15 @@ function bindEvents() {
         } else {
           await fetchArribos(false);
         }
+      }
+      if (state.allFleetMode && state.allFleetBuses.length > 0) {
+        for (const b of state.allFleetBuses) {
+          if (typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
+            b.lat = b.rawLat;
+            b.lng = b.rawLng;
+          }
+        }
+        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
       }
     }
   });
