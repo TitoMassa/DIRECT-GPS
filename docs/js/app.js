@@ -3937,48 +3937,89 @@ function renderLineFlotaView() {
     : scopeChoferes;
 
   // Build map of blockId -> best today car/driver observation for the Servicios tab
-  const blockAssignMap = new Map(); // blockId -> { coche, choferNombre, choferLegajo, esAdaptado, enLineaAhora, lat, lng, lastGps, lastStopId, bandera, lapNumber, shiftLaps, desvioRaw, desvioSec, updatedAt }
-  const setBlockAssign = (blockId, entry) => {
-    if (!blockId) return;
-    const prev = blockAssignMap.get(blockId);
-    if (!prev || (entry.enLineaAhora && !prev.enLineaAhora) || (entry.updatedAt || 0) > (prev.updatedAt || 0)) {
-      blockAssignMap.set(blockId, entry);
-    }
-  };
+  // Enforces two physical invariants:
+  //  1) A turno is marked "En línea" ONLY if that car is currently matched to THAT turno (never on finished morning turnos!).
+  //  2) The same physical car cannot be assigned to two time-overlapping turnos on the same day (stale misassignments are pruned!).
+  const blockAssignMap = new Map();
   if (model) {
+    const nowSvcSec = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
+    const candidatesByBlock = new Map(); // blockId -> Map<coche, candidate>
+
+    const addCandidate = (blockId, coche, entry) => {
+      if (!blockId || !coche) return;
+      const bi = model.blockInfoById?.get(blockId);
+      if (!bi) return;
+      let byCar = candidatesByBlock.get(blockId);
+      if (!byCar) {
+        byCar = new Map();
+        candidatesByBlock.set(blockId, byCar);
+      }
+      const prev = byCar.get(coche);
+      const mergedCount = (prev?.tripCount || 0) + (entry.tripDelta || 0);
+      const liveMeta = liveMatchByCoche.get(coche) || null;
+      const liveBlockId = liveMeta?.blockInfo?.blockId || '';
+      const inTurnoWindow = nowSvcSec >= bi.startSec - 15 * 60 && nowSvcSec <= bi.endSec + 25 * 60;
+      const isLiveOnBlock = Boolean(
+        entry.carEnLinea && (liveBlockId ? liveBlockId === blockId : inTurnoWindow)
+      );
+      const next = {
+        blockId,
+        startSec: bi.startSec,
+        endSec: bi.endSec,
+        coche,
+        choferNombre: entry.choferNombre || prev?.choferNombre || '',
+        choferLegajo: entry.choferLegajo || prev?.choferLegajo || '',
+        esAdaptado: Boolean(entry.esAdaptado || prev?.esAdaptado),
+        enLineaAhora: isLiveOnBlock,
+        lat: entry.lat ?? prev?.lat ?? null,
+        lng: entry.lng ?? prev?.lng ?? null,
+        lastGps: entry.lastGps || prev?.lastGps || '',
+        lastStopId: entry.lastStopId || prev?.lastStopId || '',
+        bandera: entry.bandera || prev?.bandera || '',
+        lapNumber: isLiveOnBlock
+          ? liveMeta?.lapNumber || entry.lapNumber || prev?.lapNumber || null
+          : entry.lapNumber || prev?.lapNumber || null,
+        shiftLaps: bi.shiftLaps || entry.shiftLaps || prev?.shiftLaps || null,
+        desvioRaw: entry.desvioRaw || prev?.desvioRaw || '',
+        desvioSec: entry.desvioRaw ? entry.desvioSec : prev?.desvioSec ?? entry.desvioSec ?? 0,
+        tripCount: mergedCount,
+        updatedAt: Math.max(prev?.updatedAt || 0, entry.updatedAt || 0)
+      };
+      byCar.set(coche, next);
+    };
+
     for (const t of todayTrips) {
       const tr = model.tripByKey?.get(t.tripKey);
-      if (!tr?.blockId) continue;
+      if (!tr?.blockId || !t.coche) continue;
       const carRec = carByNum.get(t.coche);
-      const isLiveNow = Boolean(carRec?.enLineaAhora);
-      setBlockAssign(tr.blockId, {
-        coche: t.coche,
+      addCandidate(tr.blockId, t.coche, {
         choferNombre: t.choferNombre || carRec?.lastChoferNombre || '',
         choferLegajo: t.choferLegajo || carRec?.lastChoferLegajo || '',
         esAdaptado: Boolean(t.esAdaptado || carRec?.esAdaptado),
-        enLineaAhora: isLiveNow,
+        carEnLinea: Boolean(carRec?.enLineaAhora),
         lat: carRec?.lastLat ?? t.lat ?? null,
         lng: carRec?.lastLng ?? t.lng ?? null,
         lastGps: carRec?.lastGps || t.ultimaGps || '',
         lastStopId: carRec?.lastStopId || t.stopId || '',
         bandera: carRec?.lastBandera || tr.branch?.bandera || '',
-        lapNumber: isLiveNow ? liveMatchByCoche.get(t.coche)?.lapNumber || tr.lapNumber : tr.lapNumber,
+        lapNumber: tr.lapNumber,
         shiftLaps: tr.shiftLaps,
         desvioRaw: carRec?.lastDesvioRaw || t.desvioRaw || '',
         desvioSec: carRec?.lastDesvioSec ?? t.desvioSec ?? 0,
-        updatedAt: Math.max(t.updatedAt || 0, carRec?.lastSeenAt || 0)
+        tripDelta: 1,
+        updatedAt: t.updatedAt || 0
       });
     }
+
     for (const c of allCoches.filter((x) => x.vistoHoy)) {
       const m = resolveCarMeta(c);
       const bId = m?.blockInfo?.blockId;
       if (!bId) continue;
-      setBlockAssign(bId, {
-        coche: c.coche,
+      addCandidate(bId, c.coche, {
         choferNombre: c.lastChoferNombre || '',
         choferLegajo: c.lastChoferLegajo || '',
         esAdaptado: Boolean(c.esAdaptado),
-        enLineaAhora: Boolean(c.enLineaAhora),
+        carEnLinea: Boolean(c.enLineaAhora),
         lat: c.lastLat,
         lng: c.lastLng,
         lastGps: c.lastGps,
@@ -3988,8 +4029,34 @@ function renderLineFlotaView() {
         shiftLaps: m.shiftLaps,
         desvioRaw: c.lastDesvioRaw || '',
         desvioSec: c.lastDesvioSec || 0,
+        tripDelta: c.enLineaAhora ? 3 : 1,
         updatedAt: c.lastSeenAt || 0
       });
+    }
+
+    // Flatten and resolve globally: highest-confidence (live on block -> most trips -> freshest) claims its block;
+    // reject any overlapping turno claim by the same physical car (while keeping non-overlapping T1/T2 relevos!).
+    const allCands = [];
+    for (const byCar of candidatesByBlock.values()) {
+      for (const cand of byCar.values()) allCands.push(cand);
+    }
+    allCands.sort((a, b) => {
+      if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+      if (b.tripCount !== a.tripCount) return b.tripCount - a.tripCount;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+
+    const claimedWindowsByCoche = new Map(); // coche -> Array<{ startSec, endSec }>
+    for (const cand of allCands) {
+      if (blockAssignMap.has(cand.blockId)) continue;
+      const used = claimedWindowsByCoche.get(cand.coche) || [];
+      const overlaps = used.some(
+        (w) => cand.startSec < w.endSec - 600 && w.startSec < cand.endSec - 600
+      );
+      if (overlaps) continue;
+      blockAssignMap.set(cand.blockId, cand);
+      used.push({ startSec: cand.startSec, endSec: cand.endSec });
+      claimedWindowsByCoche.set(cand.coche, used);
     }
   }
 
