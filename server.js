@@ -669,6 +669,42 @@ async function handleApi(req, res, urlObj) {
       });
     }
 
+    if (pathname === '/api/flota-activa' && req.method === 'GET') {
+      const nowMs = Date.now();
+      const todayKey = getArgentinaDayKey(nowMs);
+      const activeCutoff = nowMs - 38 * 60 * 1000;
+      const units = [];
+      for (const u of Object.values(fleetStore.units || {})) {
+        if ((u.updatedAt || 0) < activeCutoff) continue;
+        const lat = Number(u.lat);
+        const lng = Number(u.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+        units.push({
+          codigoLinea: Number(u.codigoLinea),
+          descripcionLinea: u.descripcionLinea || LINE_NAMES_BY_CODE[u.codigoLinea] || `L${u.codigoLinea}`,
+          coche: u.coche,
+          choferNombre: u.choferNombre || '',
+          choferLegajo: u.choferLegajo || '',
+          esAdaptado: Boolean(u.esAdaptado),
+          bandera: u.bandera || '',
+          lat,
+          lng,
+          desvioSec: Number(u.desvioSec) || 0,
+          desvioRaw: u.desvioRaw || '',
+          ultimaGps: u.ultimaGps || '',
+          lastStopId: u.stopId || '',
+          lastTripKey: u.tripKey || '',
+          lastSeenAt: u.updatedAt || nowMs,
+          enLineaAhora: true
+        });
+      }
+      return sendJson(res, 200, {
+        data: { dayKey: todayKey, activeWindowMin: 38, units },
+        source: 'fleet-memory-disk',
+        savedAt: nowMs
+      });
+    }
+
     if (pathname === '/api/fleet-memory' && req.method === 'GET') {
       const rawLineas = searchParams.get('lineas') || searchParams.get('codLinea') || '';
       const filterSet = new Set(

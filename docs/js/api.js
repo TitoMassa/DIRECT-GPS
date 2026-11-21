@@ -117,13 +117,13 @@ function openMirrorDb() {
   });
 }
 
-async function saveFleetMirror(snapshot) {
+async function saveIdbValue(key, value) {
   const db = await openMirrorDb();
   if (!db) return;
   return new Promise((resolve) => {
     try {
       const tx = db.transaction(IDB_STORE, 'readwrite');
-      tx.objectStore(IDB_STORE).put(snapshot, 'fleet_memory');
+      tx.objectStore(IDB_STORE).put(value, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     } catch {
@@ -132,13 +132,13 @@ async function saveFleetMirror(snapshot) {
   });
 }
 
-async function readFleetMirror() {
+async function readIdbValue(key) {
   const db = await openMirrorDb();
   if (!db) return null;
   return new Promise((resolve) => {
     try {
       const tx = db.transaction(IDB_STORE, 'readonly');
-      const req = tx.objectStore(IDB_STORE).get('fleet_memory');
+      const req = tx.objectStore(IDB_STORE).get(key);
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => resolve(null);
     } catch {
@@ -147,10 +147,66 @@ async function readFleetMirror() {
   });
 }
 
-// ── Permanent static archives (docs/data/catalogo.json, recorridos/, horarios/) ──
+async function saveFleetMirror(snapshot) {
+  return saveIdbValue('fleet_memory', snapshot);
+}
+
+async function readFleetMirror() {
+  return readIdbValue('fleet_memory');
+}
+
+// ── Permanent static archives (docs/data/catalogo.json, recorridos/, horarios/) + OTA sync ──
+const REMOTE_DATA_BASE = 'https://titomassa.github.io/DIRECT-GPS/data';
 let catalogoPromise = null;
 const archiveHorariosByLine = new Map(); // codLinea -> Promise<file|null>
 const archiveRecorridosByLine = new Map(); // codLinea -> Promise<branches|null>
+let localHorariosUpdatedAt = '';
+let remoteHorariosUpdatedAt = '';
+let otaIndexChecked = false;
+let otaSyncPromise = null;
+
+async function ensureOtaHorariosIndex() {
+  if (otaIndexChecked) return remoteHorariosUpdatedAt;
+  if (!otaSyncPromise) {
+    otaSyncPromise = (async () => {
+      try {
+        const localUrl = new URL('../data/horarios/index.json', import.meta.url);
+        const localIdx = await fetch(localUrl, { cache: 'no-cache' })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null);
+        localHorariosUpdatedAt = String(localIdx?.updatedAt || '');
+
+        const savedMeta = await readIdbValue('ota_horarios_meta');
+        if (savedMeta?.updatedAt && savedMeta.updatedAt > localHorariosUpdatedAt) {
+          remoteHorariosUpdatedAt = String(savedMeta.updatedAt);
+        }
+
+        if (!isBrowserOffline()) {
+          const remoteIdx = await fetchWithTimeout(
+            `${REMOTE_DATA_BASE}/horarios/index.json`,
+            { cache: 'no-store' },
+            5000
+          )
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null);
+          const remAt = String(remoteIdx?.updatedAt || '');
+          if (remAt && remAt > localHorariosUpdatedAt && remAt >= remoteHorariosUpdatedAt) {
+            const changed = remAt !== remoteHorariosUpdatedAt;
+            remoteHorariosUpdatedAt = remAt;
+            await saveIdbValue('ota_horarios_meta', { updatedAt: remAt, syncedAt: Date.now() });
+            if (changed) archiveHorariosByLine.clear();
+          }
+        }
+      } catch {
+        // Non-fatal: bundled archive remains available offline
+      } finally {
+        otaIndexChecked = true;
+      }
+      return remoteHorariosUpdatedAt;
+    })();
+  }
+  return otaSyncPromise;
+}
 
 function loadCatalogo() {
   if (!catalogoPromise) {
@@ -195,14 +251,41 @@ function loadArchiveRecorrido(codLinea) {
 function loadArchiveLine(codLinea) {
   const key = String(Number(codLinea));
   if (!archiveHorariosByLine.has(key)) {
-    const url = new URL(`../data/horarios/${key}.json`, import.meta.url);
-    const p = fetch(url, { cache: 'no-cache' })
-      .then((res) => (res.ok ? res.json() : null))
-      .catch(() => null)
-      .then((file) => {
-        if (!file) archiveHorariosByLine.delete(key);
-        return file;
-      });
+    const p = (async () => {
+      // Trigger non-blocking OTA index check once per session
+      await ensureOtaHorariosIndex();
+
+      // 1) If GitHub Pages has a newer archive than the bundled APK/cache, use/fetch OTA copy
+      if (remoteHorariosUpdatedAt && remoteHorariosUpdatedAt > localHorariosUpdatedAt) {
+        const otaKey = `ota_horarios:${key}`;
+        const cachedOta = await readIdbValue(otaKey);
+        if (cachedOta?.updatedAt === remoteHorariosUpdatedAt && cachedOta?.file) {
+          return cachedOta.file;
+        }
+        if (!isBrowserOffline()) {
+          const remoteFile = await fetchWithTimeout(
+            `${REMOTE_DATA_BASE}/horarios/${key}.json`,
+            { cache: 'no-store' },
+            6500
+          )
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null);
+          if (remoteFile?.paradas) {
+            saveIdbValue(otaKey, { updatedAt: remoteHorariosUpdatedAt, file: remoteFile });
+            return remoteFile;
+          }
+        }
+        if (cachedOta?.file) return cachedOta.file;
+      }
+
+      // 2) Bundled local static archive
+      const url = new URL(`../data/horarios/${key}.json`, import.meta.url);
+      const file = await fetch(url, { cache: 'no-cache' })
+        .then((res) => (res.ok ? res.json() : null))
+        .catch(() => null);
+      if (!file) archiveHorariosByLine.delete(key);
+      return file;
+    })();
     archiveHorariosByLine.set(key, p);
   }
   return archiveHorariosByLine.get(key);
@@ -573,7 +656,54 @@ export const api = {
 
   flotaLinea: (codLinea) => apiGet(`/api/flota?codLinea=${encodeURIComponent(codLinea)}`, null, 7000),
 
-  flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000)
+  flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000),
+
+  flotaActiva: async () => {
+    try {
+      const res = await apiGet('/api/flota-activa', null, 7500);
+      if (Array.isArray(res?.data?.units)) return res;
+    } catch {
+      // Seamless fallback to /api/fleet-memory (all lines) if Worker doesn't expose /api/flota-activa yet
+    }
+    const mem = await apiGet('/api/fleet-memory', null, 7500);
+    const cat = await loadCatalogo();
+    const nowMs = Date.now();
+    const activeCutoff = nowMs - 38 * 60 * 1000;
+    const todayKey = mem?.data?.dayKey || '';
+    const units = [];
+    for (const u of mem?.data?.units || []) {
+      const lat = Number(u.lat);
+      const lng = Number(u.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+      if (todayKey && u.dayKey && u.dayKey !== todayKey) continue;
+      if (u.updatedAt && u.updatedAt < activeCutoff) continue;
+      const lineObj = cat?.lineByCode?.get(Number(u.codigoLinea));
+      units.push({
+        codigoLinea: Number(u.codigoLinea),
+        descripcionLinea: lineObj?.descripcion || `L${u.codigoLinea}`,
+        coche: String(u.coche || '').trim(),
+        choferNombre: u.choferNombre || '',
+        choferLegajo: u.choferLegajo || '',
+        esAdaptado: Boolean(u.esAdaptado),
+        bandera: u.bandera || '',
+        dirBandera: u.dirBandera || '',
+        lat,
+        lng,
+        desvioSec: Number(u.desvioSec) || 0,
+        desvioRaw: u.desvioRaw || '',
+        ultimaGps: u.ultimaGps || '',
+        lastStopId: u.stopId || '',
+        lastTripKey: u.tripKey || '',
+        lastSeenAt: u.updatedAt || nowMs,
+        enLineaAhora: true
+      });
+    }
+    return {
+      data: { dayKey: todayKey, activeWindowMin: 38, units },
+      source: 'fleet-memory-fallback',
+      savedAt: nowMs
+    };
+  }
 };
 
 /**

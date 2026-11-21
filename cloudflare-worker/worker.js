@@ -1721,7 +1721,6 @@ export class FleetMemory {
         LINE_NAMES_BY_CODE[codLinea] ||
         `L${codLinea}`;
       const capacity = this._getCapacityByLine(nowMs, todayKey, codLinea).get(codLinea) || null;
-      const learnedTransitions = this._getLearnedTransitions([codLinea]);
 
       return Response.json({
         codigoLinea: codLinea,
@@ -1730,10 +1729,82 @@ export class FleetMemory {
         retentionDays: ROSTER_RETENTION_DAYS,
         meta: this._getRosterMetaSummary(),
         capacity,
-        learnedTransitions,
+        learnedTransitions: [],
         todayTrips,
         coches,
         choferes
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/flota-activa') {
+      const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+      const carRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, descripcion_linea, es_adaptado,
+                  last_chofer_nombre, last_chofer_legajo,
+                  last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
+                  last_seen_at, last_day_key
+           FROM fleet_cars
+           WHERE last_day_key = ? AND last_seen_at >= ?
+           ORDER BY codigo_linea ASC, last_seen_at DESC`,
+          todayKey,
+          activeCutoff
+        )
+        .toArray();
+
+      const unitRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw, bandera, dir_bandera, ultima_gps, updated_at
+           FROM unit_last_seen
+           WHERE updated_at >= ?`,
+          activeCutoff
+        )
+        .toArray();
+      const unitMap = new Map();
+      for (const u of unitRows) unitMap.set(`${u.codigo_linea}:${u.coche}`, u);
+
+      const byKey = new Map();
+      for (const r of carRows) {
+        const key = `${r.codigo_linea}:${r.coche}`;
+        const u = unitMap.get(key) || null;
+        const lat = Number(r.last_lat ?? u?.lat);
+        const lng = Number(r.last_lng ?? u?.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+        byKey.set(key, {
+          codigoLinea: Number(r.codigo_linea),
+          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          coche: r.coche,
+          choferNombre: r.last_chofer_nombre || '',
+          choferLegajo: r.last_chofer_legajo || '',
+          esAdaptado: Boolean(r.es_adaptado),
+          bandera: r.last_bandera || u?.bandera || '',
+          dirBandera: u?.dir_bandera || '',
+          lat,
+          lng,
+          desvioSec: Number(r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec) || 0,
+          desvioRaw: r.last_desvio_raw || u?.desvio_raw || '',
+          ultimaGps: r.last_gps || u?.ultima_gps || '',
+          lastStopId: r.last_stop_id || '',
+          lastTripKey: r.last_trip_key || (u?.day_key === todayKey ? u.trip_key : '') || '',
+          lastServiceNum: Number(r.last_service_num) || 0,
+          lastTurnoIdx: Number(r.last_turno_idx) || 0,
+          lastTurnoStart: r.last_turno_start || '',
+          lastTurnoEnd: r.last_turno_end || '',
+          lastLapNum: Number(r.last_lap_num) || 0,
+          lastShiftLaps: Number(r.last_shift_laps) || 0,
+          lastSeenAt: Math.max(Number(r.last_seen_at) || 0, Number(u?.updated_at) || 0),
+          enLineaAhora: true
+        });
+      }
+
+      return Response.json({
+        dayKey: todayKey,
+        activeWindowMin: Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000),
+        meta: this._getRosterMetaSummary(),
+        units: Array.from(byKey.values())
       });
     }
 
@@ -1977,30 +2048,6 @@ export class FleetMemory {
           );
         }
 
-        // Permanent shift & vuelta learning: if this physical car previously completed another trip today
-        // (and it wasn't a superseded misassignment), record whether the same driver continued or a relevo occurred!
-        const prevUnitRows = this.sql
-          .exec(
-            'SELECT day_key, trip_key, chofer_nombre, chofer_legajo FROM unit_last_seen WHERE codigo_linea = ? AND coche = ?',
-            cod,
-            coche
-          )
-          .toArray();
-        if (prevUnitRows.length > 0) {
-          const pu = prevUnitRows[0];
-          const prevTripKey = String(pu.trip_key || '').trim();
-          if (
-            pu.day_key === dayKey &&
-            prevTripKey &&
-            prevTripKey !== tripKey &&
-            prevTripKey !== supersededTripKey
-          ) {
-            const prevDrv = String(pu.chofer_legajo || pu.chofer_nombre || '').trim().toUpperCase();
-            const curDrv = String(e.choferLegajo || e.choferNombre || '').trim().toUpperCase();
-            this._recordShiftTransition(cod, dayKey, prevTripKey, tripKey, prevDrv, curDrv, coche, nowMs);
-          }
-        }
-
         this.sql.exec(
           `INSERT INTO trip_assignments (
             day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
@@ -2165,12 +2212,10 @@ export class FleetMemory {
         }
       }
 
-      const learnedTransitions = this._getLearnedTransitions(lineCodes);
-
       return Response.json({
         dayKey,
         stopSnapshot,
-        learnedTransitions,
+        learnedTransitions: [],
         trips: tripRows.map((r) => ({
           codigoLinea: r.codigo_linea,
           tripKey: r.trip_key,
@@ -2677,6 +2722,51 @@ export default {
           }
         }
         return jsonResponse({ data: { dayKey: todayKey, results: results.slice(0, 12) }, source: 'fleet-memory-mem', savedAt: nowMs });
+      }
+
+      if (pathname === '/api/flota-activa' && request.method === 'GET') {
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch('https://fleet-memory/flota-activa');
+            const data = await doRes.json();
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+          } catch {
+            // Fall through to in-memory fallback
+          }
+        }
+        const nowMs = Date.now();
+        const todayKey = getArgentinaDayKey(nowMs);
+        const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+        const units = [];
+        for (const u of fallbackUnits.values()) {
+          if ((u.updatedAt || 0) < activeCutoff) continue;
+          const lat = Number(u.lat);
+          const lng = Number(u.lng);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+          units.push({
+            codigoLinea: Number(u.codigoLinea),
+            descripcionLinea: u.descripcionLinea || LINE_NAMES_BY_CODE[u.codigoLinea] || `L${u.codigoLinea}`,
+            coche: u.coche,
+            choferNombre: u.choferNombre || '',
+            choferLegajo: u.choferLegajo || '',
+            esAdaptado: Boolean(u.esAdaptado),
+            bandera: u.bandera || '',
+            lat,
+            lng,
+            desvioSec: Number(u.desvioSec) || 0,
+            desvioRaw: u.desvioRaw || '',
+            ultimaGps: u.ultimaGps || '',
+            lastStopId: u.stopId || '',
+            lastSeenAt: u.updatedAt || nowMs,
+            enLineaAhora: true
+          });
+        }
+        return jsonResponse({
+          data: { dayKey: todayKey, activeWindowMin: Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000), units },
+          source: 'fleet-memory-mem',
+          savedAt: nowMs
+        });
       }
 
       if (pathname === '/api/fleet-memory' && request.method === 'GET') {

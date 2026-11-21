@@ -8,6 +8,7 @@ name: Archivo de horarios programados
 on:
   schedule:
     - cron: '30 6 * * *'
+    - cron: '30 11 * * *'
   workflow_dispatch:
     inputs:
       offsets:
