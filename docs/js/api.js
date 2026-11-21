@@ -1,5 +1,4 @@
 import { DEFAULT_API_BASE } from './config.js';
-import { isNative } from './native.js';
 import {
   staticBootstrap,
   staticCalles,
@@ -21,8 +20,7 @@ function resolveApiBase() {
   if (saved) return saved;
 
   const host = window.location.hostname;
-  // In Capacitor Android, bundled assets are served from https://localhost; live API calls must still hit the Cloudflare Worker.
-  if (!isNative && (host === 'localhost' || host === '127.0.0.1')) {
+  if (host === 'localhost' || host === '127.0.0.1') {
     return '';
   }
   return (DEFAULT_API_BASE || '').replace(/\/+$/, '');

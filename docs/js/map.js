@@ -2,10 +2,11 @@ import { CORRIENTES_CENTER, MAP_TILES, getLineColor, getDirectionColor } from '.
 import { formatDistance } from './api.js';
 
 export class TransitMap {
-  constructor(containerId, { onBusSelect, onStopPick, onAllFleetBusSelect } = {}) {
+  constructor(containerId, { onBusSelect, onStopPick, onAllFleetBusSelect, onUserDrag } = {}) {
     this.onBusSelect = onBusSelect || (() => {});
     this.onStopPick = onStopPick || (() => {});
     this.onAllFleetBusSelect = onAllFleetBusSelect || this.onBusSelect;
+    this.onUserDrag = onUserDrag || (() => {});
 
     this.canvasRenderer = L.canvas({ padding: 0.35 });
 
@@ -26,6 +27,9 @@ export class TransitMap {
     });
 
     this.isInteracting = false;
+    this.map.on('dragstart', () => {
+      this.onUserDrag();
+    });
     this.map.on('movestart zoomstart', () => {
       this.isInteracting = true;
     });
@@ -535,6 +539,22 @@ export class TransitMap {
     const offsetY = (pad.paddingBottomRight[1] - pad.paddingTopLeft[1]) / 2;
     const shiftedCenter = this.map.unproject(targetPt.add([offsetX, offsetY]), targetZoom);
     this.map.setView(shiftedCenter, targetZoom, { animate: true });
+  }
+
+  followBus(bus) {
+    if (this.isInteracting || !bus || typeof bus.lat !== 'number' || typeof bus.lng !== 'number') return;
+    const z = this.map.getZoom();
+    const pad = this._getPadding();
+    const targetPt = this.map.project([bus.lat, bus.lng], z);
+    const offsetX = (pad.paddingBottomRight[0] - pad.paddingTopLeft[0]) / 2;
+    const offsetY = (pad.paddingBottomRight[1] - pad.paddingTopLeft[1]) / 2;
+    const desiredCenter = this.map.unproject(targetPt.add([offsetX, offsetY]), z);
+    const curPt = this.map.project(this.map.getCenter(), z);
+    const desPt = this.map.project(desiredCenter, z);
+    // Only pan when bus moves >= 14px away from visual center so 20fps tracking stays silky smooth
+    if (curPt.distanceTo(desPt) >= 14) {
+      this.map.panTo(desiredCenter, { animate: true, duration: 0.45, noMoveStart: true });
+    }
   }
 
   focusBusAndStop(bus) {

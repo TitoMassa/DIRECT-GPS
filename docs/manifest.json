@@ -1,18 +1,41 @@
 {
+  "id": "/DIRECT-GPS/",
   "name": "DIRECT GPS · Corrientes",
   "short_name": "DIRECT GPS",
-  "description": "Radar en tiempo real del transporte público de Corrientes Capital",
+  "description": "Seguimiento satelital en vivo de colectivos de Corrientes Capital con coche, chofer, desvío horario, horarios 24h y servicios.",
   "start_url": "./",
+  "scope": "./",
   "display": "standalone",
-  "background_color": "#0c1118",
-  "theme_color": "#0c1118",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
   "lang": "es-AR",
+  "categories": ["navigation", "travel", "utilities"],
   "icons": [
     {
       "src": "./icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Líneas y flota",
+      "short_name": "Líneas",
+      "url": "./?tab=lineas"
+    },
+    {
+      "name": "Paradas cercanas",
+      "short_name": "Cercanas",
+      "url": "./?tab=cercanas"
     }
   ]
 }

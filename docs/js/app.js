@@ -21,6 +21,7 @@ import {
   resolveTrailDirection,
   buildTrajectoryFromBranchAlong,
   pickStopBranches,
+  pickPairedReturnBranch,
   projectOnPolyline,
   sampleBranchAtAlong
 } from './trajectory.js';
@@ -56,7 +57,10 @@ import {
   shareStop,
   haptic,
   ensureNotificationPermission,
-  notifyArrival
+  notifyArrival,
+  onPwaInstallAvailable,
+  promptPwaInstall,
+  isPwaInstalled
 } from './native.js';
 
 const busSimulator = new BusSimulator();
@@ -80,6 +84,7 @@ const state = {
   arribos: [],
   selectedBusKey: null,
   inspectorOpen: false,
+  followSelectedBus: false,
   simulateMode: true, // Default mode: EN VIVO (green) — smooth motion + offline/no-GPS timetable prediction
   isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
   horariosOpen: false,
@@ -246,18 +251,128 @@ const el = {
   btnAliasClose: document.getElementById('btn-alias-close'),
   btnAliasCancel: document.getElementById('btn-alias-cancel'),
 
+  btnChangelog: document.getElementById('btn-changelog'),
+  changelogModal: document.getElementById('changelog-modal'),
+  btnChangelogClose: document.getElementById('btn-changelog-close'),
+  changelogList: document.getElementById('changelog-list'),
+  changelogPwaBar: document.getElementById('changelog-pwa-bar'),
+  btnPwaInstall: document.getElementById('btn-pwa-install'),
+
   srAnnouncer: document.getElementById('sr-announcer'),
   srAlert: document.getElementById('sr-alert'),
   toastContainer: document.getElementById('toast-container')
 };
+
+const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4 · PWA',
+    date: '21/11/2026 · 20:25 hs',
+    items: [
+      '<strong>100% PWA:</strong> se eliminó por completo el soporte APK/Android nativo; ahora se instala directamente desde cualquier navegador como app.',
+      '<strong>Borde inferior del mapa + seguimiento automático:</strong> al tocar el chip de un colectivo, el mapa lo sigue en vivo y muestra sus datos en una barra inferior que come espacio del mapa (no del menú), con <strong>✕</strong> arriba a la derecha y acceso directo a la línea (coches, choferes y servicios) tocando la placa de línea.',
+      '<strong>Dirección real por BANDERA garantizada:</strong> bloqueo en 3 capas (vector GPS, grilla oficial y protección anti-retroceso) para que en modo EN VIVO ningún colectivo avance en sentido contrario.',
+      '<strong>Sincronía total en "Siguiente vuelta":</strong> el desvío horario y la posición en mapa de cada tarjeta de siguiente vuelta ahora coinciden exactamente con el colectivo real.',
+      '<strong>Horizonte de arribos ampliado:</strong> hasta <strong>180 min</strong> en "Todas las líneas" y hasta <strong>220 min</strong> por línea individual.',
+      '<strong>Historial de cambios:</strong> acceso discreto desde la barra superior con fecha y hora de cada actualización.'
+    ]
+  },
+  {
+    version: 'v2.3',
+    date: '21/11/2026 · 18:26 hs',
+    items: [
+      '<strong>Modo libre realmente en vivo:</strong> barrido simultáneo de 16 paradas troncales cada 12 s (GPS fresco de segundos en toda la ciudad) y movimiento fluido por calles en modo EN VIVO.'
+    ]
+  },
+  {
+    version: 'v2.2',
+    date: '21/11/2026 · 17:46 hs',
+    items: [
+      '<strong>Emparejamiento global de servicios y choferes:</strong> corrección de Servicios, Choferes y Coches en las 33 líneas, eliminación de etiquetas viejas de turnos anteriores y filtro de viajes futuros en cabecera.'
+    ]
+  },
+  {
+    version: 'v2.1',
+    date: '21/11/2026 · 16:25 hs',
+    items: [
+      '<strong>Horarios y turnos inamovibles (~7–8 h):</strong> desactivada la alteración dinámica de diagramas, sincronización automática de horarios programados, capa opcional de toda la flota circulando, grilla de paradas y horarios por línea y navegación inferior rediseñada.'
+    ]
+  }
+];
+
+function renderChangelogList() {
+  if (!el.changelogList) return;
+  el.changelogList.innerHTML = CHANGELOG_ENTRIES.map(
+    (entry) => `
+      <article class="changelog-item">
+        <div class="changelog-item-head">
+          <span class="changelog-ver">${escapeHtml(entry.version)}</span>
+          <time class="changelog-date">${escapeHtml(entry.date)}</time>
+        </div>
+        <ul class="changelog-bullets">
+          ${entry.items.map((txt) => `<li>${txt}</li>`).join('')}
+        </ul>
+      </article>
+    `
+  ).join('');
+}
+
+function openChangelogModal() {
+  if (!el.changelogModal) return;
+  lastModalTriggerEl = document.activeElement;
+  renderChangelogList();
+  el.changelogModal.classList.remove('hidden');
+  el.btnChangelogClose?.focus();
+}
+
+function closeChangelogModal() {
+  if (!el.changelogModal || el.changelogModal.classList.contains('hidden')) return;
+  el.changelogModal.classList.add('hidden');
+  if (lastModalTriggerEl && typeof lastModalTriggerEl.focus === 'function') {
+    lastModalTriggerEl.focus();
+  }
+  lastModalTriggerEl = null;
+}
 
 let lastModalTriggerEl = null;
 
 const transitMap = new TransitMap('map', {
   onBusSelect: (busKey) => openBusInspector(busKey),
   onAllFleetBusSelect: (busKey) => openAllFleetBusInspector(busKey),
-  onStopPick: (stop) => openStopRadar(stop, '000')
+  onStopPick: (stop) => openStopRadar(stop, '000'),
+  onUserDrag: () => {
+    if (state.followSelectedBus) {
+      state.followSelectedBus = false;
+      const cur = getCurrentlySelectedBus();
+      if (cur && state.inspectorOpen) updateInspectorFields(cur);
+    }
+  }
 });
+
+function getCurrentlySelectedBus() {
+  if (!state.selectedBusKey) return null;
+  return (
+    state.arribos.find((b) => b.key === state.selectedBusKey) ||
+    state.trackedUnit?.buses?.find((b) => b.key === state.selectedBusKey) ||
+    (state.trackedUnit?.bus?.key === state.selectedBusKey ? state.trackedUnit.bus : null) ||
+    state.allFleetBuses.find((b) => b.key === state.selectedBusKey) ||
+    null
+  );
+}
+
+function syncInspectorLayoutHeight() {
+  const isOpen = Boolean(state.inspectorOpen && !el.busInspector?.classList.contains('hidden'));
+  el.appShell?.classList.toggle('inspector-open', isOpen);
+  if (isOpen && el.busInspector) {
+    requestAnimationFrame(() => {
+      const h = Math.max(96, Math.round(el.busInspector.offsetHeight || 132));
+      el.appShell?.style.setProperty('--insp-h', `${h}px`);
+      transitMap.invalidateSize();
+    });
+  } else {
+    el.appShell?.style.removeProperty('--insp-h');
+    requestAnimationFrame(() => transitMap.invalidateSize());
+  }
+}
 
 // ============================================================================
 // Utilities, Screen-Reader Announcer & Toast
@@ -1008,6 +1123,7 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
 function normalizeArrivals(rawList, stopId, stopCoords) {
   const seenCounts = new Map();
   const primaryRouteByBaseId = new Map();
+  const primaryBusByBaseId = new Map();
   const now = Date.now();
 
   // Sort by ascending ETA first so the 1st occurrence (`occ === 1`) of any coche is ALWAYS its earliest arrival,
@@ -1024,6 +1140,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     seenCounts.set(baseId, occ);
     const key = occ > 1 ? `${baseId}-${occ}` : baseId;
     const isLiveNextLap = Boolean(coche && occ > 1);
+    const primaryBus = isLiveNextLap ? primaryBusByBaseId.get(baseId) || null : null;
 
     const lat = parseFloat(a.latitud);
     const lng = parseFloat(a.longitud);
@@ -1032,10 +1149,10 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const eta = parseEtaMinutes(a.tiempoRestanteArribo);
     const straightDist =
       validPos && stopCoords ? distanceMeters(lat, lng, stopCoords.lat, stopCoords.lng) : null;
-    const desvio = parseDesvioHorario(a.desvioHorario);
+    const desvio = primaryBus?.desvio || parseDesvioHorario(a.desvioHorario);
     const chofer = parseChoferInfo(a.identificadorChofer, a.choferNombre, a.choferLegajo);
-    const gpsRaw = String(a.ultimaFechaHoraGPS || '').trim();
-    const gpsTimeOnly = formatGpsTimeOnly(gpsRaw);
+    const gpsRaw = primaryBus?.ultimaFechaHoraGPS || String(a.ultimaFechaHoraGPS || '').trim();
+    const gpsTimeOnly = primaryBus?.gpsTimeOnly || formatGpsTimeOnly(gpsRaw);
     const gpsMs = parseGpsTimestampMs(gpsRaw);
 
     let headingPrevFix = null;
@@ -1059,15 +1176,15 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
     const branches = state.routeBranchesCache.get(a.codigoLinea) || [];
 
     const draftBus = {
-      lat: validPos ? lat : null,
-      lng: validPos ? lng : null,
+      lat: primaryBus?.lat ?? (validPos ? lat : null),
+      lng: primaryBus?.lng ?? (validPos ? lng : null),
       gpsMs,
       descripcionBandera: (a.descripcionBandera || a.descripcionCortaBandera || 'Servicio urbano').trim(),
       eta
     };
 
     const trajectory =
-      validPos && stopCoords
+      draftBus.lat !== null && draftBus.lng !== null && stopCoords
         ? resolveBusTrajectory(draftBus, stopId, stopCoords, branches, gpsHist || headingPrevFix)
         : null;
 
@@ -1082,7 +1199,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
         : 0;
     const etaSec = eta.minutes <= 0 ? 45 : eta.minutes * 60;
 
-    return {
+    const built = {
       key,
       codigoLinea: a.codigoLinea,
       descripcionLinea: lineName,
@@ -1091,7 +1208,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       tiempoRaw: a.tiempoRestanteArribo || '',
       eta,
       etaSecondsRemaining: etaSec,
-      esAdaptado: Boolean(a.esAdaptado),
+      esAdaptado: Boolean(a.esAdaptado || primaryBus?.esAdaptado),
       esLleno: a.esLleno === true,
       esExtendido: Boolean(a.esExtendido),
       viaParada: a.viaParada || null,
@@ -1100,8 +1217,8 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       lapNumber: null,
       isCortadoBlock: false,
       nextLapStopTime: null,
-      lat: validPos ? lat : null,
-      lng: validPos ? lng : null,
+      lat: draftBus.lat,
+      lng: draftBus.lng,
       prevGpsFix,
       confirmedDirectionBandera: trajectory?.confirmedDirectionBandera || confirmedDir?.bandera || '',
       directionSource: trajectory?.directionSource || (confirmedDir ? 'persisted' : 'eta'),
@@ -1109,9 +1226,9 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       routeMeters,
       proximityPct: computeProximityPercent(eta.minutes, routeMeters),
       identificadorCoche: coche,
-      choferNombre: chofer.nombre,
-      choferLegajo: chofer.legajo,
-      choferRaw: chofer.raw,
+      choferNombre: primaryBus?.choferNombre || chofer.nombre,
+      choferLegajo: primaryBus?.choferLegajo || chofer.legajo,
+      choferRaw: primaryBus?.choferRaw || chofer.raw,
       desvio,
       ultimaFechaHoraGPS: gpsRaw,
       gpsTimeOnly,
@@ -1123,9 +1240,11 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       nextLapExtraMeters,
       isOppositeLeg: Boolean(trajectory?.isOppositeLeg),
       isNextCycle: Boolean(trajectory?.isNextCycle || isLiveNextLap),
-      realBandera: trajectory?.realBandera || draftBus.descripcionBandera,
-      realBanderaColor: trajectory?.realBanderaColor || getLineColor(lineName)
+      realBandera: primaryBus?.realBandera || trajectory?.realBandera || draftBus.descripcionBandera,
+      realBanderaColor: primaryBus?.realBanderaColor || trajectory?.realBanderaColor || getLineColor(lineName)
     };
+    if (!isLiveNextLap) primaryBusByBaseId.set(baseId, built);
+    return built;
   });
 }
 
@@ -1171,7 +1290,7 @@ function syncSimCardsDom() {
   }
 
   if (state.inspectorOpen && state.selectedBusKey) {
-    const focused = state.arribos.find((b) => b.key === state.selectedBusKey);
+    const focused = getCurrentlySelectedBus();
     if (focused) updateInspectorFields(focused);
   }
 }
@@ -1211,6 +1330,10 @@ function startSimLoop() {
       if (shouldSyncDom) {
         simLastDomMs = now;
         if (hasStopWork) syncSimCardsDom();
+        if (state.followSelectedBus && state.selectedBusKey && !transitMap.isInteracting) {
+          const followed = getCurrentlySelectedBus();
+          if (followed) transitMap.followBus(followed);
+        }
       }
     }
     simRafId = requestAnimationFrame(frame);
@@ -1738,6 +1861,9 @@ function updateInspectorFields(bus) {
 
   el.inspLineBadge.textContent = bus.descripcionLinea;
   el.inspLineBadge.style.setProperty('--line-color', color);
+  el.inspLineBadge.dataset.codLinea = bus.codigoLinea || '';
+  el.inspLineBadge.dataset.lineName = bus.descripcionLinea || '';
+  el.inspLineBadge.title = `Ver coches, choferes y servicios de Línea ${bus.descripcionLinea}`;
   el.inspBandera.innerHTML = `<span class="dir-dot" style="background:${dirColor}"></span><span class="arrival-bandera-txt">${escapeHtml(
     currentBandera
   )}</span>`;
@@ -1848,15 +1974,17 @@ function updateInspectorFields(bus) {
 
   const gpsParts = [];
   const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
+  const isFollowing = Boolean(state.followSelectedBus && state.selectedBusKey === bus.key);
+  if (isFollowing) gpsParts.push('Siguiendo');
   if (bus.isFreeTracked) {
-    if (bus.enLineaAhora) gpsParts.push('Seguimiento en vivo');
-    else gpsParts.push('Última ubicación conocida');
+    if (bus.enLineaAhora && !isFollowing) gpsParts.push('En vivo');
+    else if (!bus.enLineaAhora) gpsParts.push('Última ubicación');
     if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
     else if (bus.lastSeenLabel) gpsParts.push(bus.lastSeenLabel);
   } else if (isOfflineStyled) {
     gpsParts.push(bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario');
   } else {
-    if (bus.gpsTimeOnly) gpsParts.push(bus.gpsTimeOnly);
+    if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
     if (bus.esExtendido) gpsParts.push('+Flota');
   }
   el.inspGps.textContent = gpsParts.join(' · ') || '—';
@@ -1870,24 +1998,43 @@ function updateInspectorFields(bus) {
   }
 }
 
-// Tapping an arrival row in the dock: pan & zoom visually on map + announce concise summary for screen readers
+function resolvePrimaryBusForSelection(bus) {
+  if (!bus || !bus.isNextLap) return bus;
+  if (bus.nextLapOfKey) {
+    const direct = state.arribos.find((b) => b.key === bus.nextLapOfKey);
+    if (direct) return direct;
+  }
+  if (bus.identificadorCoche) {
+    const sameCar = state.arribos.find(
+      (b) =>
+        !b.isNextLap &&
+        Number(b.codigoLinea) === Number(bus.codigoLinea) &&
+        String(b.identificadorCoche) === String(bus.identificadorCoche)
+    );
+    if (sameCar) return sameCar;
+  }
+  return bus;
+}
+
+// Tapping an arrival row in the dock: pan, auto-follow & open docked bottom edge strip on the map
 function focusBusOnMap(busKey) {
   const bus = state.arribos.find((b) => b.key === busKey);
   if (!bus) return;
-  const mapTarget =
-    bus.isNextLap && bus.nextLapOfKey
-      ? state.arribos.find((b) => b.key === bus.nextLapOfKey) || bus
-      : bus;
+  const mapTarget = resolvePrimaryBusForSelection(bus);
 
   state.selectedBusKey = mapTarget.key;
-  state.inspectorOpen = false;
-  el.busInspector.classList.add('hidden');
+  state.inspectorOpen = true;
+  state.followSelectedBus = true;
 
-  // If mobile bottom panel is expanded, return to 50/50 split so the map is clearly visible
+  // If mobile bottom panel is expanded, return to 50/50 split so the map + docked strip are clearly visible
   if (state.dockExpanded) {
     setSheetIndex(1, { silent: true });
   }
   haptic('light');
+
+  updateInspectorFields(mapTarget);
+  el.busInspector.classList.remove('hidden');
+  syncInspectorLayoutHeight();
 
   if (!state.horariosOpen) renderArribosList();
   transitMap.updateBuses(state.arribos, {
@@ -1896,31 +2043,39 @@ function focusBusOnMap(busKey) {
     simulateMode: state.simulateMode
   });
   transitMap.focusBus(mapTarget, 16);
-  announce(`Seleccionado: ${buildArrivalAriaLabel(bus)}`);
+  announce(`Siguiendo: ${buildArrivalAriaLabel(mapTarget)}`);
 }
 
-// Tapping a bus chip directly on the map: open the ultra-compact inspector card
+// Tapping a bus chip directly on the map: open docked bottom edge strip & auto-follow the bus
 function openBusInspector(busKey) {
   const trackedPool = state.trackedUnit?.buses || [];
-  const bus =
+  const rawBus =
     state.arribos.find((b) => b.key === busKey) ||
     trackedPool.find((b) => b.key === busKey) ||
     (state.trackedUnit?.bus?.key === busKey ? state.trackedUnit.bus : null) ||
     state.allFleetBuses.find((b) => b.key === busKey) ||
     null;
-  if (!bus) {
+  if (!rawBus) {
     closeBusInspector();
     return;
   }
+  const bus = resolvePrimaryBusForSelection(rawBus);
 
-  state.selectedBusKey = busKey;
+  state.selectedBusKey = bus.key;
   state.inspectorOpen = true;
+  state.followSelectedBus = true;
   if (bus.isFreeTracked && state.trackedUnit) {
     state.trackedUnit.bus = bus;
     state.trackedUnit.coche = bus.identificadorCoche || state.trackedUnit.coche;
   }
+  if (state.dockExpanded) {
+    setSheetIndex(1, { silent: true });
+  }
+  haptic('light');
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
+  syncInspectorLayoutHeight();
+
   if (!bus.isFreeTracked && !bus.isCityFleet && !state.horariosOpen) renderArribosList();
   const displayList = bus.isFreeTracked && trackedPool.length > 0 ? trackedPool : state.arribos;
   transitMap.updateBuses(displayList, {
@@ -1931,6 +2086,7 @@ function openBusInspector(busKey) {
   if (state.allFleetMode) {
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
   }
+  transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
 }
 
 function stopTrackedUnit() {
@@ -1944,8 +2100,10 @@ function closeBusInspector() {
   const wasFreeTracked = Boolean(state.trackedUnit);
   stopTrackedUnit();
   state.inspectorOpen = false;
+  state.followSelectedBus = false;
   state.selectedBusKey = null;
   el.busInspector.classList.add('hidden');
+  syncInspectorLayoutHeight();
   transitMap.drawFocusVector(null);
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
@@ -2035,37 +2193,66 @@ function buildCityFleetBusObject(u) {
 }
 
 // Lightweight 20fps street-following kinematics for citywide Modo Libre (allFleetBuses)
-const cityFleetSim = new Map(); // bus.key -> { branch, along, gpsAlong, maxAlong, speedMps, lastGpsMs, isStopped }
+const cityFleetSim = new Map(); // bus.key -> { branch, along, gpsAlong, targetAlong, maxAlong, speedMps, lastGpsMs, isStopped }
 
-function pickCityBusBranch(bus, branches, confirmedDir) {
+function pickCityBusBranch(bus, branches, rec, gpsMs) {
   if (!Array.isArray(branches) || branches.length === 0) return null;
   const lat = bus.rawLat ?? bus.lat;
   const lng = bus.rawLng ?? bus.lng;
   if (typeof lat !== 'number' || typeof lng !== 'number') return null;
 
-  // 1) Confirmed multi-point GPS trail direction wins when bus is near that branch
+  // Layer 1: Direct physical GPS movement vector (prevGpsFix -> curGps) strictly advancing along a branch
+  const prevFix = rec?.prevGpsFix;
+  if (prevFix && typeof prevFix.lat === 'number' && typeof prevFix.lng === 'number') {
+    const dtPrev = gpsMs && prevFix.gpsMs ? (gpsMs - prevFix.gpsMs) / 1000 : 30;
+    const moved = distanceMeters(prevFix.lat, prevFix.lng, lat, lng) ?? 0;
+    if (dtPrev >= 4 && dtPrev <= 240 && moved >= 25 && moved <= Math.max(2500, dtPrev * 32)) {
+      let bestFwd = null;
+      let bestFwdScore = Infinity;
+      for (const b of branches) {
+        const pCur = projectOnPolyline(b.pts, b.cum, lat, lng);
+        if (!pCur || pCur.perp > 260) continue;
+        const pPrev = projectOnPolyline(b.pts, b.cum, prevFix.lat, prevFix.lng);
+        if (!pPrev || pPrev.perp > 260) continue;
+        const deltaAlong = pCur.along - pPrev.along;
+        if (deltaAlong >= Math.max(12, moved * 0.35)) {
+          const score = pCur.perp + pPrev.perp * 0.5 - Math.min(80, deltaAlong * 0.15);
+          if (score < bestFwdScore) {
+            bestFwdScore = score;
+            bestFwd = { branch: b, proj: pCur, dirSource: 'vector', ambiguous: false };
+          }
+        }
+      }
+      if (bestFwd) return bestFwd;
+    }
+  }
+
+  // Layer 2: Confirmed multi-point GPS trail direction wins when bus is near that branch
+  const confirmedDir = rec?.confirmedDir;
   if (confirmedDir && typeof confirmedDir.branchIndex === 'number' && branches[confirmedDir.branchIndex]) {
     const cb = branches[confirmedDir.branchIndex];
     const cp = projectOnPolyline(cb.pts, cb.cum, lat, lng);
-    if (cp && cp.perp <= 260) return { branch: cb, proj: cp };
+    if (cp && cp.perp <= 260) return { branch: cb, proj: cp, dirSource: 'trail', ambiguous: false };
   }
 
-  // 2) Matched schedule trip branch
+  // Layer 3: Matched schedule trip branch (knows exact BANDERA for this time & service)
   if (bus._matchedBranch && branches.includes(bus._matchedBranch)) {
     const mp = projectOnPolyline(bus._matchedBranch.pts, bus._matchedBranch.cum, lat, lng);
-    if (mp && mp.perp <= 260) return { branch: bus._matchedBranch, proj: mp };
+    if (mp && mp.perp <= 260) return { branch: bus._matchedBranch, proj: mp, dirSource: 'schedule', ambiguous: false };
   }
 
-  // 3) Closest branch with bandera tie-breaker
+  // Layer 4: Closest branch with bandera tie-breaker (flagged ambiguous on shared 2-way streets!)
   const normB = String(bus.realBandera || bus.descripcionBandera || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]+/g, ' ')
     .trim();
   let best = null;
   let bestScore = Infinity;
+  let nearCount = 0;
   for (const b of branches) {
     const proj = projectOnPolyline(b.pts, b.cum, lat, lng);
     if (!proj || proj.perp > 320) continue;
+    if (proj.perp <= 100) nearCount += 1;
     const bn = String(b.bandera || '')
       .toUpperCase()
       .replace(/[^A-Z0-9]+/g, ' ')
@@ -2074,10 +2261,74 @@ function pickCityBusBranch(bus, branches, confirmedDir) {
     const score = proj.perp + (normB && !matchBand ? 140 : 0);
     if (score < bestScore) {
       bestScore = score;
-      best = { branch: b, proj };
+      best = { branch: b, proj, dirSource: 'fallback', ambiguous: false };
     }
   }
+  if (best && nearCount >= 2) {
+    best.ambiguous = true;
+  }
   return best;
+}
+
+function applyScheduleMetaToCityBus(bus, meta) {
+  if (!meta) return;
+  if (meta.trip?.branch) {
+    bus._matchedBranch = meta.trip.branch;
+    if (meta.trip.branch.bandera) {
+      bus.realBandera = meta.trip.branch.bandera;
+      bus.realBanderaColor = meta.trip.branch.color || getLineColor(bus.descripcionLinea);
+    }
+  }
+  bus.serviceNumber = meta.serviceNumber;
+  bus.turnoIndex = meta.turnoIndex;
+  bus.serviceTurnosCount = meta.serviceTurnosCount;
+  bus.lapNumber = meta.lapNumber;
+  bus.shiftLaps = meta.shiftLaps;
+  bus.isCortadoBlock = meta.isCortado;
+  bus.isRelevoEnLinea = meta.isRelevoEnLinea;
+  bus.turnoStart = meta.startHHMM;
+  bus.turnoEnd = meta.endHHMM;
+  bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
+}
+
+function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
+  const byLine = new Map();
+  const missingAssetLines = [];
+  for (const bus of buses) {
+    const cod = Number(bus.codigoLinea);
+    if (!byLine.has(cod)) byLine.set(cod, []);
+    byLine.get(cod).push(bus);
+  }
+  for (const [cod, lineBuses] of byLine.entries()) {
+    const branches = state.routeBranchesCache.get(cod);
+    const horFile = state.horariosArchiveCache.get(cod);
+    if (!branches?.length || !horFile) {
+      missingAssetLines.push(cod);
+      continue;
+    }
+    const model = buildLineScheduleModel(cod, branches, horFile, todayTipo);
+    if (!model) continue;
+    const matchInputs = lineBuses.map((bus) => ({
+      identificadorCoche: bus.identificadorCoche,
+      coche: bus.identificadorCoche,
+      lat: bus.rawLat ?? bus.lat,
+      lng: bus.rawLng ?? bus.lng,
+      bandera: bus.descripcionBandera,
+      ultimaFechaHoraGPS: bus.ultimaFechaHoraGPS,
+      lastGps: bus.ultimaFechaHoraGPS,
+      desvioSec: bus.desvio?.seconds || 0,
+      desvioRaw: bus.desvio?.raw || '',
+      lastSeenAt: bus.lastSeenAt,
+      enLineaAhora: true
+    }));
+    const globalMatched = matchFreeFleetUnitsToModel(model, matchInputs, nowSec, state.lastRealGpsByUnit);
+    for (let i = 0; i < lineBuses.length; i++) {
+      const bus = lineBuses[i];
+      const meta = globalMatched.get(bus.identificadorCoche) || resolveUnitScheduleMeta(model, matchInputs[i], nowSec);
+      if (meta) applyScheduleMetaToCityBus(bus, meta);
+    }
+  }
+  return missingAssetLines;
 }
 
 function reconcileCityFleetSim(buses = []) {
@@ -2096,19 +2347,61 @@ function reconcileCityFleetSim(buses = []) {
     const gpsAgeSec = gpsMs ? Math.max(0, (nowMs - gpsMs) / 1000) : 999;
 
     const branches = state.routeBranchesCache.get(bus.codigoLinea) || [];
-    const picked = pickCityBusBranch(bus, branches, rec?.confirmedDir);
+    const picked = pickCityBusBranch(bus, branches, rec, gpsMs);
     if (!picked) {
       cityFleetSim.delete(bus.key);
       continue;
     }
 
-    const { branch, proj } = picked;
-    const gpsAlong = proj.along;
+    let { branch, proj, dirSource, ambiguous } = picked;
+    let gpsAlong = proj.along;
+    const prevSim = cityFleetSim.get(bus.key);
+
+    // Anti-backwards safety guard: if real GPS moved backwards along our chosen branch (> 55m),
+    // immediately flip to the paired return BANDERA (or whichever nearby branch advances forward)!
+    if (prevSim && prevSim.branch === branch && gpsAlong < prevSim.gpsAlong - 55) {
+      let flipped = null;
+      const paired = pickPairedReturnBranch(branches, branch);
+      if (paired && paired !== branch) {
+        const pp = projectOnPolyline(paired.pts, paired.cum, rawLat, rawLng);
+        if (pp && pp.perp <= 260) {
+          flipped = { branch: paired, proj: pp };
+        }
+      }
+      if (!flipped && rec?.prevGpsFix) {
+        let bestAlt = null;
+        let bestPerp = Infinity;
+        for (const alt of branches) {
+          if (alt === branch) continue;
+          const pCur = projectOnPolyline(alt.pts, alt.cum, rawLat, rawLng);
+          const pPrev = projectOnPolyline(alt.pts, alt.cum, rec.prevGpsFix.lat, rec.prevGpsFix.lng);
+          if (pCur && pPrev && pCur.perp <= 260 && pCur.along - pPrev.along > 15 && pCur.perp < bestPerp) {
+            bestPerp = pCur.perp;
+            bestAlt = { branch: alt, proj: pCur };
+          }
+        }
+        flipped = bestAlt;
+      }
+      if (flipped) {
+        branch = flipped.branch;
+        proj = flipped.proj;
+        gpsAlong = proj.along;
+        dirSource = 'reversal';
+        ambiguous = false;
+      }
+    }
+
+    const dirConfirmed = dirSource === 'vector' || dirSource === 'trail' || dirSource === 'schedule' || dirSource === 'reversal';
+    if (dirConfirmed && branch.bandera) {
+      bus.realBandera = branch.bandera;
+      bus.realBanderaColor = branch.color || getLineColor(bus.descripcionLinea);
+    }
+
     const nearTerminal = gpsAlong <= 140 || (branch.totalLen || 0) - gpsAlong <= 140;
 
     // Learn real speed from penultimate -> latest GPS fix
     let speedMps = 5.4;
-    let isStopped = gpsAgeSec > 180 || nearTerminal;
+    let isStopped = gpsAgeSec > 180 || nearTerminal || (!dirConfirmed && ambiguous);
     const prevFix = rec?.prevGpsFix;
     if (!isStopped && prevFix && gpsMs && prevFix.gpsMs) {
       const dtPrev = (gpsMs - prevFix.gpsMs) / 1000;
@@ -2130,7 +2423,6 @@ function reconcileCityFleetSim(buses = []) {
       ? gpsAlong
       : Math.min(Math.max(0, branch.totalLen - 15), gpsAlong + Math.max(180, speedMps * 42));
 
-    const prevSim = cityFleetSim.get(bus.key);
     let curAlong = targetAlong;
     if (prevSim && prevSim.branch === branch) {
       const diff = targetAlong - prevSim.along;
@@ -2249,58 +2541,28 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     // Enrich with cached immutable schedule models immediately when already loaded
     const nowSec = getArgentinaSecOfDay();
     const todayTipo = getArgentinaTodayTipo();
-    const missingRouteLines = [];
-    for (const bus of byKey.values()) {
-      const branches = state.routeBranchesCache.get(bus.codigoLinea);
-      if (!branches?.length && !missingRouteLines.includes(bus.codigoLinea)) {
-        missingRouteLines.push(bus.codigoLinea);
-      }
-      const horFile = state.horariosArchiveCache.get(bus.codigoLinea);
-      if (branches?.length && horFile) {
-        const model = buildLineScheduleModel(bus.codigoLinea, branches, horFile, todayTipo);
-        const meta = resolveUnitScheduleMeta(
-          model,
-          {
-            lat: bus.rawLat,
-            lng: bus.rawLng,
-            bandera: bus.descripcionBandera,
-            lastGps: bus.ultimaFechaHoraGPS,
-            desvioSec: bus.desvio?.seconds || 0,
-            desvioRaw: bus.desvio?.raw || '',
-            lastSeenAt: bus.lastSeenAt,
-            enLineaAhora: true
-          },
-          nowSec
-        );
-        if (meta) {
-          bus._matchedBranch = meta.trip?.branch || null;
-          bus.serviceNumber = meta.serviceNumber;
-          bus.turnoIndex = meta.turnoIndex;
-          bus.serviceTurnosCount = meta.serviceTurnosCount;
-          bus.lapNumber = meta.lapNumber;
-          bus.shiftLaps = meta.shiftLaps;
-          bus.isCortadoBlock = meta.isCortado;
-          bus.isRelevoEnLinea = meta.isRelevoEnLinea;
-          bus.turnoStart = meta.startHHMM;
-          bus.turnoEnd = meta.endHHMM;
-          bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
-        }
-      }
-    }
-
     state.allFleetBuses = Array.from(byKey.values());
+    const missingAssetLines = enrichCityFleetWithSchedules(state.allFleetBuses, nowSec, todayTipo);
+
     reconcileCityFleetSim(state.allFleetBuses);
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
     if (state.simulateMode && state.allFleetBuses.length > 0) {
       startSimLoop();
     }
 
-    // Load street polylines for active lines in the background (cached forever) so EN VIVO moves every bus along its streets
-    if (missingRouteLines.length > 0) {
-      ensureBranchesLoaded(missingRouteLines)
+    // Load both street polylines AND immutable schedules for active lines in the background (cached forever)
+    // so every bus has exact BANDERA direction lock + Service/Turno/Vuelta in EN VIVO mode
+    if (missingAssetLines.length > 0) {
+      ensureScheduleAssetsLoaded(missingAssetLines)
         .then(() => {
           if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
+          enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
           reconcileCityFleetSim(state.allFleetBuses);
+          transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+          if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
+            const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
+            if (refreshed) updateInspectorFields(refreshed);
+          }
           if (state.simulateMode && state.allFleetBuses.length > 0) {
             startSimLoop();
           }
@@ -2308,10 +2570,13 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
         .catch(() => {});
     }
 
-    // If user currently has a city-fleet bus open in inspector, refresh its fields seamlessly
+    // If user currently has a city-fleet bus open in the docked strip, refresh fields & keep following
     if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
       const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
-      if (refreshed) updateInspectorFields(refreshed);
+      if (refreshed) {
+        updateInspectorFields(refreshed);
+        if (state.followSelectedBus) transitMap.followBus(refreshed);
+      }
     }
 
     if (fit && state.allFleetBuses.length > 0 && !state.activeStop) {
@@ -2351,12 +2616,14 @@ async function openAllFleetBusInspector(busKey) {
   haptic('light');
   state.selectedBusKey = bus.key;
   state.inspectorOpen = true;
+  state.followSelectedBus = true;
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
+  syncInspectorLayoutHeight();
   transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: bus.key });
-  transitMap.focusBus(bus, Math.max(15, transitMap.map.getZoom()));
+  transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
 
-  // Resolve exact immutable Service / Turno / Vuelta asynchronously if that line's archive wasn't loaded yet
+  // Resolve exact immutable Service / Turno / Vuelta & true BANDERA asynchronously if that line's archive wasn't loaded yet
   await ensureScheduleAssetsLoaded([bus.codigoLinea]);
   const branches = state.routeBranchesCache.get(bus.codigoLinea) || [];
   const horFile = state.horariosArchiveCache.get(bus.codigoLinea) || null;
@@ -2377,17 +2644,9 @@ async function openAllFleetBusInspector(busKey) {
       getArgentinaSecOfDay()
     );
     if (meta) {
-      bus._matchedBranch = meta.trip?.branch || null;
-      bus.serviceNumber = meta.serviceNumber;
-      bus.turnoIndex = meta.turnoIndex;
-      bus.serviceTurnosCount = meta.serviceTurnosCount;
-      bus.lapNumber = meta.lapNumber;
-      bus.shiftLaps = meta.shiftLaps;
-      bus.isCortadoBlock = meta.isCortado;
-      bus.isRelevoEnLinea = meta.isRelevoEnLinea;
-      bus.turnoStart = meta.startHHMM;
-      bus.turnoEnd = meta.endHHMM;
-      bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
+      applyScheduleMetaToCityBus(bus, meta);
+      reconcileCityFleetSim(state.allFleetBuses);
+      transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
       if (state.inspectorOpen && state.selectedBusKey === bus.key) {
         updateInspectorFields(bus);
       }
@@ -2584,14 +2843,16 @@ async function locateFleetUnitOnMap({
   if (initBus.lat !== null && initBus.lng !== null) {
     state.selectedBusKey = initBus.key;
     state.inspectorOpen = true;
+    state.followSelectedBus = true;
     updateInspectorFields(initBus);
     el.busInspector.classList.remove('hidden');
+    syncInspectorLayoutHeight();
     transitMap.updateBuses(tracker.buses, {
       filterLine: 'ALL',
       selectedBusKey: initBus.key,
       simulateMode: false
     });
-    transitMap.focusBus(initBus, 15);
+    transitMap.focusBus(initBus, 15.5);
   } else {
     showToast(`Buscando ubicación en vivo de ${choferNombre || `Coche #${coche}`} (${resolvedLineName})...`, 'info', 2200);
   }
@@ -2645,15 +2906,17 @@ async function locateFleetUnitOnMap({
         tracker.buses = liveBuses;
         state.selectedBusKey = found.key;
         state.inspectorOpen = true;
+        if (isFirst) state.followSelectedBus = true;
         updateInspectorFields(found);
         el.busInspector.classList.remove('hidden');
+        syncInspectorLayoutHeight();
         transitMap.updateBuses(tracker.buses, {
           filterLine: 'ALL',
           selectedBusKey: found.key,
           simulateMode: false
         });
         if (isFirst) {
-          transitMap.focusBus(found, 15);
+          transitMap.focusBus(found, 15.5);
           const srvTxt = found.serviceNumber ? `Servicio ${found.serviceNumber}` : '';
           const lapTxt = found.lapNumber ? `, vuelta ${formatLapSpoken(found.lapNumber)}` : '';
           const spanTxt = found.serviceSpan ? `, horario ${found.serviceSpan}` : '';
@@ -2662,6 +2925,8 @@ async function locateFleetUnitOnMap({
               found.choferNombre ? `, chofer ${found.choferNombre}` : ''
             }${srvTxt ? `, ${srvTxt}` : ''}${lapTxt}${spanTxt}.`
           );
+        } else if (state.followSelectedBus) {
+          transitMap.followBus(found);
         }
       } else if (isFirst) {
         if (initBus.lat === null) {
@@ -2872,28 +3137,34 @@ function reconcileWithSchedulePrediction(
           }
         }
 
-        // If this is a cold-start Poll 1 on a shared two-way street (no `prevGpsFix` heading vector yet)
-        // and the spatial-temporal schedule anchor proves the bus is actually on `prevTrip` (`legDepth === 1`)
-        // heading toward the turnaround cabecera, refine its trajectory to `previous_leg` immediately!
+        // If this is a cold-start Poll 1 on a shared two-way street (no `prevGpsFix` heading vector yet,
+        // or trajectory direction was only inferred by ETA without GPS trail) and the spatial-temporal
+        // schedule anchor proves the bus is on a different BANDERA/leg, refine its trajectory immediately!
         if (
           !b.isNextLap &&
           !b.prevGpsFix &&
-          b.trajectory?.leg === 'direct' &&
-          m.trip?.prevTrip &&
+          (!b.directionSource || b.directionSource === 'eta') &&
+          m.trip &&
           b.stopProj &&
           typeof b.lat === 'number' &&
           typeof b.lng === 'number'
         ) {
           const gpsClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec;
           const liveAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, b.desvio?.seconds || 0);
-          if (liveAnchor && liveAnchor.legDepth === 1 && !liveAnchor.atOriginTerminal) {
+          const anchorDiffers =
+            liveAnchor &&
+            liveAnchor.branch &&
+            !liveAnchor.atOriginTerminal &&
+            ((liveAnchor.legDepth >= 1 && b.trajectory?.leg === 'direct') ||
+              (liveAnchor.branch.bandera && b.realBandera && liveAnchor.branch.bandera !== b.realBandera));
+          if (anchorDiffers) {
             const refinedTraj = buildTrajectoryFromBranchAlong(
               liveAnchor.branch,
               liveAnchor.along,
               m.trip.branch,
               b.stopProj,
               {
-                isAtTerminal: Boolean(b.trajectory.isAtTerminal),
+                isAtTerminal: Boolean(b.trajectory?.isAtTerminal),
                 etaSec: b.etaSecondsRemaining || 600
               }
             );
@@ -2901,8 +3172,8 @@ function reconcileWithSchedulePrediction(
               b.trajectory = refinedTraj;
               b.routeMeters = refinedTraj.totalMeters;
               b.isOppositeLeg = Boolean(refinedTraj.isOppositeLeg);
-              b.realBandera = refinedTraj.realBandera || b.realBandera;
-              b.realBanderaColor = refinedTraj.realBanderaColor || b.realBanderaColor;
+              b.realBandera = refinedTraj.realBandera || liveAnchor.branch.bandera || b.realBandera;
+              b.realBanderaColor = refinedTraj.realBanderaColor || liveAnchor.branch.color || b.realBanderaColor;
             }
           }
         }
@@ -2987,9 +3258,47 @@ function reconcileWithSchedulePrediction(
     api.reportFleetSeen(seenReports, todayDayKey);
   }
 
+  // Final synchronizer: guarantees every "Siguiente vuelta" card mirrors the EXACT live position,
+  // desvio, BANDERA, GPS timestamp, and driver of its primary vehicle (both EN VIVO & ULT. GPS).
+  const syncNextLapCardsToPrimary = (list) => {
+    const primaryByKey = new Map();
+    const primaryByCar = new Map();
+    for (const b of list) {
+      if (b.isNextLap) continue;
+      primaryByKey.set(b.key, b);
+      if (b.identificadorCoche) {
+        const ck = `${b.codigoLinea}:${b.identificadorCoche}`;
+        if (!primaryByCar.has(ck) || (b.etaSecondsRemaining ?? 99999) < (primaryByCar.get(ck).etaSecondsRemaining ?? 99999)) {
+          primaryByCar.set(ck, b);
+        }
+      }
+    }
+    for (const b of list) {
+      if (!b.isNextLap) continue;
+      const src =
+        (b.nextLapOfKey ? primaryByKey.get(b.nextLapOfKey) : null) ||
+        (b.identificadorCoche ? primaryByCar.get(`${b.codigoLinea}:${b.identificadorCoche}`) : null) ||
+        null;
+      if (!src) continue;
+      b.nextLapOfKey = src.key;
+      if (typeof src.lat === 'number' && typeof src.lng === 'number') {
+        b.lat = src.lat;
+        b.lng = src.lng;
+      }
+      if (src.desvio) b.desvio = { ...src.desvio };
+      if (src.ultimaFechaHoraGPS) b.ultimaFechaHoraGPS = src.ultimaFechaHoraGPS;
+      if (src.gpsTimeOnly) b.gpsTimeOnly = src.gpsTimeOnly;
+      if (src.realBandera) b.realBandera = src.realBandera;
+      if (src.realBanderaColor) b.realBanderaColor = src.realBanderaColor;
+      if (src.choferNombre && !b.choferNombre) b.choferNombre = src.choferNombre;
+      if (src.choferLegajo && !b.choferLegajo) b.choferLegajo = src.choferLegajo;
+    }
+    return list;
+  };
+
   // ULT. GPS (blue mode): show ONLY static last GPS positions without schedule-synthesized units
   if (!state.simulateMode) {
-    return liveBuses;
+    return syncNextLapCardsToPrimary(liveBuses);
   }
 
   // EN VIVO (green mode): synthesize realistic street-following buses for active turns without live GPS
@@ -3002,10 +3311,10 @@ function reconcileWithSchedulePrediction(
     `L${cod}`;
 
   // UNIFIED caps across online & offline so brief network hiccups NEVER make scheduled arrivals blink in/out!
-  // Single-line mode uses 130 min horizon to cover low-frequency 2h headway lines (109B, 105C Perichón, Riachuelo).
+  // "Todas las líneas de la parada" shows up to 180 min; individual line shows up to 220 min.
   const isSingleLine = Boolean(state.focusedLineCode);
-  const maxUpcoming = isSingleLine ? 6 : 3;
-  const maxAheadMin = isSingleLine ? 130 : 75;
+  const maxUpcoming = isSingleLine ? 12 : 8;
+  const maxAheadMin = isSingleLine ? 220 : 180;
 
   for (const cod of targetLineCodes) {
     const branches = state.routeBranchesCache.get(cod) || [];
@@ -3137,7 +3446,7 @@ function reconcileWithSchedulePrediction(
     }
   }
 
-  return [...liveBuses, ...predictedAll].sort(
+  return syncNextLapCardsToPrimary([...liveBuses, ...predictedAll]).sort(
     (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
   );
 }
@@ -3488,11 +3797,12 @@ async function fetchArribos(showSkeleton = false, { announceSummary = false, isR
       transitMap.fitFleet(visibleForFit);
     }
 
-    if (state.selectedBusKey) {
+    if (state.selectedBusKey && !state.selectedBusKey.startsWith('city:') && !state.selectedBusKey.startsWith('track:')) {
       const stillHere = state.arribos.find((b) => b.key === state.selectedBusKey);
       if (stillHere) {
         if (state.inspectorOpen) updateInspectorFields(stillHere);
         transitMap.drawFocusVector(stillHere);
+        if (state.followSelectedBus) transitMap.followBus(stillHere);
       } else {
         closeBusInspector();
       }
@@ -6756,6 +7066,24 @@ function bindEvents() {
   });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
+  el.inspLineBadge?.addEventListener('click', () => {
+    const cod = Number(el.inspLineBadge.dataset.codLinea);
+    const name = el.inspLineBadge.dataset.lineName || el.inspLineBadge.textContent?.trim();
+    if (!cod) return;
+    haptic('light');
+    const linea =
+      state.lineas.find((l) => Number(l.codigo) === cod) ||
+      state.catalogo?.lineByCode?.get(cod) || {
+        codigo: cod,
+        descripcion: name || `L${cod}`
+      };
+    switchTab('lineas');
+    if (isBottomSheetLayout() && getSheetIndex() === 0) {
+      setSheetIndex(1, { silent: true });
+    }
+    openLineFlota(linea);
+    announce(`Abriendo coches, choferes y servicios de Línea ${linea.descripcion}.`);
+  });
   el.btnInspTrack?.addEventListener('click', () => {
     const key = el.btnInspTrack.dataset.busKey || state.selectedBusKey;
     const bus = state.allFleetBuses.find((b) => b.key === key);
@@ -6791,21 +7119,41 @@ function bindEvents() {
     });
   });
   el.btnInspCenter?.addEventListener('click', () => {
-    const bus =
-      state.arribos.find((b) => b.key === state.selectedBusKey) ||
-      state.trackedUnit?.buses?.find((b) => b.key === state.selectedBusKey) ||
-      state.trackedUnit?.bus ||
-      state.allFleetBuses.find((b) => b.key === state.selectedBusKey) ||
-      null;
+    const bus = getCurrentlySelectedBus();
     if (bus) {
       haptic('light');
-      transitMap.focusBus(bus, 16);
+      state.followSelectedBus = true;
+      transitMap.focusBus(bus, Math.max(16, transitMap.map.getZoom()));
+      updateInspectorFields(bus);
     }
   });
   el.btnInspRoute.addEventListener('click', () => {
     const cod = el.btnInspRoute.dataset.codLinea;
     const name = el.btnInspRoute.dataset.lineName;
     if (cod) loadRouteForLine(cod, name, { clearExisting: true, fit: true });
+  });
+
+  el.btnChangelog?.addEventListener('click', () => {
+    haptic('light');
+    openChangelogModal();
+  });
+  el.btnChangelogClose?.addEventListener('click', closeChangelogModal);
+  el.changelogModal?.addEventListener('click', (e) => {
+    if (e.target === el.changelogModal) closeChangelogModal();
+  });
+  onPwaInstallAvailable((available) => {
+    if (el.changelogPwaBar) {
+      el.changelogPwaBar.classList.toggle('hidden', !available || isPwaInstalled());
+    }
+  });
+  el.btnPwaInstall?.addEventListener('click', async () => {
+    const outcome = await promptPwaInstall();
+    if (outcome === 'accepted') {
+      showToast('DIRECT GPS instalado como app (PWA)', 'success', 2600);
+      el.changelogPwaBar?.classList.add('hidden');
+    } else if (outcome === 'unavailable') {
+      showToast('Usá el menú de tu navegador → "Instalar aplicación"', 'info', 3000);
+    }
   });
 
   el.btnAllBuses?.addEventListener('click', () => toggleAllFleetMode());
@@ -6878,7 +7226,12 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
+    if (el.changelogModal && !el.changelogModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeChangelogModal();
+        return;
+      }
+    } else if (el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
       if (e.key === 'Escape') {
         closeAliasModal();
         return;
@@ -6905,6 +7258,10 @@ function bindEvents() {
   });
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.quick-search-wrap')) closeSearchDropdown();
+  });
+
+  window.addEventListener('resize', () => {
+    if (state.inspectorOpen) syncInspectorLayoutHeight();
   });
 
   window.addEventListener('offline', () => {
@@ -6958,10 +7315,18 @@ function resumeRealtime() {
       startSimLoop();
     }
   }
+  if (state.allFleetMode) {
+    if (wasPaused) refreshAllFleetBuses({ fit: false, silent: true });
+    if (state.simulateMode && state.allFleetBuses.length > 0) startSimLoop();
+  }
 }
 
-// Android system back button / swipe-back layered navigation
+// Layered back navigation (Escape / PWA history)
 async function handleNativeBack() {
+  if (el.changelogModal && !el.changelogModal.classList.contains('hidden')) {
+    closeChangelogModal();
+    return true;
+  }
   if (el.aliasModal && !el.aliasModal.classList.contains('hidden')) {
     closeAliasModal();
     return true;
@@ -7057,14 +7422,13 @@ async function init() {
     }
   });
 
-  // Re-apply system bar colors after native bridge init
   setSystemBarsTheme(savedTheme);
 
   loadFavorites();
   bindEvents();
   updateSignalPill();
 
-  if (!isNative && 'serviceWorker' in navigator) {
+  if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
@@ -7081,10 +7445,8 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // On web, warm routes + schedules gently in idle time after initial load; on Android they're bundled inside the APK
-  if (!isNative) {
-    setTimeout(() => warmOfflineArchive(), 8000);
-  }
+  // Warm routes + schedules gently in idle time so offline PWA & Modo Libre work instantly
+  setTimeout(() => warmOfflineArchive(), 8000);
 
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
@@ -7099,7 +7461,6 @@ async function init() {
     renderRadarWelcome();
   }
 
-  // Reveal the native WebView cleanly once initial content is ready
   requestAnimationFrame(() => {
     transitMap.invalidateSize();
     hideSplash();

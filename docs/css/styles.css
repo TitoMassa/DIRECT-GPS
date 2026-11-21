@@ -2187,29 +2187,63 @@ input:focus-visible,
 }
 
 /* ==========================================================================
-   Floating Bus Telemetry Sheet (Desktop & Mobile)
+   Docked Bottom Map Edge Telemetry Strip (Desktop & Mobile)
+   Sits flush along the bottom edge of the map viewport (eating into the map,
+   never covering the menu), with X at top-right and clickable Line link.
    ========================================================================== */
 .bus-inspector {
   position: fixed;
-  bottom: calc(16px + var(--safe-bottom));
-  left: calc(var(--dock-w) + var(--safe-left) + 16px);
-  width: 326px;
-  max-width: calc(100vw - var(--dock-w) - 84px);
+  bottom: 0;
+  left: calc(var(--dock-w) + var(--safe-left));
+  right: 0;
+  width: auto;
+  max-width: none;
   z-index: 460;
   background: var(--surface-0);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-float);
-  padding: 11px 12px;
+  border-top: 1px solid var(--border-strong);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.32);
+  padding: 9px calc(14px + var(--safe-right)) calc(9px + var(--safe-bottom)) 14px;
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 7px;
+}
+
+.app-shell.inspector-open .map-canvas {
+  bottom: var(--insp-h, 134px);
+}
+
+.app-shell.inspector-open .map-controls {
+  bottom: calc(var(--insp-h, 134px) + 12px);
 }
 
 .bus-inspector-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
+}
+
+.insp-line-btn {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  transition: transform 0.12s ease, filter 0.12s ease;
+}
+
+.insp-line-btn::after {
+  content: '›';
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+.insp-line-btn:hover {
+  filter: brightness(1.1);
+}
+
+.insp-line-btn:active {
+  transform: scale(0.96);
 }
 
 .insp-title-wrap {
@@ -2217,7 +2251,7 @@ input:focus-visible,
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .insp-bandera {
@@ -2238,7 +2272,7 @@ input:focus-visible,
 
 .insp-metrics-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1px;
   background: var(--border);
   border: 1px solid var(--border);
@@ -2248,7 +2282,7 @@ input:focus-visible,
 
 .insp-metric {
   background: var(--surface-1);
-  padding: 6px 8px;
+  padding: 5px 8px;
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -2257,7 +2291,7 @@ input:focus-visible,
 
 .insp-metric-label {
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-3);
@@ -2265,7 +2299,7 @@ input:focus-visible,
 
 .insp-metric-val {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--text-1);
   font-variant-numeric: tabular-nums;
@@ -2277,9 +2311,9 @@ input:focus-visible,
 .insp-driver-inline {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 .insp-driver-inline strong {
@@ -2295,7 +2329,7 @@ input:focus-visible,
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 6px 8px;
+  gap: 5px 8px;
 }
 
 .insp-foot-actions {
@@ -2306,20 +2340,98 @@ input:focus-visible,
 }
 
 .mini-close-btn {
-  width: 24px;
-  height: 24px;
-  border-radius: 5px;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
   display: grid;
   place-items: center;
-  color: var(--text-3);
+  color: var(--text-2);
   background: var(--surface-1);
-  font-size: 11px;
+  border: 1px solid var(--border);
+  font-size: 11.5px;
   flex-shrink: 0;
+  align-self: flex-start;
 }
 
 .mini-close-btn:hover {
   color: var(--text-1);
   background: var(--surface-hover);
+}
+
+/* Changelog Modal & PWA Install Banner */
+.changelog-card {
+  width: min(460px, calc(100vw - 24px));
+  max-height: 82dvh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.changelog-pwa-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.32);
+  font-size: 12px;
+  color: var(--text-1);
+}
+
+.changelog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.changelog-item {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.changelog-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.changelog-ver {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.changelog-date {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.changelog-bullets {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+.changelog-bullets strong {
+  color: var(--text-1);
 }
 
 /* ==========================================================================
@@ -3402,13 +3514,28 @@ input:focus-visible,
     pointer-events: none;
   }
 
+  .app-shell.inspector-open:not(.dock-expanded) .map-canvas {
+    bottom: calc(52dvh + var(--insp-h, 132px));
+  }
+
+  .app-shell.inspector-open:not(.dock-expanded) .map-controls {
+    bottom: calc(52dvh + var(--insp-h, 132px) + 8px);
+  }
+
   .bus-inspector {
-    left: calc(10px + var(--safe-left));
-    right: calc(56px + var(--safe-right));
-    width: auto;
+    left: 0;
+    right: 0;
+    width: 100%;
     max-width: none;
-    bottom: calc(52dvh + 10px);
-    padding: 9px 10px;
+    bottom: 52dvh;
+    border-radius: 12px 12px 0 0;
+    border-bottom: 1px solid var(--border);
+    padding: 8px calc(10px + var(--safe-right)) 8px calc(10px + var(--safe-left));
+    gap: 6px;
+  }
+
+  .bus-inspector .insp-metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .app-shell.dock-expanded .bus-inspector {

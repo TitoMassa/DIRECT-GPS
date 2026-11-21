@@ -84,7 +84,7 @@ function estimateInitialKinematics(bus, newTraj, stopId, nowSec, gpsMs, etaSec, 
   // 2) Local scheduled segment speed along the matched trip (distinguishes highway/bridge vs downtown!)
   if (bus.scheduledTrip && bus.stopProj) {
     const ev = evaluateTripState(bus.scheduledTrip, stopId, bus.stopProj, nowSec, aheadSec, {
-      maxAheadSec: 160 * 60
+      maxAheadSec: 240 * 60
     });
     if (ev && !ev.isAtTerminal && ev.speedMps > 1.2) {
       const schedSpd = clamp(ev.speedMps * 0.92, 2.8, 18.0);
@@ -574,7 +574,7 @@ export class BusSimulator {
       this._applySampleToBus(bus, prev, false);
     }
 
-    // Mirror next-lap (`Sig. vuelta`) virtual cards onto their reconciled source bus (lat/lng, routeMeters, live status)
+    // Mirror next-lap (`Sig. vuelta`) virtual cards onto their reconciled source bus (lat/lng, desvio, GPS, routeMeters, live status)
     for (const bus of nextLapBuses) {
       const src = busByKey.get(bus.nextLapOfKey);
       if (!src) continue;
@@ -586,6 +586,11 @@ export class BusSimulator {
       }
       bus.nextLapSourceLive = !src.isPredicted && !src.gpsLost;
       bus.predictionReason = bus.nextLapSourceLive ? 'next-lap-live' : 'next-lap-offline';
+      if (src.desvio) bus.desvio = src.desvio;
+      if (src.ultimaFechaHoraGPS) bus.ultimaFechaHoraGPS = src.ultimaFechaHoraGPS;
+      if (src.gpsTimeOnly) bus.gpsTimeOnly = src.gpsTimeOnly;
+      if (src.choferNombre) bus.choferNombre = src.choferNombre;
+      if (src.choferLegajo) bus.choferLegajo = src.choferLegajo;
       if (src.realBandera) bus.realBandera = src.realBandera;
       if (src.realBanderaColor) bus.realBanderaColor = src.realBanderaColor;
     }
@@ -613,7 +618,7 @@ export class BusSimulator {
       // ── Mode A: Timetable-driven smooth 30fps tracking anchored to last GPS + gradual recovery ──
       if (st.mode === 'schedule' && st.scheduledTrip && st.stopProj) {
         const ev = evaluateTripState(st.scheduledTrip, st.stopId, st.stopProj, nowSec, st.predDesvioSec || 0, {
-          maxAheadSec: 160 * 60,
+          maxAheadSec: 240 * 60,
           anchor: st.scheduleAnchor || null
         });
         let targetSpeed = 0;
@@ -785,6 +790,9 @@ export class BusSimulator {
         bus.routeMeters = Math.max(0, src.routeMeters + (bus.nextLapExtraMeters || 0));
         bus.distanceMeters = bus.routeMeters;
       }
+      if (src.desvio) bus.desvio = src.desvio;
+      if (src.ultimaFechaHoraGPS) bus.ultimaFechaHoraGPS = src.ultimaFechaHoraGPS;
+      if (src.gpsTimeOnly) bus.gpsTimeOnly = src.gpsTimeOnly;
       if (src.realBandera) bus.realBandera = src.realBandera;
       if (src.realBanderaColor) bus.realBanderaColor = src.realBanderaColor;
 
