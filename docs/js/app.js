@@ -8619,17 +8619,6 @@ function renderLineRecorridoView() {
   });
   if (rv.viewMode === 'grilla' && isTodayTipo && currentTripIdx >= 0) {
     requestAnimationFrame(() => scrollNowCol(false));
-  } else if (rv.viewMode === 'paradas' && isTodayTipo) {
-    requestAnimationFrame(() => {
-      el.lineasContent.querySelectorAll('.rec-preview-chips').forEach((strip) => {
-        if (strip.scrollWidth <= strip.clientWidth + 4) return;
-        const nextChip = strip.querySelector('[data-next-chip="1"]');
-        if (nextChip) {
-          // Keep 1–2 preceding past times visible right before the highlighted next departure
-          strip.scrollLeft = Math.max(0, nextChip.offsetLeft - 88);
-        }
-      });
-    });
   }
 }
 
