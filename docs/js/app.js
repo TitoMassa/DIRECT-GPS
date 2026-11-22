@@ -108,6 +108,19 @@ const state = {
   allFleetRosterOpen: false,
   allFleetRosterTab: 'coches', // 'coches' | 'choferes'
   allFleetRosterQuery: '',
+
+  // Global Chronological Events Timeline Modal (-7d History / Today Live / +7d Scheduled)
+  eventsModalOpen: false,
+  eventsDayOffset: 0, // -7 .. 0 (Hoy) .. +7 (Programado)
+  eventsFilter: 'all', // 'all' | 'relevo' | 'inicio' | 'fin'
+  eventsQuery: '',
+  eventsLoading: false,
+  eventsBundle: null,
+  eventsBundleSavedAt: 0,
+  eventsIsOfflineCache: false,
+  eventsTimerId: null,
+  eventsClickTargets: [],
+
   themeColor: '#10141c',
   dockExpanded: false,
 
@@ -251,6 +264,20 @@ const el = {
   btnZoomIn: document.getElementById('btn-zoom-in'),
   btnZoomOut: document.getElementById('btn-zoom-out'),
 
+  btnEventsTimeline: document.getElementById('btn-events-timeline'),
+  eventsModal: document.getElementById('events-modal'),
+  eventsModalSub: document.getElementById('events-modal-sub'),
+  btnCloseEventsModal: document.getElementById('btn-close-events-modal'),
+  btnEventsPrevDay: document.getElementById('btn-events-prev-day'),
+  btnEventsNextDay: document.getElementById('btn-events-next-day'),
+  btnEventsTodayReset: document.getElementById('btn-events-today-reset'),
+  eventsDayMain: document.getElementById('events-day-main'),
+  eventsDaySub: document.getElementById('events-day-sub'),
+  eventsFilterInput: document.getElementById('events-filter-input'),
+  eventsTypeFilters: document.getElementById('events-type-filters'),
+  btnEventsJumpNow: document.getElementById('btn-events-jump-now'),
+  eventsTimelineBody: document.getElementById('events-timeline-body'),
+
   allFleetRoster: document.getElementById('all-fleet-roster'),
   allFleetRosterSub: document.getElementById('all-fleet-roster-sub'),
   btnCloseAllFleetRoster: document.getElementById('btn-close-all-fleet-roster'),
@@ -285,6 +312,14 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.12',
+    date: '22/11/2026 · 12:35 hs',
+    items: [
+      '<strong>Línea cronológica global de Eventos:</strong> nuevo botón <strong>Eventos</strong> sobre el mapa que despliega en una línea de tiempo vertical todos los <strong>inicios de servicio</strong>, <strong>relevos de turno</strong> (quién sale y quién releva), <strong>inicios/fines de turno</strong> y <strong>fines de servicio</strong> de las 26 líneas con coche y chofer en cuanto se detectan.',
+      '<strong>Navegación 7 días atrás y adelante + acceso directo al chip:</strong> usá las flechas <strong>‹</strong> y <strong>›</strong> para revisar el historial de eventos de los últimos 7 días o los eventos programados de los próximos 7 días, y tocá cualquier evento con coche asignado para ir directo a su chip en el mapa.'
+    ]
+  },
   {
     version: 'v2.4.11',
     date: '22/11/2026 · 10:55 hs',
@@ -3217,6 +3252,663 @@ function toggleAllFleetMode(forceState = null) {
       refreshAllFleetBuses({ fit: false, silent: true });
     }
   }, REFRESH_INTERVAL_SEC * 1000);
+}
+
+// ============================================================================
+// Global Vertical Chronological Events Timeline (-7d History / Today / +7d)
+// ============================================================================
+const EVENTS_MAX_PAST_DAYS = 7;
+const EVENTS_MAX_FUTURE_DAYS = 7;
+const eventsLineModelCache = new Map(); // `${codLinea}:${tipoDia}` -> LineScheduleModel | null
+
+function formatEventsDayNavLabel(dayKey, todayKey, offset = 0) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || ''));
+  const ddmm = m ? `${m[3]}/${m[2]}` : dayKey;
+  const dowIdx = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay() : 0;
+  const dowShort = SHORT_DOW_ES[dowIdx] || '';
+  const tipo = dowIdx === 0 ? 'domingo' : dowIdx === 6 ? 'sabado' : 'habil';
+  const tipoLabel = tipo === 'domingo' ? 'Domingo' : tipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  if (offset === 0 || dayKey === todayKey) {
+    return { main: `Hoy · ${dowShort} ${ddmm}`, shortBadge: 'Hoy', tipo, tipoLabel };
+  }
+  if (offset === -1 || dayKey === shiftDayKey(todayKey, -1)) {
+    return { main: `Ayer · ${dowShort} ${ddmm}`, shortBadge: 'Ayer', tipo, tipoLabel };
+  }
+  if (offset === 1 || dayKey === shiftDayKey(todayKey, 1)) {
+    return { main: `Mañana · ${dowShort} ${ddmm}`, shortBadge: 'Mañana', tipo, tipoLabel };
+  }
+  return { main: `${dowShort} ${ddmm}`, shortBadge: `${dowShort} ${ddmm}`, tipo, tipoLabel };
+}
+
+function formatRelativeEventTime(diffSec) {
+  if (Math.abs(diffSec) <= 900) return 'AHORA';
+  const absMin = Math.round(Math.abs(diffSec) / 60);
+  const h = Math.floor(absMin / 60);
+  const m = absMin % 60;
+  const span = h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${Math.max(1, absMin)}m`;
+  return diffSec > 0 ? `en ${span}` : `hace ${span}`;
+}
+
+function getOrBuildEventsLineModel(codLinea, tipoDia) {
+  const key = `${codLinea}:${tipoDia}`;
+  if (eventsLineModelCache.has(key)) return eventsLineModelCache.get(key);
+  const branches = state.routeBranchesCache.get(Number(codLinea)) || [];
+  const horFile = state.horariosArchiveCache.get(Number(codLinea)) || null;
+  if (!branches.length || !horFile) return null;
+  const model = buildLineScheduleModel(Number(codLinea), branches, horFile, tipoDia);
+  eventsLineModelCache.set(key, model || null);
+  return model || null;
+}
+
+function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
+  const todayKey = getArgentinaDayKey();
+  const clampedOffset = Math.max(-EVENTS_MAX_PAST_DAYS, Math.min(EVENTS_MAX_FUTURE_DAYS, Number(dayOffset) || 0));
+  const targetDayKey = shiftDayKey(todayKey, clampedOffset);
+  const targetTipo = getTipoDiaForDayKey(targetDayKey);
+  const isToday = clampedOffset === 0;
+  const isPastDay = clampedOffset < 0;
+  const isFutureDay = clampedOffset > 0;
+  const nowSec = getArgentinaSecOfDay();
+  const nowSvcSec = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
+
+  const lines = Array.isArray(state.lineas) ? state.lineas : [];
+  const events = [];
+
+  for (const linea of lines) {
+    const cod = Number(linea?.codigo);
+    if (!cod) continue;
+    const lineName = String(linea.descripcion || `L${cod}`);
+    const model = getOrBuildEventsLineModel(cod, targetTipo);
+    const services = Array.isArray(model?.fleetSummary?.services) ? model.fleetSummary.services : [];
+    if (services.length === 0) continue;
+
+    let blockAssignMap = new Map();
+    if (!isFutureDay) {
+      const lineBundle = bundleData?.lines?.[String(cod)] || null;
+      const allCoches = Array.isArray(lineBundle?.coches) ? [...lineBundle.coches] : [];
+      const allChoferes = Array.isArray(lineBundle?.choferes) ? [...lineBundle.choferes] : [];
+      const dayTrips = Array.isArray(lineBundle?.dayTripsByDay?.[targetDayKey])
+        ? lineBundle.dayTripsByDay[targetDayKey]
+        : [];
+      const dayObs = Array.isArray(lineBundle?.dayObsByDay?.[targetDayKey])
+        ? lineBundle.dayObsByDay[targetDayKey]
+        : [];
+
+      // Overlay any live Modo Libre units on Hoy for instant 10s driver/car accuracy
+      if (isToday && Array.isArray(state.allFleetBuses) && state.allFleetBuses.length > 0) {
+        const byNum = new Map(allCoches.map((c) => [String(c.coche), c]));
+        for (const b of state.allFleetBuses) {
+          if (Number(b.codigoLinea) !== cod) continue;
+          const num = String(b.identificadorCoche || b.coche || '').trim();
+          if (!num) continue;
+          const prev = byNum.get(num);
+          const merged = {
+            ...(prev || {}),
+            coche: num,
+            esAdaptado: Boolean(b.esAdaptado || prev?.esAdaptado),
+            vistoHoy: true,
+            enLineaAhora: true,
+            lastChoferNombre: b.choferNombre || prev?.lastChoferNombre || '',
+            lastChoferLegajo: b.choferLegajo || prev?.lastChoferLegajo || '',
+            lastBandera: b.realBandera || b.descripcionBandera || prev?.lastBandera || '',
+            lastGps: b.ultimaFechaHoraGPS || prev?.lastGps || '',
+            lastLat: typeof b.rawLat === 'number' ? b.rawLat : prev?.lastLat ?? null,
+            lastLng: typeof b.rawLng === 'number' ? b.rawLng : prev?.lastLng ?? null,
+            lastDesvioRaw: b.desvio?.raw || prev?.lastDesvioRaw || '',
+            lastDesvioSec: b.desvio?.seconds || prev?.lastDesvioSec || 0,
+            lastSeenAt: Math.max(Number(b.lastSeenAt) || 0, Number(prev?.lastSeenAt) || 0, Date.now()),
+            lastDayKey: todayKey
+          };
+          byNum.set(num, merged);
+        }
+        allCoches.length = 0;
+        allCoches.push(...byNum.values());
+      }
+
+      const liveCoches = isToday ? allCoches.filter((c) => c.enLineaAhora) : [];
+      const liveMatchByCoche =
+        isToday && liveCoches.length > 0
+          ? matchFreeFleetUnitsToModel(model, liveCoches, nowSec, state.lastRealGpsByUnit)
+          : new Map();
+
+      const built = buildFlotaDayAssignments({
+        model,
+        schedSummary: model.fleetSummary,
+        trips: dayTrips,
+        dayObs,
+        allCoches,
+        allChoferes,
+        dayKey: targetDayKey,
+        isToday,
+        nowSec: isToday ? nowSec : 26 * 3600,
+        liveMatchByCoche
+      });
+      blockAssignMap = built.blockAssignMap || new Map();
+    }
+
+    const packTarget = (assign, turno, srv) => {
+      if (!assign?.coche) return null;
+      return {
+        codLinea: cod,
+        lineName,
+        coche: assign.coche,
+        choferNombre: assign.choferNombre || '',
+        choferLegajo: assign.choferLegajo || '',
+        esAdaptado: Boolean(assign.esAdaptado),
+        lat: assign.lat ?? null,
+        lng: assign.lng ?? null,
+        bandera: assign.bandera || '',
+        lastGps: assign.lastGps || '',
+        lastStopId: assign.lastStopId || '',
+        desvioRaw: assign.desvioRaw || '',
+        desvioSec: assign.desvioSec || 0,
+        enLineaAhora: Boolean(isToday && assign.enLineaAhora),
+        lastSeenLabel: isToday ? (assign.enLineaAhora ? 'En línea' : 'Hoy') : formatEventsDayNavLabel(targetDayKey, todayKey, clampedOffset).shortBadge,
+        serviceMeta: {
+          serviceNumber: srv.serviceNumber,
+          turnoIndex: turno.turnoIndex,
+          serviceTurnosCount: (srv.turnos || []).length,
+          lapNumber: assign.lapNumber || null,
+          shiftLaps: turno.shiftLaps || null,
+          isCortado: Boolean(turno.isCortado),
+          isRelevoEnLinea: Boolean(turno.isRelevoEnLinea),
+          startHHMM: formatSecHHMM(turno.startSec),
+          endHHMM: formatSecHHMM(turno.endSec)
+        }
+      };
+    };
+
+    for (const srv of services) {
+      const turnos = Array.isArray(srv.turnos) ? srv.turnos : [];
+      if (turnos.length === 0) continue;
+
+      const firstT = turnos[0];
+      const firstAssign = blockAssignMap.get(firstT.blockId) || null;
+      events.push({
+        kind: 'inicio_servicio',
+        category: 'inicio',
+        eventSec: firstT.startSec,
+        codLinea: cod,
+        lineName,
+        serviceNumber: srv.serviceNumber,
+        turnosCount: turnos.length,
+        title: turnos.length > 1 ? 'Inicio de servicio · T1' : 'Inicio de servicio',
+        metaText: [
+          `${formatSecHHMM(firstT.startSec)}–${formatSecHHMM(firstT.endSec)}`,
+          firstT.shiftLaps ? formatShiftLaps(firstT.shiftLaps) : ''
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        actorLabel: 'Inicia',
+        actor: firstAssign,
+        outActor: null,
+        inActor: null,
+        target: packTarget(firstAssign, firstT, srv)
+      });
+
+      for (let i = 0; i < turnos.length - 1; i++) {
+        const curT = turnos[i];
+        const nextT = turnos[i + 1];
+        const curAssign = blockAssignMap.get(curT.blockId) || null;
+        const nextAssign = blockAssignMap.get(nextT.blockId) || null;
+        const gapSec = nextT.startSec - curT.endSec;
+
+        if (gapSec <= 45 * 60) {
+          // Continuous shift handoff / relevo
+          const preferredAssign =
+            nextAssign?.coche && (!isToday || nowSvcSec >= nextT.startSec - 1800 || !curAssign?.coche)
+              ? { assign: nextAssign, turno: nextT }
+              : curAssign?.coche
+                ? { assign: curAssign, turno: curT }
+                : nextAssign?.coche
+                  ? { assign: nextAssign, turno: nextT }
+                  : null;
+          events.push({
+            kind: 'relevo',
+            category: 'relevo',
+            eventSec: nextT.startSec,
+            codLinea: cod,
+            lineName,
+            serviceNumber: srv.serviceNumber,
+            turnosCount: turnos.length,
+            title: `Relevo · T${curT.turnoIndex} → T${nextT.turnoIndex}`,
+            metaText: [
+              `T${nextT.turnoIndex} ${formatSecHHMM(nextT.startSec)}–${formatSecHHMM(nextT.endSec)}`,
+              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : ''
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            actorLabel: 'Relevo',
+            actor: null,
+            outActor: curAssign,
+            inActor: nextAssign,
+            target: preferredAssign ? packTarget(preferredAssign.assign, preferredAssign.turno, srv) : null
+          });
+        } else {
+          // Cortado split: distinct end of turno + later start of turno
+          events.push({
+            kind: 'fin_turno',
+            category: 'fin',
+            eventSec: curT.endSec,
+            codLinea: cod,
+            lineName,
+            serviceNumber: srv.serviceNumber,
+            turnosCount: turnos.length,
+            title: `Fin de turno T${curT.turnoIndex}`,
+            metaText: `Cortado · receso hasta ${formatSecHHMM(nextT.startSec)}`,
+            actorLabel: 'Finaliza',
+            actor: curAssign,
+            outActor: null,
+            inActor: null,
+            target: packTarget(curAssign, curT, srv)
+          });
+          events.push({
+            kind: 'inicio_turno',
+            category: 'inicio',
+            eventSec: nextT.startSec,
+            codLinea: cod,
+            lineName,
+            serviceNumber: srv.serviceNumber,
+            turnosCount: turnos.length,
+            title: `Inicio de turno T${nextT.turnoIndex}`,
+            metaText: [
+              `${formatSecHHMM(nextT.startSec)}–${formatSecHHMM(nextT.endSec)}`,
+              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : ''
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            actorLabel: 'Inicia',
+            actor: nextAssign,
+            outActor: null,
+            inActor: null,
+            target: packTarget(nextAssign, nextT, srv)
+          });
+        }
+      }
+
+      const lastT = turnos[turnos.length - 1];
+      const lastAssign = blockAssignMap.get(lastT.blockId) || null;
+      events.push({
+        kind: 'fin_servicio',
+        category: 'fin',
+        eventSec: lastT.endSec,
+        codLinea: cod,
+        lineName,
+        serviceNumber: srv.serviceNumber,
+        turnosCount: turnos.length,
+        title: turnos.length > 1 ? `Fin de servicio · T${lastT.turnoIndex}` : 'Fin de servicio',
+        metaText: `Fin de jornada · Srv ${srv.serviceNumber}`,
+        actorLabel: 'Finaliza',
+        actor: lastAssign,
+        outActor: null,
+        inActor: null,
+        target: packTarget(lastAssign, lastT, srv)
+      });
+    }
+  }
+
+  events.sort((a, b) => {
+    if (a.eventSec !== b.eventSec) return a.eventSec - b.eventSec;
+    const lineCmp = a.lineName.localeCompare(b.lineName, 'es', { numeric: true });
+    if (lineCmp !== 0) return lineCmp;
+    return (a.serviceNumber || 0) - (b.serviceNumber || 0);
+  });
+
+  for (const ev of events) {
+    if (isPastDay) {
+      ev.phase = 'past';
+      ev.relText = '';
+    } else if (isFutureDay) {
+      ev.phase = 'upcoming';
+      ev.relText = 'Prog.';
+    } else {
+      const diff = ev.eventSec - nowSvcSec;
+      ev.phase = Math.abs(diff) <= 900 ? 'now' : diff < 0 ? 'past' : 'upcoming';
+      ev.relText = formatRelativeEventTime(diff);
+    }
+  }
+
+  return {
+    todayKey,
+    targetDayKey,
+    clampedOffset,
+    isToday,
+    isPastDay,
+    isFutureDay,
+    nowSvcSec,
+    navInfo: formatEventsDayNavLabel(targetDayKey, todayKey, clampedOffset),
+    events
+  };
+}
+
+function scrollEventsToNow(behavior = 'auto') {
+  if (!el.eventsTimelineBody) return;
+  const anchor =
+    el.eventsTimelineBody.querySelector('#events-now-anchor') ||
+    el.eventsTimelineBody.querySelector('.ev-item.is-now') ||
+    el.eventsTimelineBody.querySelector('.ev-item.is-upcoming');
+  if (!anchor) return;
+  const container = el.eventsTimelineBody;
+  const targetTop = Math.max(0, anchor.offsetTop - Math.round(container.clientHeight * 0.28));
+  container.scrollTo({ top: targetTop, behavior });
+}
+
+function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = {}) {
+  if (!el.eventsTimelineBody) return;
+  const prevScroll = preserveScroll ? el.eventsTimelineBody.scrollTop : 0;
+
+  const offset = Math.max(-EVENTS_MAX_PAST_DAYS, Math.min(EVENTS_MAX_FUTURE_DAYS, Number(state.eventsDayOffset) || 0));
+  const todayKey = getArgentinaDayKey();
+  const targetDayKey = shiftDayKey(todayKey, offset);
+  const navInfo = formatEventsDayNavLabel(targetDayKey, todayKey, offset);
+
+  if (el.btnEventsPrevDay) el.btnEventsPrevDay.disabled = offset <= -EVENTS_MAX_PAST_DAYS;
+  if (el.btnEventsNextDay) el.btnEventsNextDay.disabled = offset >= EVENTS_MAX_FUTURE_DAYS;
+  if (el.eventsDayMain) el.eventsDayMain.textContent = navInfo.main;
+  if (el.btnEventsTodayReset) {
+    el.btnEventsTodayReset.classList.toggle('is-historical', offset !== 0);
+    el.btnEventsTodayReset.title = offset !== 0 ? 'Tocá para volver a hoy' : 'Eventos de hoy';
+  }
+  if (el.btnEventsJumpNow) {
+    el.btnEventsJumpNow.classList.toggle('hidden', offset !== 0);
+  }
+  if (el.eventsTypeFilters) {
+    el.eventsTypeFilters.querySelectorAll('[data-events-filter]').forEach((btn) => {
+      const active = btn.dataset.eventsFilter === state.eventsFilter;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  if (state.eventsLoading) {
+    if (el.eventsDaySub) el.eventsDaySub.textContent = `${navInfo.tipoLabel} · Cargando cronología...`;
+    el.eventsTimelineBody.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    return;
+  }
+
+  const built = buildGlobalEventsForDay(offset, state.eventsBundle);
+  const normQ = String(state.eventsQuery || '')
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  const filtered = built.events.filter((ev) => {
+    if (state.eventsFilter !== 'all' && ev.category !== state.eventsFilter) return false;
+    if (!normQ) return true;
+    const hay = [
+      ev.lineName,
+      `servicio ${ev.serviceNumber}`,
+      `srv ${ev.serviceNumber}`,
+      ev.title,
+      formatSecHHMM(ev.eventSec),
+      ev.actor?.coche || '',
+      ev.actor?.choferNombre || '',
+      ev.outActor?.coche || '',
+      ev.outActor?.choferNombre || '',
+      ev.inActor?.coche || '',
+      ev.inActor?.choferNombre || ''
+    ]
+      .join(' ')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    return hay.includes(normQ);
+  });
+
+  const modeTag = built.isPastDay
+    ? 'Historial'
+    : built.isFutureDay
+      ? 'Programado'
+      : state.isOffline || state.eventsIsOfflineCache
+        ? 'Caché local'
+        : 'En vivo';
+
+  if (el.eventsDaySub) {
+    el.eventsDaySub.textContent = `${navInfo.tipoLabel} · ${filtered.length} ${filtered.length === 1 ? 'evento' : 'eventos'} · ${modeTag}${offset !== 0 ? ' · Volver a hoy' : ''}`;
+  }
+  if (el.eventsModalSub) {
+    if (built.isToday) {
+      const clock = formatRosterClockArtWithSec(state.eventsBundleSavedAt || Date.now());
+      el.eventsModalSub.textContent =
+        state.isOffline || state.eventsIsOfflineCache
+          ? `Sin conexión · Caché local${clock ? ` (${clock})` : ''} · Tocá un evento para ver el chip`
+          : `Actualización automática cada ${REFRESH_INTERVAL_SEC} s · Tocá un evento para ir al chip`;
+    } else if (built.isPastDay) {
+      el.eventsModalSub.textContent = 'Registro histórico (últimos 7 días) · Tocá un coche registrado para verlo en mapa';
+    } else {
+      el.eventsModalSub.textContent = 'Eventos programados (próximos 7 días) · Coches y choferes se asignan al iniciar';
+    }
+  }
+
+  if (filtered.length === 0) {
+    state.eventsClickTargets = [];
+    el.eventsTimelineBody.innerHTML = `<div class="fleet-roster-empty">${
+      normQ || state.eventsFilter !== 'all'
+        ? 'No hay eventos que coincidan con ese filtro.'
+        : 'No se encontraron eventos programados para este día.'
+    }</div>`;
+    return;
+  }
+
+  const targets = [];
+  const renderSingleActor = (label, a, isFuture, isPast) => {
+    if (a?.coche || a?.choferNombre) {
+      const carHtml = a.coche ? `<span class="ev-car-chip">#${escapeHtml(a.coche)}</span>` : '';
+      const drvHtml = a.choferNombre ? `<span class="ev-driver-name">${escapeHtml(a.choferNombre)}</span>` : '';
+      return `<div class="ev-actor-row"><span class="ev-actor-label">${escapeHtml(label)}:</span>${carHtml}${drvHtml}</div>`;
+    }
+    return `<div class="ev-actor-row"><span class="ev-pending-txt">${
+      isFuture
+        ? 'Programado · coche y chofer por confirmar'
+        : isPast
+          ? 'Sin registro de coche/chofer guardado'
+          : 'Por confirmar al detectarse en línea'
+    }</span></div>`;
+  };
+
+  let nowDividerInserted = false;
+  const nowClockHHMM = formatSecHHMM(built.nowSvcSec);
+  const nowDividerHtml = `<div id="events-now-anchor" class="ev-now-divider" role="separator" aria-label="Hora actual ${escapeHtml(nowClockHHMM)}"><span class="ev-now-pill"><span class="ev-now-dot" aria-hidden="true"></span>AHORA · ${escapeHtml(nowClockHHMM)}</span><span class="ev-now-line" aria-hidden="true"></span></div>`;
+
+  const htmlParts = ['<div class="events-timeline-list">'];
+  for (const ev of filtered) {
+    if (built.isToday && !nowDividerInserted && ev.eventSec >= built.nowSvcSec) {
+      htmlParts.push(nowDividerHtml);
+      nowDividerInserted = true;
+    }
+
+    const color = getLineColor(ev.lineName);
+    const phaseCls = ev.phase === 'now' ? 'is-now' : ev.phase === 'past' ? 'is-past' : 'is-upcoming';
+    const hhmm = formatSecHHMM(ev.eventSec);
+
+    let actorsHtml = '';
+    if (ev.kind === 'relevo') {
+      const outHas = Boolean(ev.outActor?.coche || ev.outActor?.choferNombre);
+      const inHas = Boolean(ev.inActor?.coche || ev.inActor?.choferNombre);
+      if (!outHas && !inHas) {
+        actorsHtml = `<div class="ev-actor-row"><span class="ev-pending-txt">${
+          built.isFutureDay
+            ? 'Relevo programado · choferes por confirmar'
+            : built.isPastDay
+              ? 'Sin registro de relevo guardado'
+              : 'Relevo programado · se completará al detectarse'
+        }</span></div>`;
+      } else {
+        const outRow = outHas
+          ? `<div class="ev-actor-row"><span class="ev-actor-label">Sale:</span>${
+              ev.outActor.coche ? `<span class="ev-car-chip">#${escapeHtml(ev.outActor.coche)}</span>` : ''
+            }${ev.outActor.choferNombre ? `<span class="ev-driver-name">${escapeHtml(ev.outActor.choferNombre)}</span>` : ''}</div>`
+          : '';
+        const inRow = inHas
+          ? `<div class="ev-actor-row"><span class="ev-actor-label">Releva:</span>${
+              ev.inActor.coche ? `<span class="ev-car-chip">#${escapeHtml(ev.inActor.coche)}</span>` : ''
+            }${ev.inActor.choferNombre ? `<span class="ev-driver-name">${escapeHtml(ev.inActor.choferNombre)}</span>` : ''}</div>`
+          : `<div class="ev-actor-row"><span class="ev-actor-label">Releva:</span><span class="ev-pending-txt">por confirmar</span></div>`;
+        actorsHtml = outRow + inRow;
+      }
+    } else {
+      actorsHtml = renderSingleActor(ev.actorLabel, ev.actor, built.isFutureDay, built.isPastDay);
+    }
+
+    const idx = targets.length;
+    targets.push({
+      codLinea: ev.codLinea,
+      lineName: ev.lineName,
+      busTarget: ev.target
+    });
+
+    const ctaHtml = ev.target
+      ? `<span class="ev-map-cta">Ver chip #${escapeHtml(ev.target.coche)} ›</span>`
+      : `<span class="ev-meta-txt">Ver servicios ›</span>`;
+
+    htmlParts.push(`
+      <div class="ev-item ${phaseCls}" role="listitem">
+        <div class="ev-time-col" aria-hidden="true">
+          <span class="ev-time-hhmm">${escapeHtml(hhmm)}</span>
+          ${ev.relText ? `<span class="ev-time-rel">${escapeHtml(ev.relText)}</span>` : ''}
+        </div>
+        <div class="ev-rail-col" aria-hidden="true">
+          <span class="ev-node ev-node-${escapeHtml(ev.kind)}"></span>
+        </div>
+        <div class="ev-card-wrap">
+          <button type="button" class="ev-card" data-event-idx="${idx}">
+            <div class="ev-card-head">
+              <div class="ev-card-head-left">
+                <span class="fleet-roster-line-pill" style="background:${color}">${escapeHtml(ev.lineName)}</span>
+                <span class="ev-type-title">${escapeHtml(ev.title)}</span>
+              </div>
+              <span class="ev-srv-tag">Srv ${ev.serviceNumber}</span>
+            </div>
+            <div class="ev-actors">${actorsHtml}</div>
+            <div class="ev-card-foot">
+              <span class="ev-meta-txt">${escapeHtml(ev.metaText)}</span>
+              ${ctaHtml}
+            </div>
+          </button>
+        </div>
+      </div>
+    `);
+  }
+  if (built.isToday && !nowDividerInserted) {
+    htmlParts.push(nowDividerHtml);
+  }
+  htmlParts.push('</div>');
+
+  state.eventsClickTargets = targets;
+  el.eventsTimelineBody.innerHTML = htmlParts.join('');
+
+  if (scrollToNow && built.isToday) {
+    requestAnimationFrame(() => scrollEventsToNow('auto'));
+  } else if (preserveScroll) {
+    el.eventsTimelineBody.scrollTop = prevScroll;
+  }
+}
+
+let eventsLoadSeq = 0;
+async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false, silent = false } = {}) {
+  const mySeq = ++eventsLoadSeq;
+  if (!silent) {
+    state.eventsLoading = true;
+    renderEventsTimeline();
+  }
+  try {
+    const allCodes = (state.lineas || []).map((l) => Number(l.codigo)).filter(Boolean);
+    const [, bundleRes] = await Promise.all([
+      ensureScheduleAssetsLoaded(allCodes),
+      api.getOfflineBundleCached({ maxAgeMs: forceBundle ? 0 : 20000, force: forceBundle })
+    ]);
+    if (mySeq !== eventsLoadSeq || !state.eventsModalOpen) return;
+    state.eventsBundle = bundleRes?.data || state.eventsBundle;
+    state.eventsBundleSavedAt = Number(bundleRes?.savedAt) || Date.now();
+    state.eventsIsOfflineCache = Boolean(bundleRes?.isOfflineCache);
+    state.eventsLoading = false;
+    renderEventsTimeline({ scrollToNow, preserveScroll: silent });
+  } catch {
+    if (mySeq !== eventsLoadSeq || !state.eventsModalOpen) return;
+    state.eventsLoading = false;
+    renderEventsTimeline({ scrollToNow, preserveScroll: silent });
+  }
+}
+
+function openEventsModal() {
+  if (!el.eventsModal) return;
+  haptic('light');
+  state.eventsModalOpen = true;
+  state.eventsDayOffset = 0;
+  state.eventsFilter = 'all';
+  state.eventsQuery = '';
+  if (el.eventsFilterInput) el.eventsFilterInput.value = '';
+  el.eventsModal.classList.remove('hidden');
+  loadEventsTimelineData({ forceBundle: false, scrollToNow: true, silent: false });
+
+  if (state.eventsTimerId) clearInterval(state.eventsTimerId);
+  state.eventsTimerId = setInterval(() => {
+    if (state.eventsModalOpen && state.eventsDayOffset === 0 && !state.isAppPaused) {
+      if (state.isOffline) {
+        renderEventsTimeline({ preserveScroll: true });
+      } else {
+        loadEventsTimelineData({ forceBundle: true, scrollToNow: false, silent: true });
+      }
+    }
+  }, REFRESH_INTERVAL_SEC * 1000);
+}
+
+function closeEventsModal() {
+  state.eventsModalOpen = false;
+  if (state.eventsTimerId) {
+    clearInterval(state.eventsTimerId);
+    state.eventsTimerId = null;
+  }
+  el.eventsModal?.classList.add('hidden');
+}
+
+function changeEventsDay(nextOffset) {
+  const clamped = Math.max(-EVENTS_MAX_PAST_DAYS, Math.min(EVENTS_MAX_FUTURE_DAYS, Number(nextOffset) || 0));
+  if (clamped === state.eventsDayOffset) return;
+  state.eventsDayOffset = clamped;
+  haptic('light');
+  renderEventsTimeline({ scrollToNow: clamped === 0, preserveScroll: false });
+  if (clamped !== 0 && el.eventsTimelineBody) {
+    el.eventsTimelineBody.scrollTop = 0;
+  }
+}
+
+function handleEventsTimelineClick(e) {
+  const btn = e.target.closest('[data-event-idx]');
+  if (!btn) return;
+  const idx = Number(btn.dataset.eventIdx);
+  const entry = state.eventsClickTargets[idx];
+  if (!entry) return;
+  haptic('light');
+  closeEventsModal();
+
+  const target = entry.busTarget;
+  if (target?.coche) {
+    // If Modo Libre is active and this bus chip is live on the map, fly straight to it identically to Modo Libre roster!
+    const liveCityBus = state.allFleetMode
+      ? state.allFleetBuses.find(
+          (b) =>
+            Number(b.codigoLinea) === Number(target.codLinea) &&
+            String(b.identificadorCoche || b.coche || '').trim() === String(target.coche).trim()
+        )
+      : null;
+    if (liveCityBus) {
+      openAllFleetBusInspector(liveCityBus.key);
+      return;
+    }
+    locateFleetUnitOnMap(target);
+    return;
+  }
+
+  // Programmed / unassigned event: open that line's Servicios schedule directly
+  const lineaObj = state.lineas.find((l) => Number(l.codigo) === Number(entry.codLinea)) || {
+    codigo: entry.codLinea,
+    descripcion: entry.lineName
+  };
+  switchTab('lineas');
+  openLineFlota(lineaObj, { initialTab: 'servicios' });
+  showToast(`Línea ${entry.lineName} · Aún sin coche asignado a este evento`, 'info', 2400);
 }
 
 /**
@@ -8588,6 +9280,41 @@ function bindEvents() {
     }
   });
 
+  el.btnEventsTimeline?.addEventListener('click', () => openEventsModal());
+  el.btnCloseEventsModal?.addEventListener('click', closeEventsModal);
+  el.eventsModal?.addEventListener('click', (e) => {
+    if (e.target === el.eventsModal) closeEventsModal();
+  });
+  el.btnEventsPrevDay?.addEventListener('click', () => changeEventsDay(state.eventsDayOffset - 1));
+  el.btnEventsNextDay?.addEventListener('click', () => changeEventsDay(state.eventsDayOffset + 1));
+  el.btnEventsTodayReset?.addEventListener('click', () => {
+    if (state.eventsDayOffset !== 0) {
+      changeEventsDay(0);
+    } else {
+      scrollEventsToNow('smooth');
+    }
+  });
+  el.eventsFilterInput?.addEventListener('input', (e) => {
+    state.eventsQuery = e.target.value || '';
+    renderEventsTimeline({ scrollToNow: false, preserveScroll: false });
+  });
+  el.eventsTypeFilters?.addEventListener('click', (e) => {
+    const jumpBtn = e.target.closest('#btn-events-jump-now');
+    if (jumpBtn) {
+      haptic('light');
+      scrollEventsToNow('smooth');
+      return;
+    }
+    const pill = e.target.closest('[data-events-filter]');
+    if (!pill) return;
+    const nextFilter = pill.dataset.eventsFilter || 'all';
+    if (state.eventsFilter === nextFilter) return;
+    state.eventsFilter = nextFilter;
+    haptic('light');
+    renderEventsTimeline({ scrollToNow: state.eventsDayOffset === 0, preserveScroll: false });
+  });
+  el.eventsTimelineBody?.addEventListener('click', handleEventsTimelineClick);
+
   el.btnAllBuses?.addEventListener('click', () => toggleAllFleetMode());
   el.btnAllBusesList?.addEventListener('click', () => toggleAllFleetRosterModal());
   el.btnCloseAllFleetRoster?.addEventListener('click', closeAllFleetRosterModal);
@@ -8690,6 +9417,11 @@ function bindEvents() {
         closeThemeModal();
         return;
       }
+    } else if (el.eventsModal && !el.eventsModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeEventsModal();
+        return;
+      }
     } else if (el.allFleetRoster && !el.allFleetRoster.classList.contains('hidden')) {
       if (e.key === 'Escape') {
         closeAllFleetRosterModal();
@@ -8744,6 +9476,7 @@ function bindEvents() {
     );
     if (state.activeStop) renderOfflineOrFallback(false);
     if (state.drill.step === 'flota') renderLineFlotaView();
+    if (state.eventsModalOpen) renderEventsTimeline({ preserveScroll: true });
   });
 
   window.addEventListener('online', () => {
@@ -8754,6 +9487,7 @@ function bindEvents() {
       if (state.allFleetMode) refreshAllFleetBuses({ fit: false, silent: true });
       if (state.drill.step === 'flota') refreshActiveLineFlotaSilent();
       else if (state.drill.step === 'lineas') loadFlotaResumen(true);
+      if (state.eventsModalOpen) loadEventsTimelineData({ forceBundle: true, silent: true });
       warmOfflineArchive({ forceBundle: true });
     }
   });
@@ -8798,10 +9532,17 @@ function resumeRealtime() {
     if (state.drill.step === 'flota') refreshActiveLineFlotaSilent();
     else if (state.drill.step === 'lineas') loadFlotaResumen(true);
   }
+  if (wasPaused && state.eventsModalOpen && state.eventsDayOffset === 0) {
+    loadEventsTimelineData({ forceBundle: true, silent: true });
+  }
 }
 
 // Layered back navigation (Escape / PWA history)
 async function handleNativeBack() {
+  if (el.eventsModal && !el.eventsModal.classList.contains('hidden')) {
+    closeEventsModal();
+    return true;
+  }
   if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
     closeThemeModal();
     return true;

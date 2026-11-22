@@ -716,6 +716,35 @@ export const api = {
     return res;
   },
 
+  getOfflineBundleCached: async ({ maxAgeMs = 25000, force = false } = {}) => {
+    const now = Date.now();
+    const idbSnap = await readIdbValue('offline_bundle');
+    const idbTs = Number(idbSnap?.savedAt) || 0;
+    if (!force && idbSnap?.data && (isBrowserOffline() || now - idbTs < maxAgeMs)) {
+      return {
+        data: idbSnap.data,
+        savedAt: idbTs,
+        isOfflineCache: isBrowserOffline()
+      };
+    }
+    if (!isBrowserOffline()) {
+      try {
+        const res = await apiGet('/api/offline-bundle', null, 15000);
+        if (res?.data) {
+          const savedAt = Number(res.savedAt) || Date.now();
+          await persistOfflineBundleSnapshot(res.data, savedAt);
+          return { data: res.data, savedAt, isOfflineCache: false };
+        }
+      } catch {
+        // Fall back to IDB snapshot below
+      }
+    }
+    if (idbSnap?.data) {
+      return { data: idbSnap.data, savedAt: idbTs, isOfflineCache: true };
+    }
+    return { data: null, savedAt: 0, isOfflineCache: isBrowserOffline() };
+  },
+
   flotaResumen: async ({ live = true } = {}) => {
     try {
       const res = await apiGet(`/api/flota-resumen${live ? '?live=1' : ''}`, null, 9000);

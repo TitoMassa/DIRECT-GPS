@@ -374,8 +374,69 @@
       </div>
     </div>
 
+    <!-- Floating Global Events Timeline Button (Top-Left of Map Canvas) -->
+    <button
+      type="button"
+      id="btn-events-timeline"
+      class="map-events-fab"
+      aria-haspopup="dialog"
+      aria-controls="events-modal"
+      title="Línea cronológica global de inicios, relevos y fines de servicio"
+      aria-label="Abrir línea cronológica global de eventos de servicios y turnos"
+    >
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <line x1="6" y1="4" x2="6" y2="20"/>
+        <circle cx="6" cy="6.5" r="2.2" fill="currentColor"/>
+        <circle cx="6" cy="12" r="2.2" fill="currentColor"/>
+        <circle cx="6" cy="17.5" r="2.2" fill="currentColor"/>
+        <line x1="11.5" y1="6.5" x2="20" y2="6.5"/>
+        <line x1="11.5" y1="12" x2="18.5" y2="12"/>
+        <line x1="11.5" y1="17.5" x2="20" y2="17.5"/>
+      </svg>
+      <span>Eventos</span>
+    </button>
+
     <!-- Full-Viewport Leaflet Map Canvas (aria-hidden so screen readers never get trapped in 40+ map pins; all data is exposed cleanly in the main panel above) -->
     <div id="map" class="map-canvas" aria-hidden="true"></div>
+
+    <!-- Global Vertical Chronological Events Timeline Modal (-7d History / Today Live / +7d Scheduled) -->
+    <div id="events-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="events-modal-title">
+      <div class="modal-card events-modal-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="events-modal-title">Eventos globales</h2>
+            <p id="events-modal-sub" class="modal-sub">Inicios, relevos y fines de turno · Todas las líneas</p>
+          </div>
+          <button type="button" id="btn-close-events-modal" class="mini-close-btn" aria-label="Cerrar línea de eventos">✕</button>
+        </div>
+
+        <div class="srv-day-nav events-day-nav" role="group" aria-label="Navegar entre los últimos 7 días, hoy y próximos 7 días programados">
+          <button type="button" id="btn-events-prev-day" class="srv-day-arrow" title="Día anterior (hasta 7 días atrás)" aria-label="Día anterior">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <button type="button" id="btn-events-today-reset" class="srv-day-label" title="Volver a hoy" aria-live="polite">
+            <span id="events-day-main" class="srv-day-main">Hoy</span>
+            <span id="events-day-sub" class="srv-day-sub">Cargando eventos...</span>
+          </button>
+          <button type="button" id="btn-events-next-day" class="srv-day-arrow" title="Día siguiente (programado)" aria-label="Día siguiente">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+
+        <div class="events-controls-stack">
+          <input id="events-filter-input" type="search" class="modal-input fleet-roster-search" placeholder="Filtrar línea, coche, chofer o evento..." autocomplete="off" aria-label="Filtrar eventos por línea, coche o chofer" />
+          <div id="events-type-filters" class="events-filter-pills" role="group" aria-label="Filtrar tipo de evento">
+            <button type="button" class="events-pill active" data-events-filter="all" aria-pressed="true">Todos</button>
+            <button type="button" class="events-pill" data-events-filter="relevo" aria-pressed="false">Relevos</button>
+            <button type="button" class="events-pill" data-events-filter="inicio" aria-pressed="false">Inicios</button>
+            <button type="button" class="events-pill" data-events-filter="fin" aria-pressed="false">Fines</button>
+            <button type="button" id="btn-events-jump-now" class="events-pill events-pill-now hidden" title="Desplazar al momento actual">● Ahora</button>
+          </div>
+        </div>
+
+        <div id="events-timeline-body" class="events-timeline-body" role="list" aria-label="Línea cronológica de eventos"></div>
+      </div>
+    </div>
 
     <!-- Optional Live All-Fleet Roster Modal (Modo Libre: Coches 0->9 / Choferes A->Z) -->
     <div id="all-fleet-roster" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="all-fleet-roster-title">
