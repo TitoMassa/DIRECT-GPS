@@ -2036,7 +2036,7 @@ export class FleetMemory {
 
       const unitRows = this.sql
         .exec(
-          `SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw, bandera, dir_bandera, ultima_gps, updated_at
+          `SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw, bandera, dir_bandera, ultima_gps, gps_trail, updated_at
            FROM unit_last_seen
            WHERE updated_at >= ?`,
           activeCutoff
@@ -2050,8 +2050,11 @@ export class FleetMemory {
         if (REMOVED_LINE_CODES.has(Number(r.codigo_linea))) continue;
         const key = `${r.codigo_linea}:${r.coche}`;
         const u = unitMap.get(key) || null;
-        const lat = Number(r.last_lat ?? u?.lat);
-        const lng = Number(r.last_lng ?? u?.lng);
+        const rGpsMs = parseGpsStampMs(r.last_gps) || 0;
+        const uGpsMs = parseGpsStampMs(u?.ultima_gps) || 0;
+        const useUnitGps = Boolean(u && uGpsMs > rGpsMs && Number.isFinite(Number(u.lat)) && Number.isFinite(Number(u.lng)) && (Number(u.lat) !== 0 || Number(u.lng) !== 0));
+        const lat = Number(useUnitGps ? u.lat : (r.last_lat ?? u?.lat));
+        const lng = Number(useUnitGps ? u.lng : (r.last_lng ?? u?.lng));
         if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
         byKey.set(key, {
           codigoLinea: Number(r.codigo_linea),
@@ -2060,13 +2063,14 @@ export class FleetMemory {
           choferNombre: r.last_chofer_nombre || '',
           choferLegajo: r.last_chofer_legajo || '',
           esAdaptado: Boolean(r.es_adaptado),
-          bandera: r.last_bandera || u?.bandera || '',
+          bandera: (useUnitGps ? u?.bandera : r.last_bandera) || r.last_bandera || u?.bandera || '',
           dirBandera: u?.dir_bandera || '',
           lat,
           lng,
-          desvioSec: Number(r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec) || 0,
-          desvioRaw: r.last_desvio_raw || u?.desvio_raw || '',
-          ultimaGps: r.last_gps || u?.ultima_gps || '',
+          desvioSec: Number(useUnitGps ? u?.desvio_sec : (r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec)) || 0,
+          desvioRaw: (useUnitGps ? u?.desvio_raw : r.last_desvio_raw) || r.last_desvio_raw || u?.desvio_raw || '',
+          ultimaGps: (useUnitGps ? u?.ultima_gps : r.last_gps) || r.last_gps || u?.ultima_gps || '',
+          gpsTrail: u?.gps_trail ? this._parseGpsTrail(u.gps_trail) : [],
           lastStopId: r.last_stop_id || '',
           lastTripKey: r.last_trip_key || (u?.day_key === todayKey ? u.trip_key : '') || '',
           lastServiceNum: Number(r.last_service_num) || 0,
@@ -2892,13 +2896,15 @@ export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn
   };
 }
 
-// 16 directed multi-line hub stops (codLinea='000') covering all Corrientes + Chaco-Corrientes
-// lines in BOTH directions in ~650 ms (< 20 subrequests, safely under Cloudflare Workers Free cap).
+// 22 directed multi-line hub stops (codLinea='000') covering ALL 26 active Corrientes + Chaco-Corrientes
+// lines in BOTH Ida & Vuelta directions (< 25 subrequests, safely under Cloudflare Workers Free cap).
 const LIVE_CITY_HUB_STOPS = [
   'CT31218', 'CT31213', 'CT31604', 'CT31338',
-  'CT1398', 'CT313032', 'CT31337', 'CT31475',
-  'CT31368', 'CT31610', 'CT31831', 'L9041027',
-  'L9041046', 'CH469', 'CH1018', 'CH115'
+  'CT1398', 'CT31631', 'CT313032', 'CT31337',
+  'CT31475', 'CT31368', 'CT31610', 'CT31831',
+  'CT32070', 'CT31363', 'CT31648', 'L9041027',
+  'L9041046', 'CH469', 'CH426', 'CH444',
+  'CH1018', 'CH115'
 ];
 const LIVE_CITY_SWEEP_TTL_MS = 8500;
 let liveCitySweepCache = { ts: 0, units: [] };
@@ -2928,7 +2934,7 @@ export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchSto
           const coche = String(a.identificadorCoche || '').trim();
           const lat = parseFloat(a.latitud);
           const lng = parseFloat(a.longitud);
-          if (!cod || !coche || Number.isNaN(lat) || Number.isNaN(lng) || (lat === 0 && lng === 0)) continue;
+          if (!cod || !coche || REMOVED_LINE_CODES.has(cod) || Number.isNaN(lat) || Number.isNaN(lng) || (lat === 0 && lng === 0)) continue;
           const key = `${cod}:${coche}`;
           const gpsMs = parseGpsStampMs(a.ultimaFechaHoraGPS);
           const prev = byUnit.get(key);
@@ -2937,7 +2943,7 @@ export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchSto
           if (!prev || gpsMs > prev._gpsMs || (gpsMs === prev._gpsMs && hasChofer && !prevHasChofer)) {
             byUnit.set(key, {
               codigoLinea: cod,
-              descripcionLinea: String(a.descripcionLinea || LINE_NAMES_BY_CODE[cod] || `L${cod}`).trim(),
+              descripcionLinea: resolvePublicLineName(cod, a.descripcionLinea),
               coche,
               choferNombre: a.choferNombre || prev?.choferNombre || '',
               choferLegajo: a.choferLegajo || prev?.choferLegajo || '',
@@ -3328,13 +3334,20 @@ export default {
           }
         }
 
-        // Overlay brand-new live hub SOAP positions (keeping fresher GPS timestamp per unit!)
+        // Overlay brand-new live hub SOAP positions (keeping fresher GPS timestamp & full gpsTrail per unit!)
         for (const lu of liveUnits) {
           const k = `${lu.codigoLinea}:${lu.coche}`;
           const prev = mergedByKey.get(k);
           const luGpsMs = parseGpsStampMs(lu.ultimaGps) || lu.lastSeenAt || 0;
           const prevGpsMs = prev ? parseGpsStampMs(prev.ultimaGps) || prev.lastSeenAt || 0 : 0;
           if (!prev || luGpsMs >= prevGpsMs) {
+            const baseTrail = Array.isArray(prev?.gpsTrail) ? [...prev.gpsTrail] : [];
+            if (Number.isFinite(lu.lat) && Number.isFinite(lu.lng) && luGpsMs > 0) {
+              const lastPt = baseTrail[baseTrail.length - 1];
+              if (!lastPt || luGpsMs > (Number(lastPt[2]) || 0)) {
+                baseTrail.push([Number(lu.lat.toFixed(6)), Number(lu.lng.toFixed(6)), luGpsMs]);
+              }
+            }
             mergedByKey.set(k, {
               ...(prev || {}),
               ...lu,
@@ -3344,14 +3357,22 @@ export default {
               bandera: lu.bandera || prev?.bandera || '',
               desvioRaw: lu.desvioRaw || prev?.desvioRaw || '',
               desvioSec: lu.desvioRaw ? lu.desvioSec : prev?.desvioSec || 0,
+              gpsTrail: baseTrail.slice(-6),
               liveFresh: true
             });
           }
         }
 
-        const units = Array.from(mergedByKey.values()).sort(
-          (a, b) => a.codigoLinea - b.codigoLinea || (b.lastSeenAt || 0) - (a.lastSeenAt || 0)
-        );
+        // When live bidirectional 22-hub sweep succeeded, prune stale DO ghost buses whose real GPS > 15 min old
+        const staleGhostCutoffMs = nowMs - 15 * 60 * 1000;
+        const units = Array.from(mergedByKey.values())
+          .filter((u) => {
+            if (u.liveFresh || liveUnits.length === 0) return true;
+            const gpsMs = parseGpsStampMs(u.ultimaGps) || 0;
+            const refMs = gpsMs || Number(u.lastSeenAt) || 0;
+            return refMs >= staleGhostCutoffMs;
+          })
+          .sort((a, b) => a.codigoLinea - b.codigoLinea || (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
         return jsonResponse({
           data: {
             dayKey: doData?.dayKey || todayKey,

@@ -285,6 +285,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.7',
+    date: '22/11/2026 · 09:05 hs',
+    items: [
+      '<strong>Modo libre 100% en vivo y sin datos viejos:</strong> se amplió el barrido directo en tiempo real a <strong>22 nodos bidireccionales</strong> (cubriendo Ida y Vuelta de las 26 líneas activas, incluyendo 104B, 106A, 902, 904A y Santa Ana), se priorizó siempre el timestamp GPS más reciente y se filtraron unidades fantasma inactivas (>15 min).',
+      '<strong>Simulación EN VIVO más fiel en Modo libre:</strong> el servidor ahora entrega la traza GPS histórica (<code>gpsTrail</code>) desde el primer cuadro para conocer la velocidad y dirección real al instante; se eliminó el frenado/acelerón cada 7 s y el salto de animación cada 10 s, con detección real de unidades detenidas y desaceleración suave.'
+    ]
+  },
+  {
     version: 'v2.4.6',
     date: '22/11/2026 · 08:45 hs',
     items: [
@@ -1221,7 +1229,7 @@ async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
 const MAX_UNIT_TRAIL_POINTS = 8;
 const UNIT_TRAIL_MAX_AGE_MS = 12 * 60 * 1000;
 
-function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.now()) {
+function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.now(), extraServerTrail = null) {
   const gpsMs = parseGpsTimestampMs(gpsRaw);
   const curFix = { lat, lng, gpsMs, ts: now };
   let hist = state.lastRealGpsByUnit.get(baseId);
@@ -1251,51 +1259,60 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
   };
 
   if (!hist || !hist.latest) {
-    // Cold-start hydration from central FleetMemory (multi-point trail + server-persisted confirmed direction)
+    // Cold-start hydration from central FleetMemory / /api/flota-activa gpsTrail (multi-point trail + confirmed direction)
     const initTrail = [];
     let memPrev = null;
     let initConfirmedDir = null;
 
-    if (coche && Array.isArray(state.fleetMemory?.units)) {
-      const memUnit = state.fleetMemory.units.find(
-        (u) => Number(u.codigoLinea) === Number(codLinea) && String(u.coche || '').trim() === coche
-      );
-      if (memUnit) {
-        const refMs = gpsMs ?? now;
-        const serverTrail = Array.isArray(memUnit.gpsTrail) ? memUnit.gpsTrail : [];
-        for (const pt of serverTrail) {
-          const pLat = Number(Array.isArray(pt) ? pt[0] : pt?.lat);
-          const pLng = Number(Array.isArray(pt) ? pt[1] : pt?.lng);
-          const pMs = Number(Array.isArray(pt) ? pt[2] : pt?.gpsMs) || null;
-          if (!Number.isFinite(pLat) || !Number.isFinite(pLng) || (pLat === 0 && pLng === 0)) continue;
-          if (pMs && refMs - pMs > UNIT_TRAIL_MAX_AGE_MS) continue;
-          if (pMs && gpsMs && pMs >= gpsMs - 2000) continue;
-          pushToTrail(initTrail, { lat: pLat, lng: pLng, gpsMs: pMs, ts: pMs || memUnit.updatedAt || now });
-        }
+    const memUnit =
+      coche && Array.isArray(state.fleetMemory?.units)
+        ? state.fleetMemory.units.find(
+            (u) => Number(u.codigoLinea) === Number(codLinea) && String(u.coche || '').trim() === coche
+          )
+        : null;
+    const combinedServerTrail = [
+      ...(Array.isArray(extraServerTrail) ? extraServerTrail : []),
+      ...(Array.isArray(memUnit?.gpsTrail) ? memUnit.gpsTrail : [])
+    ];
+    if (combinedServerTrail.length > 0 || memUnit) {
+      const refMs = gpsMs ?? now;
+      const sortedPts = combinedServerTrail
+        .map((pt) => ({
+          lat: Number(Array.isArray(pt) ? pt[0] : pt?.lat),
+          lng: Number(Array.isArray(pt) ? pt[1] : pt?.lng),
+          gpsMs: Number(Array.isArray(pt) ? pt[2] : pt?.gpsMs) || null
+        }))
+        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng) && (p.lat !== 0 || p.lng !== 0))
+        .sort((a, b) => (a.gpsMs || 0) - (b.gpsMs || 0));
 
-        // Fallback single point if server doesn't have gpsTrail yet
-        if (initTrail.length === 0 && typeof memUnit.lat === 'number' && typeof memUnit.lng === 'number') {
-          const mMs = parseGpsTimestampMs(memUnit.ultimaGps);
-          if (mMs && gpsMs && gpsMs - mMs >= 4000 && gpsMs - mMs <= UNIT_TRAIL_MAX_AGE_MS) {
-            pushToTrail(initTrail, { lat: memUnit.lat, lng: memUnit.lng, gpsMs: mMs, ts: memUnit.updatedAt || mMs });
-          }
-        }
+      for (const p of sortedPts) {
+        if (p.gpsMs && refMs - p.gpsMs > UNIT_TRAIL_MAX_AGE_MS) continue;
+        if (p.gpsMs && gpsMs && p.gpsMs >= gpsMs - 2000) continue;
+        pushToTrail(initTrail, { lat: p.lat, lng: p.lng, gpsMs: p.gpsMs, ts: p.gpsMs || memUnit?.updatedAt || now });
+      }
 
-        if (initTrail.length > 0) {
-          const lastServer = initTrail[initTrail.length - 1];
-          const ageSec = gpsMs && lastServer.gpsMs ? (gpsMs - lastServer.gpsMs) / 1000 : 30;
-          if (ageSec >= 3 && ageSec <= 180) memPrev = lastServer;
+      // Fallback single point if server doesn't have gpsTrail yet
+      if (initTrail.length === 0 && memUnit && typeof memUnit.lat === 'number' && typeof memUnit.lng === 'number') {
+        const mMs = parseGpsTimestampMs(memUnit.ultimaGps);
+        if (mMs && gpsMs && gpsMs - mMs >= 4000 && gpsMs - mMs <= UNIT_TRAIL_MAX_AGE_MS) {
+          pushToTrail(initTrail, { lat: memUnit.lat, lng: memUnit.lng, gpsMs: mMs, ts: memUnit.updatedAt || mMs });
         }
+      }
 
-        if (memUnit.dirBandera && memUnit.updatedAt && now - memUnit.updatedAt <= 8 * 60 * 1000) {
-          initConfirmedDir = {
-            bandera: String(memUnit.dirBandera).trim(),
-            confidence: 0.72,
-            gpsMs: parseGpsTimestampMs(memUnit.ultimaGps),
-            ts: memUnit.updatedAt,
-            fromServer: true
-          };
-        }
+      if (initTrail.length > 0) {
+        const lastServer = initTrail[initTrail.length - 1];
+        const ageSec = gpsMs && lastServer.gpsMs ? (gpsMs - lastServer.gpsMs) / 1000 : 30;
+        if (ageSec >= 3 && ageSec <= 180) memPrev = lastServer;
+      }
+
+      if (memUnit?.dirBandera && memUnit.updatedAt && now - memUnit.updatedAt <= 8 * 60 * 1000) {
+        initConfirmedDir = {
+          bandera: String(memUnit.dirBandera).trim(),
+          confidence: 0.72,
+          gpsMs: parseGpsTimestampMs(memUnit.ultimaGps),
+          ts: memUnit.updatedAt,
+          fromServer: true
+        };
       }
     }
 
@@ -2346,7 +2363,7 @@ function openBusInspector(busKey) {
     simulateMode: state.simulateMode
   });
   if (state.allFleetMode) {
-    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
   }
   transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
 }
@@ -2376,7 +2393,7 @@ function closeBusInspector() {
     simulateMode: state.simulateMode
   });
   if (state.allFleetMode) {
-    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: null });
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: null, simulateMode: state.simulateMode });
   }
   if (wasFreeTracked && !state.activeStop) {
     transitMap.clearRoutes();
@@ -2608,6 +2625,7 @@ function buildCityFleetBusObject(u) {
     rawLng: Number(u.lng),
     ultimaFechaHoraGPS: gpsRaw,
     gpsTimeOnly: formatGpsTimeOnly(gpsRaw),
+    gpsTrail: Array.isArray(u.gpsTrail) ? u.gpsTrail : [],
     lastStopId: u.lastStopId || '',
     lastTripKey: u.lastTripKey || '',
     lastSeenAt: u.lastSeenAt || Date.now(),
@@ -2780,7 +2798,16 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
     seenKeys.add(bus.key);
 
     const baseId = `${bus.codigoLinea}-c${bus.identificadorCoche}`;
-    const rec = recordUnitGpsFix(baseId, bus.codigoLinea, bus.identificadorCoche, rawLat, rawLng, bus.ultimaFechaHoraGPS, nowMs);
+    const rec = recordUnitGpsFix(
+      baseId,
+      bus.codigoLinea,
+      bus.identificadorCoche,
+      rawLat,
+      rawLng,
+      bus.ultimaFechaHoraGPS,
+      nowMs,
+      bus.gpsTrail
+    );
     const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
     const gpsAgeSec = gpsMs ? Math.max(0, (nowMs - gpsMs) / 1000) : 999;
 
@@ -2840,38 +2867,49 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
       bus.realBanderaColor = branch.color || getLineColor(bus.descripcionLinea);
     }
 
-    const nearTerminal = gpsAlong <= 140 || (branch.totalLen || 0) - gpsAlong <= 140;
+    const nearTerminal = gpsAlong <= 120 || (branch.totalLen || 0) - gpsAlong <= 120;
+    const isFreshNewFix = Boolean(gpsMs && prevSim?.lastGpsMs && gpsMs > prevSim.lastGpsMs);
 
-    // Learn real speed from penultimate -> latest GPS fix
-    let speedMps = 5.4;
-    let isStopped = gpsAgeSec > 180 || nearTerminal || (!dirConfirmed && ambiguous);
+    // Learn real cruising speed from penultimate -> latest real GPS fix (blended smoothly with previous speed)
+    let speedMps = prevSim && prevSim.speedMps > 1.0 ? prevSim.speedMps : 5.4;
+    let isStopped = gpsAgeSec > 150 || nearTerminal || (!dirConfirmed && ambiguous);
     const prevFix = rec?.prevGpsFix;
     if (!isStopped && prevFix && gpsMs && prevFix.gpsMs) {
       const dtPrev = (gpsMs - prevFix.gpsMs) / 1000;
       if (dtPrev >= 4 && dtPrev <= 180) {
         const moved = distanceMeters(prevFix.lat, prevFix.lng, rawLat, rawLng) ?? 0;
-        if (moved < 16 && dtPrev >= 10) {
+        if (moved < 14 && dtPrev >= 12) {
           isStopped = true;
           speedMps = 0;
-        } else if (moved >= 16 && moved < Math.max(2000, dtPrev * 30)) {
-          speedMps = Math.max(2.2, Math.min(18.5, (moved * 1.03) / dtPrev));
+        } else if (moved >= 14 && moved < Math.max(2200, dtPrev * 30)) {
+          const measured = Math.max(2.0, Math.min(19.0, (moved * 1.02) / dtPrev));
+          speedMps =
+            prevSim && !prevSim.isStopped && prevSim.speedMps > 1.0 && isFreshNewFix
+              ? measured * 0.65 + prevSim.speedMps * 0.35
+              : measured;
         }
       }
     }
 
-    // Advance initial along slightly to account for small GPS reporting lag (capped at 22s)
-    const initialLead = !isStopped && gpsAgeSec <= 45 ? Math.min(22, gpsAgeSec) * speedMps * 0.75 : 0;
-    const targetAlong = Math.min(Math.max(0, branch.totalLen - 15), gpsAlong + initialLead);
+    // Realistic GPS-lag lead (capped at 20s) + bounded dead-reckoning ceiling so stale pings never drift blocks away
+    const initialLead = !isStopped && gpsAgeSec <= 40 ? Math.min(20, gpsAgeSec) * speedMps * 0.8 : 0;
+    const targetAlong = Math.min(Math.max(0, branch.totalLen - 12), gpsAlong + initialLead);
+    const maxLeadMeters = Math.min(280, Math.max(85, speedMps * 36));
     const maxAlong = isStopped
       ? gpsAlong
-      : Math.min(Math.max(0, branch.totalLen - 15), gpsAlong + Math.max(180, speedMps * 42));
+      : Math.min(Math.max(0, branch.totalLen - 12), gpsAlong + maxLeadMeters);
 
     let curAlong = targetAlong;
     if (prevSim && prevSim.branch === branch) {
-      const diff = targetAlong - prevSim.along;
-      if (diff >= -220 && diff <= 420) {
-        // Zero-backjump continuity: keep simulated position if slightly ahead, gently pull forward if behind
-        curAlong = diff < 0 ? prevSim.along : prevSim.along + diff * 0.45;
+      if (isStopped) {
+        // Gently settle onto real GPS if bus genuinely stopped (small step avoids abrupt pop)
+        curAlong = Math.abs(gpsAlong - prevSim.along) <= 35 ? gpsAlong : prevSim.along;
+      } else {
+        const diff = targetAlong - prevSim.along;
+        if (diff >= -180 && diff <= 380) {
+          // Zero-backjump continuity: never jump backwards; let continuous cruise speed smoothly close small gaps
+          curAlong = diff < 0 ? prevSim.along : prevSim.along + diff * 0.35;
+        }
       }
     }
     curAlong = Math.max(0, Math.min(branch.totalLen, curAlong));
@@ -2880,7 +2918,7 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
       branch,
       along: curAlong,
       gpsAlong,
-      targetAlong,
+      expectedAlong: Math.min(maxAlong, targetAlong),
       maxAlong,
       speedMps: isStopped ? 0 : speedMps,
       lastGpsMs: gpsMs,
@@ -2913,12 +2951,24 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
     const sim = cityFleetSim.get(bus.key);
     if (!sim || sim.isStopped || sim.speedMps <= 0.1 || !sim.branch) continue;
 
-    // Gentle speed bleed if slightly ahead of targetAlong, smooth catch-up if behind
+    // Advance expectedAlong continuously at learned GPS speed so there is zero 7-second rubber-banding
+    sim.expectedAlong = Math.min(sim.maxAlong, (sim.expectedAlong ?? sim.along) + sim.speedMps * dtSec);
+
+    const gap = sim.expectedAlong - sim.along;
     let effSpeed = sim.speedMps;
-    if (sim.along > sim.targetAlong + 45) {
-      effSpeed *= 0.45;
-    } else if (sim.along < sim.targetAlong - 20) {
-      effSpeed *= 1.35;
+    if (gap < -15) {
+      // Gently bleed excess overshoot so real GPS catches up without stopping
+      effSpeed *= Math.max(0.35, 1 + gap / 160);
+    } else if (gap > 15) {
+      // Smoothly catch up when behind real GPS
+      effSpeed *= Math.min(1.4, 1 + gap / 120);
+    }
+
+    // Soft coast-down over the final 35m before maxAlong ceiling so stale pings decelerate smoothly instead of slamming
+    const remToMax = sim.maxAlong - sim.along;
+    if (remToMax <= 0.05) continue;
+    if (remToMax < 35) {
+      effSpeed *= Math.max(0.12, remToMax / 35);
     }
 
     const nextAlong = Math.min(sim.maxAlong, sim.along + effSpeed * dtSec);
@@ -2990,7 +3040,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     const missingAssetLines = enrichCityFleetWithSchedules(state.allFleetBuses, nowSec, todayTipo);
 
     reconcileCityFleetSim(state.allFleetBuses);
-    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+    transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
     if (state.allFleetRosterOpen) renderAllFleetRoster();
     if (state.simulateMode && state.allFleetBuses.length > 0) {
       startSimLoop();
@@ -3004,7 +3054,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
           if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
           enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
           reconcileCityFleetSim(state.allFleetBuses);
-          transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+          transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
           if (state.allFleetRosterOpen) renderAllFleetRoster();
           if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
             const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
@@ -3067,7 +3117,7 @@ async function openAllFleetBusInspector(busKey) {
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
   syncInspectorLayoutHeight();
-  transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: bus.key });
+  transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: bus.key, simulateMode: state.simulateMode });
   transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
 
   // Resolve exact immutable Service / Turno / Vuelta & true BANDERA asynchronously if that line's archive wasn't loaded yet
@@ -3093,7 +3143,7 @@ async function openAllFleetBusInspector(busKey) {
     if (meta) {
       applyScheduleMetaToCityBus(bus, meta);
       reconcileCityFleetSim(state.allFleetBuses);
-      transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+      transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
       if (state.inspectorOpen && state.selectedBusKey === bus.key) {
         updateInspectorFields(bus);
       }
@@ -7987,7 +8037,7 @@ function bindEvents() {
       }
       if (state.allFleetMode && state.allFleetBuses.length > 0) {
         reconcileCityFleetSim(state.allFleetBuses);
-        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
         startSimLoop();
       }
     } else {
@@ -8022,7 +8072,7 @@ function bindEvents() {
             b.lng = b.rawLng;
           }
         }
-        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+        transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
       }
     }
   });

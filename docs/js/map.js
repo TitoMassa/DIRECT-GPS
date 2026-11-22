@@ -406,7 +406,7 @@ export class TransitMap {
     }
   }
 
-  updateAllFleetBuses(buses = [], { selectedBusKey = null } = {}) {
+  updateAllFleetBuses(buses = [], { selectedBusKey = null, simulateMode = false } = {}) {
     const activeStopUnits = new Set();
     for (const entry of this.busMarkers.values()) {
       const b = entry.data;
@@ -427,8 +427,15 @@ export class TransitMap {
       const iconSig = `city|${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${bus.desvio?.status || ''}|${isSelected ? 1 : 0}`;
       const existing = this.allFleetMarkers.get(bus.key);
       if (existing) {
-        if (Math.abs(bus.lat - existing.lat) >= 1e-6 || Math.abs(bus.lng - existing.lng) >= 1e-6) {
-          this._animateMarker(existing.marker, existing.marker.getLatLng(), [bus.lat, bus.lng], 650);
+        if (simulateMode) {
+          existing.marker._animToken = (existing.marker._animToken || 0) + 1;
+          if (Math.abs(bus.lat - existing.lat) >= 1.5e-7 || Math.abs(bus.lng - existing.lng) >= 1.5e-7) {
+            existing.marker.setLatLng([bus.lat, bus.lng]);
+            existing.lat = bus.lat;
+            existing.lng = bus.lng;
+          }
+        } else if (Math.abs(bus.lat - existing.lat) >= 1e-6 || Math.abs(bus.lng - existing.lng) >= 1e-6) {
+          this._animateMarker(existing.marker, existing.marker.getLatLng(), [bus.lat, bus.lng], 550);
           existing.lat = bus.lat;
           existing.lng = bus.lng;
         }
