@@ -285,6 +285,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.10',
+    date: '22/11/2026 · 10:00 hs',
+    items: [
+      '<strong>Historial diario de 7 días también en Coches y Choferes:</strong> ahora podés retroceder y avanzar día por día con las flechas (<strong>‹</strong> / <strong>›</strong>) en las 3 pestañas (<strong>Coches</strong>, <strong>Choferes</strong> y <strong>Servicios</strong>) para ver exactamente qué coche, chofer y servicio trabajó cada día durante los últimos 7 días, sin que se borre el registro anterior cuando un chofer o coche vuelve a trabajar hoy.'
+    ]
+  },
+  {
     version: 'v2.4.9',
     date: '22/11/2026 · 09:50 hs',
     items: [
@@ -6013,29 +6020,6 @@ function renderLineFlotaView() {
     return parts.join(', ');
   };
 
-  const scopeCoches = fv.scope === 'hoy' ? allCoches.filter((c) => c.vistoHoy) : allCoches;
-  const scopeChoferes = fv.scope === 'hoy' ? allChoferes.filter((d) => d.vistoHoy) : allChoferes;
-
-  const query = el.lineasFilterInput.value.trim().toLowerCase();
-  const visibleCoches = query
-    ? scopeCoches.filter((c) => {
-        const m = resolveCarMeta(c);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
-        return `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${c.lastBandera || ''} ${srvTxt}`
-          .toLowerCase()
-          .includes(query);
-      })
-    : scopeCoches;
-  const visibleChoferes = query
-    ? scopeChoferes.filter((d) => {
-        const m = resolveDriverMeta(d);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
-        return `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${d.lastBandera || ''} ${srvTxt}`
-          .toLowerCase()
-          .includes(query);
-      })
-    : scopeChoferes;
-
   const maxDayOffset = Math.max(0, retentionDays - 1);
   const serviceDayOffset = Math.max(0, Math.min(maxDayOffset, Number(fv.serviceDayOffset) || 0));
   const selectedServiceDayKey = shiftDayKey(todayKey, -serviceDayOffset);
@@ -6046,13 +6030,25 @@ function renderLineFlotaView() {
 
   const activeSrvSchedSummary = isHistoricalSrvDay ? serviceDayEntry?.schedSummary || null : fv.schedSummary;
   const activeSrvModel = isHistoricalSrvDay ? serviceDayEntry?.model || null : model;
+  const activeDayObs = isHistoricalSrvDay
+    ? Array.isArray(serviceDayEntry?.dayObs)
+      ? serviceDayEntry.dayObs
+      : []
+    : Array.isArray(data.dayObs)
+      ? data.dayObs
+      : [];
+  const activeDayTrips = isHistoricalSrvDay
+    ? Array.isArray(serviceDayEntry?.dayTrips)
+      ? serviceDayEntry.dayTrips
+      : []
+    : todayTrips;
   const activeSrvAssignMap = isHistoricalSrvDay
     ? serviceDayEntry && !serviceDayEntry.loading && activeSrvModel
       ? buildFlotaDayAssignments({
           model: activeSrvModel,
           schedSummary: activeSrvSchedSummary,
-          trips: serviceDayEntry.dayTrips || [],
-          dayObs: serviceDayEntry.dayObs || [],
+          trips: activeDayTrips,
+          dayObs: activeDayObs,
           allCoches,
           allChoferes,
           dayKey: selectedServiceDayKey,
@@ -6062,6 +6058,337 @@ function renderLineFlotaView() {
         }).blockAssignMap
       : new Map()
     : blockAssignMap;
+
+  // Build day-scoped Coches & Choferes for selectedServiceDayKey (never overwritten when working again on a newer day!)
+  const buildDayRoster = () => {
+    const carMap = new Map();
+    const drvMap = new Map();
+    const parseStampMs = (gpsStr, fallbackMs = 0) => parseGpsTimestampMs(gpsStr) || Number(fallbackMs) || 0;
+    const drvKeyOf = (leg, name) => {
+      const l = String(leg || '').trim().toUpperCase();
+      if (l) return `leg:${l}`;
+      const n = normDriverName(name);
+      return n ? `name:${n}` : '';
+    };
+    const carMetaFallback = new Map();
+    for (const c of allCoches) carMetaFallback.set(c.coche, c);
+    const drvMetaFallback = new Map();
+    for (const d of allChoferes) {
+      const k = drvKeyOf(d.choferLegajo, d.choferNombre);
+      if (k) drvMetaFallback.set(k, d);
+    }
+
+    const upsertCar = (rec) => {
+      const num = String(rec.coche || '').trim();
+      if (!num) return;
+      const baseCar = carMetaFallback.get(num) || null;
+      const seenAt = parseStampMs(rec.lastGps, rec.lastSeenAt);
+      const prev = carMap.get(num);
+      const driversList = prev ? [...prev.dayDrivers] : [];
+      const dName = String(rec.lastChoferNombre || '').trim();
+      const dLeg = String(rec.lastChoferLegajo || '').trim();
+      if (dName && !driversList.some((x) => isSameDriver(x.legajo, x.nombre, dLeg, dName))) {
+        driversList.push({ nombre: dName, legajo: dLeg, seenAt });
+      }
+      if (!prev) {
+        carMap.set(num, {
+          coche: num,
+          esAdaptado: Boolean(rec.esAdaptado || baseCar?.esAdaptado),
+          vistoHoy: !isHistoricalSrvDay,
+          enLineaAhora: Boolean(!isHistoricalSrvDay && rec.enLineaAhora),
+          lastChoferNombre: dName,
+          lastChoferLegajo: dLeg,
+          dayDrivers: driversList,
+          lastBandera: rec.lastBandera || '',
+          lastGps: rec.lastGps || '',
+          lastStopId: rec.lastStopId || '',
+          lastLat: rec.lastLat ?? null,
+          lastLng: rec.lastLng ?? null,
+          lastDesvioSec: rec.lastDesvioSec || 0,
+          lastDesvioRaw: rec.lastDesvioRaw || '',
+          lastTripKey: rec.lastTripKey || '',
+          lastServiceNum: Number(rec.lastServiceNum) || 0,
+          lastTurnoIdx: Number(rec.lastTurnoIdx) || 0,
+          lastSeenAt: seenAt,
+          lastDayKey: selectedServiceDayKey
+        });
+      } else {
+        prev.dayDrivers = driversList;
+        prev.esAdaptado = Boolean(prev.esAdaptado || rec.esAdaptado);
+        prev.enLineaAhora = Boolean(prev.enLineaAhora || (!isHistoricalSrvDay && rec.enLineaAhora));
+        if (seenAt >= prev.lastSeenAt) {
+          prev.lastSeenAt = seenAt;
+          if (dName) {
+            prev.lastChoferNombre = dName;
+            if (dLeg) prev.lastChoferLegajo = dLeg;
+          }
+          if (rec.lastBandera) prev.lastBandera = rec.lastBandera;
+          if (rec.lastGps) prev.lastGps = rec.lastGps;
+          if (rec.lastStopId) prev.lastStopId = rec.lastStopId;
+          if (rec.lastLat !== null && rec.lastLat !== undefined) prev.lastLat = rec.lastLat;
+          if (rec.lastLng !== null && rec.lastLng !== undefined) prev.lastLng = rec.lastLng;
+          if (rec.lastDesvioRaw) {
+            prev.lastDesvioRaw = rec.lastDesvioRaw;
+            prev.lastDesvioSec = rec.lastDesvioSec || 0;
+          }
+          if (rec.lastTripKey) prev.lastTripKey = rec.lastTripKey;
+          if (rec.lastServiceNum) prev.lastServiceNum = Number(rec.lastServiceNum);
+          if (rec.lastTurnoIdx) prev.lastTurnoIdx = Number(rec.lastTurnoIdx);
+        } else {
+          if (!prev.lastChoferNombre && dName) prev.lastChoferNombre = dName;
+          if (!prev.lastChoferLegajo && dLeg) prev.lastChoferLegajo = dLeg;
+          if (!prev.lastBandera && rec.lastBandera) prev.lastBandera = rec.lastBandera;
+          if (!prev.lastGps && rec.lastGps) prev.lastGps = rec.lastGps;
+          if (prev.lastLat === null && rec.lastLat !== null && rec.lastLat !== undefined) prev.lastLat = rec.lastLat;
+          if (prev.lastLng === null && rec.lastLng !== null && rec.lastLng !== undefined) prev.lastLng = rec.lastLng;
+          if (!prev.lastTripKey && rec.lastTripKey) prev.lastTripKey = rec.lastTripKey;
+        }
+      }
+    };
+
+    const upsertDriver = (rec) => {
+      const dName = String(rec.choferNombre || '').trim();
+      const dLeg = String(rec.choferLegajo || '').trim();
+      const dk = drvKeyOf(dLeg, dName);
+      if (!dk) return;
+      const baseDrv = drvMetaFallback.get(dk) || null;
+      const finalName = dName || baseDrv?.choferNombre || '';
+      const finalLeg = dLeg || baseDrv?.choferLegajo || '';
+      const coche = String(rec.lastCoche || '').trim();
+      const seenAt = parseStampMs(rec.lastGps, rec.lastSeenAt);
+      const prev = drvMap.get(dk);
+      const carsList = prev ? [...prev.dayCars] : [];
+      if (coche && !carsList.includes(coche)) carsList.push(coche);
+      if (!prev) {
+        drvMap.set(dk, {
+          driverKey: dk,
+          choferNombre: finalName,
+          choferLegajo: finalLeg,
+          lastCoche: coche,
+          dayCars: carsList,
+          lastEsAdaptado: Boolean(rec.lastEsAdaptado || (coche && carMetaFallback.get(coche)?.esAdaptado)),
+          vistoHoy: !isHistoricalSrvDay,
+          enLineaAhora: Boolean(!isHistoricalSrvDay && rec.enLineaAhora),
+          lastBandera: rec.lastBandera || '',
+          lastGps: rec.lastGps || '',
+          lastStopId: rec.lastStopId || '',
+          lastLat: rec.lastLat ?? null,
+          lastLng: rec.lastLng ?? null,
+          lastDesvioSec: rec.lastDesvioSec || 0,
+          lastDesvioRaw: rec.lastDesvioRaw || '',
+          lastTripKey: rec.lastTripKey || '',
+          lastServiceNum: Number(rec.lastServiceNum) || 0,
+          lastTurnoIdx: Number(rec.lastTurnoIdx) || 0,
+          lastSeenAt: seenAt,
+          lastDayKey: selectedServiceDayKey
+        });
+      } else {
+        prev.dayCars = carsList;
+        if (!prev.choferLegajo && finalLeg) prev.choferLegajo = finalLeg;
+        if (prev.choferNombre.startsWith('Legajo ') && finalName && !finalName.startsWith('Legajo ')) {
+          prev.choferNombre = finalName;
+        }
+        prev.enLineaAhora = Boolean(prev.enLineaAhora || (!isHistoricalSrvDay && rec.enLineaAhora));
+        if (seenAt >= prev.lastSeenAt) {
+          prev.lastSeenAt = seenAt;
+          if (coche) prev.lastCoche = coche;
+          if (rec.lastEsAdaptado) prev.lastEsAdaptado = true;
+          if (rec.lastBandera) prev.lastBandera = rec.lastBandera;
+          if (rec.lastGps) prev.lastGps = rec.lastGps;
+          if (rec.lastStopId) prev.lastStopId = rec.lastStopId;
+          if (rec.lastLat !== null && rec.lastLat !== undefined) prev.lastLat = rec.lastLat;
+          if (rec.lastLng !== null && rec.lastLng !== undefined) prev.lastLng = rec.lastLng;
+          if (rec.lastDesvioRaw) {
+            prev.lastDesvioRaw = rec.lastDesvioRaw;
+            prev.lastDesvioSec = rec.lastDesvioSec || 0;
+          }
+          if (rec.lastTripKey) prev.lastTripKey = rec.lastTripKey;
+          if (rec.lastServiceNum) prev.lastServiceNum = Number(rec.lastServiceNum);
+          if (rec.lastTurnoIdx) prev.lastTurnoIdx = Number(rec.lastTurnoIdx);
+        } else {
+          if (!prev.lastCoche && coche) prev.lastCoche = coche;
+          if (!prev.lastBandera && rec.lastBandera) prev.lastBandera = rec.lastBandera;
+          if (!prev.lastGps && rec.lastGps) prev.lastGps = rec.lastGps;
+          if (prev.lastLat === null && rec.lastLat !== null && rec.lastLat !== undefined) prev.lastLat = rec.lastLat;
+          if (prev.lastLng === null && rec.lastLng !== null && rec.lastLng !== undefined) prev.lastLng = rec.lastLng;
+          if (!prev.lastTripKey && rec.lastTripKey) prev.lastTripKey = rec.lastTripKey;
+        }
+      }
+    };
+
+    // 1) Seed from day-scoped fleet_daily_obs (permanent 7-day per-day archive!)
+    for (const o of activeDayObs) {
+      if (!o?.coche) continue;
+      upsertCar({
+        coche: o.coche,
+        esAdaptado: o.esAdaptado,
+        lastChoferNombre: o.choferNombre,
+        lastChoferLegajo: o.choferLegajo,
+        lastBandera: o.lastBandera,
+        lastGps: o.lastGps,
+        lastStopId: o.lastStopId,
+        lastLat: o.lastLat,
+        lastLng: o.lastLng,
+        lastDesvioSec: o.lastDesvioSec,
+        lastDesvioRaw: o.lastDesvioRaw,
+        lastTripKey: o.lastTripKey,
+        lastServiceNum: o.lastServiceNum,
+        lastTurnoIdx: o.lastTurnoIdx,
+        lastSeenAt: o.lastSeenAt
+      });
+      if (o.choferNombre || o.choferLegajo) {
+        upsertDriver({
+          choferNombre: o.choferNombre,
+          choferLegajo: o.choferLegajo,
+          lastCoche: o.coche,
+          lastEsAdaptado: o.esAdaptado,
+          lastBandera: o.lastBandera,
+          lastGps: o.lastGps,
+          lastStopId: o.lastStopId,
+          lastLat: o.lastLat,
+          lastLng: o.lastLng,
+          lastDesvioSec: o.lastDesvioSec,
+          lastDesvioRaw: o.lastDesvioRaw,
+          lastTripKey: o.lastTripKey,
+          lastServiceNum: o.lastServiceNum,
+          lastTurnoIdx: o.lastTurnoIdx,
+          lastSeenAt: o.lastSeenAt
+        });
+      }
+    }
+
+    // 2) Merge day-scoped trip_assignments (recovers Saturday/historical drivers even after they work again today!)
+    for (const t of activeDayTrips) {
+      if (!t?.coche) continue;
+      const tr = activeSrvModel?.tripByKey?.get(t.tripKey) || null;
+      const band = tr?.branch?.bandera || '';
+      upsertCar({
+        coche: t.coche,
+        esAdaptado: t.esAdaptado,
+        lastChoferNombre: t.choferNombre,
+        lastChoferLegajo: t.choferLegajo,
+        lastBandera: band,
+        lastGps: t.ultimaGps,
+        lastStopId: t.stopId,
+        lastLat: t.lat,
+        lastLng: t.lng,
+        lastDesvioSec: t.desvioSec,
+        lastDesvioRaw: t.desvioRaw,
+        lastTripKey: t.tripKey,
+        lastSeenAt: t.updatedAt
+      });
+      if (t.choferNombre || t.choferLegajo) {
+        upsertDriver({
+          choferNombre: t.choferNombre,
+          choferLegajo: t.choferLegajo,
+          lastCoche: t.coche,
+          lastEsAdaptado: t.esAdaptado,
+          lastBandera: band,
+          lastGps: t.ultimaGps,
+          lastStopId: t.stopId,
+          lastLat: t.lat,
+          lastLng: t.lng,
+          lastDesvioSec: t.desvioSec,
+          lastDesvioRaw: t.desvioRaw,
+          lastTripKey: t.tripKey,
+          lastSeenAt: t.updatedAt
+        });
+      }
+    }
+
+    // 3) Merge live/day-matching fleet_cars & fleet_drivers (live flags on Hoy + fallback for pre-dayObs days)
+    for (const c of allCoches) {
+      if (isHistoricalSrvDay ? c.lastDayKey !== selectedServiceDayKey : !c.vistoHoy) continue;
+      upsertCar(c);
+    }
+    for (const d of allChoferes) {
+      if (isHistoricalSrvDay ? d.lastDayKey !== selectedServiceDayKey : !d.vistoHoy) continue;
+      upsertDriver(d);
+    }
+
+    // Sort day cars: En línea first (on Hoy), then most recent lastSeenAt, then numeric coche
+    const cars = Array.from(carMap.values()).sort((a, b) => {
+      if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+      if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+      return compareCocheNumericAsc(a.coche, b.coche);
+    });
+    // Sort day drivers: En línea first (on Hoy), then most recent lastSeenAt, then A-Z
+    const drivers = Array.from(drvMap.values()).sort((a, b) => {
+      if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+      if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+      return String(a.choferNombre || '').localeCompare(String(b.choferNombre || ''), 'es');
+    });
+    return { cars, drivers };
+  };
+
+  const dayRoster = srvDayLoading ? { cars: [], drivers: [] } : buildDayRoster();
+  const scopeCoches = dayRoster.cars;
+  const scopeChoferes = dayRoster.drivers;
+
+  // Resolve service/turno metadata strictly against the SELECTED DAY's schedule & assignments
+  const resolveDayCarMeta = (c) => {
+    if (!isHistoricalSrvDay) return resolveCarMeta(c);
+    if (!activeSrvModel) return null;
+    for (const [bId, a] of activeSrvAssignMap.entries()) {
+      if (a.coche !== c.coche) continue;
+      const bi = activeSrvModel.blockInfoById?.get(bId);
+      if (bi) {
+        return {
+          serviceNumber: bi.serviceNumber,
+          turnoIndex: bi.turnoIndex,
+          serviceTurnosCount: bi.serviceTurnosCount,
+          shiftLaps: bi.shiftLaps,
+          startHHMM: formatSecHHMM(bi.startSec),
+          endHHMM: formatSecHHMM(bi.endSec),
+          blockInfo: bi
+        };
+      }
+    }
+    return c.lastTripKey ? resolveUnitScheduleMeta(activeSrvModel, { tripKey: c.lastTripKey }, 26 * 3600) : null;
+  };
+
+  const resolveDayDriverMeta = (d) => {
+    if (!isHistoricalSrvDay) return resolveDriverMeta(d);
+    if (!activeSrvModel) return null;
+    for (const [bId, a] of activeSrvAssignMap.entries()) {
+      if (!isSameDriver(d.choferLegajo, d.choferNombre, a.choferLegajo, a.choferNombre)) continue;
+      const bi = activeSrvModel.blockInfoById?.get(bId);
+      if (bi) {
+        return {
+          serviceNumber: bi.serviceNumber,
+          turnoIndex: bi.turnoIndex,
+          serviceTurnosCount: bi.serviceTurnosCount,
+          shiftLaps: bi.shiftLaps,
+          startHHMM: formatSecHHMM(bi.startSec),
+          endHHMM: formatSecHHMM(bi.endSec),
+          blockInfo: bi
+        };
+      }
+    }
+    return d.lastTripKey ? resolveUnitScheduleMeta(activeSrvModel, { tripKey: d.lastTripKey }, 26 * 3600) : null;
+  };
+
+  const query = el.lineasFilterInput.value.trim().toLowerCase();
+  const visibleCoches = query
+    ? scopeCoches.filter((c) => {
+        const m = resolveDayCarMeta(c);
+        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        const drvsTxt = (c.dayDrivers || []).map((x) => `${x.nombre} ${x.legajo}`).join(' ');
+        return `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${drvsTxt} ${c.lastBandera || ''} ${srvTxt}`
+          .toLowerCase()
+          .includes(query);
+      })
+    : scopeCoches;
+  const visibleChoferes = query
+    ? scopeChoferes.filter((d) => {
+        const m = resolveDayDriverMeta(d);
+        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        const carsTxt = (d.dayCars || []).join(' ');
+        return `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${carsTxt} ${d.lastBandera || ''} ${srvTxt}`
+          .toLowerCase()
+          .includes(query);
+      })
+    : scopeChoferes;
 
   const allServices = Array.isArray(activeSrvSchedSummary?.services) ? activeSrvSchedSummary.services : [];
   const visibleServices = query
@@ -6077,11 +6404,11 @@ function renderLineFlotaView() {
     : allServices;
   const dayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
 
-  // Real historical summary metrics for past days in Servicios
+  // Real historical summary metrics for past days across Coches, Choferes & Servicios
   let histTotalTurnos = 0;
   let histCoveredTurnos = 0;
-  const histCarsSet = new Set();
-  const histDriversSet = new Set();
+  const histCarsSet = new Set(scopeCoches.map((c) => c.coche));
+  const histDriversSet = new Set(scopeChoferes.map((d) => normDriverName(d.choferNombre)).filter(Boolean));
   if (isHistoricalSrvDay) {
     for (const s of allServices) {
       for (const t of s.turnos || []) {
@@ -6090,17 +6417,9 @@ function renderLineFlotaView() {
         if (a && (a.coche || a.choferNombre)) {
           histCoveredTurnos += 1;
           if (a.coche) histCarsSet.add(String(a.coche).trim());
-          if (a.choferNombre) histDriversSet.add(String(a.choferNombre).trim().toUpperCase());
+          if (a.choferNombre) histDriversSet.add(normDriverName(a.choferNombre));
         }
       }
-    }
-    for (const o of serviceDayEntry?.dayObs || []) {
-      if (o?.coche) histCarsSet.add(String(o.coche).trim());
-      if (o?.choferNombre) histDriversSet.add(String(o.choferNombre).trim().toUpperCase());
-    }
-    for (const tr of serviceDayEntry?.dayTrips || []) {
-      if (tr?.coche) histCarsSet.add(String(tr.coche).trim());
-      if (tr?.choferNombre) histDriversSet.add(String(tr.choferNombre).trim().toUpperCase());
     }
   }
 
@@ -6111,10 +6430,10 @@ function renderLineFlotaView() {
   );
   const lastLiveClock = formatRosterClockArtWithSec(freshLiveTs);
   let autoMetaText = '';
-  if (isHistoricalSrvDay && fv.tab === 'servicios') {
+  if (isHistoricalSrvDay) {
     if (srvDayLoading) {
       autoMetaText = `Historial · ${dayNavInfo.main} · Cargando registros...`;
-    } else if (histCoveredTurnos > 0 || histCarsSet.size > 0) {
+    } else if (histCoveredTurnos > 0 || histCarsSet.size > 0 || histDriversSet.size > 0) {
       const parts = [`Historial · ${dayNavInfo.main}`];
       if (histTotalTurnos > 0) parts.push(`${histCoveredTurnos}/${histTotalTurnos} turnos`);
       if (histCarsSet.size > 0) parts.push(`${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`);
@@ -6143,9 +6462,9 @@ function renderLineFlotaView() {
     const resolveFlotaBandera = (latVal, lngVal, cocheId, srvMeta, fallbackBand) => {
       const la = parseFloat(latVal);
       const ln = parseFloat(lngVal);
-      const lineBranches = model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
+      const lineBranches = activeSrvModel?.branches || model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
       if (!Number.isNaN(la) && !Number.isNaN(ln) && (la !== 0 || ln !== 0) && lineBranches.length > 0) {
-        const rec = cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
+        const rec = !isHistoricalSrvDay && cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
         const picked = pickCityBusBranch(
           { rawLat: la, rawLng: ln, _matchedBranch: srvMeta?.trip?.branch || null },
           lineBranches,
@@ -6156,16 +6475,26 @@ function renderLineFlotaView() {
       }
       return srvMeta?.trip?.branch?.bandera || fallbackBand || `Línea ${linea.descripcion}`;
     };
-    if (visibleCoches.length === 0) {
+    if (srvDayLoading) {
+      listHtml = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    } else if (srvDayError) {
       listHtml = `
         <div class="empty-state">
-          <h3>${query ? 'Sin coches coincidentes' : fv.scope === 'hoy' ? 'Sin coches registrados hoy' : 'Sin coches registrados todavía'}</h3>
+          <h3>No se pudo cargar ${escapeHtml(dayNavInfo.main)}</h3>
+          <p>${escapeHtml(srvDayError)}</p>
+          <button type="button" id="btn-srv-day-retry" class="secondary-action-btn">Reintentar</button>
+        </div>
+      `;
+    } else if (visibleCoches.length === 0) {
+      listHtml = `
+        <div class="empty-state">
+          <h3>${query ? 'Sin coches coincidentes' : `Sin coches registrados · ${escapeHtml(dayNavInfo.shortBadge)}`}</h3>
           <p>${
             query
               ? 'Probá con otro número de coche, servicio o apellido de chofer.'
-              : fv.scope === 'hoy' && allCoches.length > 0
-                ? `Hoy todavía no se detectaron unidades activas. Cambiá a Últimos ${retentionDays} días para ver los ${allCoches.length} coches recientes de la línea.`
-                : 'El sistema escanea automáticamente todas las líneas cada pocos minutos y guarda la flota en el servidor.'
+              : isHistoricalSrvDay
+                ? `No quedaron registros de coches guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
+                : 'El sistema escanea automáticamente todas las líneas y guarda el registro diario por 7 días.'
           }</p>
         </div>
       `;
@@ -6174,14 +6503,20 @@ function renderLineFlotaView() {
         <ul class="flota-list" role="list" aria-label="Flota de coches de línea ${escapeHtml(linea.descripcion)}">
           ${visibleCoches
             .map((c) => {
-              const seen = formatRosterSeenInfo(c.lastSeenAt, c.lastDayKey, todayKey);
-              const isLiveNow = Boolean(c.enLineaAhora);
+              const seen = formatRosterSeenInfo(c.lastSeenAt, selectedServiceDayKey, todayKey);
+              const isLiveNow = Boolean(!isHistoricalSrvDay && c.enLineaAhora);
               const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
-              const srvMeta = resolveCarMeta(c);
+              const srvMeta = resolveDayCarMeta(c);
               const realBanderaTxt = resolveFlotaBandera(c.lastLat, c.lastLng, c.coche, srvMeta, c.lastBandera);
-              const driverTxt = c.lastChoferNombre
-                ? `${c.lastChoferNombre}${c.lastChoferLegajo ? ` (${c.lastChoferLegajo})` : ''}`
-                : '';
+              const dayDrvs = Array.isArray(c.dayDrivers) ? c.dayDrivers : [];
+              const multiDriversHtml =
+                dayDrvs.length > 1
+                  ? `Choferes: ${dayDrvs
+                      .map((x) => `<strong>${escapeHtml(x.nombre)}</strong>${x.legajo ? ` <span class="legajo-chip">${escapeHtml(x.legajo)}</span>` : ''}`)
+                      .join(' · ')}`
+                  : c.lastChoferNombre
+                    ? `${isLiveNow ? 'Chofer' : 'Chofer'}: <strong>${escapeHtml(c.lastChoferNombre)}</strong>${c.lastChoferLegajo ? ` <span class="legajo-chip">${escapeHtml(c.lastChoferLegajo)}</span>` : ''}`
+                    : 'Chofer s/d';
               const targetIdx = clickTargets.length;
               clickTargets.push({
                 codLinea: linea.codigo,
@@ -6207,10 +6542,10 @@ function renderLineFlotaView() {
                   ? `en línea ahora, visto ${seen.whenSpoken}`
                   : seen.isToday
                     ? `en servicio hoy, visto ${seen.whenSpoken}`
-                    : `visto por última vez ${seen.whenSpoken}`,
+                    : `visto ${seen.whenSpoken}`,
                 formatServiceSpoken(srvMeta, isLiveNow),
-                driverTxt
-                  ? `chofer: ${c.lastChoferNombre}${c.lastChoferLegajo ? `, legajo ${c.lastChoferLegajo}` : ''}`
+                dayDrvs.length > 0
+                  ? `chofer: ${dayDrvs.map((x) => x.nombre).join(', ')}`
                   : 'chofer sin datos',
                 'Tocá para ver en el mapa'
               ].filter(Boolean);
@@ -6227,7 +6562,7 @@ function renderLineFlotaView() {
                       </div>
                       ${formatServiceLineHtml(srvMeta, isLiveNow, !isLiveNow)}
                       <div class="flota-row-sub">
-                        <span>${driverTxt ? `${isLiveNow ? 'Chofer' : 'Últ. chofer'}: <strong>${escapeHtml(c.lastChoferNombre)}</strong>${c.lastChoferLegajo ? ` <span class="legajo-chip">${escapeHtml(c.lastChoferLegajo)}</span>` : ''}` : 'Chofer s/d'}</span>
+                        <span>${multiDriversHtml}</span>
                       </div>
                       <div class="flota-row-foot">
                         <span class="flota-bandera-txt">${escapeHtml(realBanderaTxt)}</span>
@@ -6246,9 +6581,9 @@ function renderLineFlotaView() {
     const resolveFlotaBandera = (latVal, lngVal, cocheId, srvMeta, fallbackBand) => {
       const la = parseFloat(latVal);
       const ln = parseFloat(lngVal);
-      const lineBranches = model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
+      const lineBranches = activeSrvModel?.branches || model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
       if (!Number.isNaN(la) && !Number.isNaN(ln) && (la !== 0 || ln !== 0) && lineBranches.length > 0) {
-        const rec = cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
+        const rec = !isHistoricalSrvDay && cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
         const picked = pickCityBusBranch(
           { rawLat: la, rawLng: ln, _matchedBranch: srvMeta?.trip?.branch || null },
           lineBranches,
@@ -6259,16 +6594,26 @@ function renderLineFlotaView() {
       }
       return srvMeta?.trip?.branch?.bandera || fallbackBand || `Línea ${linea.descripcion}`;
     };
-    if (visibleChoferes.length === 0) {
+    if (srvDayLoading) {
+      listHtml = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    } else if (srvDayError) {
       listHtml = `
         <div class="empty-state">
-          <h3>${query ? 'Sin choferes coincidentes' : fv.scope === 'hoy' ? 'Sin choferes registrados hoy' : 'Sin choferes registrados todavía'}</h3>
+          <h3>No se pudo cargar ${escapeHtml(dayNavInfo.main)}</h3>
+          <p>${escapeHtml(srvDayError)}</p>
+          <button type="button" id="btn-srv-day-retry" class="secondary-action-btn">Reintentar</button>
+        </div>
+      `;
+    } else if (visibleChoferes.length === 0) {
+      listHtml = `
+        <div class="empty-state">
+          <h3>${query ? 'Sin choferes coincidentes' : `Sin choferes registrados · ${escapeHtml(dayNavInfo.shortBadge)}`}</h3>
           <p>${
             query
               ? 'Probá con otro nombre, legajo, servicio o número de coche.'
-              : fv.scope === 'hoy' && allChoferes.length > 0
-                ? `Hoy todavía no se detectaron choferes activos. Cambiá a Últimos ${retentionDays} días para ver los ${allChoferes.length} choferes recientes de la línea.`
-                : 'El sistema registra automáticamente a cada chofer y el último coche en el que fue visto en el servidor.'
+              : isHistoricalSrvDay
+                ? `No quedaron registros de choferes guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
+                : 'El sistema guarda automáticamente la actividad diaria de cada chofer durante 7 días.'
           }</p>
         </div>
       `;
@@ -6277,11 +6622,16 @@ function renderLineFlotaView() {
         <ul class="flota-list" role="list" aria-label="Choferes de línea ${escapeHtml(linea.descripcion)}">
           ${visibleChoferes
             .map((d) => {
-              const seen = formatRosterSeenInfo(d.lastSeenAt, d.lastDayKey, todayKey);
-              const isLiveNow = Boolean(d.enLineaAhora);
+              const seen = formatRosterSeenInfo(d.lastSeenAt, selectedServiceDayKey, todayKey);
+              const isLiveNow = Boolean(!isHistoricalSrvDay && d.enLineaAhora);
               const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
-              const srvMeta = resolveDriverMeta(d);
+              const srvMeta = resolveDayDriverMeta(d);
               const realBanderaTxt = resolveFlotaBandera(d.lastLat, d.lastLng, d.lastCoche, srvMeta, d.lastBandera);
+              const dayCars = Array.isArray(d.dayCars) && d.dayCars.length > 0 ? d.dayCars : d.lastCoche ? [d.lastCoche] : [];
+              const carsLabelHtml =
+                dayCars.length > 1
+                  ? `Coches: ${dayCars.map((num) => `<strong>#${escapeHtml(num)}</strong>`).join(' · ')}`
+                  : `${isLiveNow ? 'Coche actual' : 'Coche'}: <strong>#${escapeHtml(d.lastCoche || '—')}</strong>${d.lastEsAdaptado ? ' <span class="adapted-icon-badge">♿</span>' : ''}`;
               const targetIdx = clickTargets.length;
               clickTargets.push({
                 codLinea: linea.codigo,
@@ -6305,9 +6655,9 @@ function renderLineFlotaView() {
                 `Chofer ${d.choferNombre}${d.choferLegajo ? `, legajo ${d.choferLegajo}` : ''}`,
                 isLiveNow ? 'en línea ahora' : seen.whenSpoken,
                 formatServiceSpoken(srvMeta, isLiveNow),
-                d.lastCoche
-                  ? `${isLiveNow ? 'en el coche' : 'último coche'} ${d.lastCoche}${d.lastEsAdaptado ? ', unidad adaptada' : ''}`
-                  : 'último coche sin datos',
+                dayCars.length > 0
+                  ? `${isLiveNow ? 'en el coche' : 'coche'} ${dayCars.join(', ')}${d.lastEsAdaptado ? ', unidad adaptada' : ''}`
+                  : 'coche sin datos',
                 'Tocá para ver en el mapa'
               ].filter(Boolean);
               return `
@@ -6323,7 +6673,7 @@ function renderLineFlotaView() {
                       </div>
                       ${formatServiceLineHtml(srvMeta, isLiveNow, !isLiveNow)}
                       <div class="flota-row-sub">
-                        <span class="flota-last-coche">${isLiveNow ? 'Coche actual' : 'Último coche'}: <strong>#${escapeHtml(d.lastCoche || '—')}</strong>${d.lastEsAdaptado ? ' <span class="adapted-icon-badge">♿</span>' : ''}</span>
+                        <span class="flota-last-coche">${carsLabelHtml}</span>
                       </div>
                       <div class="flota-row-foot">
                         <span class="flota-bandera-txt">${escapeHtml(realBanderaTxt)}</span>
@@ -6490,7 +6840,7 @@ function renderLineFlotaView() {
   const learnedTypicalToday = Number(cap?.learnedTypicalToday) || 0;
 
   let crossCardHtml = '';
-  if (isHistoricalSrvDay && fv.tab === 'servicios') {
+  if (isHistoricalSrvDay) {
     const histSched = activeSrvSchedSummary;
     const histTotal = histSched?.totalServices || allServices.length || 0;
     const histSchedVal =
@@ -6514,7 +6864,7 @@ function renderLineFlotaView() {
         ? `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'} · ${histDriversSet.size} ${histDriversSet.size === 1 ? 'chofer' : 'choferes'} registrados`
         : 'Sin observaciones guardadas ese día';
     crossCardHtml = `
-      <div class="flota-cross-card" role="region" aria-label="Resumen histórico de servicios del día seleccionado">
+      <div class="flota-cross-card" role="region" aria-label="Resumen histórico del día seleccionado">
         <div class="flota-cross-cell">
           <span class="flota-cross-label">Programado · ${escapeHtml(dayNavInfo.tipoLabel)}</span>
           <span class="flota-cross-val">${escapeHtml(histSchedVal)}</span>
@@ -6608,34 +6958,29 @@ function renderLineFlotaView() {
 
   const canGoPrevDay = serviceDayOffset < maxDayOffset;
   const canGoNextDay = serviceDayOffset > 0;
-  const scopeBarHtml =
-    fv.tab === 'servicios'
-      ? `
-      <div class="srv-day-nav" role="group" aria-label="Historial de servicios de los últimos ${retentionDays} días">
-        <button type="button" id="btn-srv-prev-day" class="srv-day-arrow" ${canGoPrevDay ? '' : 'disabled'} title="Día anterior" aria-label="Día anterior">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 18 9 12 15 6"/></svg>
-        </button>
-        <button type="button" id="btn-srv-today-reset" class="srv-day-label ${isHistoricalSrvDay ? 'is-historical' : ''}" title="${isHistoricalSrvDay ? 'Tocá para volver a hoy' : 'Servicios de hoy'}" aria-live="polite">
-          <span class="srv-day-main">${escapeHtml(dayNavInfo.main)}</span>
-          <span class="srv-day-sub">${escapeHtml(dayNavInfo.tipoLabel)}${srvDayLoading ? ' · Cargando...' : ` · ${activeCount} srv.`}${isHistoricalSrvDay ? ' · Volver a hoy' : ''}</span>
-        </button>
-        <button type="button" id="btn-srv-next-day" class="srv-day-arrow" ${canGoNextDay ? '' : 'disabled'} title="Día siguiente" aria-label="Día siguiente">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="9 18 15 12 9 6"/></svg>
-        </button>
-      </div>
-    `
-      : `
-      <div class="flota-scope-bar">
-        <div class="flota-scope-group" role="group" aria-label="Período de la lista">
-          <button type="button" class="seg-btn seg-btn-xs ${fv.scope === 'semana' ? 'active' : ''}" data-flota-scope="semana" aria-pressed="${fv.scope === 'semana'}">Últimos ${retentionDays} días</button>
-          <button type="button" class="seg-btn seg-btn-xs ${fv.scope === 'hoy' ? 'active' : ''}" data-flota-scope="hoy" aria-pressed="${fv.scope === 'hoy'}">Hoy (${fv.tab === 'coches' ? hoyCochesCount : hoyChoferesCount})</button>
-        </div>
-        <span class="mono-meta">${query ? `${activeCount} de ${activeScopeTotal}` : `${activeCount} reg.`}</span>
-      </div>
-    `;
+  const dayUnitLabel =
+    fv.tab === 'coches'
+      ? `${activeCount} ${activeCount === 1 ? 'coche' : 'coches'}`
+      : fv.tab === 'choferes'
+        ? `${activeCount} ${activeCount === 1 ? 'chofer' : 'choferes'}`
+        : `${activeCount} srv.`;
+  const scopeBarHtml = `
+    <div class="srv-day-nav" role="group" aria-label="Historial diario de los últimos ${retentionDays} días">
+      <button type="button" id="btn-srv-prev-day" class="srv-day-arrow" ${canGoPrevDay ? '' : 'disabled'} title="Día anterior" aria-label="Día anterior">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <button type="button" id="btn-srv-today-reset" class="srv-day-label ${isHistoricalSrvDay ? 'is-historical' : ''}" title="${isHistoricalSrvDay ? 'Tocá para volver a hoy' : 'Registros de hoy'}" aria-live="polite">
+        <span class="srv-day-main">${escapeHtml(dayNavInfo.main)}</span>
+        <span class="srv-day-sub">${escapeHtml(dayNavInfo.tipoLabel)}${srvDayLoading ? ' · Cargando...' : ` · ${dayUnitLabel}`}${isHistoricalSrvDay ? ' · Volver a hoy' : ''}</span>
+      </button>
+      <button type="button" id="btn-srv-next-day" class="srv-day-arrow" ${canGoNextDay ? '' : 'disabled'} title="Día siguiente" aria-label="Día siguiente">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="9 18 15 12 9 6"/></svg>
+      </button>
+    </div>
+  `;
 
   const todaySrvCount = Array.isArray(fv.schedSummary?.services) ? fv.schedSummary.services.length : 0;
-  const tabSrvCount = fv.tab === 'servicios' && !srvDayLoading ? allServices.length : todaySrvCount;
+  const tabSrvCount = !srvDayLoading ? allServices.length : todaySrvCount;
 
   el.lineasContent.innerHTML = `
     <div class="flota-view">
@@ -6935,8 +7280,8 @@ async function refreshActiveLineFlotaSilent() {
   if (getActiveTab() !== 'lineas' || state.drill.step !== 'flota' || !state.drill.linea) return;
   const fv = state.flotaView;
   if (fv.loading) return;
-  // Don't overwrite historical day view in Servicios; keep live 10s polling on Hoy & Coches/Choferes
-  if (fv.tab === 'servicios' && Number(fv.serviceDayOffset) > 0) return;
+  // Don't overwrite historical day view across Coches / Choferes / Servicios; run live 10s polling on Hoy
+  if (Number(fv.serviceDayOffset) > 0) return;
 
   const linea = state.drill.linea;
   flotaSilentRefreshInFlight = true;
