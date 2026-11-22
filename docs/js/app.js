@@ -6443,7 +6443,7 @@ function renderLineFlotaView() {
   );
   const lastLiveClock = formatRosterClockArtWithSec(freshLiveTs);
   const servingOfflineCache = Boolean(
-    state.isOffline || fv.isOfflineCache || (isHistoricalSrvDay && srvDayEntry?.isOfflineCache)
+    state.isOffline || fv.isOfflineCache || (isHistoricalSrvDay && serviceDayEntry?.isOfflineCache)
   );
   let autoMetaText = '';
   if (isHistoricalSrvDay) {
@@ -7182,8 +7182,10 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
       error: null
     });
     renderLineFlotaView();
-    const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
-    announce(`Historial de servicios: ${nav.main}, ${nav.tipoLabel}.`);
+    if (fv.serviceDayOffset === clamped) {
+      const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
+      announce(`Historial de servicios: ${nav.main}, ${nav.tipoLabel}.`);
+    }
   } catch (err) {
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     fv.serviceDayCache.set(targetDayKey, {
@@ -7225,6 +7227,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     if (force) {
       state.flotaView.loading = true;
       state.flotaView.error = null;
+      state.flotaView.serviceDayOffset = 0;
       state.flotaView.serviceDayCache = new Map();
     }
   }
@@ -7336,6 +7339,7 @@ async function refreshActiveLineFlotaSilent() {
       lastSeenAt: Date.now()
     });
 
+    if (Number(state.flotaView.serviceDayOffset) > 0) return;
     const prevScroll = el.lineasContent.scrollTop;
     renderLineFlotaView();
     el.lineasContent.scrollTop = prevScroll;
