@@ -6002,6 +6002,9 @@ function formatServiceDayNavLabel(dayKey, todayKey) {
   if (dayKey === shiftDayKey(todayKey, -1)) {
     return { main: `Ayer · ${dowShort} ${ddmm}`, shortBadge: 'Ayer', tipo, tipoLabel };
   }
+  if (dayKey === shiftDayKey(todayKey, 1)) {
+    return { main: `Mañana · ${dowShort} ${ddmm}`, shortBadge: 'Mañana', tipo, tipoLabel };
+  }
   return { main: `${dowShort} ${ddmm}`, shortBadge: `${dowShort} ${ddmm}`, tipo, tipoLabel };
 }
 
@@ -6726,43 +6729,51 @@ function renderLineFlotaView() {
   };
 
   const maxDayOffset = Math.max(0, retentionDays - 1);
-  const serviceDayOffset = Math.max(0, Math.min(maxDayOffset, Number(fv.serviceDayOffset) || 0));
+  const minDayOffset = -EVENTS_MAX_FUTURE_DAYS; // negative offset = future scheduled days (+1..+7)
+  const serviceDayOffset = Math.max(minDayOffset, Math.min(maxDayOffset, Number(fv.serviceDayOffset) || 0));
   const selectedServiceDayKey = shiftDayKey(todayKey, -serviceDayOffset);
-  const isHistoricalSrvDay = serviceDayOffset > 0;
+  const isFutureSrvDay = serviceDayOffset < 0;
+  const isHistoricalSrvDay = serviceDayOffset !== 0;
   const serviceDayEntry = isHistoricalSrvDay ? fv.serviceDayCache?.get(selectedServiceDayKey) || null : null;
   const srvDayLoading = Boolean(isHistoricalSrvDay && (!serviceDayEntry || serviceDayEntry.loading));
   const srvDayError = isHistoricalSrvDay ? serviceDayEntry?.error || null : null;
 
   const activeSrvSchedSummary = isHistoricalSrvDay ? serviceDayEntry?.schedSummary || null : fv.schedSummary;
   const activeSrvModel = isHistoricalSrvDay ? serviceDayEntry?.model || null : model;
-  const activeDayObs = isHistoricalSrvDay
-    ? Array.isArray(serviceDayEntry?.dayObs)
-      ? serviceDayEntry.dayObs
-      : []
-    : Array.isArray(data.dayObs)
-      ? data.dayObs
-      : [];
-  const activeDayTrips = isHistoricalSrvDay
-    ? Array.isArray(serviceDayEntry?.dayTrips)
-      ? serviceDayEntry.dayTrips
-      : []
-    : todayTrips;
-  const activeSrvAssignMap = isHistoricalSrvDay
-    ? serviceDayEntry && !serviceDayEntry.loading && activeSrvModel
-      ? buildFlotaDayAssignments({
-          model: activeSrvModel,
-          schedSummary: activeSrvSchedSummary,
-          trips: activeDayTrips,
-          dayObs: activeDayObs,
-          allCoches,
-          allChoferes,
-          dayKey: selectedServiceDayKey,
-          isToday: false,
-          nowSec: 26 * 3600,
-          liveMatchByCoche: new Map()
-        }).blockAssignMap
-      : new Map()
-    : blockAssignMap;
+  const activeDayObs = isFutureSrvDay
+    ? []
+    : isHistoricalSrvDay
+      ? Array.isArray(serviceDayEntry?.dayObs)
+        ? serviceDayEntry.dayObs
+        : []
+      : Array.isArray(data.dayObs)
+        ? data.dayObs
+        : [];
+  const activeDayTrips = isFutureSrvDay
+    ? []
+    : isHistoricalSrvDay
+      ? Array.isArray(serviceDayEntry?.dayTrips)
+        ? serviceDayEntry.dayTrips
+        : []
+      : todayTrips;
+  const activeSrvAssignMap = isFutureSrvDay
+    ? new Map()
+    : isHistoricalSrvDay
+      ? serviceDayEntry && !serviceDayEntry.loading && activeSrvModel
+        ? buildFlotaDayAssignments({
+            model: activeSrvModel,
+            schedSummary: activeSrvSchedSummary,
+            trips: activeDayTrips,
+            dayObs: activeDayObs,
+            allCoches,
+            allChoferes,
+            dayKey: selectedServiceDayKey,
+            isToday: false,
+            nowSec: 26 * 3600,
+            liveMatchByCoche: new Map()
+          }).blockAssignMap
+        : new Map()
+      : blockAssignMap;
 
   // Build day-scoped Coches & Choferes for selectedServiceDayKey (never overwritten when working again on a newer day!)
   const buildDayRoster = () => {
@@ -7026,7 +7037,7 @@ function renderLineFlotaView() {
     return { cars, drivers };
   };
 
-  const dayRoster = srvDayLoading ? { cars: [], drivers: [] } : buildDayRoster();
+  const dayRoster = srvDayLoading || isFutureSrvDay ? { cars: [], drivers: [] } : buildDayRoster();
   const scopeCoches = dayRoster.cars;
   const scopeChoferes = dayRoster.drivers;
 
@@ -7138,7 +7149,11 @@ function renderLineFlotaView() {
     state.isOffline || fv.isOfflineCache || (isHistoricalSrvDay && serviceDayEntry?.isOfflineCache)
   );
   let autoMetaText = '';
-  if (isHistoricalSrvDay) {
+  if (isFutureSrvDay) {
+    autoMetaText = srvDayLoading
+      ? `Programado · ${dayNavInfo.main} · Cargando diagrama...`
+      : `Programado · ${dayNavInfo.main} · ${allServices.length} ${allServices.length === 1 ? 'servicio' : 'servicios'} (${dayNavInfo.tipoLabel})`;
+  } else if (isHistoricalSrvDay) {
     if (srvDayLoading) {
       autoMetaText = `Historial · ${dayNavInfo.main} · Cargando registros...`;
     } else if (histCoveredTurnos > 0 || histCarsSet.size > 0 || histDriversSet.size > 0) {
@@ -7201,13 +7216,21 @@ function renderLineFlotaView() {
     } else if (visibleCoches.length === 0) {
       listHtml = `
         <div class="empty-state">
-          <h3>${query ? 'Sin coches coincidentes' : `Sin coches registrados · ${escapeHtml(dayNavInfo.shortBadge)}`}</h3>
+          <h3>${
+            query
+              ? 'Sin coches coincidentes'
+              : isFutureSrvDay
+                ? `Programado · ${escapeHtml(dayNavInfo.shortBadge)}`
+                : `Sin coches registrados · ${escapeHtml(dayNavInfo.shortBadge)}`
+          }</h3>
           <p>${
             query
               ? 'Probá con otro número de coche, servicio o apellido de chofer.'
-              : isHistoricalSrvDay
-                ? `No quedaron registros de coches guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                : 'El sistema escanea automáticamente todas las líneas y guarda el registro diario por 7 días.'
+              : isFutureSrvDay
+                ? `Los coches de ${escapeHtml(dayNavInfo.main)} se registran automáticamente al iniciar el servicio. Mirá el diagrama completo en Servicios.`
+                : isHistoricalSrvDay
+                  ? `No quedaron registros de coches guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
+                  : 'El sistema escanea automáticamente todas las líneas y guarda el registro diario por 7 días.'
           }</p>
         </div>
       `;
@@ -7320,13 +7343,21 @@ function renderLineFlotaView() {
     } else if (visibleChoferes.length === 0) {
       listHtml = `
         <div class="empty-state">
-          <h3>${query ? 'Sin choferes coincidentes' : `Sin choferes registrados · ${escapeHtml(dayNavInfo.shortBadge)}`}</h3>
+          <h3>${
+            query
+              ? 'Sin choferes coincidentes'
+              : isFutureSrvDay
+                ? `Programado · ${escapeHtml(dayNavInfo.shortBadge)}`
+                : `Sin choferes registrados · ${escapeHtml(dayNavInfo.shortBadge)}`
+          }</h3>
           <p>${
             query
               ? 'Probá con otro nombre, legajo, servicio o número de coche.'
-              : isHistoricalSrvDay
-                ? `No quedaron registros de choferes guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                : 'El sistema guarda automáticamente la actividad diaria de cada chofer durante 7 días.'
+              : isFutureSrvDay
+                ? `Los choferes de ${escapeHtml(dayNavInfo.main)} se asignan automáticamente al iniciar cada turno. Mirá los horarios en Servicios.`
+                : isHistoricalSrvDay
+                  ? `No quedaron registros de choferes guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
+                  : 'El sistema guarda automáticamente la actividad diaria de cada chofer durante 7 días.'
           }</p>
         </div>
       `;
@@ -7422,8 +7453,9 @@ function renderLineFlotaView() {
       `;
     } else {
       const assignedCount = activeSrvAssignMap.size;
-      const histNoticeHtml =
-        isHistoricalSrvDay && assignedCount === 0
+      const histNoticeHtml = isFutureSrvDay
+        ? `<div class="srv-hist-note">Diagrama programado para ${escapeHtml(dayNavInfo.main)} (${escapeHtml(dayNavInfo.tipoLabel)}) · Los coches y choferes se completan al iniciar el servicio.</div>`
+        : isHistoricalSrvDay && assignedCount === 0
           ? `<div class="srv-hist-note">Sin registros guardados para ${escapeHtml(dayNavInfo.main)} · Mostrando diagrama programado (${escapeHtml(dayNavInfo.tipoLabel)}).</div>`
           : '';
       listHtml = `
@@ -7443,7 +7475,9 @@ function renderLineFlotaView() {
                     isLiveNow && assign?.lapNumber
                       ? `Vta ${formatLapNumber(assign.lapNumber)}${t.shiftLaps ? `/${formatLapNumber(t.shiftLaps)}` : ''}`
                       : '';
-                  let assignHtml = `<span class="srv-turno-unassigned">${isHistoricalSrvDay ? 'Sin registro' : 'Sin registro hoy'}</span>`;
+                  let assignHtml = `<span class="srv-turno-unassigned">${
+                    isFutureSrvDay ? 'Programado' : isHistoricalSrvDay ? 'Sin registro' : 'Sin registro hoy'
+                  }</span>`;
                   let btnOpen = `<div class="srv-turno-row">`;
                   let btnClose = `</div>`;
 
@@ -7566,25 +7600,34 @@ function renderLineFlotaView() {
               histSched?.relevoEnLineaCount > 0 ? ` · ${histSched.relevoEnLineaCount} c/ relevo` : ''
             }`
         : `Diagrama ${dayNavInfo.tipoLabel}`;
+    const rightCellLabel = isFutureSrvDay
+      ? `Estado · ${dayNavInfo.shortBadge}`
+      : `Registrado · ${dayNavInfo.shortBadge}`;
     const histObsVal = srvDayLoading
       ? 'Cargando...'
-      : histTotalTurnos > 0
-        ? `${histCoveredTurnos}/${histTotalTurnos} turnos`
-        : `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`;
+      : isFutureSrvDay
+        ? 'Programado'
+        : histTotalTurnos > 0
+          ? `${histCoveredTurnos}/${histTotalTurnos} turnos`
+          : `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`;
     const histObsSub = srvDayLoading
-      ? 'Consultando registros del servidor'
-      : histCarsSet.size > 0 || histDriversSet.size > 0
-        ? `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'} · ${histDriversSet.size} ${histDriversSet.size === 1 ? 'chofer' : 'choferes'} registrados`
-        : 'Sin observaciones guardadas ese día';
+      ? isFutureSrvDay
+        ? 'Cargando horarios programados'
+        : 'Consultando registros del servidor'
+      : isFutureSrvDay
+        ? 'Coches y choferes al iniciar el servicio'
+        : histCarsSet.size > 0 || histDriversSet.size > 0
+          ? `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'} · ${histDriversSet.size} ${histDriversSet.size === 1 ? 'chofer' : 'choferes'} registrados`
+          : 'Sin observaciones guardadas ese día';
     crossCardHtml = `
-      <div class="flota-cross-card" role="region" aria-label="Resumen histórico del día seleccionado">
+      <div class="flota-cross-card" role="region" aria-label="${isFutureSrvDay ? 'Resumen programado del día seleccionado' : 'Resumen histórico del día seleccionado'}">
         <div class="flota-cross-cell">
           <span class="flota-cross-label">Programado · ${escapeHtml(dayNavInfo.tipoLabel)}</span>
           <span class="flota-cross-val">${escapeHtml(histSchedVal)}</span>
           <span class="flota-cross-sub">${escapeHtml(histSchedSub)}</span>
         </div>
         <div class="flota-cross-cell">
-          <span class="flota-cross-label">Registrado · ${escapeHtml(dayNavInfo.shortBadge)}</span>
+          <span class="flota-cross-label">${escapeHtml(rightCellLabel)}</span>
           <span class="flota-cross-val">${escapeHtml(histObsVal)}</span>
           <span class="flota-cross-sub">${escapeHtml(histObsSub)}</span>
         </div>
@@ -7670,7 +7713,7 @@ function renderLineFlotaView() {
   }
 
   const canGoPrevDay = serviceDayOffset < maxDayOffset;
-  const canGoNextDay = serviceDayOffset > 0;
+  const canGoNextDay = serviceDayOffset > minDayOffset;
   const dayUnitLabel =
     fv.tab === 'coches'
       ? `${activeCount} ${activeCount === 1 ? 'coche' : 'coches'}`
@@ -7678,13 +7721,13 @@ function renderLineFlotaView() {
         ? `${activeCount} ${activeCount === 1 ? 'chofer' : 'choferes'}`
         : `${activeCount} srv.`;
   const scopeBarHtml = `
-    <div class="srv-day-nav" role="group" aria-label="Historial diario de los últimos ${retentionDays} días">
+    <div class="srv-day-nav" role="group" aria-label="Navegar entre historial de los últimos ${retentionDays} días, hoy y próximos días programados">
       <button type="button" id="btn-srv-prev-day" class="srv-day-arrow" ${canGoPrevDay ? '' : 'disabled'} title="Día anterior" aria-label="Día anterior">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 18 9 12 15 6"/></svg>
       </button>
       <button type="button" id="btn-srv-today-reset" class="srv-day-label ${isHistoricalSrvDay ? 'is-historical' : ''}" title="${isHistoricalSrvDay ? 'Tocá para volver a hoy' : 'Registros de hoy'}" aria-live="polite">
         <span class="srv-day-main">${escapeHtml(dayNavInfo.main)}</span>
-        <span class="srv-day-sub">${escapeHtml(dayNavInfo.tipoLabel)}${srvDayLoading ? ' · Cargando...' : ` · ${dayUnitLabel}`}${isHistoricalSrvDay ? ' · Volver a hoy' : ''}</span>
+        <span class="srv-day-sub">${escapeHtml(dayNavInfo.tipoLabel)}${srvDayLoading ? ' · Cargando...' : ` · ${dayUnitLabel}`}${isFutureSrvDay ? ' · Prog.' : ''}${isHistoricalSrvDay ? ' · Volver a hoy' : ''}</span>
       </button>
       <button type="button" id="btn-srv-next-day" class="srv-day-arrow" ${canGoNextDay ? '' : 'disabled'} title="Día siguiente" aria-label="Día siguiente">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="9 18 15 12 9 6"/></svg>
@@ -7727,7 +7770,7 @@ function renderLineFlotaView() {
     loadServiceHistoryDay(linea, serviceDayOffset + 1);
   });
   document.getElementById('btn-srv-next-day')?.addEventListener('click', () => {
-    if (serviceDayOffset <= 0) return;
+    if (serviceDayOffset <= minDayOffset) return;
     haptic('light');
     loadServiceHistoryDay(linea, serviceDayOffset - 1);
   });
@@ -7825,7 +7868,9 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
   if (!linea || state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
   const retentionDays = fv.data?.retentionDays || 7;
   const maxOffset = Math.max(0, retentionDays - 1);
-  const clamped = Math.max(0, Math.min(maxOffset, Number(dayOffset) || 0));
+  const minOffset = -EVENTS_MAX_FUTURE_DAYS;
+  const clamped = Math.max(minOffset, Math.min(maxOffset, Number(dayOffset) || 0));
+  const isFutureDay = clamped < 0;
   fv.serviceDayOffset = clamped;
   if (!(fv.serviceDayCache instanceof Map)) fv.serviceDayCache = new Map();
 
@@ -7843,7 +7888,7 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
   if (cached && !cached.loading && !cached.error && !force) {
     renderLineFlotaView();
     const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
-    announce(`Historial de servicios: ${nav.main}, ${nav.tipoLabel}.`);
+    announce(`${isFutureDay ? 'Servicios programados' : 'Historial de servicios'}: ${nav.main}, ${nav.tipoLabel}.`);
     return;
   }
 
@@ -7852,12 +7897,33 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
     dayObs: [],
     schedSummary: cached?.schedSummary || null,
     model: cached?.model || null,
+    isOfflineCache: false,
     loading: true,
     error: null
   });
   renderLineFlotaView();
 
   try {
+    if (isFutureDay) {
+      const schedSummary = await computeLineScheduledFleetSummary(linea.codigo, targetTipo);
+      if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+      fv.serviceDayCache.set(targetDayKey, {
+        dayTrips: [],
+        dayObs: [],
+        schedSummary,
+        model: schedSummary?._model || null,
+        isOfflineCache: false,
+        loading: false,
+        error: null
+      });
+      renderLineFlotaView();
+      if (fv.serviceDayOffset === clamped) {
+        const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
+        announce(`Servicios programados: ${nav.main}, ${nav.tipoLabel}.`);
+      }
+      return;
+    }
+
     const [res, schedSummary] = await Promise.all([
       api.flotaLinea(linea.codigo, targetDayKey),
       computeLineScheduledFleetSummary(linea.codigo, targetTipo)
@@ -8000,8 +8066,8 @@ async function refreshActiveLineFlotaSilent() {
   if (getActiveTab() !== 'lineas' || state.drill.step !== 'flota' || !state.drill.linea) return;
   const fv = state.flotaView;
   if (fv.loading) return;
-  // Don't overwrite historical day view across Coches / Choferes / Servicios; run live 10s polling on Hoy
-  if (Number(fv.serviceDayOffset) > 0) return;
+  // Don't overwrite historical or future scheduled day view; run live 10s polling on Hoy only
+  if (Number(fv.serviceDayOffset) !== 0) return;
 
   const linea = state.drill.linea;
   flotaSilentRefreshInFlight = true;
@@ -8031,7 +8097,7 @@ async function refreshActiveLineFlotaSilent() {
       lastSeenAt: Date.now()
     });
 
-    if (Number(state.flotaView.serviceDayOffset) > 0) return;
+    if (Number(state.flotaView.serviceDayOffset) !== 0) return;
     const prevScroll = el.lineasContent.scrollTop;
     renderLineFlotaView();
     el.lineasContent.scrollTop = prevScroll;
