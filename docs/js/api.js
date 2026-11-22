@@ -1,4 +1,4 @@
-import { DEFAULT_API_BASE } from './config.js';
+import { DEFAULT_API_BASE, REMOVED_LINE_CODES, normalizePublicLineName } from './config.js';
 import {
   staticBootstrap,
   staticCalles,
@@ -7,6 +7,54 @@ import {
   staticParadasCercanas,
   staticRecorridos
 } from './static-data.js';
+
+function sanitizeLineItem(item) {
+  if (!item || typeof item !== 'object') return item;
+  const cod = Number(item.codigoLinea ?? item.codigo);
+  if (!cod) return item;
+  if (item.descripcionLinea !== undefined) {
+    item.descripcionLinea = normalizePublicLineName(cod, item.descripcionLinea);
+  }
+  if (item.descripcion !== undefined && item.codigo !== undefined) {
+    item.descripcion = normalizePublicLineName(cod, item.descripcion);
+  }
+  return item;
+}
+
+function sanitizeLineArray(arr) {
+  if (!Array.isArray(arr)) return arr;
+  return arr
+    .filter((item) => {
+      const cod = Number(item?.codigoLinea ?? item?.codigo);
+      return !cod || !REMOVED_LINE_CODES.has(cod);
+    })
+    .map(sanitizeLineItem);
+}
+
+function sanitizeApiPayload(json) {
+  if (!json || typeof json !== 'object') return json;
+  const targets = [json, json.data].filter((o) => o && typeof o === 'object');
+  for (const obj of targets) {
+    if (Array.isArray(obj.lineas)) {
+      obj.lineas = sanitizeLineArray(obj.lineas).sort((a, b) =>
+        String(a.descripcion || a.descripcionLinea || '').localeCompare(
+          String(b.descripcion || b.descripcionLinea || ''),
+          'es',
+          { numeric: true }
+        )
+      );
+    }
+    if (Array.isArray(obj.arribos)) obj.arribos = sanitizeLineArray(obj.arribos);
+    if (Array.isArray(obj.corridorFleet)) obj.corridorFleet = sanitizeLineArray(obj.corridorFleet);
+    if (Array.isArray(obj.units)) obj.units = sanitizeLineArray(obj.units);
+    if (Array.isArray(obj.trips)) obj.trips = sanitizeLineArray(obj.trips);
+    if (Array.isArray(obj.results)) obj.results = sanitizeLineArray(obj.results);
+    if (obj.codigoLinea && obj.descripcionLinea !== undefined) {
+      obj.descripcionLinea = normalizePublicLineName(obj.codigoLinea, obj.descripcionLinea);
+    }
+  }
+  return json;
+}
 
 function resolveApiBase() {
   const params = new URLSearchParams(window.location.search);
@@ -63,7 +111,7 @@ async function apiGet(path, fallbackFn = null, timeoutMs = 8000) {
     if (!res.ok) {
       throw new Error(json.error || `Error ${res.status}`);
     }
-    return json;
+    return sanitizeApiPayload(json);
   } catch (err) {
     if (fallbackFn) return fallbackFn(err);
     throw err;
@@ -217,11 +265,20 @@ function loadCatalogo() {
           catalogoPromise = null;
           return null;
         }
+        const lineas = sanitizeLineArray(cat.lineas || []).sort((a, b) =>
+          String(a.descripcion || '').localeCompare(String(b.descripcion || ''), 'es', { numeric: true })
+        );
+        const paradas = (cat.paradas || [])
+          .map((p) => ({
+            ...p,
+            lineas: (p.lineas || []).filter((c) => !REMOVED_LINE_CODES.has(Number(c)))
+          }))
+          .filter((p) => p.lineas.length > 0);
         const stopById = new Map();
         const lineByCode = new Map();
-        for (const l of cat.lineas || []) lineByCode.set(Number(l.codigo), l);
-        for (const p of cat.paradas || []) stopById.set(String(p.id).toUpperCase(), p);
-        return { ...cat, stopById, lineByCode };
+        for (const l of lineas) lineByCode.set(Number(l.codigo), l);
+        for (const p of paradas) stopById.set(String(p.id).toUpperCase(), p);
+        return { ...cat, lineas, paradas, stopById, lineByCode };
       });
   }
   return catalogoPromise;

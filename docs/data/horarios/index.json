@@ -187,35 +187,8 @@
         "sabado": "2026-11-21",
         "domingo": "2026-11-22"
       },
-      "descripcion": "RIACHUELO - ERSA",
+      "descripcion": "103D",
       "paradas": 90
-    },
-    "517": {
-      "tipos": {
-        "habil": "2026-11-20",
-        "sabado": "2026-11-21",
-        "domingo": "2026-11-22"
-      },
-      "descripcion": "904A CAMPUS / NAC",
-      "paradas": 0
-    },
-    "607": {
-      "tipos": {
-        "habil": "2026-11-20",
-        "sabado": "2026-11-21",
-        "domingo": "2026-11-22"
-      },
-      "descripcion": "904B SARM / NAC",
-      "paradas": 0
-    },
-    "608": {
-      "tipos": {
-        "habil": "2026-11-20",
-        "sabado": "2026-11-21",
-        "domingo": "2026-11-22"
-      },
-      "descripcion": "904C BQRAS / NAC",
-      "paradas": 0
     },
     "705": {
       "tipos": {
@@ -226,37 +199,13 @@
       "descripcion": "SANTA ANA-INGENIO",
       "paradas": 30
     },
-    "744": {
-      "tipos": {},
-      "descripcion": "AEROBUS",
-      "paradas": 0
-    },
-    "851": {
-      "tipos": {},
-      "descripcion": "LINEA 110 / PROV",
-      "paradas": 0
-    },
     "852": {
       "tipos": {
         "habil": "2026-11-20",
         "sabado": "2026-11-21",
         "domingo": "2026-11-22"
       },
-      "descripcion": "CHAC CORR /NAC",
-      "paradas": 0
-    },
-    "853": {
-      "tipos": {},
-      "descripcion": "CHAC RES / NAC",
-      "paradas": 0
-    },
-    "854": {
-      "tipos": {
-        "habil": "2026-11-20",
-        "sabado": "2026-11-21",
-        "domingo": "2026-11-22"
-      },
-      "descripcion": "PTO. TIROL / PROV",
+      "descripcion": "902",
       "paradas": 0
     },
     "1037": {

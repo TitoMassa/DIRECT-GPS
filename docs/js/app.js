@@ -267,6 +267,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.3',
+    date: '22/11/2026 · 06:44 hs',
+    items: [
+      '<strong>Limpieza definitiva de líneas inactivas:</strong> se eliminaron por completo de la app y del servidor las 7 líneas que no funcionan (904A CAMPUS / NAC, 904B SARM / NAC, 904C BQRAS / NAC, AEROBUS, CHAC RES / NAC, LINEA 110 / PROV y PTO. TIROL / PROV), incluyendo sus paradas exclusivas, recorridos, horarios, arribos y escaneos automáticos.',
+      '<strong>Nuevos nombres de líneas:</strong> <strong>CHAC CORR / NAC</strong> ahora figura en toda la aplicación como <strong>902</strong> y <strong>RIACHUELO - ERSA</strong> como <strong>103D</strong>.'
+    ]
+  },
+  {
     version: 'v2.4.2',
     date: '22/11/2026 · 05:10 hs',
     items: [

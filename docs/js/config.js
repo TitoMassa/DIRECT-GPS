@@ -9,6 +9,21 @@ export const REFRESH_INTERVAL_SEC = 10;
 // Backend proxy SOAP gratuito desplegado en Cloudflare Workers
 export const DEFAULT_API_BASE = 'https://direct-gps-proxy.tecladotropical.workers.dev';
 
+// Líneas inactivas eliminadas permanentemente del sistema
+export const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
+
+// Nombres públicos definitivos por código interno SmartMovePro
+export const LINE_NAME_OVERRIDES = {
+  433: '103D',
+  852: '902'
+};
+
+export function normalizePublicLineName(codLinea, fallback = '') {
+  const n = Number(codLinea);
+  if (LINE_NAME_OVERRIDES[n]) return LINE_NAME_OVERRIDES[n];
+  return String(fallback || '').trim();
+}
+
 // Distinct, high-contrast civic transit palette by Corrientes line family
 const FAMILY_COLORS = {
   '102': '#0284c7', // Corrientes River Blue
@@ -18,9 +33,8 @@ const FAMILY_COLORS = {
   '106': '#059669', // Signal Emerald
   '108': '#ea580c', // Terracotta Orange
   '109': '#2563eb', // Cobalt Blue
+  '902': '#0284c7', // Interprovincial Chaco-Corrientes Blue
   '904': '#0891b2', // Interprovincial Cyan (Corrientes-Chaco)
-  AER: '#ca8a04',   // Airport Gold
-  RIA: '#16a34a',   // Riachuelo Green
   SAN: '#dc2626'    // Santa Ana Red
 };
 
@@ -31,6 +45,7 @@ const BRANCH_OVERRIDES = {
   '103A': '#0d9488',
   '103B': '#0f766e',
   '103C': '#14b8a6',
+  '103D': '#16a34a',
   '104A': '#d97706',
   '104B': '#b45309',
   '104C': '#f59e0b',
@@ -45,6 +60,7 @@ const BRANCH_OVERRIDES = {
   '108C': '#c2410c',
   '109A': '#2563eb',
   '109B': '#1d4ed8',
+  '902': '#0284c7',
   '904A': '#0891b2',
   '904B': '#0e7490',
   '904C': '#06b6d4'

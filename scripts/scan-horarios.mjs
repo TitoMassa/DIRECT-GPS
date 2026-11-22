@@ -118,6 +118,9 @@ async function pool(items, worker, limit) {
   await Promise.all(runners);
 }
 
+const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
+const LINE_NAME_OVERRIDES = { 852: '902', 433: '103D' };
+
 async function getLineas() {
   const res = await soap(
     'RecuperarLineaPorLocalidad',
@@ -129,7 +132,9 @@ async function getLineas() {
   const seen = new Map();
   for (const item of res?.lineas || []) {
     const cod = Number(item.CodigoLineaParada);
-    if (cod && !seen.has(cod)) seen.set(cod, String(item.Descripcion || '').trim());
+    if (cod && !REMOVED_LINE_CODES.has(cod) && !seen.has(cod)) {
+      seen.set(cod, LINE_NAME_OVERRIDES[cod] || String(item.Descripcion || '').trim());
+    }
   }
   return [...seen.entries()].map(([codigo, descripcion]) => ({ codigo, descripcion }));
 }

@@ -27,8 +27,8 @@ export function ingestLearnedShiftTransitions() {
 
 // Interprovincial 904 lines (Corrientes-Chaco) operate continuous shifts with NO horarios cortados.
 // Urban lines (102-109) regularly have horarios cortados (peak cars pulling in mid-morning / returning midday).
-export const INTERPROVINCIAL_LINE_CODES = new Set([1037, 1038, 1039, 517, 607, 608]); // 904A, 904B, 904C + aliases
-const INTERURBAN_LINE_CODES = new Set([705, 433]); // SANTA ANA-INGENIO, RIACHUELO - ERSA
+export const INTERPROVINCIAL_LINE_CODES = new Set([1037, 1038, 1039, 852]); // 904A, 904B, 904C, 902
+const INTERURBAN_LINE_CODES = new Set([705, 433]); // SANTA ANA-INGENIO, 103D
 
 function getBranchKey(b) {
   return `${b?.index ?? 0}:${b?.git || normalizeBandera(b?.bandera || '')}`;

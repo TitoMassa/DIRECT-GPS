@@ -73,6 +73,13 @@ const CRON_SCAN_INTERVAL_MIN = 5;
 const CRON_BATCH_SIZE = 18; // <= 18 SOAP + 2 DO = 20 subrequests/tick (Cloudflare Free limit: 50)
 const CRON_CONCURRENCY = 3; // Gentle waves to stay well under SmartMovePro rate limits
 
+const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
+const REMOVED_LINE_SQL_LIST = '517, 607, 608, 744, 851, 853, 854';
+const LINE_NAME_OVERRIDES = {
+  433: '103D',
+  852: '902'
+};
+
 const LINE_NAMES_BY_CODE = {
   94: '102A',
   96: '102C',
@@ -94,23 +101,21 @@ const LINE_NAMES_BY_CODE = {
   353: '109B',
   356: '108A',
   357: '108C',
-  433: 'RIACHUELO - ERSA',
-  517: '904A CAMPUS / NAC',
-  607: '904B SARM / NAC',
-  608: '904C BQRAS / NAC',
+  433: '103D',
   705: 'SANTA ANA-INGENIO',
-  744: 'AEROBUS',
-  851: 'LINEA 110 / PROV',
-  852: 'CHAC CORR /NAC',
-  853: 'CHAC RES / NAC',
-  854: 'PTO. TIROL / PROV',
+  852: '902',
   1037: '904A',
   1038: '904B',
   1039: '904C'
 };
 
+function resolvePublicLineName(cod, fallback = '') {
+  const n = Number(cod);
+  if (LINE_NAME_OVERRIDES[n]) return LINE_NAME_OVERRIDES[n];
+  return String(fallback || LINE_NAMES_BY_CODE[n] || '').trim() || (n ? `L${n}` : '');
+}
+
 // Strategic downstream (~85% along each Ida & Vuelta branch) + 6 multi-line city hub probes (cod=0 -> '000').
-// 70 targets / 18 per 5-min Cron tick = complete sweep of all Corrientes lines every 20 minutes automatically.
 const FLEET_SCAN_TARGETS = [
   [94, 'CT31939'], [94, 'CT31409'],
   [97, 'CT31507'], [97, 'CT31254'],
@@ -118,6 +123,7 @@ const FLEET_SCAN_TARGETS = [
   [132, 'CT31507'], [132, 'CT31572V'],
   [133, 'CT31766'], [133, 'CT32257'],
   [134, 'CT31764'], [134, 'CT32257'],
+  [433, 'CT31373'], [433, 'RCH010'],
   [113, 'CT31518'], [113, 'CT31463'], [113, 'CT31196'],
   [115, 'CT31635'], [115, 'CT31466'],
   [114, 'CT31976'], [114, 'CT31568V'],
@@ -132,15 +138,10 @@ const FLEET_SCAN_TARGETS = [
   [357, 'CT31874'], [357, 'CT31143'],
   [342, 'CT31244B'], [342, 'CT31922'],
   [353, 'CT31244B'], [353, 'CT31340'],
-  [1037, 'CT31648'], [1037, 'CH326'],
-  [517, 'CH115'],
-  [1038, 'L9041075'], [1038, 'L9041098'],
-  [607, 'L9041075'], [607, 'CT31212'],
-  [1039, 'L9041057'], [1039, 'CT31212'],
-  [608, 'L9041057'], [608, 'CT31212'],
   [852, 'CH490'], [852, 'CH455'], [852, 'CH430'],
-  [854, 'CH1010'], [854, 'CH1007'],
-  [433, 'CT31373'], [433, 'RCH010'],
+  [1037, 'CT31648'], [1037, 'CH326'],
+  [1038, 'L9041075'], [1038, 'L9041098'],
+  [1039, 'L9041057'], [1039, 'CT31212'],
   [705, 'CT31392B'], [705, 'CT31363'],
   [0, 'CT31180'], [0, 'CT31181'], [0, 'CT31498'], [0, 'CT31942'], [0, 'CT31581'], [0, 'CT31350']
 ];
@@ -444,19 +445,31 @@ async function getLineas() {
   const normalized = [];
   for (const item of res?.lineas || []) {
     const cod = Number(item.CodigoLineaParada);
-    if (seen.has(cod)) continue;
+    if (!cod || REMOVED_LINE_CODES.has(cod) || seen.has(cod)) continue;
     seen.add(cod);
     normalized.push({
       codigo: cod,
-      descripcion: String(item.Descripcion || '').trim(),
+      descripcion: resolvePublicLineName(cod, item.Descripcion),
       codigoEntidad: item.CodigoEntidad,
       codigoEmpresa: item.CodigoEmpresa
     });
   }
-  return normalized;
+  return normalized.sort((a, b) => a.descripcion.localeCompare(b.descripcion, 'es', { numeric: true }));
 }
 
 async function fetchOneStop(sid, lcode) {
+  if (lcode && lcode !== '000' && REMOVED_LINE_CODES.has(Number(lcode))) {
+    const known = QUICK_STOPS.find((s) => s.id === sid);
+    return {
+      arribos: [],
+      idParada: sid,
+      codLinea: lcode,
+      stopCoords: known ? { lat: known.lat, lng: known.lng } : null,
+      knownStop: known || null,
+      codigoEstado: 0,
+      mensajeEstado: ''
+    };
+  }
   const raw = await soapRequest(
     'RecuperarProximosArribos',
     `<identificadorParada i:type="d:string">${escapeXml(sid)}</identificadorParada>
@@ -481,13 +494,15 @@ async function fetchOneStop(sid, lcode) {
     sLat = known.lat;
     sLng = known.lng;
   }
-  const arribos = rawArribos.map((a) => {
-    const chofer = parseChofer(a.IdentificadorChofer);
+  const arribos = [];
+  for (const a of rawArribos) {
     const cod = Number(a.CodigoLineaParada) || 0;
-    return {
+    if (REMOVED_LINE_CODES.has(cod)) continue;
+    const chofer = parseChofer(a.IdentificadorChofer);
+    arribos.push({
       codigoLinea: cod,
       tiempoRestanteArribo: String(a.Arribo || '').trim(),
-      descripcionLinea: String(a.DescripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim(),
+      descripcionLinea: resolvePublicLineName(cod, a.DescripcionLinea),
       descripcionBandera: String(a.DescripcionBandera || '').trim(),
       descripcionCortaBandera: String(a.DescripcionCortaBandera || '').trim(),
       descripcionCartelBandera: String(a.DescripcionCartelBandera || '').trim(),
@@ -504,8 +519,8 @@ async function fetchOneStop(sid, lcode) {
       desvioHorario: String(a.DesvioHorario || '').trim(),
       ultimaFechaHoraGPS: String(a.UltimaFechaHoraGPS || '').trim(),
       mensajeError: String(a.MensajeError || '').trim()
-    };
-  });
+    });
+  }
   return {
     arribos,
     idParada: sid,
@@ -776,6 +791,32 @@ export class FleetMemory {
       // Non-fatal backfill guard
     }
 
+    // Purge any legacy rows belonging to removed non-working lines and apply permanent renames (852 -> 902, 433 -> 103D)
+    try {
+      const purgeVer = Number(this._getMeta('removed_lines_purge_v', 0)) || 0;
+      if (purgeVer < 1) {
+        const tables = [
+          'fleet_cars',
+          'fleet_drivers',
+          'unit_last_seen',
+          'trip_assignments',
+          'fleet_daily_obs',
+          'fleet_capacity_daily',
+          'learned_shift_transitions'
+        ];
+        for (const tbl of tables) {
+          this.sql.exec(`DELETE FROM ${tbl} WHERE codigo_linea IN (${REMOVED_LINE_SQL_LIST})`);
+        }
+        this.sql.exec(`UPDATE fleet_cars SET descripcion_linea = '902' WHERE codigo_linea = 852`);
+        this.sql.exec(`UPDATE fleet_cars SET descripcion_linea = '103D' WHERE codigo_linea = 433`);
+        this.sql.exec(`UPDATE fleet_drivers SET descripcion_linea = '902' WHERE codigo_linea = 852`);
+        this.sql.exec(`UPDATE fleet_drivers SET descripcion_linea = '103D' WHERE codigo_linea = 433`);
+        this._setMeta('removed_lines_purge_v', 1);
+      }
+    } catch {
+      // Non-fatal purge guard
+    }
+
     this._ready = true;
   }
 
@@ -886,14 +927,14 @@ export class FleetMemory {
   _upsertRosterUnit(u, nowMs, explicitDayKey = '') {
     const cod = Number(u.codigoLinea);
     const coche = String(u.coche || u.identificadorCoche || '').trim();
-    if (!cod || !coche) return;
+    if (!cod || !coche || REMOVED_LINE_CODES.has(cod)) return;
 
     const ultimaGps = String(u.ultimaGps || u.ultimaFechaHoraGPS || '').trim();
     const { obsMs, obsDayKey } = resolveObservationTime(ultimaGps, nowMs);
     const effectiveDayKey = explicitDayKey && obsMs === nowMs ? explicitDayKey : obsDayKey;
     if (obsMs < nowMs - ROSTER_RETENTION_MS) return;
 
-    const descLinea = String(u.descripcionLinea || LINE_NAMES_BY_CODE[cod] || '').trim();
+    const descLinea = resolvePublicLineName(cod, u.descripcionLinea);
     const bandera = String(u.bandera || u.descripcionBandera || '').trim();
     const stopId = String(u.stopId || '').trim().toUpperCase();
     const esAdaptado = u.esAdaptado ? 1 : 0;
@@ -1518,7 +1559,7 @@ export class FleetMemory {
         for (const u of units) {
           const cod = Number(u.codigoLinea);
           const coche = String(u.coche || u.identificadorCoche || '').trim();
-          if (!cod || !coche) continue;
+          if (!cod || !coche || REMOVED_LINE_CODES.has(cod)) continue;
           const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
           const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
           const ultimaGps = String(u.ultimaGps || '').trim();
@@ -1941,11 +1982,10 @@ export class FleetMemory {
         seenCount: o.seen_count || 1
       }));
 
-      const descripcionLinea =
-        carRows[0]?.descripcion_linea ||
-        drvRows[0]?.descripcion_linea ||
-        LINE_NAMES_BY_CODE[codLinea] ||
-        `L${codLinea}`;
+      const descripcionLinea = resolvePublicLineName(
+        codLinea,
+        carRows[0]?.descripcion_linea || drvRows[0]?.descripcion_linea
+      );
       const capacity = this._getCapacityByLine(nowMs, todayKey, codLinea).get(codLinea) || null;
 
       return Response.json({
@@ -1999,6 +2039,7 @@ export class FleetMemory {
 
       const byKey = new Map();
       for (const r of carRows) {
+        if (REMOVED_LINE_CODES.has(Number(r.codigo_linea))) continue;
         const key = `${r.codigo_linea}:${r.coche}`;
         const u = unitMap.get(key) || null;
         const lat = Number(r.last_lat ?? u?.lat);
@@ -2006,7 +2047,7 @@ export class FleetMemory {
         if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
         byKey.set(key, {
           codigoLinea: Number(r.codigo_linea),
-          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          descripcionLinea: resolvePublicLineName(r.codigo_linea, r.descripcion_linea),
           coche: r.coche,
           choferNombre: r.last_chofer_nombre || '',
           choferLegajo: r.last_chofer_legajo || '',
@@ -2198,7 +2239,7 @@ export class FleetMemory {
       for (const u of units) {
         const cod = Number(u.codigoLinea);
         const coche = String(u.coche || '').trim();
-        if (!cod || !coche) continue;
+        if (!cod || !coche || REMOVED_LINE_CODES.has(cod)) continue;
         const lat = Number.isFinite(u.lat) ? u.lat : null;
         const lng = Number.isFinite(u.lng) ? u.lng : null;
         const ultimaGps = String(u.ultimaGps || '').trim();
@@ -2276,7 +2317,7 @@ export class FleetMemory {
         const cod = Number(e.codigoLinea ?? body.codigoLinea);
         const tripKey = String(e.tripKey || '').trim();
         const coche = String(e.coche || '').trim();
-        if (!cod || !tripKey || !coche) continue;
+        if (!cod || !tripKey || !coche || REMOVED_LINE_CODES.has(cod)) continue;
 
         const lat = Number.isFinite(Number(e.lat)) ? Number(e.lat) : null;
         const lng = Number.isFinite(Number(e.lng)) ? Number(e.lng) : null;
