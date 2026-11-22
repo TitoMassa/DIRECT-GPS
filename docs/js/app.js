@@ -3795,21 +3795,40 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
   }
   htmlParts.push('</div>');
 
+  const nextHtml = htmlParts.join('');
   state.eventsClickTargets = targets;
-  el.eventsTimelineBody.innerHTML = htmlParts.join('');
+
+  if (preserveScroll && eventsUserTouching) {
+    eventsDeferredSilentRender = true;
+    return;
+  }
+
+  if (preserveScroll && nextHtml === eventsLastRenderedHtml) {
+    return;
+  }
+
+  const savedTop = preserveScroll ? el.eventsTimelineBody.scrollTop : prevScroll;
+  el.eventsTimelineBody.innerHTML = nextHtml;
+  eventsLastRenderedHtml = nextHtml;
 
   if (scrollToNow && built.isToday) {
     requestAnimationFrame(() => scrollEventsToNow('auto'));
   } else if (preserveScroll) {
-    el.eventsTimelineBody.scrollTop = prevScroll;
+    el.eventsTimelineBody.scrollTop = savedTop;
   }
 }
+
+let eventsLastRenderedHtml = '';
+let eventsUserTouching = false;
+let eventsDeferredSilentRender = false;
+let eventsTouchReleaseTimer = null;
 
 let eventsLoadSeq = 0;
 async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false, silent = false } = {}) {
   const mySeq = ++eventsLoadSeq;
   if (!silent) {
     state.eventsLoading = true;
+    eventsLastRenderedHtml = '';
     renderEventsTimeline();
   }
   try {
@@ -3823,11 +3842,11 @@ async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false
     state.eventsBundleSavedAt = Number(bundleRes?.savedAt) || Date.now();
     state.eventsIsOfflineCache = Boolean(bundleRes?.isOfflineCache);
     state.eventsLoading = false;
-    renderEventsTimeline({ scrollToNow, preserveScroll: silent });
+    renderEventsTimeline({ scrollToNow: false, preserveScroll: silent });
   } catch {
     if (mySeq !== eventsLoadSeq || !state.eventsModalOpen) return;
     state.eventsLoading = false;
-    renderEventsTimeline({ scrollToNow, preserveScroll: silent });
+    renderEventsTimeline({ scrollToNow: false, preserveScroll: silent });
   }
 }
 
@@ -3838,9 +3857,11 @@ function openEventsModal() {
   state.eventsDayOffset = 0;
   state.eventsFilter = 'all';
   state.eventsQuery = '';
+  eventsLastRenderedHtml = '';
+  eventsDeferredSilentRender = false;
   if (el.eventsFilterInput) el.eventsFilterInput.value = '';
   el.eventsModal.classList.remove('hidden');
-  loadEventsTimelineData({ forceBundle: false, scrollToNow: true, silent: false });
+  loadEventsTimelineData({ forceBundle: false, scrollToNow: false, silent: false });
 
   if (state.eventsTimerId) clearInterval(state.eventsTimerId);
   state.eventsTimerId = setInterval(() => {
@@ -3856,6 +3877,12 @@ function openEventsModal() {
 
 function closeEventsModal() {
   state.eventsModalOpen = false;
+  eventsUserTouching = false;
+  eventsDeferredSilentRender = false;
+  if (eventsTouchReleaseTimer) {
+    clearTimeout(eventsTouchReleaseTimer);
+    eventsTouchReleaseTimer = null;
+  }
   if (state.eventsTimerId) {
     clearInterval(state.eventsTimerId);
     state.eventsTimerId = null;
@@ -3867,9 +3894,10 @@ function changeEventsDay(nextOffset) {
   const clamped = Math.max(-EVENTS_MAX_PAST_DAYS, Math.min(EVENTS_MAX_FUTURE_DAYS, Number(nextOffset) || 0));
   if (clamped === state.eventsDayOffset) return;
   state.eventsDayOffset = clamped;
+  eventsLastRenderedHtml = '';
   haptic('light');
-  renderEventsTimeline({ scrollToNow: clamped === 0, preserveScroll: false });
-  if (clamped !== 0 && el.eventsTimelineBody) {
+  renderEventsTimeline({ scrollToNow: false, preserveScroll: false });
+  if (el.eventsTimelineBody) {
     el.eventsTimelineBody.scrollTop = 0;
   }
 }
@@ -9356,12 +9384,11 @@ function bindEvents() {
   el.btnEventsTodayReset?.addEventListener('click', () => {
     if (state.eventsDayOffset !== 0) {
       changeEventsDay(0);
-    } else {
-      scrollEventsToNow('smooth');
     }
   });
   el.eventsFilterInput?.addEventListener('input', (e) => {
     state.eventsQuery = e.target.value || '';
+    eventsLastRenderedHtml = '';
     renderEventsTimeline({ scrollToNow: false, preserveScroll: false });
   });
   el.eventsTypeFilters?.addEventListener('click', (e) => {
@@ -9376,10 +9403,36 @@ function bindEvents() {
     const nextFilter = pill.dataset.eventsFilter || 'all';
     if (state.eventsFilter === nextFilter) return;
     state.eventsFilter = nextFilter;
+    eventsLastRenderedHtml = '';
     haptic('light');
-    renderEventsTimeline({ scrollToNow: state.eventsDayOffset === 0, preserveScroll: false });
+    renderEventsTimeline({ scrollToNow: false, preserveScroll: false });
+    if (el.eventsTimelineBody) el.eventsTimelineBody.scrollTop = 0;
   });
   el.eventsTimelineBody?.addEventListener('click', handleEventsTimelineClick);
+  el.eventsTimelineBody?.addEventListener(
+    'touchstart',
+    () => {
+      eventsUserTouching = true;
+      if (eventsTouchReleaseTimer) {
+        clearTimeout(eventsTouchReleaseTimer);
+        eventsTouchReleaseTimer = null;
+      }
+    },
+    { passive: true }
+  );
+  const onEventsTouchEnd = () => {
+    if (eventsTouchReleaseTimer) clearTimeout(eventsTouchReleaseTimer);
+    eventsTouchReleaseTimer = setTimeout(() => {
+      eventsUserTouching = false;
+      eventsTouchReleaseTimer = null;
+      if (eventsDeferredSilentRender && state.eventsModalOpen) {
+        eventsDeferredSilentRender = false;
+        renderEventsTimeline({ scrollToNow: false, preserveScroll: true });
+      }
+    }, 350);
+  };
+  el.eventsTimelineBody?.addEventListener('touchend', onEventsTouchEnd, { passive: true });
+  el.eventsTimelineBody?.addEventListener('touchcancel', onEventsTouchEnd, { passive: true });
 
   el.btnAllBuses?.addEventListener('click', () => toggleAllFleetMode());
   el.btnAllBusesList?.addEventListener('click', () => toggleAllFleetRosterModal());
