@@ -706,114 +706,654 @@ export const api = {
     }
   },
 
-  // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite + live 10s SOAP) ──
-  flotaResumen: ({ live = true } = {}) =>
-    apiGet(`/api/flota-resumen${live ? '?live=1' : ''}`, null, 9000),
-
-  flotaLinea: (codLinea, dayKey = '', { live = true } = {}) => {
-    const params = [`codLinea=${encodeURIComponent(codLinea)}`];
-    if (dayKey) params.push(`dayKey=${encodeURIComponent(dayKey)}`);
-    params.push(live && !dayKey ? 'live=1' : 'live=0');
-    return apiGet(`/api/flota?${params.join('&')}`, null, 9000);
+  // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite + live 10s SOAP + full IndexedDB offline cache) ──
+  offlineBundle: async () => {
+    const res = await apiGet('/api/offline-bundle', null, 15000);
+    if (res?.data) {
+      const savedAt = Number(res.savedAt) || Date.now();
+      await persistOfflineBundleSnapshot(res.data, savedAt);
+    }
+    return res;
   },
 
-  flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000),
+  flotaResumen: async ({ live = true } = {}) => {
+    try {
+      const res = await apiGet(`/api/flota-resumen${live ? '?live=1' : ''}`, null, 9000);
+      if (res?.data && Array.isArray(res.data.lineas)) {
+        saveIdbValue('flota_resumen', { savedAt: Number(res.savedAt) || Date.now(), data: res.data });
+      }
+      return res;
+    } catch (err) {
+      const cached = await readOfflineFlotaResumen();
+      if (cached) return cached;
+      throw err;
+    }
+  },
+
+  flotaLinea: async (codLinea, dayKey = '', { live = true } = {}) => {
+    const cleanCod = Number(codLinea);
+    const cleanDay = String(dayKey || '').trim();
+    const params = [`codLinea=${encodeURIComponent(codLinea)}`];
+    if (cleanDay) params.push(`dayKey=${encodeURIComponent(cleanDay)}`);
+    params.push(live && !cleanDay ? 'live=1' : 'live=0');
+    try {
+      const res = await apiGet(`/api/flota?${params.join('&')}`, null, 9000);
+      if (res?.data && cleanCod) {
+        const cacheKey = `flota_line:${cleanCod}:${cleanDay || 'today'}`;
+        saveIdbValue(cacheKey, { savedAt: Number(res.savedAt) || Date.now(), data: res.data });
+      }
+      return res;
+    } catch (err) {
+      const cached = await readOfflineFlotaLinea(cleanCod, cleanDay);
+      if (cached) return cached;
+      throw err;
+    }
+  },
+
+  flotaBuscar: async (q) => {
+    try {
+      return await apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000);
+    } catch (err) {
+      const cached = await searchOfflineFlotaBundle(q);
+      if (cached) return cached;
+      throw err;
+    }
+  },
 
   flotaActiva: async ({ live = true } = {}) => {
-    try {
-      const qs = live ? '?live=1' : '?live=0';
-      const res = await apiGet(`/api/flota-activa${qs}`, null, 10000);
-      if (Array.isArray(res?.data?.units)) return res;
-    } catch {
-      // Seamless fallback to /api/fleet-memory (all lines) if Worker doesn't expose /api/flota-activa yet
+    if (!isBrowserOffline()) {
+      try {
+        const qs = live ? '?live=1' : '?live=0';
+        const res = await apiGet(`/api/flota-activa${qs}`, null, 10000);
+        if (Array.isArray(res?.data?.units)) {
+          saveIdbValue('flota_activa', { savedAt: Number(res.savedAt) || Date.now(), data: res.data });
+          return res;
+        }
+      } catch {
+        // Fall through to fleet-memory or offline cache
+      }
+      try {
+        const mem = await apiGet('/api/fleet-memory', null, 7500);
+        const cat = await loadCatalogo();
+        const nowMs = Date.now();
+        const activeCutoff = nowMs - 38 * 60 * 1000;
+        const todayKey = mem?.data?.dayKey || '';
+        const units = [];
+        for (const u of mem?.data?.units || []) {
+          const lat = Number(u.lat);
+          const lng = Number(u.lng);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
+          if (todayKey && u.dayKey && u.dayKey !== todayKey) continue;
+          if (u.updatedAt && u.updatedAt < activeCutoff) continue;
+          const lineObj = cat?.lineByCode?.get(Number(u.codigoLinea));
+          units.push({
+            codigoLinea: Number(u.codigoLinea),
+            descripcionLinea: lineObj?.descripcion || `L${u.codigoLinea}`,
+            coche: String(u.coche || '').trim(),
+            choferNombre: u.choferNombre || '',
+            choferLegajo: u.choferLegajo || '',
+            esAdaptado: Boolean(u.esAdaptado),
+            bandera: u.bandera || '',
+            dirBandera: u.dirBandera || '',
+            lat,
+            lng,
+            desvioSec: Number(u.desvioSec) || 0,
+            desvioRaw: u.desvioRaw || '',
+            ultimaGps: u.ultimaGps || '',
+            lastStopId: u.stopId || '',
+            lastTripKey: u.tripKey || '',
+            lastSeenAt: u.updatedAt || nowMs,
+            enLineaAhora: true
+          });
+        }
+        const payload = {
+          data: { dayKey: todayKey, activeWindowMin: 38, units },
+          source: 'fleet-memory-fallback',
+          savedAt: nowMs
+        };
+        if (units.length > 0) {
+          saveIdbValue('flota_activa', { savedAt: nowMs, data: payload.data });
+        }
+        return payload;
+      } catch {
+        // Fall through to IndexedDB offline snapshot
+      }
     }
-    const mem = await apiGet('/api/fleet-memory', null, 7500);
-    const cat = await loadCatalogo();
-    const nowMs = Date.now();
-    const activeCutoff = nowMs - 38 * 60 * 1000;
-    const todayKey = mem?.data?.dayKey || '';
-    const units = [];
-    for (const u of mem?.data?.units || []) {
-      const lat = Number(u.lat);
-      const lng = Number(u.lng);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
-      if (todayKey && u.dayKey && u.dayKey !== todayKey) continue;
-      if (u.updatedAt && u.updatedAt < activeCutoff) continue;
-      const lineObj = cat?.lineByCode?.get(Number(u.codigoLinea));
-      units.push({
-        codigoLinea: Number(u.codigoLinea),
-        descripcionLinea: lineObj?.descripcion || `L${u.codigoLinea}`,
-        coche: String(u.coche || '').trim(),
-        choferNombre: u.choferNombre || '',
-        choferLegajo: u.choferLegajo || '',
-        esAdaptado: Boolean(u.esAdaptado),
-        bandera: u.bandera || '',
-        dirBandera: u.dirBandera || '',
-        lat,
-        lng,
-        desvioSec: Number(u.desvioSec) || 0,
-        desvioRaw: u.desvioRaw || '',
-        ultimaGps: u.ultimaGps || '',
-        lastStopId: u.stopId || '',
-        lastTripKey: u.tripKey || '',
-        lastSeenAt: u.updatedAt || nowMs,
-        enLineaAhora: true
-      });
-    }
-    return {
-      data: { dayKey: todayKey, activeWindowMin: 38, units },
-      source: 'fleet-memory-fallback',
-      savedAt: nowMs
-    };
+    const cached = await readOfflineFlotaActiva();
+    if (cached) return cached;
+    const offlineErr = new Error('Sin conexión a internet');
+    offlineErr.isOffline = true;
+    throw offlineErr;
   }
 };
 
-/**
- * Politely warms the Service Worker cache with all 33 Corrientes routes + 24h schedules
- * in the background while online (~500 KB gzipped total once), so ANY line & stop works
- * seamlessly even if the user later turns on airplane mode without having visited it first.
- */
-let warmStarted = false;
-export async function warmOfflineArchive() {
-  if (warmStarted || isBrowserOffline()) return;
-  if (typeof navigator !== 'undefined' && navigator.connection?.saveData) return;
-  warmStarted = true;
+// ── Full-Offline IndexedDB Snapshot Helpers (Resumen, Flota 7d, Búsqueda, Modo Libre) ──
+function getArgentinaDayKeyLocal(nowMs = Date.now()) {
+  const d = new Date(nowMs - 3 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
 
-  const waitIdle = () =>
-    new Promise((resolve) => {
-      if (typeof requestIdleCallback === 'function') {
-        requestIdleCallback(() => resolve(), { timeout: 600 });
-      } else {
-        setTimeout(resolve, 180);
-      }
-    });
+function normalizeOfflineSearchText(str = '') {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  try {
-    const cat = await loadCatalogo();
-    if (!cat?.lineas?.length) return;
+async function persistOfflineBundleSnapshot(bundleData, savedAt = Date.now()) {
+  if (!bundleData || typeof bundleData !== 'object') return;
+  await saveIdbValue('offline_bundle', { savedAt, data: bundleData });
 
-    const urls = [];
-    for (const l of cat.lineas) {
-      urls.push(new URL(`../data/recorridos/${l.codigo}.json`, import.meta.url).toString());
-      urls.push(new URL(`../data/horarios/${l.codigo}.json`, import.meta.url).toString());
+  if (bundleData.resumen && Array.isArray(bundleData.resumen.lineas)) {
+    const prevResumen = await readIdbValue('flota_resumen');
+    if (!prevResumen || savedAt >= (Number(prevResumen.savedAt) || 0)) {
+      await saveIdbValue('flota_resumen', { savedAt, data: bundleData.resumen });
     }
+  }
 
-    const hasCacheApi = typeof caches !== 'undefined';
-    for (const u of urls) {
-      if (isBrowserOffline()) return;
-      try {
-        if (hasCacheApi) {
-          const hit = await caches.match(u);
-          if (hit) continue;
+  if (Array.isArray(bundleData.activeUnits)) {
+    const prevActiva = await readIdbValue('flota_activa');
+    if (!prevActiva || savedAt >= (Number(prevActiva.savedAt) || 0)) {
+      await saveIdbValue('flota_activa', {
+        savedAt,
+        data: {
+          dayKey: bundleData.dayKey || getArgentinaDayKeyLocal(savedAt),
+          activeWindowMin: bundleData.activeWindowMin || 38,
+          meta: bundleData.meta || null,
+          units: bundleData.activeUnits
         }
-        await waitIdle();
-        await fetch(u, { priority: 'low' }).catch(() => {});
-      } catch {
-        // ignore
+      });
+    }
+  }
+
+  // Also seed fleet_memory mirror if empty so offline Stop Radar has last known trips/units immediately
+  try {
+    const prevMirror = await readFleetMirror();
+    const dayKey = bundleData.dayKey || getArgentinaDayKeyLocal(savedAt);
+    if (!prevMirror || prevMirror.dayKey !== dayKey || savedAt - (Number(prevMirror.syncedAt) || 0) > 10 * 60 * 1000) {
+      const trips = [];
+      const units = [];
+      for (const line of Object.values(bundleData.lines || {})) {
+        const cod = Number(line?.codigoLinea);
+        if (!cod) continue;
+        for (const t of line.dayTripsByDay?.[dayKey] || []) {
+          trips.push({ ...t, dayKey, codigoLinea: cod });
+        }
+      }
+      for (const u of bundleData.activeUnits || []) {
+        units.push({
+          codigoLinea: Number(u.codigoLinea),
+          coche: u.coche,
+          dayKey,
+          tripKey: u.lastTripKey || '',
+          choferNombre: u.choferNombre || '',
+          choferLegajo: u.choferLegajo || '',
+          esAdaptado: Boolean(u.esAdaptado),
+          desvioSec: Number(u.desvioSec) || 0,
+          desvioRaw: u.desvioRaw || '',
+          bandera: u.bandera || '',
+          dirBandera: u.dirBandera || '',
+          ultimaGps: u.ultimaGps || '',
+          lat: u.lat,
+          lng: u.lng,
+          stopId: u.lastStopId || '',
+          gpsTrail: Array.isArray(u.gpsTrail) ? u.gpsTrail : [],
+          updatedAt: u.lastSeenAt || savedAt
+        });
+      }
+      if (trips.length > 0 || units.length > 0) {
+        await saveFleetMirror({
+          dayKey,
+          trips,
+          units,
+          stops: prevMirror?.stops || {},
+          syncedAt: savedAt
+        });
       }
     }
   } catch {
     // Non-fatal
+  }
+}
+
+async function readOfflineFlotaResumen() {
+  const [resSnap, bundleSnap] = await Promise.all([
+    readIdbValue('flota_resumen'),
+    readIdbValue('offline_bundle')
+  ]);
+  const resTs = Number(resSnap?.savedAt) || 0;
+  const bunTs = Number(bundleSnap?.savedAt) || 0;
+  const useBundle = Boolean(bundleSnap?.data?.resumen && bunTs >= resTs);
+  const data = useBundle ? bundleSnap.data.resumen : resSnap?.data || bundleSnap?.data?.resumen || null;
+  if (!data) return null;
+  const savedAt = useBundle ? bunTs : resTs || bunTs || Date.now();
+  return sanitizeApiPayload({
+    data,
+    source: 'offline-cache',
+    isOfflineCache: true,
+    savedAt
+  });
+}
+
+async function readOfflineFlotaLinea(codLinea, dayKey = '') {
+  if (!codLinea) return null;
+  const cleanDay = String(dayKey || '').trim();
+  const [lineSnap, bundleSnap, cat] = await Promise.all([
+    readIdbValue(`flota_line:${codLinea}:${cleanDay || 'today'}`),
+    readIdbValue('offline_bundle'),
+    loadCatalogo().catch(() => null)
+  ]);
+
+  const lineTs = Number(lineSnap?.savedAt) || 0;
+  const bunTs = Number(bundleSnap?.savedAt) || 0;
+
+  if (lineSnap?.data && lineTs >= bunTs) {
+    return sanitizeApiPayload({
+      data: lineSnap.data,
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: lineTs
+    });
+  }
+
+  if (bundleSnap?.data) {
+    const b = bundleSnap.data;
+    const bundleToday = b.dayKey || getArgentinaDayKeyLocal(bunTs);
+    const selectedDayKey = /^\d{4}-\d{2}-\d{2}$/.test(cleanDay) ? cleanDay : bundleToday;
+    const lineObj = b.lines?.[String(codLinea)] || null;
+    const catLine = cat?.lineByCode?.get(Number(codLinea)) || null;
+    const descripcionLinea = normalizePublicLineName(
+      codLinea,
+      lineObj?.descripcionLinea || catLine?.descripcion || `L${codLinea}`
+    );
+    const todayTrips = Array.isArray(lineObj?.dayTripsByDay?.[bundleToday])
+      ? lineObj.dayTripsByDay[bundleToday]
+      : [];
+    const dayTrips =
+      selectedDayKey === bundleToday
+        ? todayTrips
+        : Array.isArray(lineObj?.dayTripsByDay?.[selectedDayKey])
+          ? lineObj.dayTripsByDay[selectedDayKey]
+          : [];
+    const dayObs = Array.isArray(lineObj?.dayObsByDay?.[selectedDayKey])
+      ? lineObj.dayObsByDay[selectedDayKey]
+      : [];
+
+    return sanitizeApiPayload({
+      data: {
+        codigoLinea: Number(codLinea),
+        descripcionLinea,
+        dayKey: bundleToday,
+        selectedDayKey,
+        isHistoricalDay: selectedDayKey !== bundleToday,
+        retentionDays: b.retentionDays || 7,
+        daysWithData: Array.isArray(lineObj?.daysWithData) ? lineObj.daysWithData : [bundleToday],
+        meta: b.meta || {},
+        capacity: lineObj?.capacity || null,
+        learnedTransitions: [],
+        todayTrips,
+        dayTrips,
+        dayObs,
+        coches: Array.isArray(lineObj?.coches) ? lineObj.coches : [],
+        choferes: Array.isArray(lineObj?.choferes) ? lineObj.choferes : []
+      },
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: bunTs || Date.now()
+    });
+  }
+
+  if (lineSnap?.data) {
+    return sanitizeApiPayload({
+      data: lineSnap.data,
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: lineTs || Date.now()
+    });
+  }
+  return null;
+}
+
+async function searchOfflineFlotaBundle(rawQ = '') {
+  const q = String(rawQ || '').trim();
+  const normQ = normalizeOfflineSearchText(q);
+  if (normQ.length < 2) {
+    return { data: { dayKey: getArgentinaDayKeyLocal(), results: [] }, source: 'offline-cache', isOfflineCache: true, savedAt: Date.now() };
+  }
+  const bundleSnap = await readIdbValue('offline_bundle');
+  if (!bundleSnap?.data?.lines) return null;
+  const b = bundleSnap.data;
+  const todayKey = b.dayKey || getArgentinaDayKeyLocal(bundleSnap.savedAt);
+  const matches = [];
+
+  for (const line of Object.values(b.lines)) {
+    const cod = Number(line?.codigoLinea);
+    if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+    const desc = normalizePublicLineName(cod, line.descripcionLinea);
+
+    for (const c of line.coches || []) {
+      const hay = normalizeOfflineSearchText(`${c.coche} ${desc}`);
+      if (!hay.includes(normQ) && !String(c.coche || '').toUpperCase().includes(q.toUpperCase())) continue;
+      matches.push({
+        type: 'coche',
+        codigoLinea: cod,
+        descripcionLinea: desc,
+        coche: c.coche,
+        choferNombre: c.lastChoferNombre || '',
+        choferLegajo: c.lastChoferLegajo || '',
+        esAdaptado: Boolean(c.esAdaptado),
+        vistoHoy: Boolean(c.vistoHoy),
+        enLineaAhora: Boolean(c.enLineaAhora),
+        lastBandera: c.lastBandera || '',
+        lastGps: c.lastGps || '',
+        lastStopId: c.lastStopId || '',
+        lastLat: c.lastLat ?? null,
+        lastLng: c.lastLng ?? null,
+        lastDesvioSec: Number(c.lastDesvioSec) || 0,
+        lastDesvioRaw: c.lastDesvioRaw || '',
+        lastTripKey: c.lastTripKey || '',
+        lastServiceNum: Number(c.lastServiceNum) || 0,
+        lastTurnoIdx: Number(c.lastTurnoIdx) || 0,
+        lastTurnoStart: c.lastTurnoStart || '',
+        lastTurnoEnd: c.lastTurnoEnd || '',
+        lastLapNum: Number(c.lastLapNum) || 0,
+        lastShiftLaps: Number(c.lastShiftLaps) || 0,
+        lastSeenAt: c.lastSeenAt || 0,
+        lastDayKey: c.lastDayKey || ''
+      });
+    }
+
+    for (const d of line.choferes || []) {
+      const hay = normalizeOfflineSearchText(`${d.choferNombre} ${d.choferLegajo || ''}`);
+      if (!hay.includes(normQ)) continue;
+      matches.push({
+        type: 'chofer',
+        driverKey: d.driverKey || '',
+        codigoLinea: cod,
+        descripcionLinea: desc,
+        coche: d.lastCoche || '',
+        choferNombre: d.choferNombre || '',
+        choferLegajo: d.choferLegajo || '',
+        esAdaptado: Boolean(d.lastEsAdaptado),
+        vistoHoy: Boolean(d.vistoHoy),
+        enLineaAhora: Boolean(d.enLineaAhora),
+        lastBandera: d.lastBandera || '',
+        lastGps: d.lastGps || '',
+        lastStopId: d.lastStopId || '',
+        lastLat: d.lastLat ?? null,
+        lastLng: d.lastLng ?? null,
+        lastDesvioSec: Number(d.lastDesvioSec) || 0,
+        lastDesvioRaw: d.lastDesvioRaw || '',
+        lastTripKey: d.lastTripKey || '',
+        lastServiceNum: Number(d.lastServiceNum) || 0,
+        lastTurnoIdx: Number(d.lastTurnoIdx) || 0,
+        lastTurnoStart: d.lastTurnoStart || '',
+        lastTurnoEnd: d.lastTurnoEnd || '',
+        lastLapNum: Number(d.lastLapNum) || 0,
+        lastShiftLaps: Number(d.lastShiftLaps) || 0,
+        lastSeenAt: d.lastSeenAt || 0,
+        lastDayKey: d.lastDayKey || ''
+      });
+    }
+  }
+
+  matches.sort((a, b) => {
+    if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+    if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+    return (b.lastSeenAt || 0) - (a.lastSeenAt || 0);
+  });
+
+  return sanitizeApiPayload({
+    data: { dayKey: todayKey, results: matches.slice(0, 12) },
+    source: 'offline-cache',
+    isOfflineCache: true,
+    savedAt: Number(bundleSnap.savedAt) || Date.now()
+  });
+}
+
+async function readOfflineFlotaActiva() {
+  const [actSnap, bundleSnap] = await Promise.all([
+    readIdbValue('flota_activa'),
+    readIdbValue('offline_bundle')
+  ]);
+  const actTs = Number(actSnap?.savedAt) || 0;
+  const bunTs = Number(bundleSnap?.savedAt) || 0;
+
+  if (actSnap?.data && Array.isArray(actSnap.data.units) && actTs >= bunTs) {
+    return sanitizeApiPayload({
+      data: actSnap.data,
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: actTs
+    });
+  }
+  if (bundleSnap?.data && Array.isArray(bundleSnap.data.activeUnits)) {
+    return sanitizeApiPayload({
+      data: {
+        dayKey: bundleSnap.data.dayKey || getArgentinaDayKeyLocal(bunTs),
+        activeWindowMin: bundleSnap.data.activeWindowMin || 38,
+        meta: bundleSnap.data.meta || null,
+        units: bundleSnap.data.activeUnits
+      },
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: bunTs || Date.now()
+    });
+  }
+  if (actSnap?.data) {
+    return sanitizeApiPayload({
+      data: actSnap.data,
+      source: 'offline-cache',
+      isOfflineCache: true,
+      savedAt: actTs || Date.now()
+    });
+  }
+  return null;
+}
+
+// ── Automatic Full-Offline Startup Sync (Routes, Schedules, 7-day Fleet Bundle & Corrientes OSM Map Tiles) ──
+const SW_DATA_CACHE_NAME = 'direct-gps-data-v4';
+const SW_TILE_CACHE_NAME = 'direct-gps-tiles-v2';
+const OFFLINE_BUNDLE_REFRESH_MIN_MS = 5 * 60 * 1000;
+
+function llToOsmTile(lat, lng, z) {
+  const n = 2 ** z;
+  const x = Math.floor(((lng + 180) / 360) * n);
+  const rad = (lat * Math.PI) / 180;
+  const y = Math.floor(((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) * n);
+  return { x, y };
+}
+
+function buildCorrientesOfflineTileList() {
+  // Metro box covers Corrientes Capital + Puente Belgrano + Barranqueras/Resistencia + Santa Ana/Laguna Brava (92 tiles z12-z14)
+  // City core box adds z15 street detail across downtown & main Corrientes avenues (63 tiles) -> 155 tiles total (~2.5 MB once)
+  const metro = { latMin: -27.54, latMax: -27.43, lngMin: -58.92, lngMax: -58.74 };
+  const city = { latMin: -27.515, latMax: -27.452, lngMin: -58.855, lngMax: -58.775 };
+  const centerLat = -27.479;
+  const centerLng = -58.834;
+  const specs = [
+    { z: 12, box: metro },
+    { z: 13, box: metro },
+    { z: 14, box: metro },
+    { z: 15, box: city }
+  ];
+
+  const out = [];
+  for (const { z, box } of specs) {
+    const tl = llToOsmTile(box.latMax, box.lngMin, z);
+    const br = llToOsmTile(box.latMin, box.lngMax, z);
+    const center = llToOsmTile(centerLat, centerLng, z);
+    const layerTiles = [];
+    for (let x = tl.x; x <= br.x; x++) {
+      for (let y = tl.y; y <= br.y; y++) {
+        const distSq = (x - center.x) ** 2 + (y - center.y) ** 2;
+        layerTiles.push({ z, x, y, distSq });
+      }
+    }
+    layerTiles.sort((a, b) => a.distSq - b.distSq);
+    for (const t of layerTiles) out.push(t);
+  }
+  return out;
+}
+
+let offlineBundleSyncInFlight = null;
+export async function refreshOfflineBundleSilent({ force = false } = {}) {
+  if (isBrowserOffline()) return false;
+  if (offlineBundleSyncInFlight) return offlineBundleSyncInFlight;
+  offlineBundleSyncInFlight = (async () => {
+    try {
+      if (!force) {
+        const existing = await readIdbValue('offline_bundle');
+        if (existing?.savedAt && Date.now() - Number(existing.savedAt) < OFFLINE_BUNDLE_REFRESH_MIN_MS) {
+          return true;
+        }
+      }
+      await api.offlineBundle();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      offlineBundleSyncInFlight = null;
+    }
+  })();
+  return offlineBundleSyncInFlight;
+}
+
+let warmInFlight = false;
+let warmStaticDone = false;
+let warmTilesDone = false;
+
+/**
+ * Automatically caches EVERYTHING needed for full offline PWA usage on startup (zero manual action):
+ * 1) Persistent storage request (prevents mobile cache eviction)
+ * 2) All 26 Corrientes routes (recorridos/*.json), 24h schedules (horarios/*.json), catalogo & OTA index
+ * 3) Complete 7-day fleet snapshot (/api/offline-bundle: coches, choferes, servicios, historial 7d, Modo Libre)
+ * 4) Corrientes Capital + Puente + Resistencia OSM map tiles (z12–z15, cached once, polite background pacing)
+ */
+export async function warmOfflineArchive({ forceBundle = false } = {}) {
+  if (isBrowserOffline() || warmInFlight) return;
+  if (typeof navigator !== 'undefined' && navigator.connection?.saveData) {
+    // Even in Data Saver mode, sync the tiny JSON fleet bundle so Flota/Servicios work offline
+    await refreshOfflineBundleSilent({ force: forceBundle });
+    return;
+  }
+  warmInFlight = true;
+
+  const waitIdle = (delayMs = 80) =>
+    new Promise((resolve) => {
+      setTimeout(() => {
+        if (typeof requestIdleCallback === 'function') {
+          requestIdleCallback(() => resolve(), { timeout: 500 });
+        } else {
+          resolve();
+        }
+      }, delayMs);
+    });
+
+  try {
+    if (typeof navigator !== 'undefined' && navigator.storage?.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
+
+    // Kick off the single-shot 7-day fleet/cars/drivers/services/activeUnits offline bundle immediately
+    const bundleTask = refreshOfflineBundleSilent({ force: forceBundle });
+
+    // Step 1: Ensure catalogo, OTA horarios index, and all 26 routes + 24h schedules are cached
+    const hasCacheApi = typeof caches !== 'undefined';
+    if (!warmStaticDone) {
+      await ensureOtaHorariosIndex().catch(() => {});
+      const cat = await loadCatalogo().catch(() => null);
+      if (cat?.lineas?.length) {
+        const dataCache = hasCacheApi ? await caches.open(SW_DATA_CACHE_NAME).catch(() => null) : null;
+        const urls = [
+          new URL('../data/catalogo.json', import.meta.url).toString(),
+          new URL('../data/horarios/index.json', import.meta.url).toString()
+        ];
+        for (const l of cat.lineas) {
+          urls.push(new URL(`../data/recorridos/${l.codigo}.json`, import.meta.url).toString());
+          urls.push(new URL(`../data/horarios/${l.codigo}.json`, import.meta.url).toString());
+        }
+
+        let allStaticCached = true;
+        for (const u of urls) {
+          if (isBrowserOffline()) {
+            allStaticCached = false;
+            break;
+          }
+          try {
+            if (dataCache) {
+              const hit = await dataCache.match(u);
+              if (hit) continue;
+            }
+            await waitIdle(25);
+            const res = await fetch(u, { priority: 'low' }).catch(() => null);
+            if (res && res.ok && dataCache) {
+              await dataCache.put(u, res.clone()).catch(() => {});
+            } else if (!res || !res.ok) {
+              allStaticCached = false;
+            }
+          } catch {
+            allStaticCached = false;
+          }
+        }
+        if (allStaticCached) warmStaticDone = true;
+      }
+    }
+
+    await bundleTask;
+
+    // Step 2: Gently pre-cache Corrientes Capital + Puente + Resistencia OSM map tiles (cached once!)
+    if (!warmTilesDone && hasCacheApi && !isBrowserOffline()) {
+      const tileCache = await caches.open(SW_TILE_CACHE_NAME).catch(() => null);
+      if (tileCache) {
+        const tiles = buildCorrientesOfflineTileList();
+        const subs = ['a', 'b', 'c'];
+        let allTilesCached = true;
+        let fetchedCount = 0;
+
+        for (let i = 0; i < tiles.length; i++) {
+          if (isBrowserOffline()) {
+            allTilesCached = false;
+            break;
+          }
+          const { z, x, y } = tiles[i];
+          const canonicalUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+          try {
+            const hit = await tileCache.match(canonicalUrl);
+            if (hit) continue;
+
+            // Respectful background pacing so OSM tiles & 60fps UI stay completely smooth
+            await waitIdle(fetchedCount === 0 ? 120 : 150);
+            if (isBrowserOffline()) {
+              allTilesCached = false;
+              break;
+            }
+
+            const fetchUrl = `https://${subs[i % subs.length]}.tile.openstreetmap.org/${z}/${x}/${y}.png`;
+            let res = await fetch(fetchUrl, { priority: 'low' }).catch(() => null);
+            if (!res) {
+              res = await fetch(fetchUrl, { mode: 'no-cors', priority: 'low' }).catch(() => null);
+            }
+            if (res && (res.ok || res.type === 'opaque')) {
+              await tileCache.put(canonicalUrl, res.clone()).catch(() => {});
+              fetchedCount++;
+            } else {
+              allTilesCached = false;
+            }
+          } catch {
+            allTilesCached = false;
+          }
+        }
+        if (allTilesCached) warmTilesDone = true;
+      }
+    }
+  } catch {
+    // Non-fatal: app keeps operating seamlessly
+  } finally {
+    warmInFlight = false;
   }
 }
 

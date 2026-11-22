@@ -1,7 +1,7 @@
-const CACHE_NAME = 'direct-gps-v56';
+const CACHE_NAME = 'direct-gps-v57';
 const DATA_CACHE = 'direct-gps-data-v4';
 const TILE_CACHE = 'direct-gps-tiles-v2';
-const MAX_TILES = 750;
+const MAX_TILES = 2500;
 
 const SHELL_ASSETS = [
   './',
@@ -26,6 +26,10 @@ const SHELL_ASSETS = [
 ];
 
 const TILE_HOSTS = ['tile.openstreetmap.org'];
+
+function canonicalTileKey(url) {
+  return `https://tile.openstreetmap.org${url.pathname}`;
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -61,20 +65,21 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(req.url);
 
-  // Never intercept live telemetry APIs in SW (app handles offline prediction directly)
+  // Never intercept live telemetry APIs in SW (app handles offline prediction & IndexedDB cache directly)
   if (url.pathname.includes('/api/')) return;
 
-  // 1) Map tiles (OSM / CartoDB): cache-first so visited areas of Corrientes work offline
+  // 1) Map tiles (OSM): cache-first with subdomain-normalized key (a/b/c share the same cached tile offline!)
   if (TILE_HOSTS.some((h) => url.hostname.endsWith(h))) {
+    const tileKey = canonicalTileKey(url);
     event.respondWith(
       caches.open(TILE_CACHE).then(async (cache) => {
-        const hit = await cache.match(req);
+        const hit = (await cache.match(tileKey)) || (await cache.match(req));
         if (hit) return hit;
         try {
           const res = await fetch(req);
           if (res && (res.ok || res.type === 'opaque')) {
-            cache.put(req, res.clone());
-            if (Math.random() < 0.05) trimCache(TILE_CACHE, MAX_TILES);
+            cache.put(tileKey, res.clone());
+            if (Math.random() < 0.04) trimCache(TILE_CACHE, MAX_TILES);
           }
           return res;
         } catch {

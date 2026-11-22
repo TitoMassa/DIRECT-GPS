@@ -2095,6 +2095,365 @@ export class FleetMemory {
       });
     }
 
+    if (request.method === 'GET' && url.pathname === '/offline-bundle') {
+      const minTs = nowMs - ROSTER_RETENTION_MS;
+      const activeCutoff = nowMs - SIMULTANEOUS_ACTIVE_WINDOW_MS;
+      const metaSummary = this._getRosterMetaSummary();
+
+      const carRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, descripcion_linea, es_adaptado,
+                  last_chofer_nombre, last_chofer_legajo, last_chofer_raw,
+                  last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
+                  first_seen_at, last_seen_at, last_day_key, seen_count
+           FROM fleet_cars
+           WHERE last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const drvRows = this.sql
+        .exec(
+          `SELECT codigo_linea, driver_key, descripcion_linea, chofer_nombre, chofer_legajo, chofer_raw,
+                  last_coche, last_es_adaptado, last_bandera, last_gps, last_stop_id,
+                  last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+                  last_trip_key, last_service_num, last_turno_idx, last_turno_start, last_turno_end,
+                  last_lap_num, last_shift_laps,
+                  first_seen_at, last_seen_at, last_day_key, seen_count
+           FROM fleet_drivers
+           WHERE last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const unitRows = this.sql
+        .exec(
+          `SELECT codigo_linea, coche, day_key, trip_key, desvio_sec, desvio_raw,
+                  bandera, dir_bandera, ultima_gps, lat, lng, gps_trail, updated_at
+           FROM unit_last_seen
+           WHERE updated_at >= ?`,
+          minTs
+        )
+        .toArray();
+
+      const tripRows = this.sql
+        .exec(
+          `SELECT day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
+                  es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+           FROM trip_assignments
+           WHERE updated_at >= ?
+           ORDER BY updated_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const obsRows = this.sql
+        .exec(
+          `SELECT day_key, codigo_linea, coche, driver_key, chofer_nombre, chofer_legajo, es_adaptado,
+                  last_bandera, last_gps, last_stop_id, last_lat, last_lng,
+                  last_desvio_sec, last_desvio_raw, last_trip_key, last_service_num, last_turno_idx,
+                  first_seen_at, last_seen_at, seen_count
+           FROM fleet_daily_obs
+           WHERE last_seen_at >= ?
+           ORDER BY last_seen_at DESC`,
+          minTs
+        )
+        .toArray();
+
+      const capByLine = this._getCapacityByLine(nowMs, todayKey);
+      const unitMap = new Map();
+      for (const u of unitRows) {
+        if (REMOVED_LINE_CODES.has(Number(u.codigo_linea))) continue;
+        unitMap.set(`${u.codigo_linea}:${u.coche}`, u);
+      }
+
+      const sameDriverLoose = (legA, nameA, legB, nameB) => {
+        const lA = String(legA || '').trim().toUpperCase();
+        const lB = String(legB || '').trim().toUpperCase();
+        if (lA && lB) return lA === lB;
+        const nA = String(nameA || '').trim().replace(/\.+$/, '').toUpperCase();
+        const nB = String(nameB || '').trim().replace(/\.+$/, '').toUpperCase();
+        return !nA || !nB || nA === nB;
+      };
+
+      const linesMap = new Map();
+      const ensureLineBucket = (cod, desc) => {
+        if (!linesMap.has(cod)) {
+          linesMap.set(cod, {
+            codigoLinea: cod,
+            descripcionLinea: resolvePublicLineName(cod, desc),
+            capacity: capByLine.get(cod) || null,
+            daysSet: new Set([todayKey]),
+            coches: [],
+            choferes: [],
+            dayTripsByDay: {},
+            dayObsByDay: {},
+            lastSeenAt: 0
+          });
+        }
+        return linesMap.get(cod);
+      };
+
+      const activeUnits = [];
+      for (const r of carRows) {
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const bucket = ensureLineBucket(cod, r.descripcion_linea);
+        if (r.last_day_key) bucket.daysSet.add(r.last_day_key);
+        bucket.lastSeenAt = Math.max(bucket.lastSeenAt, Number(r.last_seen_at) || 0);
+
+        const u = unitMap.get(`${cod}:${r.coche}`) || null;
+        const uFreshForCar = Boolean(
+          u &&
+            u.day_key === r.last_day_key &&
+            Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 25 * 60 * 1000 &&
+            sameDriverLoose(u.chofer_legajo, u.chofer_nombre, r.last_chofer_legajo, r.last_chofer_nombre)
+        );
+        const lat = r.last_lat ?? (uFreshForCar ? u?.lat : null) ?? null;
+        const lng = r.last_lng ?? (uFreshForCar ? u?.lng : null) ?? null;
+        const tripKey = r.last_trip_key || (uFreshForCar ? u.trip_key : '') || '';
+        const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : uFreshForCar ? u?.desvio_sec || 0 : 0;
+        const desvioRaw = r.last_desvio_raw || (uFreshForCar ? u?.desvio_raw : '') || '';
+        const enLineaAhora = r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff;
+
+        bucket.coches.push({
+          coche: r.coche,
+          esAdaptado: Boolean(r.es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          enLineaAhora,
+          lastChoferNombre: r.last_chofer_nombre || '',
+          lastChoferLegajo: r.last_chofer_legajo || '',
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+          lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+          lastDesvioSec: Number(desvioSec) || 0,
+          lastDesvioRaw: desvioRaw,
+          lastTripKey: tripKey,
+          lastServiceNum: Number(r.last_service_num) || 0,
+          lastTurnoIdx: Number(r.last_turno_idx) || 0,
+          lastTurnoStart: r.last_turno_start || '',
+          lastTurnoEnd: r.last_turno_end || '',
+          lastLapNum: Number(r.last_lap_num) || 0,
+          lastShiftLaps: Number(r.last_shift_laps) || 0,
+          dirBandera: u?.dir_bandera || '',
+          firstSeenAt: r.first_seen_at,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key,
+          seenCount: r.seen_count || 1
+        });
+
+        if (enLineaAhora) {
+          const rGpsMs = parseGpsStampMs(r.last_gps) || 0;
+          const uGpsMs = parseGpsStampMs(u?.ultima_gps) || 0;
+          const useUnitGps = Boolean(
+            u &&
+              uGpsMs > rGpsMs &&
+              Number.isFinite(Number(u.lat)) &&
+              Number.isFinite(Number(u.lng)) &&
+              (Number(u.lat) !== 0 || Number(u.lng) !== 0)
+          );
+          const aLat = Number(useUnitGps ? u.lat : (r.last_lat ?? u?.lat));
+          const aLng = Number(useUnitGps ? u.lng : (r.last_lng ?? u?.lng));
+          if (Number.isFinite(aLat) && Number.isFinite(aLng) && (aLat !== 0 || aLng !== 0)) {
+            activeUnits.push({
+              codigoLinea: cod,
+              descripcionLinea: bucket.descripcionLinea,
+              coche: r.coche,
+              choferNombre: r.last_chofer_nombre || '',
+              choferLegajo: r.last_chofer_legajo || '',
+              esAdaptado: Boolean(r.es_adaptado),
+              bandera: (useUnitGps ? u?.bandera : r.last_bandera) || r.last_bandera || u?.bandera || '',
+              dirBandera: u?.dir_bandera || '',
+              lat: aLat,
+              lng: aLng,
+              desvioSec: Number(useUnitGps ? u?.desvio_sec : (r.last_desvio_raw ? r.last_desvio_sec : u?.desvio_sec)) || 0,
+              desvioRaw: (useUnitGps ? u?.desvio_raw : r.last_desvio_raw) || r.last_desvio_raw || u?.desvio_raw || '',
+              ultimaGps: (useUnitGps ? u?.ultima_gps : r.last_gps) || r.last_gps || u?.ultima_gps || '',
+              gpsTrail: u?.gps_trail ? this._parseGpsTrail(u.gps_trail) : [],
+              lastStopId: r.last_stop_id || '',
+              lastTripKey: r.last_trip_key || (u?.day_key === todayKey ? u.trip_key : '') || '',
+              lastServiceNum: Number(r.last_service_num) || 0,
+              lastTurnoIdx: Number(r.last_turno_idx) || 0,
+              lastTurnoStart: r.last_turno_start || '',
+              lastTurnoEnd: r.last_turno_end || '',
+              lastLapNum: Number(r.last_lap_num) || 0,
+              lastShiftLaps: Number(r.last_shift_laps) || 0,
+              lastSeenAt: Math.max(Number(r.last_seen_at) || 0, Number(u?.updated_at) || 0),
+              enLineaAhora: true
+            });
+          }
+        }
+      }
+
+      for (const r of drvRows) {
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const bucket = ensureLineBucket(cod, r.descripcion_linea);
+        if (r.last_day_key) bucket.daysSet.add(r.last_day_key);
+        bucket.lastSeenAt = Math.max(bucket.lastSeenAt, Number(r.last_seen_at) || 0);
+
+        const u = r.last_coche ? unitMap.get(`${cod}:${r.last_coche}`) : null;
+        const isSameCarFresh = Boolean(
+          u &&
+            u.day_key === r.last_day_key &&
+            Math.abs((u.updated_at || 0) - (r.last_seen_at || 0)) <= 25 * 60 * 1000 &&
+            sameDriverLoose(u.chofer_legajo, u.chofer_nombre, r.chofer_legajo, r.chofer_nombre)
+        );
+        const lat = r.last_lat ?? (isSameCarFresh ? u?.lat : null) ?? null;
+        const lng = r.last_lng ?? (isSameCarFresh ? u?.lng : null) ?? null;
+        const tripKey = r.last_trip_key || (isSameCarFresh ? u?.trip_key : '') || '';
+        const desvioSec = r.last_desvio_raw ? r.last_desvio_sec : isSameCarFresh ? u?.desvio_sec || 0 : 0;
+        const desvioRaw = r.last_desvio_raw || (isSameCarFresh ? u?.desvio_raw : '') || '';
+
+        bucket.choferes.push({
+          driverKey: r.driver_key,
+          choferNombre: r.chofer_nombre,
+          choferLegajo: r.chofer_legajo || '',
+          lastCoche: r.last_coche || '',
+          lastEsAdaptado: Boolean(r.last_es_adaptado),
+          vistoHoy: r.last_day_key === todayKey,
+          enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
+          lastBandera: r.last_bandera || '',
+          lastGps: r.last_gps || '',
+          lastStopId: r.last_stop_id || '',
+          lastLat: Number.isFinite(Number(lat)) ? Number(lat) : null,
+          lastLng: Number.isFinite(Number(lng)) ? Number(lng) : null,
+          lastDesvioSec: Number(desvioSec) || 0,
+          lastDesvioRaw: desvioRaw,
+          lastTripKey: tripKey,
+          lastServiceNum: Number(r.last_service_num) || 0,
+          lastTurnoIdx: Number(r.last_turno_idx) || 0,
+          lastTurnoStart: r.last_turno_start || '',
+          lastTurnoEnd: r.last_turno_end || '',
+          lastLapNum: Number(r.last_lap_num) || 0,
+          lastShiftLaps: Number(r.last_shift_laps) || 0,
+          firstSeenAt: r.first_seen_at,
+          lastSeenAt: r.last_seen_at,
+          lastDayKey: r.last_day_key,
+          seenCount: r.seen_count || 1
+        });
+      }
+
+      for (const t of tripRows) {
+        const cod = Number(t.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod) || !t.day_key) continue;
+        const bucket = ensureLineBucket(cod, '');
+        bucket.daysSet.add(t.day_key);
+        if (!bucket.dayTripsByDay[t.day_key]) bucket.dayTripsByDay[t.day_key] = [];
+        bucket.dayTripsByDay[t.day_key].push({
+          tripKey: t.trip_key,
+          turnoHora: t.turno_hora,
+          coche: t.coche,
+          choferNombre: t.chofer_nombre || '',
+          choferLegajo: t.chofer_legajo || '',
+          esAdaptado: Boolean(t.es_adaptado),
+          desvioSec: t.desvio_sec || 0,
+          desvioRaw: t.desvio_raw || '',
+          ultimaGps: t.ultima_gps || '',
+          lat: t.lat,
+          lng: t.lng,
+          stopId: t.stop_id || '',
+          updatedAt: t.updated_at
+        });
+      }
+
+      for (const o of obsRows) {
+        const cod = Number(o.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod) || !o.day_key) continue;
+        const bucket = ensureLineBucket(cod, '');
+        bucket.daysSet.add(o.day_key);
+        if (!bucket.dayObsByDay[o.day_key]) bucket.dayObsByDay[o.day_key] = [];
+        bucket.dayObsByDay[o.day_key].push({
+          dayKey: o.day_key,
+          coche: o.coche,
+          driverKey: o.driver_key,
+          choferNombre: o.chofer_nombre || '',
+          choferLegajo: o.chofer_legajo || '',
+          esAdaptado: Boolean(o.es_adaptado),
+          lastBandera: o.last_bandera || '',
+          lastGps: o.last_gps || '',
+          lastStopId: o.last_stop_id || '',
+          lastLat: Number.isFinite(Number(o.last_lat)) ? Number(o.last_lat) : null,
+          lastLng: Number.isFinite(Number(o.last_lng)) ? Number(o.last_lng) : null,
+          lastDesvioSec: Number(o.last_desvio_sec) || 0,
+          lastDesvioRaw: o.last_desvio_raw || '',
+          lastTripKey: o.last_trip_key || '',
+          lastServiceNum: Number(o.last_service_num) || 0,
+          lastTurnoIdx: Number(o.last_turno_idx) || 0,
+          firstSeenAt: o.first_seen_at,
+          lastSeenAt: o.last_seen_at,
+          seenCount: o.seen_count || 1
+        });
+      }
+
+      const resumenLineas = [];
+      const lines = {};
+      for (const bucket of linesMap.values()) {
+        bucket.coches.sort((a, b) => {
+          if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+          if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+          if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+          return compareCocheIds(a.coche, b.coche);
+        });
+        bucket.choferes.sort((a, b) => {
+          if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+          if (a.vistoHoy !== b.vistoHoy) return a.vistoHoy ? -1 : 1;
+          if (b.lastSeenAt !== a.lastSeenAt) return b.lastSeenAt - a.lastSeenAt;
+          return a.choferNombre.localeCompare(b.choferNombre, 'es');
+        });
+        const cap = bucket.capacity;
+        resumenLineas.push({
+          codigoLinea: bucket.codigoLinea,
+          descripcionLinea: bucket.descripcionLinea,
+          cochesHoy: bucket.coches.filter((c) => c.vistoHoy).length,
+          cochesSemana: bucket.coches.length,
+          choferesHoy: bucket.choferes.filter((d) => d.vistoHoy).length,
+          choferesSemana: bucket.choferes.length,
+          activeNow: cap?.activeNow || 0,
+          peakSimultaneousToday: cap?.peakSimultaneousToday || 0,
+          replacementSwapsToday: cap?.replacementSwapsToday || 0,
+          learnedTypicalToday: cap?.learnedTypicalToday || 0,
+          lastSeenAt: bucket.lastSeenAt
+        });
+        lines[String(bucket.codigoLinea)] = {
+          codigoLinea: bucket.codigoLinea,
+          descripcionLinea: bucket.descripcionLinea,
+          capacity: cap,
+          daysWithData: Array.from(bucket.daysSet).sort().reverse(),
+          coches: bucket.coches,
+          choferes: bucket.choferes,
+          dayTripsByDay: bucket.dayTripsByDay,
+          dayObsByDay: bucket.dayObsByDay
+        };
+      }
+
+      resumenLineas.sort((a, b) =>
+        a.descripcionLinea.localeCompare(b.descripcionLinea, 'es', { numeric: true })
+      );
+
+      return Response.json({
+        dayKey: todayKey,
+        retentionDays: ROSTER_RETENTION_DAYS,
+        activeWindowMin: Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000),
+        meta: metaSummary,
+        resumen: {
+          dayKey: todayKey,
+          retentionDays: ROSTER_RETENTION_DAYS,
+          meta: metaSummary,
+          lineas: resumenLineas
+        },
+        activeUnits,
+        lines
+      });
+    }
+
     if (request.method === 'POST' && url.pathname === '/live-city-ingest') {
       const body = await request.json().catch(() => ({}));
       const units = Array.isArray(body.units) ? body.units : [];
@@ -2913,6 +3272,10 @@ const LIVE_CITY_SWEEP_TTL_MS = 8500;
 let liveCitySweepCache = { ts: 0, units: [] };
 let liveCitySweepInFlight = null;
 
+const OFFLINE_BUNDLE_TTL_MS = 45000;
+let offlineBundleCache = { ts: 0, data: null };
+let offlineBundleInFlight = null;
+
 export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchStopFn = fetchOneStop) {
   if (nowMs - liveCitySweepCache.ts < LIVE_CITY_SWEEP_TTL_MS && liveCitySweepCache.units.length > 0) {
     return liveCitySweepCache.units;
@@ -3386,6 +3749,55 @@ export default {
           },
           source: liveUnits.length > 0 ? (doData ? 'live-hubs+do' : 'live-hubs') : doData ? 'fleet-memory-do' : 'fleet-memory-mem',
           savedAt: Date.now()
+        });
+      }
+
+      if (pathname === '/api/offline-bundle' && request.method === 'GET') {
+        const nowMs = Date.now();
+        if (offlineBundleCache.data && nowMs - offlineBundleCache.ts < OFFLINE_BUNDLE_TTL_MS) {
+          return jsonResponse({
+            data: offlineBundleCache.data,
+            source: 'offline-bundle-edge',
+            savedAt: offlineBundleCache.ts
+          });
+        }
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            if (!offlineBundleInFlight) {
+              offlineBundleInFlight = stub
+                .fetch('https://fleet-memory/offline-bundle')
+                .then((r) => (r.ok ? r.json() : null))
+                .finally(() => {
+                  offlineBundleInFlight = null;
+                });
+            }
+            const bundle = await offlineBundleInFlight;
+            if (bundle) {
+              offlineBundleCache = { ts: Date.now(), data: bundle };
+              return jsonResponse({
+                data: bundle,
+                source: 'offline-bundle-do',
+                savedAt: offlineBundleCache.ts
+              });
+            }
+          } catch {
+            // Fall through to empty fallback
+          }
+        }
+        const todayKey = getArgentinaDayKey(nowMs);
+        return jsonResponse({
+          data: {
+            dayKey: todayKey,
+            retentionDays: ROSTER_RETENTION_DAYS,
+            activeWindowMin: Math.round(SIMULTANEOUS_ACTIVE_WINDOW_MS / 60000),
+            meta: null,
+            resumen: { dayKey: todayKey, retentionDays: ROSTER_RETENTION_DAYS, meta: null, lineas: [] },
+            activeUnits: [],
+            lines: {}
+          },
+          source: 'offline-bundle-empty',
+          savedAt: nowMs
         });
       }
 

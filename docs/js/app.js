@@ -2,6 +2,7 @@ import { CORRIENTES_CENTER, REFRESH_INTERVAL_SEC, getLineColor } from './config.
 import {
   api,
   warmOfflineArchive,
+  refreshOfflineBundleSilent,
   distanceMeters,
   formatDistance,
   formatBlocks,
@@ -284,6 +285,13 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.11',
+    date: '22/11/2026 · 10:55 hs',
+    items: [
+      '<strong>Modo offline completo automático al iniciar la PWA:</strong> al abrir la aplicación con conexión, ahora guarda automáticamente en caché local <strong>todo</strong>: el mapa de Corrientes, Puente y Resistencia (<code>z12–z15</code> con caché unificada), los <strong>26 recorridos y paradas</strong>, los <strong>horarios completos 24 h</strong>, y el <strong>paquete completo de flota de 7 días</strong> (coches, choferes, servicios, historial diario, búsqueda global y último estado de Modo libre), refrescándolo en segundo plano sin sacrificar fluidez.'
+    ]
+  },
   {
     version: 'v2.4.10',
     date: '22/11/2026 · 10:00 hs',
@@ -866,7 +874,7 @@ function switchTab(tabName) {
     p.classList.toggle('active', active);
     p.setAttribute('aria-hidden', String(!active));
   });
-  if (tabName === 'lineas' && !state.isOffline) {
+  if (tabName === 'lineas') {
     loadFlotaResumen(false);
   }
 }
@@ -3101,15 +3109,18 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
       transitMap.fitFleet(state.allFleetBuses);
     }
     if (!silent) {
+      const fromCache = Boolean(res?.isOfflineCache || state.isOffline);
       showToast(
         state.allFleetBuses.length > 0
-          ? `${state.allFleetBuses.length} colectivos circulando en todas las líneas`
+          ? fromCache
+            ? `Sin conexión · ${state.allFleetBuses.length} colectivos desde caché local`
+            : `${state.allFleetBuses.length} colectivos circulando en todas las líneas`
           : 'No se detectaron colectivos activos en este momento',
-        state.allFleetBuses.length > 0 ? 'success' : 'info',
+        state.allFleetBuses.length > 0 ? (fromCache ? 'info' : 'success') : 'info',
         2600
       );
       announce(
-        `${state.allFleetBuses.length} colectivos circulando visibles en el mapa. Tocá cualquier unidad para ver sus datos.`
+        `${state.allFleetBuses.length} colectivos ${fromCache ? 'guardados en caché local' : 'circulando'} visibles en el mapa. Tocá cualquier unidad para ver sus datos.`
       );
     }
   } catch {
@@ -5128,9 +5139,10 @@ function formatRosterSeenInfo(tsMs, lastDayKey, todayDayKey) {
 
 let flotaResumenInFlight = false;
 async function loadFlotaResumen(force = false) {
-  if (flotaResumenInFlight || state.isOffline) return;
+  if (flotaResumenInFlight) return;
+  if (state.isOffline && state.flotaSummaryByLine.size > 0) return;
   const now = Date.now();
-  if (!force && now - state.flotaSummaryLastFetchMs < 9000) return;
+  if (!force && !state.isOffline && now - state.flotaSummaryLastFetchMs < 9000) return;
   flotaResumenInFlight = true;
   try {
     const res = await api.flotaResumen({ live: true });
@@ -6430,6 +6442,9 @@ function renderLineFlotaView() {
     Number(fv.lastSyncAt) || 0
   );
   const lastLiveClock = formatRosterClockArtWithSec(freshLiveTs);
+  const servingOfflineCache = Boolean(
+    state.isOffline || fv.isOfflineCache || (isHistoricalSrvDay && srvDayEntry?.isOfflineCache)
+  );
   let autoMetaText = '';
   if (isHistoricalSrvDay) {
     if (srvDayLoading) {
@@ -6439,10 +6454,15 @@ function renderLineFlotaView() {
       if (histTotalTurnos > 0) parts.push(`${histCoveredTurnos}/${histTotalTurnos} turnos`);
       if (histCarsSet.size > 0) parts.push(`${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`);
       if (histDriversSet.size > 0) parts.push(`${histDriversSet.size} chof.`);
+      if (servingOfflineCache) parts.push('Caché local');
       autoMetaText = parts.join(' · ');
     } else {
-      autoMetaText = `Historial · ${dayNavInfo.main} · ${allServices.length} ${allServices.length === 1 ? 'servicio' : 'servicios'} (${dayNavInfo.tipoLabel})`;
+      autoMetaText = `Historial · ${dayNavInfo.main} · ${allServices.length} ${allServices.length === 1 ? 'servicio' : 'servicios'} (${dayNavInfo.tipoLabel})${servingOfflineCache ? ' · Caché local' : ''}`;
     }
+  } else if (servingOfflineCache) {
+    autoMetaText = lastLiveClock
+      ? `Sin conexión · Caché local (Act. ${lastLiveClock}) · Historial ${retentionDays}d`
+      : `Sin conexión · Caché local · Historial ${retentionDays}d`;
   } else {
     autoMetaText = lastLiveClock
       ? `En vivo (cada ${REFRESH_INTERVAL_SEC}s) · Act. ${lastLiveClock} · Historial ${retentionDays}d`
@@ -7157,6 +7177,7 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
       dayObs: Array.isArray(d.dayObs) ? d.dayObs : [],
       schedSummary,
       model: schedSummary?._model || null,
+      isOfflineCache: Boolean(res?.isOfflineCache),
       loading: false,
       error: null
     });
@@ -7170,9 +7191,10 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
       dayObs: [],
       schedSummary: null,
       model: null,
+      isOfflineCache: false,
       loading: false,
       error: err?.isOffline
-        ? 'Conectate a internet para consultar el historial de días anteriores.'
+        ? 'Sin conexión y sin copia guardada para este día aún. Abrí la app una vez con internet para sincronizar todo automáticamente.'
         : err?.message || 'No se pudo cargar el historial de este día.'
     });
     renderLineFlotaView();
@@ -7194,6 +7216,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
       serviceDayOffset: 0,
       serviceDayCache: new Map(),
       lastSyncAt: null,
+      isOfflineCache: false,
       loading: true,
       error: null
     };
@@ -7219,6 +7242,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     state.flotaView.schedSummary = schedSummary;
     state.flotaView.model = schedSummary?._model || null;
     state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
+    state.flotaView.isOfflineCache = Boolean(res?.isOfflineCache);
     state.flotaView.loading = false;
     state.flotaView.error = null;
     state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
@@ -7268,7 +7292,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     state.flotaView.loading = false;
     state.flotaView.error = err?.isOffline
-      ? 'Conectate a internet para consultar la lista actualizada de coches y choferes del sistema.'
+      ? 'Sin conexión y sin copia guardada aún. Abrí la app una vez con internet para guardar todo automáticamente en caché local.'
       : err.message || 'No se pudo conectar con el servidor.';
     renderLineFlotaView();
     announce(state.flotaView.error);
@@ -7293,6 +7317,7 @@ async function refreshActiveLineFlotaSilent() {
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     state.flotaView.data = data;
     state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
+    state.flotaView.isOfflineCache = Boolean(res?.isOfflineCache);
     state.flotaView.error = null;
 
     const cHoy = (data.coches || []).filter((c) => c.vistoHoy).length;
@@ -8708,19 +8733,24 @@ function bindEvents() {
     state.isOffline = true;
     showToast(
       state.simulateMode
-        ? 'Sin conexión · Predicción activa por horarios'
-        : 'Sin conexión · Cambiá a EN VIVO para predicción por horarios',
+        ? 'Sin conexión · Usando caché local y predicción por horarios'
+        : 'Sin conexión · Usando caché local (cambiá a EN VIVO para predicción)',
       'info',
       3000
     );
     if (state.activeStop) renderOfflineOrFallback(false);
+    if (state.drill.step === 'flota') renderLineFlotaView();
   });
 
   window.addEventListener('online', () => {
     if (state.isOffline) {
       state.isOffline = false;
-      showToast('Conexión recuperada · Sincronizando GPS...', 'success', 2200);
+      showToast('Conexión recuperada · Sincronizando GPS y caché local...', 'success', 2200);
       if (state.activeStop) fetchArribos(false);
+      if (state.allFleetMode) refreshAllFleetBuses({ fit: false, silent: true });
+      if (state.drill.step === 'flota') refreshActiveLineFlotaSilent();
+      else if (state.drill.step === 'lineas') loadFlotaResumen(true);
+      warmOfflineArchive({ forceBundle: true });
     }
   });
 
@@ -8896,8 +8926,13 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // Warm routes + schedules gently in idle time so offline PWA & Modo Libre work instantly
-  setTimeout(() => warmOfflineArchive(), 8000);
+  // Automatically cache routes, 24h schedules, 7-day fleet/services bundle, and Corrientes OSM map tiles on startup
+  setTimeout(() => warmOfflineArchive(), 1500);
+  setInterval(() => {
+    if (!state.isAppPaused && !state.isOffline) {
+      refreshOfflineBundleSilent();
+    }
+  }, 10 * 60 * 1000);
 
   const params = new URLSearchParams(window.location.search);
   const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
