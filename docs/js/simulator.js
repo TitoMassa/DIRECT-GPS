@@ -826,8 +826,8 @@ export class BusSimulator {
     const moved =
       typeof prevLat !== 'number' ||
       typeof prevLng !== 'number' ||
-      Math.abs(sample.lat - prevLat) > 1.5e-6 ||
-      Math.abs(sample.lng - prevLng) > 1.5e-6;
+      Math.abs(sample.lat - prevLat) > 1.5e-7 ||
+      Math.abs(sample.lng - prevLng) > 1.5e-7;
 
     bus._posChanged = moved;
     bus.trajectory = st.activeTraj;

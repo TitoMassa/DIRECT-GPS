@@ -285,6 +285,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.6',
+    date: '22/11/2026 · 08:45 hs',
+    items: [
+      '<strong>Horarios completos del día en vista Paradas:</strong> ahora la vista <strong>Líneas → Horarios → Paradas</strong> muestra también los horarios pasados del día actual (en tono gris atenuado), el <strong>próximo</strong> resaltado en azul y los siguientes en blanco/negro, deslizable horizontalmente en cada parada y con ubicación automática en el horario actual.',
+      '<strong>Fluidez nativa a 60 fps:</strong> se eliminó el límite de 20 fps en el seguimiento EN VIVO de colectivos (Paradas, Modo libre y seguimiento en mapa), se ajustó el paneo suave de cámara al seguir una unidad y se activó composición por GPU y renderizado progresivo en listas largas sin quitar ninguna función.'
+    ]
+  },
+  {
     version: 'v2.4.5',
     date: '22/11/2026 · 08:20 hs',
     items: [
@@ -1539,6 +1547,7 @@ function startSimLoop() {
   if (simRafId !== null) return;
   simLastFrameMs = performance.now();
   simLastDomMs = simLastFrameMs;
+  let simLastFollowMs = simLastFrameMs;
 
   const frame = (now) => {
     const hasStopWork = Boolean(state.activeStop && state.arribos.length > 0 && !state.trackedUnit);
@@ -1549,12 +1558,14 @@ function startSimLoop() {
       return;
     }
     const elapsedMs = now - simLastFrameMs;
-    // Target ~20fps (50ms interval) for silky motion with minimal mobile CPU/battery
-    if (elapsedMs >= 50 && (hasStopWork || hasCityWork || hasTrackedWork)) {
-      const dtSec = Math.min(0.15, elapsedMs / 1000);
+    // Native display refresh rate (60fps / 120fps) for ultra-fluid map marker motion
+    if (elapsedMs >= 4 && (hasStopWork || hasCityWork || hasTrackedWork)) {
+      const dtSec = Math.min(0.1, elapsedMs / 1000);
       simLastFrameMs = now;
 
       const shouldSyncDom = now - simLastDomMs >= 1000;
+      const shouldFollow = now - simLastFollowMs >= 350;
+
       if (hasStopWork) {
         busSimulator.step(dtSec, state.arribos, { updateEta: shouldSyncDom });
         if (!transitMap.isInteracting) {
@@ -1574,13 +1585,17 @@ function startSimLoop() {
         }
       }
 
-      if (shouldSyncDom) {
-        simLastDomMs = now;
-        if (hasStopWork) syncSimCardsDom();
+      if (shouldFollow) {
+        simLastFollowMs = now;
         if (state.followSelectedBus && state.selectedBusKey && !transitMap.isInteracting) {
           const followed = getCurrentlySelectedBus();
           if (followed) transitMap.followBus(followed);
         }
+      }
+
+      if (shouldSyncDom) {
+        simLastDomMs = now;
+        if (hasStopWork) syncSimCardsDom();
       }
     }
     simRafId = requestAnimationFrame(frame);
@@ -2907,7 +2922,7 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
     }
 
     const nextAlong = Math.min(sim.maxAlong, sim.along + effSpeed * dtSec);
-    if (nextAlong - sim.along < 0.08) continue;
+    if (nextAlong - sim.along < 0.005) continue;
     sim.along = nextAlong;
     const pt = sampleBranchAtAlong(sim.branch, sim.along);
     if (pt) {
@@ -7190,11 +7205,14 @@ function renderLineRecorridoView() {
       </div>
     `;
   } else {
-    // ORDERED STOPS TIMELINE VIEW (with quick upcoming times + tap to expand all pass times)
+    // ORDERED STOPS TIMELINE VIEW (full day schedule: past dimmed + next highlighted + future, horizontally scrollable)
+    const legendHtml = isTodayTipo
+      ? `<span class="rec-legend-inline"><span class="rec-legend-dot is-passed"></span>Pasados · <span class="rec-legend-dot is-next"></span>Próximo</span>`
+      : `<span class="mono-meta">Tocá una parada para ver servicios</span>`;
     bodyHtml = `
       <div class="rec-matrix-toolbar">
         <span class="mono-meta">${visibleStops.length} paradas en orden · ${filteredTrips.length} vueltas</span>
-        <span class="mono-meta">Tocá una parada para ver todas sus horas</span>
+        ${legendHtml}
       </div>
       <div class="rec-stops-timeline" style="--branch-color:${branchColor}">
         ${visibleStops
@@ -7208,14 +7226,18 @@ function renderLineRecorridoView() {
                 lap: tr.lapNumber
               }))
               .filter((p) => p.sec !== null);
-            const upcoming = isTodayTipo ? passTimes.filter((p) => p.sec >= nowSvcSec - 60) : passTimes;
-            const previewList = (upcoming.length ? upcoming : passTimes).slice(0, 5);
+            const firstUpcoming = isTodayTipo ? passTimes.find((p) => p.sec >= nowSvcSec - 60) || null : null;
             const isExpanded = rv.expandedStopId === st.id;
-            const previewHtml = previewList
-              .map(
-                (p, idx) =>
-                  `<span class="rec-time-chip ${isTodayTipo && idx === 0 && upcoming.length ? 'is-next' : ''}">${formatSecHHMM(p.sec)}</span>`
-              )
+            const previewHtml = passTimes
+              .map((p) => {
+                const passed = isTodayTipo && p.sec < nowSvcSec - 60;
+                const isNext = isTodayTipo && firstUpcoming !== null && p === firstUpcoming;
+                return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}"${
+                  isNext ? ' data-next-chip="1"' : ''
+                } title="${
+                  p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
+                }">${formatSecHHMM(p.sec)}</span>`;
+              })
               .join('');
             const allTimesHtml = isExpanded
               ? `
@@ -7223,7 +7245,7 @@ function renderLineRecorridoView() {
                   ${passTimes
                     .map((p) => {
                       const passed = isTodayTipo && p.sec < nowSvcSec - 60;
-                      const isNext = isTodayTipo && upcoming.length && p === upcoming[0];
+                      const isNext = isTodayTipo && firstUpcoming !== null && p === firstUpcoming;
                       return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}" title="${
                         p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
                       }">${formatSecHHMM(p.sec)}${p.srv ? `<small>S${p.srv}</small>` : ''}</span>`;
@@ -7328,9 +7350,11 @@ function renderLineRecorridoView() {
   el.lineasContent.querySelectorAll('[data-toggle-stop]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const sid = btn.dataset.toggleStop;
+      const prevScroll = el.lineasContent.scrollTop;
       state.recorridoView.expandedStopId = state.recorridoView.expandedStopId === sid ? null : sid;
       haptic('light');
       renderLineRecorridoView();
+      el.lineasContent.scrollTop = prevScroll;
     });
   });
 
@@ -7361,6 +7385,17 @@ function renderLineRecorridoView() {
   });
   if (rv.viewMode === 'grilla' && isTodayTipo && currentTripIdx >= 0) {
     requestAnimationFrame(() => scrollNowCol(false));
+  } else if (rv.viewMode === 'paradas' && isTodayTipo) {
+    requestAnimationFrame(() => {
+      el.lineasContent.querySelectorAll('.rec-preview-chips').forEach((strip) => {
+        if (strip.scrollWidth <= strip.clientWidth + 4) return;
+        const nextChip = strip.querySelector('[data-next-chip="1"]');
+        if (nextChip) {
+          // Keep 1–2 preceding past times visible right before the highlighted next departure
+          strip.scrollLeft = Math.max(0, nextChip.offsetLeft - 88);
+        }
+      });
+    });
   }
 }
 

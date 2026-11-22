@@ -271,7 +271,7 @@ export class TransitMap {
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       const entry = this.busMarkers.get(bus.key);
       if (!entry) continue;
-      if (Math.abs(bus.lat - entry.lat) < 2e-6 && Math.abs(bus.lng - entry.lng) < 2e-6) {
+      if (Math.abs(bus.lat - entry.lat) < 1.5e-7 && Math.abs(bus.lng - entry.lng) < 1.5e-7) {
         bus._posChanged = false;
         continue;
       }
@@ -393,7 +393,7 @@ export class TransitMap {
       if (typeof bus.lat !== 'number' || typeof bus.lng !== 'number') continue;
       const entry = this.allFleetMarkers.get(bus.key);
       if (!entry) continue;
-      if (Math.abs(bus.lat - entry.lat) < 2e-6 && Math.abs(bus.lng - entry.lng) < 2e-6) {
+      if (Math.abs(bus.lat - entry.lat) < 1.5e-7 && Math.abs(bus.lng - entry.lng) < 1.5e-7) {
         bus._posChanged = false;
         continue;
       }
@@ -551,9 +551,9 @@ export class TransitMap {
     const desiredCenter = this.map.unproject(targetPt.add([offsetX, offsetY]), z);
     const curPt = this.map.project(this.map.getCenter(), z);
     const desPt = this.map.project(desiredCenter, z);
-    // Only pan when bus moves >= 14px away from visual center so 20fps tracking stays silky smooth
-    if (curPt.distanceTo(desPt) >= 14) {
-      this.map.panTo(desiredCenter, { animate: true, duration: 0.45, noMoveStart: true });
+    // Gently glide map center as the bus moves for fluid 60fps camera tracking
+    if (curPt.distanceTo(desPt) >= 6) {
+      this.map.panTo(desiredCenter, { animate: true, duration: 0.35, easeLinearity: 0.45, noMoveStart: true });
     }
   }
 
