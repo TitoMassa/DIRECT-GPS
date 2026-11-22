@@ -285,6 +285,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.8',
+    date: '22/11/2026 · 09:25 hs',
+    items: [
+      '<strong>Nuevo nombre de línea:</strong> <strong>SANTA ANA - INGENIO</strong> ahora figura en toda la aplicación y en el servidor como <strong>109C</strong>.'
+    ]
+  },
+  {
     version: 'v2.4.7',
     date: '22/11/2026 · 09:05 hs',
     items: [

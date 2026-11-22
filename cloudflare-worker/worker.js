@@ -77,6 +77,7 @@ const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
 const REMOVED_LINE_SQL_LIST = '517, 607, 608, 744, 851, 853, 854';
 const LINE_NAME_OVERRIDES = {
   433: '103D',
+  705: '109C',
   852: '902'
 };
 
@@ -102,7 +103,7 @@ const LINE_NAMES_BY_CODE = {
   356: '108A',
   357: '108C',
   433: '103D',
-  705: 'SANTA ANA-INGENIO',
+  705: '109C',
   852: '902',
   1037: '904A',
   1038: '904B',
@@ -791,10 +792,10 @@ export class FleetMemory {
       // Non-fatal backfill guard
     }
 
-    // Purge any legacy rows belonging to removed non-working lines and apply permanent renames (852 -> 902, 433 -> 103D)
+    // Purge any legacy rows belonging to removed non-working lines and apply permanent renames (852 -> 902, 433 -> 103D, 705 -> 109C)
     try {
       const purgeVer = Number(this._getMeta('removed_lines_purge_v', 0)) || 0;
-      if (purgeVer < 1) {
+      if (purgeVer < 2) {
         const tables = [
           'fleet_cars',
           'fleet_drivers',
@@ -809,9 +810,11 @@ export class FleetMemory {
         }
         this.sql.exec(`UPDATE fleet_cars SET descripcion_linea = '902' WHERE codigo_linea = 852`);
         this.sql.exec(`UPDATE fleet_cars SET descripcion_linea = '103D' WHERE codigo_linea = 433`);
+        this.sql.exec(`UPDATE fleet_cars SET descripcion_linea = '109C' WHERE codigo_linea = 705`);
         this.sql.exec(`UPDATE fleet_drivers SET descripcion_linea = '902' WHERE codigo_linea = 852`);
         this.sql.exec(`UPDATE fleet_drivers SET descripcion_linea = '103D' WHERE codigo_linea = 433`);
-        this._setMeta('removed_lines_purge_v', 1);
+        this.sql.exec(`UPDATE fleet_drivers SET descripcion_linea = '109C' WHERE codigo_linea = 705`);
+        this._setMeta('removed_lines_purge_v', 2);
       }
     } catch {
       // Non-fatal purge guard

@@ -119,7 +119,7 @@ async function pool(items, worker, limit) {
 }
 
 const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
-const LINE_NAME_OVERRIDES = { 852: '902', 433: '103D' };
+const LINE_NAME_OVERRIDES = { 852: '902', 433: '103D', 705: '109C' };
 
 async function getLineas() {
   const res = await soap(

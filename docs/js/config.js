@@ -15,6 +15,7 @@ export const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
 // Nombres públicos definitivos por código interno SmartMovePro
 export const LINE_NAME_OVERRIDES = {
   433: '103D',
+  705: '109C',
   852: '902'
 };
 
@@ -34,8 +35,7 @@ const FAMILY_COLORS = {
   '108': '#ea580c', // Terracotta Orange
   '109': '#2563eb', // Cobalt Blue
   '902': '#0284c7', // Interprovincial Chaco-Corrientes Blue
-  '904': '#0891b2', // Interprovincial Cyan (Corrientes-Chaco)
-  SAN: '#dc2626'    // Santa Ana Red
+  '904': '#0891b2'  // Interprovincial Cyan (Corrientes-Chaco)
 };
 
 const BRANCH_OVERRIDES = {
@@ -60,6 +60,7 @@ const BRANCH_OVERRIDES = {
   '108C': '#c2410c',
   '109A': '#2563eb',
   '109B': '#1d4ed8',
+  '109C': '#dc2626',
   '902': '#0284c7',
   '904A': '#0891b2',
   '904B': '#0e7490',

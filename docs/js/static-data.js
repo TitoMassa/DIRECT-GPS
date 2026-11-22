@@ -93,11 +93,11 @@ export const STATIC_LINEAS = [
   { codigo: 357, descripcion: '108C' },
   { codigo: 342, descripcion: '109A' },
   { codigo: 353, descripcion: '109B' },
+  { codigo: 705, descripcion: '109C' },
   { codigo: 852, descripcion: '902' },
   { codigo: 1037, descripcion: '904A' },
   { codigo: 1038, descripcion: '904B' },
-  { codigo: 1039, descripcion: '904C' },
-  { codigo: 705, descripcion: 'SANTA ANA-INGENIO' }
+  { codigo: 1039, descripcion: '904C' }
 ];
 
 const STATIC_CALLES = [
