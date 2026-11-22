@@ -3796,6 +3796,255 @@ input:focus-visible,
   }
 }
 
+/* Redesigned Pure-Black GPS Brand Mark */
+.brand-mark-gps {
+  background: #000000 !important;
+  color: #ffffff !important;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+/* Optional Live Fleet Roster Button (visible when Modo Libre is active) */
+.map-ctrl-fleet-list.active {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+
+/* Free UI Background Color Picker Modal */
+.theme-modal-card {
+  width: min(410px, calc(100vw - 24px));
+  max-height: min(82vh, 560px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.theme-swatches {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.theme-swatch-btn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-1);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease), transform 120ms var(--ease);
+}
+
+.theme-swatch-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.theme-swatch-btn.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--accent);
+  background: var(--surface-2);
+}
+
+.theme-swatch-chip {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  flex-shrink: 0;
+  border: 1px solid var(--border-strong);
+  box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.18);
+}
+
+.theme-swatch-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.theme-swatch-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.theme-swatch-tag {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-3);
+}
+
+.theme-custom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+}
+
+.theme-custom-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  cursor: pointer;
+}
+
+.theme-color-input {
+  width: 44px;
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  padding: 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Modo Libre Optional Live Coches / Choferes Roster Modal */
+.fleet-roster-card {
+  width: min(460px, calc(100vw - 20px));
+  max-height: min(84vh, 640px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fleet-roster-search-wrap {
+  width: 100%;
+}
+
+.fleet-roster-search {
+  width: 100%;
+  height: 36px;
+  font-size: 13px;
+}
+
+.fleet-roster-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  min-height: 160px;
+  max-height: 55vh;
+  padding-right: 2px;
+}
+
+.fleet-roster-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-1);
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms var(--ease), border-color 140ms var(--ease);
+}
+
+.fleet-roster-row:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.fleet-roster-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fleet-roster-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.fleet-roster-line-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #ffffff;
+  flex-shrink: 0;
+  letter-spacing: 0.01em;
+}
+
+.fleet-roster-primary {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fleet-roster-primary.mono {
+  font-family: var(--font-mono);
+}
+
+.fleet-roster-sub {
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fleet-roster-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fleet-roster-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.fleet-roster-empty {
+  padding: 28px 14px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.fleet-roster-note {
+  padding: 6px 4px 2px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
 /* Accessibility: Reduced Motion */
 @media (prefers-reduced-motion: reduce) {
   *,

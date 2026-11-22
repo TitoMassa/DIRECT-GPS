@@ -104,6 +104,10 @@ const state = {
   allFleetBuses: [],
   allFleetLoading: false,
   allFleetTimerId: null,
+  allFleetRosterOpen: false,
+  allFleetRosterTab: 'coches', // 'coches' | 'choferes'
+  allFleetRosterQuery: '',
+  themeColor: '#10141c',
   dockExpanded: false,
 
   // Offline archives & system FleetMemory caches
@@ -188,8 +192,6 @@ const el = {
   iconSoundOn: document.getElementById('icon-sound-on'),
   iconSoundOff: document.getElementById('icon-sound-off'),
   btnThemeToggle: document.getElementById('btn-theme-toggle'),
-  iconSun: document.getElementById('icon-sun'),
-  iconMoon: document.getElementById('icon-moon'),
   metaThemeColor: document.getElementById('meta-theme-color'),
 
   stopHero: document.getElementById('stop-hero'),
@@ -241,11 +243,26 @@ const el = {
 
   btnAllBuses: document.getElementById('btn-all-buses'),
   allBusesCount: document.getElementById('all-buses-count'),
+  btnAllBusesList: document.getElementById('btn-all-buses-list'),
   btnMapLocate: document.getElementById('btn-map-locate'),
   btnMapCenterStop: document.getElementById('btn-map-center-stop'),
   btnMapScanArea: document.getElementById('btn-map-scan-area'),
   btnZoomIn: document.getElementById('btn-zoom-in'),
   btnZoomOut: document.getElementById('btn-zoom-out'),
+
+  allFleetRoster: document.getElementById('all-fleet-roster'),
+  allFleetRosterSub: document.getElementById('all-fleet-roster-sub'),
+  btnCloseAllFleetRoster: document.getElementById('btn-close-all-fleet-roster'),
+  btnRosterTabCoches: document.getElementById('btn-roster-tab-coches'),
+  btnRosterTabChoferes: document.getElementById('btn-roster-tab-choferes'),
+  allFleetRosterFilter: document.getElementById('all-fleet-roster-filter'),
+  allFleetRosterBody: document.getElementById('all-fleet-roster-body'),
+
+  themeModal: document.getElementById('theme-modal'),
+  btnThemeClose: document.getElementById('btn-theme-close'),
+  themeSwatches: document.getElementById('theme-swatches'),
+  themeCustomColor: document.getElementById('theme-custom-color'),
+  themeCustomHex: document.getElementById('theme-custom-hex'),
 
   aliasModal: document.getElementById('alias-modal'),
   aliasModalForm: document.getElementById('alias-modal-form'),
@@ -267,6 +284,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.5',
+    date: '22/11/2026 · 08:20 hs',
+    items: [
+      '<strong>Selector libre de color de fondo + Negro AMOLED puro:</strong> ahora podés elegir entre 14 colores (incluido <strong>Negro AMOLED #000000</strong>) o cualquier color personalizado; los textos, bordes y paneles se adaptan automáticamente para mantener siempre la máxima legibilidad (sin modificar el mapa).',
+      '<strong>Lista completa en vivo en Modo libre:</strong> al activar todos los colectivos aparece un botón opcional para ver en tiempo real todos los <strong>Coches (orden numérico de menor a mayor)</strong> y <strong>Choferes (orden alfabético A–Z)</strong> en línea ahora, tocando cualquiera para seguirlo en el mapa.',
+      '<strong>Nuevo ícono de la app:</strong> fondo negro puro con triángulo blanco de GPS apuntando hacia arriba.',
+      '<strong>Corrección en historial de Servicios:</strong> se corrigió el texto "Historial undefined" en días pasados y ahora muestra la fecha, turnos cubiertos, coches y choferes registrados de ese día.'
+    ]
+  },
   {
     version: 'v2.4.4',
     date: '22/11/2026 · 07:45 hs',
@@ -445,20 +472,198 @@ function showToast(message, type = 'info', duration = 3200, { silent = false } =
 }
 
 // ============================================================================
-// Theme
+// Theme: Free UI Background Color + Pure AMOLED + Automatic WCAG Contrast
 // ============================================================================
-function applyTheme(theme) {
-  document.documentElement.setAttribute('data-theme', theme);
-  localStorage.setItem(STORAGE_THEME_KEY, theme);
-  const isLight = theme === 'light';
-  el.iconSun.classList.toggle('hidden', isLight);
-  el.iconMoon.classList.toggle('hidden', !isLight);
-  el.btnThemeToggle.setAttribute(
-    'aria-label',
-    isLight ? 'Tema claro activo. Cambiar a tema oscuro' : 'Tema oscuro activo. Cambiar a tema claro'
-  );
-  el.metaThemeColor.setAttribute('content', isLight ? '#f4f5f7' : '#0b0d10');
-  setSystemBarsTheme(theme);
+const THEME_PRESETS = [
+  { name: 'Negro AMOLED', hex: '#000000', tag: 'AMOLED' },
+  { name: 'Obsidiana', hex: '#10141c', tag: 'Oscuro' },
+  { name: 'Grafito', hex: '#18181b', tag: 'Oscuro' },
+  { name: 'Azul Noche', hex: '#0b192c', tag: 'Oscuro' },
+  { name: 'Índigo Profundo', hex: '#161233', tag: 'Oscuro' },
+  { name: 'Verde Bosque', hex: '#0b1f18', tag: 'Oscuro' },
+  { name: 'Bordó Oscuro', hex: '#240d15', tag: 'Oscuro' },
+  { name: 'Café Espresso', hex: '#1d1511', tag: 'Oscuro' },
+  { name: 'Blanco Puro', hex: '#ffffff', tag: 'Claro' },
+  { name: 'Hielo Claro', hex: '#eef2f7', tag: 'Claro' },
+  { name: 'Crema Cálido', hex: '#f7f3ea', tag: 'Claro' },
+  { name: 'Celeste Suave', hex: '#e8f3ff', tag: 'Claro' },
+  { name: 'Menta Suave', hex: '#e8f8f0', tag: 'Claro' },
+  { name: 'Lavanda Suave', hex: '#f1ecff', tag: 'Claro' }
+];
+
+function normalizeHexColor(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'dark') return '#10141c';
+  if (s === 'light') return '#ffffff';
+  if (/^#[0-9a-f]{6}$/.test(s)) return s;
+  if (/^#[0-9a-f]{3}$/.test(s)) {
+    return `#${s[1]}${s[1]}${s[2]}${s[2]}${s[3]}${s[3]}`;
+  }
+  return '#10141c';
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function rgbToHex({ r, g, b }) {
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  return `#${[clamp(r), clamp(g), clamp(b)].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function mixHex(hexA, hexB, weightB) {
+  const a = hexToRgb(hexA);
+  const b = hexToRgb(hexB);
+  const w = Math.max(0, Math.min(1, weightB));
+  return rgbToHex({
+    r: a.r * (1 - w) + b.r * w,
+    g: a.g * (1 - w) + b.g * w,
+    b: a.b * (1 - w) + b.b * w
+  });
+}
+
+function relativeLuminance(hex) {
+  const { r, g, b } = hexToRgb(hex);
+  const lin = (c) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+function applyTheme(colorOrLegacy) {
+  const hex = normalizeHexColor(colorOrLegacy);
+  state.themeColor = hex;
+  localStorage.setItem(STORAGE_THEME_KEY, hex);
+
+  const lum = relativeLuminance(hex);
+  const contrastWithWhite = 1.05 / (lum + 0.05);
+  const contrastWithBlack = (lum + 0.05) / 0.055;
+  const isLight = contrastWithBlack > contrastWithWhite;
+  const isAmoled = hex === '#000000';
+
+  const root = document.documentElement;
+  root.setAttribute('data-theme', isLight ? 'light' : 'dark');
+
+  const vars = isAmoled
+    ? {
+        '--bg-canvas': '#000000',
+        '--surface-0': '#000000',
+        '--surface-1': '#0d0d0d',
+        '--surface-2': '#171717',
+        '--surface-hover': '#212121',
+        '--surface-active': '#2b2b2b',
+        '--border': 'rgba(255, 255, 255, 0.13)',
+        '--border-strong': 'rgba(255, 255, 255, 0.26)',
+        '--text-1': '#ffffff',
+        '--text-2': 'rgba(255, 255, 255, 0.80)',
+        '--text-3': 'rgba(255, 255, 255, 0.58)',
+        '--accent': '#38bdf8',
+        '--accent-soft': 'rgba(56, 189, 248, 0.18)',
+        '--ok': '#22c55e',
+        '--ok-soft': 'rgba(34, 197, 94, 0.18)',
+        '--warn': '#fbbf24',
+        '--warn-soft': 'rgba(251, 191, 36, 0.18)',
+        '--late': '#fb7185',
+        '--late-soft': 'rgba(251, 113, 133, 0.18)',
+        '--shadow-float': '0 12px 32px -8px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.7)',
+        '--shadow-sm': '0 2px 10px rgba(0, 0, 0, 0.65)'
+      }
+    : isLight
+      ? {
+          '--bg-canvas': mixHex(hex, '#000000', 0.055),
+          '--surface-0': hex,
+          '--surface-1': mixHex(hex, '#000000', 0.045),
+          '--surface-2': mixHex(hex, '#000000', 0.09),
+          '--surface-hover': mixHex(hex, '#000000', 0.13),
+          '--surface-active': mixHex(hex, '#000000', 0.18),
+          '--border': 'rgba(10, 15, 26, 0.13)',
+          '--border-strong': 'rgba(10, 15, 26, 0.25)',
+          '--text-1': '#0a0f1a',
+          '--text-2': 'rgba(10, 15, 26, 0.76)',
+          '--text-3': 'rgba(10, 15, 26, 0.58)',
+          '--accent': '#0369a1',
+          '--accent-soft': 'rgba(3, 105, 161, 0.14)',
+          '--ok': '#15803d',
+          '--ok-soft': 'rgba(21, 128, 61, 0.14)',
+          '--warn': '#b45309',
+          '--warn-soft': 'rgba(180, 83, 9, 0.14)',
+          '--late': '#be123c',
+          '--late-soft': 'rgba(190, 18, 60, 0.14)',
+          '--shadow-float': '0 12px 30px -8px rgba(10, 15, 26, 0.18), 0 2px 6px rgba(10, 15, 26, 0.09)',
+          '--shadow-sm': '0 2px 8px rgba(10, 15, 26, 0.10)'
+        }
+      : {
+          '--bg-canvas': mixHex(hex, '#000000', 0.18),
+          '--surface-0': hex,
+          '--surface-1': mixHex(hex, '#ffffff', 0.065),
+          '--surface-2': mixHex(hex, '#ffffff', 0.12),
+          '--surface-hover': mixHex(hex, '#ffffff', 0.175),
+          '--surface-active': mixHex(hex, '#ffffff', 0.23),
+          '--border': 'rgba(255, 255, 255, 0.12)',
+          '--border-strong': 'rgba(255, 255, 255, 0.24)',
+          '--text-1': '#ffffff',
+          '--text-2': 'rgba(255, 255, 255, 0.80)',
+          '--text-3': 'rgba(255, 255, 255, 0.60)',
+          '--accent': '#38bdf8',
+          '--accent-soft': 'rgba(56, 189, 248, 0.18)',
+          '--ok': '#4ade80',
+          '--ok-soft': 'rgba(74, 222, 128, 0.18)',
+          '--warn': '#fbbf24',
+          '--warn-soft': 'rgba(251, 191, 36, 0.18)',
+          '--late': '#fb7185',
+          '--late-soft': 'rgba(251, 113, 133, 0.18)',
+          '--shadow-float': '0 12px 32px -8px rgba(0, 0, 0, 0.62), 0 1px 4px rgba(0, 0, 0, 0.36)',
+          '--shadow-sm': '0 2px 10px rgba(0, 0, 0, 0.34)'
+        };
+
+  for (const [prop, val] of Object.entries(vars)) {
+    root.style.setProperty(prop, val);
+  }
+
+  el.metaThemeColor?.setAttribute('content', hex);
+  el.btnThemeToggle?.setAttribute('aria-label', `Color de fondo actual ${hex.toUpperCase()}. Tocá para cambiar`);
+  if (el.themeCustomColor) el.themeCustomColor.value = hex;
+  if (el.themeCustomHex) el.themeCustomHex.textContent = hex.toUpperCase();
+  setSystemBarsTheme(isLight ? 'light' : 'dark');
+  renderThemeSwatches();
+}
+
+function renderThemeSwatches() {
+  if (!el.themeSwatches) return;
+  const activeHex = normalizeHexColor(state.themeColor);
+  el.themeSwatches.innerHTML = THEME_PRESETS.map((p) => {
+    const isActive = p.hex === activeHex;
+    return `
+      <button
+        type="button"
+        class="theme-swatch-btn ${isActive ? 'active' : ''}"
+        data-theme-hex="${p.hex}"
+        role="radio"
+        aria-checked="${isActive}"
+      >
+        <span class="theme-swatch-chip" style="background:${p.hex}" aria-hidden="true"></span>
+        <span class="theme-swatch-info">
+          <span class="theme-swatch-name">${escapeHtml(p.name)}</span>
+          <span class="theme-swatch-tag">${escapeHtml(p.tag)} · ${p.hex.toUpperCase()}</span>
+        </span>
+      </button>
+    `;
+  }).join('');
+}
+
+function openThemeModal() {
+  if (!el.themeModal) return;
+  renderThemeSwatches();
+  if (el.themeCustomColor) el.themeCustomColor.value = normalizeHexColor(state.themeColor);
+  if (el.themeCustomHex) el.themeCustomHex.textContent = normalizeHexColor(state.themeColor).toUpperCase();
+  el.themeModal.classList.remove('hidden');
+  haptic('light');
+}
+
+function closeThemeModal() {
+  el.themeModal?.classList.add('hidden');
 }
 
 // ============================================================================
@@ -2177,6 +2382,175 @@ function updateAllFleetButtonUi() {
     el.allBusesCount.textContent = String(n);
     el.allBusesCount.classList.toggle('hidden', !state.allFleetMode || n === 0);
   }
+  if (el.btnAllBusesList) {
+    el.btnAllBusesList.classList.toggle('hidden', !state.allFleetMode);
+    el.btnAllBusesList.classList.toggle('active', state.allFleetMode && state.allFleetRosterOpen);
+    el.btnAllBusesList.setAttribute('aria-pressed', String(state.allFleetMode && state.allFleetRosterOpen));
+  }
+}
+
+function compareCocheNumericAsc(a, b) {
+  const sA = String(a || '').trim();
+  const sB = String(b || '').trim();
+  const nA = parseInt(sA.replace(/\D+/g, ''), 10);
+  const nB = parseInt(sB.replace(/\D+/g, ''), 10);
+  if (Number.isFinite(nA) && Number.isFinite(nB) && nA !== nB) return nA - nB;
+  return sA.localeCompare(sB, 'es', { numeric: true });
+}
+
+function renderAllFleetRoster() {
+  if (!el.allFleetRosterBody || !state.allFleetRosterOpen) return;
+  const buses = Array.isArray(state.allFleetBuses) ? state.allFleetBuses : [];
+  const q = String(state.allFleetRosterQuery || '').trim().toLowerCase();
+  const tab = state.allFleetRosterTab === 'choferes' ? 'choferes' : 'coches';
+
+  const busesWithDrivers = buses.filter((b) => String(b.choferNombre || '').trim().length > 0);
+  const withoutDriverCount = Math.max(0, buses.length - busesWithDrivers.length);
+
+  if (el.allFleetRosterSub) {
+    const clock = formatRosterClockArtWithSec(Date.now());
+    el.allFleetRosterSub.textContent = `${buses.length} ${buses.length === 1 ? 'unidad' : 'unidades'} en línea · Act. ${clock} · Auto cada ${REFRESH_INTERVAL_SEC}s`;
+  }
+  if (el.btnRosterTabCoches) {
+    el.btnRosterTabCoches.textContent = `Coches (${buses.length})`;
+    el.btnRosterTabCoches.classList.toggle('active', tab === 'coches');
+    el.btnRosterTabCoches.setAttribute('aria-selected', String(tab === 'coches'));
+  }
+  if (el.btnRosterTabChoferes) {
+    el.btnRosterTabChoferes.textContent = `Choferes (${busesWithDrivers.length})`;
+    el.btnRosterTabChoferes.classList.toggle('active', tab === 'choferes');
+    el.btnRosterTabChoferes.setAttribute('aria-selected', String(tab === 'choferes'));
+  }
+
+  const prevScroll = el.allFleetRosterBody.scrollTop;
+
+  if (tab === 'coches') {
+    const sorted = [...buses].sort((a, b) => {
+      const cmp = compareCocheNumericAsc(a.identificadorCoche, b.identificadorCoche);
+      if (cmp !== 0) return cmp;
+      return String(a.descripcionLinea || '').localeCompare(String(b.descripcionLinea || ''), 'es', { numeric: true });
+    });
+    const filtered = q
+      ? sorted.filter((b) =>
+          `${b.identificadorCoche} ${b.descripcionLinea} ${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.realBandera || b.descripcionBandera || ''}`
+            .toLowerCase()
+            .includes(q)
+        )
+      : sorted;
+
+    if (filtered.length === 0) {
+      el.allFleetRosterBody.innerHTML = `<div class="fleet-roster-empty">${
+        buses.length === 0 ? 'Consultando colectivos en línea...' : 'Sin coches que coincidan con el filtro.'
+      }</div>`;
+      return;
+    }
+
+    el.allFleetRosterBody.innerHTML = filtered
+      .map((b) => {
+        const lineColor = getLineColor(b.descripcionLinea);
+        const bandera = b.realBandera || b.descripcionBandera || '';
+        const driverText = b.choferNombre
+          ? `${b.choferNombre}${b.choferLegajo ? ` (${b.choferLegajo})` : ''}`
+          : 'Chofer sin informar';
+        const desv = b.desvio || { label: '', cls: '' };
+        const desvHtml = desv.label ? `<span class="desvio-pill ${desv.cls}">${escapeHtml(desv.label)}</span>` : '';
+        return `
+          <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
+            <div class="fleet-roster-main">
+              <div class="fleet-roster-top">
+                <span class="fleet-roster-primary mono">Coche ${escapeHtml(b.identificadorCoche)}</span>
+                <span class="fleet-roster-line-pill" style="background:${lineColor}">${escapeHtml(b.descripcionLinea)}</span>
+              </div>
+              <div class="fleet-roster-sub">${escapeHtml(driverText)}</div>
+              ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
+            </div>
+            <div class="fleet-roster-right">
+              ${desvHtml}
+            </div>
+          </button>
+        `;
+      })
+      .join('');
+    el.allFleetRosterBody.scrollTop = prevScroll;
+    return;
+  }
+
+  // Tab: Choferes (strict alphabetical A-Z)
+  const sortedDrivers = [...busesWithDrivers].sort((a, b) => {
+    const cmp = String(a.choferNombre || '').localeCompare(String(b.choferNombre || ''), 'es', { sensitivity: 'base' });
+    if (cmp !== 0) return cmp;
+    return compareCocheNumericAsc(a.identificadorCoche, b.identificadorCoche);
+  });
+  const filteredDrivers = q
+    ? sortedDrivers.filter((b) =>
+        `${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.identificadorCoche} ${b.descripcionLinea} ${b.realBandera || b.descripcionBandera || ''}`
+          .toLowerCase()
+          .includes(q)
+      )
+    : sortedDrivers;
+
+  if (filteredDrivers.length === 0) {
+    el.allFleetRosterBody.innerHTML = `<div class="fleet-roster-empty">${
+      buses.length === 0
+        ? 'Consultando choferes en línea...'
+        : busesWithDrivers.length === 0
+          ? 'Las unidades activas aún no reportaron nombre de chofer.'
+          : 'Sin choferes que coincidan con el filtro.'
+    }</div>`;
+    return;
+  }
+
+  const rowsHtml = filteredDrivers
+    .map((b) => {
+      const lineColor = getLineColor(b.descripcionLinea);
+      const bandera = b.realBandera || b.descripcionBandera || '';
+      const desv = b.desvio || { label: '', cls: '' };
+      const desvHtml = desv.label ? `<span class="desvio-pill ${desv.cls}">${escapeHtml(desv.label)}</span>` : '';
+      return `
+        <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
+          <div class="fleet-roster-main">
+            <div class="fleet-roster-top">
+              <span class="fleet-roster-primary">${escapeHtml(b.choferNombre)}</span>
+              <span class="fleet-roster-line-pill" style="background:${lineColor}">${escapeHtml(b.descripcionLinea)}</span>
+            </div>
+            <div class="fleet-roster-sub">Coche ${escapeHtml(b.identificadorCoche)}${b.choferLegajo ? ` · Leg. ${escapeHtml(b.choferLegajo)}` : ''}</div>
+            ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
+          </div>
+          <div class="fleet-roster-right">
+            ${desvHtml}
+          </div>
+        </button>
+      `;
+    })
+    .join('');
+
+  const noteHtml =
+    withoutDriverCount > 0 && !q
+      ? `<div class="fleet-roster-note">+ ${withoutDriverCount} ${withoutDriverCount === 1 ? 'unidad sin chofer informado' : 'unidades sin chofer informado'} (visibles en pestaña Coches)</div>`
+      : '';
+
+  el.allFleetRosterBody.innerHTML = `${rowsHtml}${noteHtml}`;
+  el.allFleetRosterBody.scrollTop = prevScroll;
+}
+
+function openAllFleetRosterModal() {
+  if (!state.allFleetMode || !el.allFleetRoster) return;
+  state.allFleetRosterOpen = true;
+  el.allFleetRoster.classList.remove('hidden');
+  updateAllFleetButtonUi();
+  renderAllFleetRoster();
+  haptic('light');
+}
+
+function closeAllFleetRosterModal() {
+  state.allFleetRosterOpen = false;
+  el.allFleetRoster?.classList.add('hidden');
+  updateAllFleetButtonUi();
+}
+
+function toggleAllFleetRosterModal() {
+  if (state.allFleetRosterOpen) closeAllFleetRosterModal();
+  else openAllFleetRosterModal();
 }
 
 function buildCityFleetBusObject(u) {
@@ -2602,6 +2976,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
 
     reconcileCityFleetSim(state.allFleetBuses);
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+    if (state.allFleetRosterOpen) renderAllFleetRoster();
     if (state.simulateMode && state.allFleetBuses.length > 0) {
       startSimLoop();
     }
@@ -2615,6 +2990,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
           enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
           reconcileCityFleetSim(state.allFleetBuses);
           transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
+          if (state.allFleetRosterOpen) renderAllFleetRoster();
           if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
             const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
             if (refreshed) updateInspectorFields(refreshed);
@@ -2721,6 +3097,7 @@ function toggleAllFleetMode(forceState = null) {
   if (!next) {
     state.allFleetBuses = [];
     state.allFleetLoading = false;
+    closeAllFleetRosterModal();
     cityFleetSim.clear();
     if (!state.activeStop) stopSimLoop();
     transitMap.clearAllFleetBuses();
@@ -5612,17 +5989,57 @@ function renderLineFlotaView() {
     : allServices;
   const dayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
 
+  // Real historical summary metrics for past days in Servicios
+  let histTotalTurnos = 0;
+  let histCoveredTurnos = 0;
+  const histCarsSet = new Set();
+  const histDriversSet = new Set();
+  if (isHistoricalSrvDay) {
+    for (const s of allServices) {
+      for (const t of s.turnos || []) {
+        histTotalTurnos += 1;
+        const a = activeSrvAssignMap.get(t.blockId);
+        if (a && (a.coche || a.choferNombre)) {
+          histCoveredTurnos += 1;
+          if (a.coche) histCarsSet.add(String(a.coche).trim());
+          if (a.choferNombre) histDriversSet.add(String(a.choferNombre).trim().toUpperCase());
+        }
+      }
+    }
+    for (const o of serviceDayEntry?.dayObs || []) {
+      if (o?.coche) histCarsSet.add(String(o.coche).trim());
+      if (o?.choferNombre) histDriversSet.add(String(o.choferNombre).trim().toUpperCase());
+    }
+    for (const tr of serviceDayEntry?.dayTrips || []) {
+      if (tr?.coche) histCarsSet.add(String(tr.coche).trim());
+      if (tr?.choferNombre) histDriversSet.add(String(tr.choferNombre).trim().toUpperCase());
+    }
+  }
+
   const freshLiveTs = Math.max(
     Number(meta.lastLiveAt) || 0,
     Number(meta.lastCronAt) || 0,
     Number(fv.lastSyncAt) || 0
   );
   const lastLiveClock = formatRosterClockArtWithSec(freshLiveTs);
-  const autoMetaText = isHistoricalSrvDay && fv.tab === 'servicios'
-    ? `Historial ${dayNavInfo.shortLabel} · Retención ${retentionDays}d`
-    : lastLiveClock
+  let autoMetaText = '';
+  if (isHistoricalSrvDay && fv.tab === 'servicios') {
+    if (srvDayLoading) {
+      autoMetaText = `Historial · ${dayNavInfo.main} · Cargando registros...`;
+    } else if (histCoveredTurnos > 0 || histCarsSet.size > 0) {
+      const parts = [`Historial · ${dayNavInfo.main}`];
+      if (histTotalTurnos > 0) parts.push(`${histCoveredTurnos}/${histTotalTurnos} turnos`);
+      if (histCarsSet.size > 0) parts.push(`${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`);
+      if (histDriversSet.size > 0) parts.push(`${histDriversSet.size} chof.`);
+      autoMetaText = parts.join(' · ');
+    } else {
+      autoMetaText = `Historial · ${dayNavInfo.main} · ${allServices.length} ${allServices.length === 1 ? 'servicio' : 'servicios'} (${dayNavInfo.tipoLabel})`;
+    }
+  } else {
+    autoMetaText = lastLiveClock
       ? `En vivo (cada ${REFRESH_INTERVAL_SEC}s) · Act. ${lastLiveClock} · Historial ${retentionDays}d`
       : `En vivo · Actualización automática cada ${REFRESH_INTERVAL_SEC}s · Historial ${retentionDays}d`;
+  }
 
   const hoyCochesCount = allCoches.filter((c) => c.vistoHoy).length;
   const hoyChoferesCount = allChoferes.filter((d) => d.vistoHoy).length;
@@ -5985,7 +6402,44 @@ function renderLineFlotaView() {
   const learnedTypicalToday = Number(cap?.learnedTypicalToday) || 0;
 
   let crossCardHtml = '';
-  if ((sched && sched.totalServices > 0) || hoyCochesCount > 0 || learnedTypicalToday > 0) {
+  if (isHistoricalSrvDay && fv.tab === 'servicios') {
+    const histSched = activeSrvSchedSummary;
+    const histTotal = histSched?.totalServices || allServices.length || 0;
+    const histSchedVal =
+      histTotal > 0 ? `${histTotal} ${histTotal === 1 ? 'servicio' : 'servicios'}` : 'Sin horario fijo';
+    const histSchedSub =
+      histTotal > 0
+        ? histSched?.cortadosCount > 0
+          ? `${histSched.corridosCount} corridos · ${histSched.cortadosCount} cortados`
+          : `${histTotal === 1 ? 'Turno continuo' : 'Todos corridos'}${
+              histSched?.relevoEnLineaCount > 0 ? ` · ${histSched.relevoEnLineaCount} c/ relevo` : ''
+            }`
+        : `Diagrama ${dayNavInfo.tipoLabel}`;
+    const histObsVal = srvDayLoading
+      ? 'Cargando...'
+      : histTotalTurnos > 0
+        ? `${histCoveredTurnos}/${histTotalTurnos} turnos`
+        : `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'}`;
+    const histObsSub = srvDayLoading
+      ? 'Consultando registros del servidor'
+      : histCarsSet.size > 0 || histDriversSet.size > 0
+        ? `${histCarsSet.size} ${histCarsSet.size === 1 ? 'coche' : 'coches'} · ${histDriversSet.size} ${histDriversSet.size === 1 ? 'chofer' : 'choferes'} registrados`
+        : 'Sin observaciones guardadas ese día';
+    crossCardHtml = `
+      <div class="flota-cross-card" role="region" aria-label="Resumen histórico de servicios del día seleccionado">
+        <div class="flota-cross-cell">
+          <span class="flota-cross-label">Programado · ${escapeHtml(dayNavInfo.tipoLabel)}</span>
+          <span class="flota-cross-val">${escapeHtml(histSchedVal)}</span>
+          <span class="flota-cross-sub">${escapeHtml(histSchedSub)}</span>
+        </div>
+        <div class="flota-cross-cell">
+          <span class="flota-cross-label">Registrado · ${escapeHtml(dayNavInfo.shortBadge)}</span>
+          <span class="flota-cross-val">${escapeHtml(histObsVal)}</span>
+          <span class="flota-cross-sub">${escapeHtml(histObsSub)}</span>
+        </div>
+      </div>
+    `;
+  } else if ((sched && sched.totalServices > 0) || hoyCochesCount > 0 || learnedTypicalToday > 0) {
     const tipoKey = sched?.tipoDia || cap?.tipoDia || getArgentinaTodayTipo();
     const tipoLabel =
       tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : 'Lun–Vie';
@@ -7450,11 +7904,19 @@ function bindEvents() {
   el.arribosList.addEventListener('click', handleArribosListClick);
   el.horariosPanel.addEventListener('click', handleHorariosPanelClick);
 
-  el.btnThemeToggle.addEventListener('click', () => {
-    const cur = document.documentElement.getAttribute('data-theme');
-    const next = cur === 'dark' ? 'light' : 'dark';
-    applyTheme(next);
-    announce(next === 'light' ? 'Tema claro activado.' : 'Tema oscuro activado.');
+  el.btnThemeToggle.addEventListener('click', openThemeModal);
+  el.btnThemeClose?.addEventListener('click', closeThemeModal);
+  el.themeModal?.addEventListener('click', (e) => {
+    if (e.target === el.themeModal) closeThemeModal();
+  });
+  el.themeSwatches?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-theme-hex]');
+    if (!btn) return;
+    haptic('light');
+    applyTheme(btn.dataset.themeHex);
+  });
+  el.themeCustomColor?.addEventListener('input', (e) => {
+    applyTheme(e.target.value);
   });
 
   el.btnSoundToggle.addEventListener('click', () => {
@@ -7644,6 +8106,33 @@ function bindEvents() {
   });
 
   el.btnAllBuses?.addEventListener('click', () => toggleAllFleetMode());
+  el.btnAllBusesList?.addEventListener('click', () => toggleAllFleetRosterModal());
+  el.btnCloseAllFleetRoster?.addEventListener('click', closeAllFleetRosterModal);
+  el.allFleetRoster?.addEventListener('click', (e) => {
+    if (e.target === el.allFleetRoster) closeAllFleetRosterModal();
+  });
+  [el.btnRosterTabCoches, el.btnRosterTabChoferes].forEach((tabBtn) => {
+    tabBtn?.addEventListener('click', () => {
+      const nextTab = tabBtn.dataset.rosterTab === 'choferes' ? 'choferes' : 'coches';
+      if (state.allFleetRosterTab === nextTab) return;
+      state.allFleetRosterTab = nextTab;
+      haptic('light');
+      if (el.allFleetRosterBody) el.allFleetRosterBody.scrollTop = 0;
+      renderAllFleetRoster();
+    });
+  });
+  el.allFleetRosterFilter?.addEventListener('input', (e) => {
+    state.allFleetRosterQuery = e.target.value || '';
+    renderAllFleetRoster();
+  });
+  el.allFleetRosterBody?.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-roster-bus-key]');
+    if (!row) return;
+    const busKey = row.dataset.rosterBusKey;
+    if (!busKey) return;
+    closeAllFleetRosterModal();
+    openAllFleetBusInspector(busKey);
+  });
   el.btnMapLocate?.addEventListener('click', () => {
     haptic('light');
     locateUserGps();
@@ -7713,7 +8202,17 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (el.changelogModal && !el.changelogModal.classList.contains('hidden')) {
+    if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeThemeModal();
+        return;
+      }
+    } else if (el.allFleetRoster && !el.allFleetRoster.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeAllFleetRosterModal();
+        return;
+      }
+    } else if (el.changelogModal && !el.changelogModal.classList.contains('hidden')) {
       if (e.key === 'Escape') {
         closeChangelogModal();
         return;
@@ -7815,6 +8314,14 @@ function resumeRealtime() {
 
 // Layered back navigation (Escape / PWA history)
 async function handleNativeBack() {
+  if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
+    closeThemeModal();
+    return true;
+  }
+  if (el.allFleetRoster && !el.allFleetRoster.classList.contains('hidden')) {
+    closeAllFleetRosterModal();
+    return true;
+  }
   if (el.changelogModal && !el.changelogModal.classList.contains('hidden')) {
     closeChangelogModal();
     return true;
@@ -7898,7 +8405,7 @@ async function init() {
   const prefersLight =
     typeof window !== 'undefined' &&
     window.matchMedia?.('(prefers-color-scheme: light)').matches;
-  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || (prefersLight ? 'light' : 'dark');
+  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || (prefersLight ? '#ffffff' : '#10141c');
   applyTheme(savedTheme);
 
   const launchLink = await initNative({
@@ -7913,8 +8420,6 @@ async function init() {
       setTimeout(() => transitMap.invalidateSize(), 180);
     }
   });
-
-  setSystemBarsTheme(savedTheme);
 
   loadFavorites();
   bindEvents();

@@ -39,10 +39,9 @@
     <header class="top-bar" role="banner">
       <div class="top-bar-inner">
         <button type="button" id="btn-brand-home" class="brand-btn" title="Volver al inicio" aria-label="DIRECT GPS Corrientes, volver al inicio">
-          <span class="brand-mark" aria-hidden="true">
+          <span class="brand-mark brand-mark-gps" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true" focusable="false">
-              <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.6" opacity="0.35"/>
-              <path d="M12 4.5L17.2 17.5L12 14.6L6.8 17.5L12 4.5Z" fill="currentColor"/>
+              <path d="M12 3.6 L19.2 20 L12 16.1 L4.8 20 Z" fill="#ffffff"/>
             </svg>
           </span>
           <span class="brand-text" aria-hidden="true">
@@ -106,13 +105,13 @@
             </svg>
           </button>
 
-          <button type="button" id="btn-theme-toggle" class="icon-btn" title="Cambiar tema Oscuro / Claro" aria-label="Cambiar a tema claro">
-            <svg id="icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-              <circle cx="12" cy="12" r="4.5"/>
-              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
-            </svg>
-            <svg id="icon-moon" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          <button type="button" id="btn-theme-toggle" class="icon-btn" title="Color de fondo de la interfaz" aria-label="Elegir color de fondo de la interfaz">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/>
+              <circle cx="17.5" cy="10.5" r="1.2" fill="currentColor" stroke="none"/>
+              <circle cx="8.5" cy="7.5" r="1.2" fill="currentColor" stroke="none"/>
+              <circle cx="6.5" cy="12.5" r="1.2" fill="currentColor" stroke="none"/>
+              <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/>
             </svg>
           </button>
         </div>
@@ -335,6 +334,23 @@
         </svg>
         <span id="all-buses-count" class="map-ctrl-badge hidden">0</span>
       </button>
+      <button
+        type="button"
+        id="btn-all-buses-list"
+        class="map-ctrl-btn map-ctrl-fleet-list hidden"
+        aria-pressed="false"
+        title="Ver lista completa de coches y choferes en línea"
+        aria-label="Desplegar lista completa de coches y choferes en línea"
+      >
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <line x1="8" y1="6" x2="21" y2="6"/>
+          <line x1="8" y1="12" x2="21" y2="12"/>
+          <line x1="8" y1="18" x2="21" y2="18"/>
+          <circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/>
+          <circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/>
+          <circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
       <button type="button" id="btn-map-locate" class="map-ctrl-btn" title="Ir a mi ubicación GPS" aria-label="Buscar paradas en mi ubicación GPS">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
           <circle cx="12" cy="12" r="4"/>
@@ -360,6 +376,48 @@
 
     <!-- Full-Viewport Leaflet Map Canvas (aria-hidden so screen readers never get trapped in 40+ map pins; all data is exposed cleanly in the main panel above) -->
     <div id="map" class="map-canvas" aria-hidden="true"></div>
+
+    <!-- Optional Live All-Fleet Roster Modal (Modo Libre: Coches 0->9 / Choferes A->Z) -->
+    <div id="all-fleet-roster" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="all-fleet-roster-title">
+      <div class="modal-card fleet-roster-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="all-fleet-roster-title">En línea ahora</h2>
+            <p id="all-fleet-roster-sub" class="modal-sub">Actualización automática cada 10 s</p>
+          </div>
+          <button type="button" id="btn-close-all-fleet-roster" class="mini-close-btn" aria-label="Cerrar lista de flota en línea">✕</button>
+        </div>
+        <div class="flota-tabs-bar" role="tablist" aria-label="Elegir lista por coches o por choferes">
+          <button type="button" id="btn-roster-tab-coches" class="flota-tab-btn active" data-roster-tab="coches" role="tab" aria-selected="true">Coches (0→9)</button>
+          <button type="button" id="btn-roster-tab-choferes" class="flota-tab-btn" data-roster-tab="choferes" role="tab" aria-selected="false">Choferes (A–Z)</button>
+        </div>
+        <div class="fleet-roster-search-wrap">
+          <input id="all-fleet-roster-filter" type="search" class="modal-input fleet-roster-search" placeholder="Filtrar por coche, chofer o línea..." autocomplete="off" aria-label="Filtrar coches o choferes en línea" />
+        </div>
+        <div id="all-fleet-roster-body" class="fleet-roster-body"></div>
+      </div>
+    </div>
+
+    <!-- Free UI Background Color Picker Modal (AMOLED + Curated Colors + Custom Color) -->
+    <div id="theme-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="theme-modal-title">
+      <div class="modal-card theme-modal-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="theme-modal-title">Color de fondo</h2>
+            <p class="modal-sub">El texto se adapta automáticamente para máxima legibilidad</p>
+          </div>
+          <button type="button" id="btn-theme-close" class="mini-close-btn" aria-label="Cerrar selector de color">✕</button>
+        </div>
+        <div id="theme-swatches" class="theme-swatches" role="radiogroup" aria-label="Colores predefinidos de fondo"></div>
+        <div class="theme-custom-row">
+          <label for="theme-custom-color" class="theme-custom-label">
+            <span>Color libre personalizado</span>
+            <span id="theme-custom-hex" class="mono-meta">#10141C</span>
+          </label>
+          <input id="theme-custom-color" type="color" class="theme-color-input" value="#10141c" aria-label="Elegir cualquier color de fondo personalizado" />
+        </div>
+      </div>
+    </div>
 
     <!-- Clean Modal for Favorite Alias Editing -->
     <div id="alias-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="alias-modal-title" aria-describedby="alias-modal-sub">
