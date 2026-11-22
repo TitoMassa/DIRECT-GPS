@@ -913,8 +913,11 @@ export class FleetMemory {
   }
 
   _getRosterMetaSummary() {
+    const lastCronAt = Number(this._getMeta('last_cron_at', 0)) || null;
+    const lastLiveAt = Number(this._getMeta('last_live_at', 0)) || lastCronAt || null;
     return {
-      lastCronAt: Number(this._getMeta('last_cron_at', 0)) || null,
+      lastCronAt,
+      lastLiveAt,
       lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || null,
       totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0,
       lastBatchUnits: Number(this._getMeta('last_batch_units', 0)) || 0,
@@ -1155,53 +1158,57 @@ export class FleetMemory {
     }
 
     // Preserve daily per-(coche, driver) shift history for the 7-day Servicios timeline
-    const obsDriverKey = driver ? driver.key : '_car';
-    this.sql.exec(
-      `INSERT INTO fleet_daily_obs (
-        day_key, codigo_linea, coche, driver_key,
-        chofer_nombre, chofer_legajo, es_adaptado,
-        last_bandera, last_gps, last_stop_id,
-        last_lat, last_lng, last_desvio_sec, last_desvio_raw,
-        last_trip_key, last_service_num, last_turno_idx,
-        first_seen_at, last_seen_at, seen_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-      ON CONFLICT(day_key, codigo_linea, coche, driver_key) DO UPDATE SET
-        chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE fleet_daily_obs.chofer_nombre END,
-        chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE fleet_daily_obs.chofer_legajo END,
-        es_adaptado = MAX(fleet_daily_obs.es_adaptado, excluded.es_adaptado),
-        last_bandera = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_daily_obs.last_bandera END,
-        last_gps = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_daily_obs.last_gps END,
-        last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_daily_obs.last_stop_id END,
-        last_lat = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lat IS NOT NULL THEN excluded.last_lat ELSE COALESCE(fleet_daily_obs.last_lat, excluded.last_lat) END,
-        last_lng = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_daily_obs.last_lng, excluded.last_lng) END,
-        last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_daily_obs.last_desvio_sec END,
-        last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_daily_obs.last_desvio_raw END,
-        last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_daily_obs.last_trip_key END,
-        last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_daily_obs.last_service_num END,
-        last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_daily_obs.last_turno_idx END,
-        first_seen_at = MIN(fleet_daily_obs.first_seen_at, excluded.first_seen_at),
-        last_seen_at = MAX(fleet_daily_obs.last_seen_at, excluded.last_seen_at),
-        seen_count = fleet_daily_obs.seen_count + 1`,
-      effectiveDayKey,
-      cod,
-      coche,
-      obsDriverKey,
-      dNombre,
-      dLegajo,
-      esAdaptado,
-      bandera,
-      ultimaGps,
-      stopId,
-      lat,
-      lng,
-      desvioSec,
-      desvioRaw,
-      tripKey,
-      serviceNum,
-      turnoIdx,
-      obsMs,
-      obsMs
-    );
+    const obsDriverKey = String(driver?.driverKey || '_car');
+    try {
+      this.sql.exec(
+        `INSERT INTO fleet_daily_obs (
+          day_key, codigo_linea, coche, driver_key,
+          chofer_nombre, chofer_legajo, es_adaptado,
+          last_bandera, last_gps, last_stop_id,
+          last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+          last_trip_key, last_service_num, last_turno_idx,
+          first_seen_at, last_seen_at, seen_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(day_key, codigo_linea, coche, driver_key) DO UPDATE SET
+          chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE fleet_daily_obs.chofer_nombre END,
+          chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE fleet_daily_obs.chofer_legajo END,
+          es_adaptado = MAX(fleet_daily_obs.es_adaptado, excluded.es_adaptado),
+          last_bandera = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_daily_obs.last_bandera END,
+          last_gps = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_daily_obs.last_gps END,
+          last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_daily_obs.last_stop_id END,
+          last_lat = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lat IS NOT NULL THEN excluded.last_lat ELSE COALESCE(fleet_daily_obs.last_lat, excluded.last_lat) END,
+          last_lng = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_daily_obs.last_lng, excluded.last_lng) END,
+          last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_daily_obs.last_desvio_sec END,
+          last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_daily_obs.last_desvio_raw END,
+          last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_daily_obs.last_trip_key END,
+          last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_daily_obs.last_service_num END,
+          last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_daily_obs.last_turno_idx END,
+          first_seen_at = MIN(fleet_daily_obs.first_seen_at, excluded.first_seen_at),
+          last_seen_at = MAX(fleet_daily_obs.last_seen_at, excluded.last_seen_at),
+          seen_count = fleet_daily_obs.seen_count + 1`,
+        effectiveDayKey,
+        cod,
+        coche,
+        obsDriverKey,
+        dNombre,
+        dLegajo,
+        esAdaptado,
+        bandera,
+        ultimaGps,
+        stopId,
+        lat,
+        lng,
+        desvioSec,
+        desvioRaw,
+        tripKey,
+        serviceNum,
+        turnoIdx,
+        obsMs,
+        obsMs
+      );
+    } catch {
+      // Non-fatal: never abort batch roster/cron updates if daily history write fails
+    }
   }
 
   /**
@@ -1613,6 +1620,7 @@ export class FleetMemory {
           this._setMeta('scan_cursor', body.nextCursor);
         }
         this._setMeta('last_cron_at', nowMs);
+        this._setMeta('last_live_at', nowMs);
         this._setMeta('last_batch_units', count);
         if (body.cycleCompleted) {
           this._setMeta('last_cycle_at', nowMs);
@@ -2087,8 +2095,49 @@ export class FleetMemory {
       let count = 0;
       for (const u of units) {
         const cod = Number(u.codigoLinea);
-        const coche = String(u.coche || '').trim();
-        if (!cod || !coche) continue;
+        const coche = String(u.coche || u.identificadorCoche || '').trim();
+        if (!cod || !coche || REMOVED_LINE_CODES.has(cod)) continue;
+        const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
+        const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
+        const ultimaGps = String(u.ultimaGps || '').trim();
+        const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
+        this.sql.exec(
+          `INSERT INTO unit_last_seen (
+            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+          ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+            day_key = excluded.day_key,
+            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+            es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
+            desvio_sec = excluded.desvio_sec,
+            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+            lat = COALESCE(excluded.lat, unit_last_seen.lat),
+            lng = COALESCE(excluded.lng, unit_last_seen.lng),
+            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+            updated_at = excluded.updated_at`,
+          cod,
+          coche,
+          todayKey,
+          String(u.choferNombre || '').trim(),
+          String(u.choferLegajo || '').trim(),
+          String(u.choferRaw || '').trim(),
+          u.esAdaptado ? 1 : 0,
+          Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+          String(u.desvioRaw || '').trim(),
+          String(u.bandera || '').trim(),
+          ultimaGps,
+          lat,
+          lng,
+          String(u.stopId || '').trim().toUpperCase(),
+          mergedTrail,
+          nowMs
+        );
         this._upsertRosterUnit(u, nowMs);
         touchedLines.add(cod);
         count++;
@@ -2096,7 +2145,8 @@ export class FleetMemory {
       if (touchedLines.size > 0) {
         this._updateLiveCapacity(nowMs, todayKey, Array.from(touchedLines));
       }
-      return Response.json({ ok: true, count });
+      this._setMeta('last_live_at', nowMs);
+      return Response.json({ ok: true, count, lastLiveAt: nowMs });
     }
 
     if (request.method === 'GET' && url.pathname === '/flota-buscar') {
@@ -2850,7 +2900,7 @@ const LIVE_CITY_HUB_STOPS = [
   'CT31368', 'CT31610', 'CT31831', 'L9041027',
   'L9041046', 'CH469', 'CH1018', 'CH115'
 ];
-const LIVE_CITY_SWEEP_TTL_MS = 10 * 1000;
+const LIVE_CITY_SWEEP_TTL_MS = 8500;
 let liveCitySweepCache = { ts: 0, units: [] };
 let liveCitySweepInFlight = null;
 
@@ -2937,6 +2987,102 @@ export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchSto
   }
 }
 
+const LINE_LIVE_SWEEP_TTL_MS = 8500;
+const lineLiveSweepCache = new Map();
+const lineLiveSweepInFlight = new Map();
+
+/**
+ * Fast live SOAP probe for a single line's strategic targets (2–4 stops in parallel).
+ * Throttled per line to ~8.5s so 10-second auto-refresh across all clients gets real-time
+ * GPS, driver, bandera & desvío updates directly from SmartMovePro and persists them to DO SQLite.
+ */
+export async function runLiveLineSweep(env, codLinea, nowMs = Date.now(), fetchStopFn = fetchOneStop) {
+  const cod = Number(codLinea);
+  if (!cod || REMOVED_LINE_CODES.has(cod)) return [];
+  const cached = lineLiveSweepCache.get(cod);
+  if (cached && nowMs - cached.ts < LINE_LIVE_SWEEP_TTL_MS) {
+    return cached.units;
+  }
+  if (lineLiveSweepInFlight.has(cod)) {
+    return lineLiveSweepInFlight.get(cod);
+  }
+
+  const targets = FLEET_SCAN_TARGETS.filter(([c]) => c === cod).map(([, stopId]) => stopId);
+  if (targets.length === 0) return [];
+
+  const job = (async () => {
+    const byUnit = new Map();
+    const resList = await Promise.all(
+      targets.map((stopId) =>
+        fetchStopFn(stopId, String(cod))
+          .then((r) => ({ ok: true, stopId, arribos: r?.arribos || [] }))
+          .catch(() => ({ ok: false, stopId, arribos: [] }))
+      )
+    );
+
+    for (const r of resList) {
+      for (const a of r.arribos) {
+        const aCod = Number(a.codigoLinea);
+        const coche = String(a.identificadorCoche || '').trim();
+        if (!aCod || !coche || REMOVED_LINE_CODES.has(aCod)) continue;
+        const key = `${aCod}:${coche}`;
+        const gpsMs = parseGpsStampMs(a.ultimaFechaHoraGPS);
+        const prev = byUnit.get(key);
+        const hasChofer = Boolean(String(a.choferNombre || a.choferLegajo || a.identificadorChofer || '').trim());
+        const prevHasChofer = Boolean(prev && (prev.choferNombre || prev.choferLegajo || prev.choferRaw));
+        if (!prev || gpsMs > prev._gpsMs || (gpsMs === prev._gpsMs && hasChofer && !prevHasChofer)) {
+          const lat = parseFloat(a.latitud);
+          const lng = parseFloat(a.longitud);
+          byUnit.set(key, {
+            codigoLinea: aCod,
+            descripcionLinea: canonicalLineName(aCod, a.descripcionLinea),
+            coche,
+            choferNombre: a.choferNombre || prev?.choferNombre || '',
+            choferLegajo: a.choferLegajo || prev?.choferLegajo || '',
+            choferRaw: a.identificadorChofer || prev?.choferRaw || '',
+            esAdaptado: Boolean(a.esAdaptado || prev?.esAdaptado),
+            desvioSec: parseDesvioSeconds(a.desvioHorario),
+            desvioRaw: a.desvioHorario || prev?.desvioRaw || '',
+            bandera: a.descripcionBandera || prev?.bandera || '',
+            ultimaGps: a.ultimaFechaHoraGPS || prev?.ultimaGps || '',
+            lat: !Number.isNaN(lat) && lat !== 0 ? lat : prev?.lat ?? null,
+            lng: !Number.isNaN(lng) && lng !== 0 ? lng : prev?.lng ?? null,
+            stopId: r.stopId,
+            _gpsMs: gpsMs || 0
+          });
+        }
+      }
+    }
+
+    const doneMs = Date.now();
+    const units = Array.from(byUnit.values()).map(({ _gpsMs, ...clean }) => clean);
+    lineLiveSweepCache.set(cod, { ts: doneMs, units });
+    for (const u of units) upsertFallbackRosterUnit(u, doneMs);
+    fallbackRosterMeta.lastLiveAt = doneMs;
+
+    const stub = getFleetStub(env);
+    if (stub) {
+      try {
+        await stub.fetch('https://fleet-memory/live-city-ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units })
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+    return units;
+  })();
+
+  lineLiveSweepInFlight.set(cod, job);
+  try {
+    return await job;
+  } finally {
+    lineLiveSweepInFlight.delete(cod);
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
@@ -2950,7 +3096,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.1',
+          version: '2.2',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {
@@ -2964,6 +3110,14 @@ export default {
       }
 
       if (pathname === '/api/flota-resumen' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const wantLive = searchParams.get('live') === '1';
+        if (wantLive) {
+          await Promise.race([
+            runLiveCityHubSweep(env, ctx, nowMs).catch(() => []),
+            new Promise((r) => setTimeout(r, 1800))
+          ]);
+        }
         const stub = getFleetStub(env);
         if (stub) {
           try {
@@ -2974,7 +3128,6 @@ export default {
             // Fall through to in-memory fallback
           }
         }
-        const nowMs = Date.now();
         const todayKey = getArgentinaDayKey(nowMs);
         const minTs = nowMs - ROSTER_RETENTION_MS;
         const byLine = new Map();
@@ -3029,7 +3182,19 @@ export default {
       if (pathname === '/api/flota' && request.method === 'GET') {
         const codLinea = Number(searchParams.get('codLinea'));
         if (!codLinea) return jsonResponse({ error: 'Falta codLinea' }, 400);
+        const nowMs = Date.now();
+        const todayKey = getArgentinaDayKey(nowMs);
         const dayKeyParam = String(searchParams.get('dayKey') || '').trim();
+        const isTodayQuery = !dayKeyParam || dayKeyParam === todayKey;
+        const wantLive = searchParams.get('live') !== '0' && isTodayQuery;
+
+        if (wantLive) {
+          await Promise.race([
+            runLiveLineSweep(env, codLinea, nowMs).catch(() => []),
+            new Promise((r) => setTimeout(r, 2800))
+          ]);
+        }
+
         const stub = getFleetStub(env);
         if (stub) {
           try {
@@ -3043,8 +3208,6 @@ export default {
             // Fall through to in-memory fallback
           }
         }
-        const nowMs = Date.now();
-        const todayKey = getArgentinaDayKey(nowMs);
         const minTs = nowMs - ROSTER_RETENTION_MS;
         const coches = Array.from(fallbackRosterCars.values())
           .filter((c) => c.codigoLinea === codLinea && c.lastSeenAt >= minTs)

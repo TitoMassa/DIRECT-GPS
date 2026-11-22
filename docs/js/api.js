@@ -706,15 +706,16 @@ export const api = {
     }
   },
 
-  // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite, never locally cached) ──
-  flotaResumen: () => apiGet('/api/flota-resumen', null, 7000),
+  // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite + live 10s SOAP) ──
+  flotaResumen: ({ live = true } = {}) =>
+    apiGet(`/api/flota-resumen${live ? '?live=1' : ''}`, null, 9000),
 
-  flotaLinea: (codLinea, dayKey = '') =>
-    apiGet(
-      `/api/flota?codLinea=${encodeURIComponent(codLinea)}${dayKey ? `&dayKey=${encodeURIComponent(dayKey)}` : ''}`,
-      null,
-      7000
-    ),
+  flotaLinea: (codLinea, dayKey = '', { live = true } = {}) => {
+    const params = [`codLinea=${encodeURIComponent(codLinea)}`];
+    if (dayKey) params.push(`dayKey=${encodeURIComponent(dayKey)}`);
+    params.push(live && !dayKey ? 'live=1' : 'live=0');
+    return apiGet(`/api/flota?${params.join('&')}`, null, 9000);
+  },
 
   flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000),
 

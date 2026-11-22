@@ -128,6 +128,7 @@ const state = {
   flotaSummaryByLine: new Map(), // codLinea -> { cochesHoy, cochesSemana, choferesHoy, choferesSemana, lastSeenAt }
   flotaSummaryMeta: null,
   flotaSummaryLastFetchMs: 0,
+  flotaCountdownSec: REFRESH_INTERVAL_SEC,
   flotaView: {
     tab: 'coches', // 'coches' | 'choferes' | 'servicios'
     scope: 'semana', // 'semana' | 'hoy'
@@ -136,6 +137,7 @@ const state = {
     model: null, // Full LineScheduleModel for resolving per-unit service/turno/vuelta
     serviceDayOffset: 0, // 0 = hoy, 1 = ayer, ..., 6 = 6 días atrás
     serviceDayCache: new Map(), // dayKey -> { dayTrips, dayObs, schedSummary, model, loading, error }
+    lastSyncAt: null,
     loading: false,
     error: null
   },
@@ -196,7 +198,6 @@ const el = {
   stopTitle: document.getElementById('stop-title'),
   stopCoordsLabel: document.getElementById('stop-coords-label'),
   lastSyncLabel: document.getElementById('last-sync-label'),
-  btnRefreshStop: document.getElementById('btn-refresh-stop'),
   btnToggleFav: document.getElementById('btn-toggle-fav'),
   btnShareStop: document.getElementById('btn-share-stop'),
   btnShowRoutes: document.getElementById('btn-show-routes'),
@@ -266,6 +267,15 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.4',
+    date: '22/11/2026 · 07:45 hs',
+    items: [
+      '<strong>Actualización automática cada 10 segundos en toda la app:</strong> se estandarizó el refresco automático en vivo cada <strong>10 s</strong> en todas las vistas (Paradas, Modo libre, Seguimiento de unidad, listado de Líneas y Flota de cada línea: Coches, Choferes y Servicios), con sondeo directo en tiempo real contra SmartMovePro.',
+      '<strong>Sin botones manuales de actualizar:</strong> se eliminaron todos los botones de actualización manual de la interfaz al quedar automatizada toda la aplicación cada 10 segundos.',
+      '<strong>Corrección del registro automático en el servidor:</strong> se reparó el error que había detenido el escaneo automático y el guardado diario del historial a las 05:15 hs.'
+    ]
+  },
   {
     version: 'v2.4.3',
     date: '22/11/2026 · 06:44 hs',
@@ -2732,14 +2742,14 @@ function toggleAllFleetMode(forceState = null) {
     if (!state.isAppPaused && state.allFleetMode) {
       refreshAllFleetBuses({ fit: false, silent: true });
     }
-  }, 12000);
+  }, REFRESH_INTERVAL_SEC * 1000);
 }
 
 /**
  * Free-form Map Locator: shows ANY car or driver directly on the map WITHOUT needing to pick a stop!
  * Draws the line's full route polylines + stops, places the unit marker immediately, opens the live
  * telemetry inspector (service, current lap, start-end schedule, driver, car), and keeps refreshing
- * live GPS via Corridor Radar every 12s while tracking.
+ * live GPS via Corridor Radar every 10s while tracking.
  */
 let trackedUnitSeq = 0;
 async function locateFleetUnitOnMap({
@@ -3044,7 +3054,7 @@ async function locateFleetUnitOnMap({
   if (state.trackedUnit && state.trackedUnit.seq === mySeq) {
     state.trackedUnit.timerId = setInterval(() => {
       if (!state.isAppPaused) refreshTrackedLive(false);
-    }, 12000);
+    }, REFRESH_INTERVAL_SEC * 1000);
   }
 }
 
@@ -4604,6 +4614,13 @@ function formatRosterClockArt(tsMs) {
   return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
+function formatRosterClockArtWithSec(tsMs) {
+  if (!tsMs || !Number.isFinite(Number(tsMs))) return '';
+  const d = new Date(Number(tsMs) - 3 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
 function formatRosterSeenInfo(tsMs, lastDayKey, todayDayKey) {
   const clock = formatRosterClockArt(tsMs);
   if (lastDayKey && todayDayKey && lastDayKey === todayDayKey) {
@@ -4650,10 +4667,10 @@ let flotaResumenInFlight = false;
 async function loadFlotaResumen(force = false) {
   if (flotaResumenInFlight || state.isOffline) return;
   const now = Date.now();
-  if (!force && now - state.flotaSummaryLastFetchMs < 45000) return;
+  if (!force && now - state.flotaSummaryLastFetchMs < 9000) return;
   flotaResumenInFlight = true;
   try {
-    const res = await api.flotaResumen();
+    const res = await api.flotaResumen({ live: true });
     const data = res?.data;
     if (data && Array.isArray(data.lineas)) {
       const nextMap = new Map();
@@ -4664,7 +4681,9 @@ async function loadFlotaResumen(force = false) {
       state.flotaSummaryMeta = data.meta || null;
       state.flotaSummaryLastFetchMs = Date.now();
       if (state.drill.step === 'lineas') {
+        const prevScroll = el.lineasContent.scrollTop;
         renderDrilldown();
+        el.lineasContent.scrollTop = prevScroll;
       }
     }
   } catch {
@@ -5593,10 +5612,17 @@ function renderLineFlotaView() {
     : allServices;
   const dayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
 
-  const lastScanClock = formatRosterClockArt(meta.lastCronAt || meta.lastCycleAt);
-  const autoMetaText = lastScanClock
-    ? `Sistema · Act. auto ${lastScanClock} · Renovación ${retentionDays}d`
-    : `Sistema · Escaneo automático cada ${meta.scanIntervalMin || 5} min · Renovación ${retentionDays}d`;
+  const freshLiveTs = Math.max(
+    Number(meta.lastLiveAt) || 0,
+    Number(meta.lastCronAt) || 0,
+    Number(fv.lastSyncAt) || 0
+  );
+  const lastLiveClock = formatRosterClockArtWithSec(freshLiveTs);
+  const autoMetaText = isHistoricalSrvDay && fv.tab === 'servicios'
+    ? `Historial ${dayNavInfo.shortLabel} · Retención ${retentionDays}d`
+    : lastLiveClock
+      ? `En vivo (cada ${REFRESH_INTERVAL_SEC}s) · Act. ${lastLiveClock} · Historial ${retentionDays}d`
+      : `En vivo · Actualización automática cada ${REFRESH_INTERVAL_SEC}s · Historial ${retentionDays}d`;
 
   const hoyCochesCount = allCoches.filter((c) => c.vistoHoy).length;
   const hoyChoferesCount = allChoferes.filter((d) => d.vistoHoy).length;
@@ -6079,12 +6105,6 @@ function renderLineFlotaView() {
           </div>
           <span class="flota-system-meta">${escapeHtml(autoMetaText)}</span>
         </div>
-        <button type="button" id="btn-flota-refresh" class="mini-action-btn" title="Actualizar lista desde el servidor" aria-label="Actualizar lista de coches y choferes de línea ${escapeHtml(linea.descripcion)} desde el servidor">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
-            <polyline points="21 3 21 9 15 9"/>
-          </svg>
-        </button>
       </div>
 
       ${crossCardHtml}
@@ -6100,16 +6120,6 @@ function renderLineFlotaView() {
       ${listHtml}
     </div>
   `;
-
-  document.getElementById('btn-flota-refresh')?.addEventListener('click', () => {
-    haptic('light');
-    if (fv.tab === 'servicios' && fv.serviceDayOffset > 0) {
-      fv.serviceDayCache?.delete(selectedServiceDayKey);
-      loadServiceHistoryDay(linea, fv.serviceDayOffset, { force: true });
-    } else {
-      openLineFlota(linea, { force: true, announceLoad: true });
-    }
-  });
 
   document.getElementById('btn-srv-prev-day')?.addEventListener('click', () => {
     if (serviceDayOffset >= maxDayOffset) return;
@@ -6285,6 +6295,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
   el.lineasFilterInput.value = '';
   const sameLine = state.drill.step === 'flota' && state.drill.linea?.codigo === linea.codigo;
   state.drill = { step: 'flota', linea, calle: null, interseccion: null, items: [] };
+  state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
   if (!sameLine) {
     state.flotaView = {
       tab: initialTab || 'coches',
@@ -6294,6 +6305,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
       model: null,
       serviceDayOffset: 0,
       serviceDayCache: new Map(),
+      lastSyncAt: null,
       loading: true,
       error: null
     };
@@ -6310,7 +6322,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
 
   try {
     const [res, schedSummary] = await Promise.all([
-      api.flotaLinea(linea.codigo),
+      api.flotaLinea(linea.codigo, '', { live: true }),
       computeLineScheduledFleetSummary(linea.codigo)
     ]);
     const data = res?.data;
@@ -6318,8 +6330,10 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 7, meta: {} };
     state.flotaView.schedSummary = schedSummary;
     state.flotaView.model = schedSummary?._model || null;
+    state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
     state.flotaView.loading = false;
     state.flotaView.error = null;
+    state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
 
     // Keep summary badge in sync with freshly fetched line roster + live capacity
     if (data) {
@@ -6370,6 +6384,52 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
       : err.message || 'No se pudo conectar con el servidor.';
     renderLineFlotaView();
     announce(state.flotaView.error);
+  }
+}
+
+let flotaSilentRefreshInFlight = false;
+async function refreshActiveLineFlotaSilent() {
+  if (flotaSilentRefreshInFlight || state.isOffline || state.isAppPaused) return;
+  if (getActiveTab() !== 'lineas' || state.drill.step !== 'flota' || !state.drill.linea) return;
+  const fv = state.flotaView;
+  if (fv.loading) return;
+  // Don't overwrite historical day view in Servicios; keep live 10s polling on Hoy & Coches/Choferes
+  if (fv.tab === 'servicios' && Number(fv.serviceDayOffset) > 0) return;
+
+  const linea = state.drill.linea;
+  flotaSilentRefreshInFlight = true;
+  try {
+    const res = await api.flotaLinea(linea.codigo, '', { live: true });
+    const data = res?.data;
+    if (!data) return;
+    if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+    state.flotaView.data = data;
+    state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
+    state.flotaView.error = null;
+
+    const cHoy = (data.coches || []).filter((c) => c.vistoHoy).length;
+    const cap = data.capacity || null;
+    state.flotaSummaryByLine.set(Number(linea.codigo), {
+      codigoLinea: Number(linea.codigo),
+      descripcionLinea: data.descripcionLinea || linea.descripcion,
+      cochesHoy: cHoy,
+      cochesSemana: (data.coches || []).length,
+      choferesHoy: (data.choferes || []).filter((d) => d.vistoHoy).length,
+      choferesSemana: (data.choferes || []).length,
+      activeNow: cap?.activeNow || 0,
+      peakSimultaneousToday: cap?.peakSimultaneousToday || cHoy,
+      replacementSwapsToday: cap?.replacementSwapsToday || 0,
+      learnedTypicalToday: cap?.learnedTypicalToday || 0,
+      lastSeenAt: Date.now()
+    });
+
+    const prevScroll = el.lineasContent.scrollTop;
+    renderLineFlotaView();
+    el.lineasContent.scrollTop = prevScroll;
+  } catch {
+    // Non-fatal: next 10s tick will retry silently
+  } finally {
+    flotaSilentRefreshInFlight = false;
   }
 }
 
@@ -7470,18 +7530,6 @@ function bindEvents() {
     }
   });
 
-  el.btnRefreshStop?.addEventListener('click', async () => {
-    if (!state.activeStop) return;
-    haptic('light');
-    state.countdownSec = REFRESH_INTERVAL_SEC;
-    el.btnRefreshStop.classList.add('is-spinning');
-    try {
-      await fetchArribos(false, { announceSummary: true, isRefresh: true });
-    } finally {
-      el.btnRefreshStop.classList.remove('is-spinning');
-    }
-  });
-
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
   el.btnShareStop.addEventListener('click', async () => {
     if (!state.activeStop) return;
@@ -7758,6 +7806,11 @@ function resumeRealtime() {
     if (wasPaused) refreshAllFleetBuses({ fit: false, silent: true });
     if (state.simulateMode && state.allFleetBuses.length > 0) startSimLoop();
   }
+  if (wasPaused && getActiveTab() === 'lineas') {
+    state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
+    if (state.drill.step === 'flota') refreshActiveLineFlotaSilent();
+    else if (state.drill.step === 'lineas') loadFlotaResumen(true);
+  }
 }
 
 // Layered back navigation (Escape / PWA history)
@@ -7906,12 +7959,26 @@ async function init() {
   });
 
   setInterval(() => {
-    if (!state.activeStop || state.isAppPaused) return;
+    if (state.isAppPaused) return;
 
-    state.countdownSec -= 1;
-    if (state.countdownSec <= 0) {
-      state.countdownSec = REFRESH_INTERVAL_SEC;
-      fetchArribos(false);
+    if (state.activeStop) {
+      state.countdownSec -= 1;
+      if (state.countdownSec <= 0) {
+        state.countdownSec = REFRESH_INTERVAL_SEC;
+        fetchArribos(false);
+      }
+    }
+
+    if (getActiveTab() === 'lineas' && (state.drill.step === 'flota' || state.drill.step === 'lineas')) {
+      state.flotaCountdownSec -= 1;
+      if (state.flotaCountdownSec <= 0) {
+        state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
+        if (state.drill.step === 'flota') {
+          refreshActiveLineFlotaSilent();
+        } else if (state.drill.step === 'lineas') {
+          loadFlotaResumen(false);
+        }
+      }
     }
   }, 1000);
 }
