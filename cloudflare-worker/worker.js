@@ -3035,7 +3035,7 @@ export async function runLiveLineSweep(env, codLinea, nowMs = Date.now(), fetchS
           const lng = parseFloat(a.longitud);
           byUnit.set(key, {
             codigoLinea: aCod,
-            descripcionLinea: canonicalLineName(aCod, a.descripcionLinea),
+            descripcionLinea: resolvePublicLineName(aCod, a.descripcionLinea),
             coche,
             choferNombre: a.choferNombre || prev?.choferNombre || '',
             choferLegajo: a.choferLegajo || prev?.choferLegajo || '',
