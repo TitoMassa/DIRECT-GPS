@@ -894,8 +894,16 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       const directImplausiblySlow = etaMin >= 7 && directDist < etaMin * 105;
       const indirectMatchesBetter = Math.abs(bestIndirectEst - etaMin) + 3 < Math.abs(estDirectMin - etaMin);
 
+      // On divided avenues (e.g. Av. Pedro Ferré, 3 de Abril, Independencia) or parallel one-way streets,
+      // a bus clearly snapped to the opposite carriageway (`perp <= 30m` and >= 12m closer than stopBranch)
+      // is physically driving the opposite BANDERA regardless of distance to the queried stop!
       const physicallyOnOppLane =
-        bestIndirect === 'previous_leg' && busOnOpp.perp + 18 < busOnStop.perp && etaMin >= 6 && directDist < 1400;
+        bestIndirect === 'previous_leg' &&
+        busOnOpp &&
+        busOnStop &&
+        busOnOpp.perp <= 30 &&
+        busOnOpp.perp + 12 < busOnStop.perp &&
+        etaMin >= 5;
 
       if ((directImplausiblySlow && indirectMatchesBetter) || physicallyOnOppLane) {
         leg = bestIndirect;

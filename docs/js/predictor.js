@@ -2343,9 +2343,12 @@ function scoreCorridorPeerAgainstService(
       }
     }
 
+    // Physical carriageway distance matters far more than SmartMovePro's queried-stop bandera label!
+    d += proj.perp * 1.1;
+
     const nb = normalizeBandera(tr.branch.bandera);
-    if (uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) {
-      d += 40;
+    if (!trailDir?.branch && uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) {
+      d += 10;
     }
 
     if (d < bestRaw) {
@@ -3539,7 +3542,7 @@ export function predictLineBusesForStop({
  *  2) Direct server-persisted service metadata (`lastServiceNum`, `lastTurnoStart`, `lastTurnoEnd`),
  *  3) Spatial-temporal projection against `model` using `(lat, lng, bandera, ultimaGps, desvioSec)`.
  */
-export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfDay()) {
+export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfDay(), gpsHistoryByUnit = null) {
   if (!unit) return null;
 
   const packTrip = (trip) => {
@@ -3608,6 +3611,29 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
     const safeDesvioSec = Math.abs(rawDesvioSec) <= 40 * 60 ? rawDesvioSec : 0;
     const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
 
+    // Resolve multi-point GPS trail direction if available
+    const coche = String(unit.coche || unit.identificadorCoche || '').trim();
+    const unitHist =
+      hasCoords && coche && gpsHistoryByUnit
+        ? gpsHistoryByUnit.get(`${model.codLinea}-c${coche}`) || gpsHistoryByUnit.get(`${model.codLinea}:${coche}`) || null
+        : null;
+    const trailDir = unitHist
+      ? resolveTrailDirection(unitHist, model.branches, { currentFix: { lat: uLat, lng: uLng, ts: Date.now() } })
+      : null;
+
+    // Precompute perpendicular distance on each branch to detect divided avenues & parallel one-way streets
+    const branchProjs = new Map();
+    let minPerp = Infinity;
+    if (hasCoords) {
+      for (const b of model.branches) {
+        const p = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+        if (p && p.perp <= 450) {
+          branchProjs.set(b, p);
+          if (p.perp < minPerp) minPerp = p.perp;
+        }
+      }
+    }
+
     const findBestSpatialTrip = (evalClockSec) => {
       let bestTrip = null;
       let bestScore = Infinity;
@@ -3617,18 +3643,29 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
         if (!trips.length) continue;
         let proj = null;
         if (hasCoords) {
-          proj = projectOnPolyline(b.pts, b.cum, uLat, uLng);
-          if (!proj || proj.perp > 450) continue;
+          proj = branchProjs.get(b) || null;
+          if (!proj) continue;
         }
         const bNorm = normalizeBandera(b.bandera || '');
         const banderaMatch =
           uNormBandera && bNorm && (bNorm.includes(uNormBandera) || uNormBandera.includes(bNorm));
         const nearTerminal = proj
-          ? proj.along <= 600 || Math.max(0, (b.totalLen || 0) - proj.along) <= 600
+          ? proj.along <= 350 || Math.max(0, (b.totalLen || 0) - proj.along) <= 350
           : false;
-        // Near terminals, SmartMovePro often labels a finishing bus with the next outbound bandera
-        const banderaPenalty = uNormBandera && !banderaMatch ? (nearTerminal ? 40 : 180) : 0;
-        const distPenalty = proj ? proj.perp * 0.45 : 0;
+
+        // SmartMovePro's `descripcionBandera` reflects the QUERIED STOP, not the bus's physical direction!
+        // Never let a queried-stop label override actual GPS trail or physical carriageway geometry.
+        let dirPenalty = 0;
+        if (trailDir?.branch) {
+          if (trailDir.branch === b) dirPenalty -= 60;
+          else if (!nearTerminal) dirPenalty += 10 * 60;
+        } else if (proj && minPerp <= 35 && proj.perp >= minPerp + 12 && !nearTerminal) {
+          // Divided avenue (e.g. Av. Pedro Ferré, 3 de Abril) or parallel one-way street: penalize wrong lane
+          dirPenalty += 240;
+        } else if (uNormBandera && !banderaMatch) {
+          dirPenalty += 10;
+        }
+        const distPenalty = proj ? proj.perp * 1.2 : 0;
 
         for (const tr of trips) {
           if (evalClockSec < tr.startSec - 20 * 60 || evalClockSec > tr.endSec + 25 * 60) continue;
@@ -3641,7 +3678,7 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
           if (schedSec === null) continue;
           const timeErr = Math.abs(evalClockSec - schedSec);
           if (timeErr > 28 * 60) continue;
-          const score = timeErr + banderaPenalty + distPenalty;
+          const score = Math.max(0, timeErr + dirPenalty + distPenalty);
           if (score < bestScore) {
             bestScore = score;
             bestTrip = tr;

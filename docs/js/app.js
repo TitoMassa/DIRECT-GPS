@@ -265,6 +265,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.1',
+    date: '21/11/2026 · 21:12 hs',
+    items: [
+      '<strong>BANDERA real del colectivo en todas las líneas y vistas:</strong> se corrigió el cálculo de sentido en seguimiento de flota (Líneas → Mapa), Modo libre, lista de coches/choferes y modo parada para mostrar siempre la <strong>BANDERA actual</strong> en la que circula el colectivo (por vector GPS, carril/mano física y horario) en lugar de la bandera de la parada consultada, junto con movimiento fluido en <strong>EN VIVO</strong> al seguir unidades desde Flota.'
+    ]
+  },
+  {
     version: 'v2.4 · PWA',
     date: '21/11/2026 · 20:25 hs',
     items: [
@@ -1301,15 +1308,16 @@ function startSimLoop() {
   simLastDomMs = simLastFrameMs;
 
   const frame = (now) => {
-    const hasStopWork = Boolean(state.activeStop && state.arribos.length > 0);
+    const hasStopWork = Boolean(state.activeStop && state.arribos.length > 0 && !state.trackedUnit);
     const hasCityWork = Boolean(state.allFleetMode && state.allFleetBuses.length > 0);
-    if (!state.simulateMode || (!state.activeStop && !state.allFleetMode)) {
+    const hasTrackedWork = Boolean(state.trackedUnit?.buses?.length > 0);
+    if (!state.simulateMode || (!state.activeStop && !state.allFleetMode && !hasTrackedWork)) {
       simRafId = null;
       return;
     }
     const elapsedMs = now - simLastFrameMs;
     // Target ~20fps (50ms interval) for silky motion with minimal mobile CPU/battery
-    if (elapsedMs >= 50 && (hasStopWork || hasCityWork)) {
+    if (elapsedMs >= 50 && (hasStopWork || hasCityWork || hasTrackedWork)) {
       const dtSec = Math.min(0.15, elapsedMs / 1000);
       simLastFrameMs = now;
 
@@ -1320,8 +1328,14 @@ function startSimLoop() {
           transitMap.moveBusPositionsFast(state.arribos);
         }
       }
+      if (hasTrackedWork) {
+        stepCityFleetSim(dtSec, state.trackedUnit.buses);
+        if (!transitMap.isInteracting) {
+          transitMap.moveBusPositionsFast(state.trackedUnit.buses);
+        }
+      }
       if (hasCityWork) {
-        stepCityFleetSim(dtSec);
+        stepCityFleetSim(dtSec, state.allFleetBuses);
         if (!transitMap.isInteracting) {
           transitMap.moveAllFleetPositionsFast(state.allFleetBuses);
         }
@@ -2094,6 +2108,9 @@ function stopTrackedUnit() {
     clearInterval(state.trackedUnit.timerId);
   }
   state.trackedUnit = null;
+  for (const k of cityFleetSim.keys()) {
+    if (k.startsWith('track:')) cityFleetSim.delete(k);
+  }
 }
 
 function closeBusInspector() {
@@ -2206,7 +2223,7 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
   if (prevFix && typeof prevFix.lat === 'number' && typeof prevFix.lng === 'number') {
     const dtPrev = gpsMs && prevFix.gpsMs ? (gpsMs - prevFix.gpsMs) / 1000 : 30;
     const moved = distanceMeters(prevFix.lat, prevFix.lng, lat, lng) ?? 0;
-    if (dtPrev >= 4 && dtPrev <= 240 && moved >= 25 && moved <= Math.max(2500, dtPrev * 32)) {
+    if (dtPrev >= 4 && dtPrev <= 240 && moved >= 22 && moved <= Math.max(2500, dtPrev * 32)) {
       let bestFwd = null;
       let bestFwdScore = Infinity;
       for (const b of branches) {
@@ -2215,7 +2232,7 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
         const pPrev = projectOnPolyline(b.pts, b.cum, prevFix.lat, prevFix.lng);
         if (!pPrev || pPrev.perp > 260) continue;
         const deltaAlong = pCur.along - pPrev.along;
-        if (deltaAlong >= Math.max(12, moved * 0.35)) {
+        if (deltaAlong >= Math.max(10, moved * 0.35)) {
           const score = pCur.perp + pPrev.perp * 0.5 - Math.min(80, deltaAlong * 0.15);
           if (score < bestFwdScore) {
             bestFwdScore = score;
@@ -2235,39 +2252,41 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
     if (cp && cp.perp <= 260) return { branch: cb, proj: cp, dirSource: 'trail', ambiguous: false };
   }
 
-  // Layer 3: Matched schedule trip branch (knows exact BANDERA for this time & service)
+  // Precompute pure geometric projections (NEVER biased by SmartMovePro's queried-stop descripcionBandera!)
+  const projs = [];
+  for (const b of branches) {
+    const proj = projectOnPolyline(b.pts, b.cum, lat, lng);
+    if (proj && proj.perp <= 340) {
+      projs.push({ branch: b, proj });
+    }
+  }
+  projs.sort((a, b) => a.proj.perp - b.proj.perp);
+
+  // Layer 3: Distinct physical carriageway / one-way street (e.g. Av. Pedro Ferré north vs south, or one-way streets)
+  if (projs.length > 0) {
+    const best = projs[0];
+    const secondPerp = projs.length > 1 ? projs[1].proj.perp : Infinity;
+    const nearTerm = best.proj.along <= 180 || (best.branch.totalLen || 0) - best.proj.along <= 180;
+    if (!nearTerm && best.proj.perp <= 35 && (projs.length === 1 || secondPerp - best.proj.perp >= 10)) {
+      return { branch: best.branch, proj: best.proj, dirSource: 'lane', ambiguous: false };
+    }
+  }
+
+  // Layer 4: Matched schedule trip branch (knows exact BANDERA for this time & service on shared 2-way streets)
   if (bus._matchedBranch && branches.includes(bus._matchedBranch)) {
     const mp = projectOnPolyline(bus._matchedBranch.pts, bus._matchedBranch.cum, lat, lng);
     if (mp && mp.perp <= 260) return { branch: bus._matchedBranch, proj: mp, dirSource: 'schedule', ambiguous: false };
   }
 
-  // Layer 4: Closest branch with bandera tie-breaker (flagged ambiguous on shared 2-way streets!)
-  const normB = String(bus.realBandera || bus.descripcionBandera || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, ' ')
-    .trim();
-  let best = null;
-  let bestScore = Infinity;
-  let nearCount = 0;
-  for (const b of branches) {
-    const proj = projectOnPolyline(b.pts, b.cum, lat, lng);
-    if (!proj || proj.perp > 320) continue;
-    if (proj.perp <= 100) nearCount += 1;
-    const bn = String(b.bandera || '')
-      .toUpperCase()
-      .replace(/[^A-Z0-9]+/g, ' ')
-      .trim();
-    const matchBand = normB && bn && (bn.includes(normB) || normB.includes(bn));
-    const score = proj.perp + (normB && !matchBand ? 140 : 0);
-    if (score < bestScore) {
-      bestScore = score;
-      best = { branch: b, proj, dirSource: 'fallback', ambiguous: false };
-    }
-  }
-  if (best && nearCount >= 2) {
-    best.ambiguous = true;
-  }
-  return best;
+  // Layer 5: Pure closest branch without stop-bandera distortion (flagged ambiguous if 2+ branches overlap within 100m)
+  if (projs.length === 0) return null;
+  const nearCount = projs.filter((p) => p.proj.perp <= 100).length;
+  return {
+    branch: projs[0].branch,
+    proj: projs[0].proj,
+    dirSource: 'fallback',
+    ambiguous: nearCount >= 2
+  };
 }
 
 function applyScheduleMetaToCityBus(bus, meta) {
@@ -2324,14 +2343,16 @@ function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
     const globalMatched = matchFreeFleetUnitsToModel(model, matchInputs, nowSec, state.lastRealGpsByUnit);
     for (let i = 0; i < lineBuses.length; i++) {
       const bus = lineBuses[i];
-      const meta = globalMatched.get(bus.identificadorCoche) || resolveUnitScheduleMeta(model, matchInputs[i], nowSec);
+      const meta =
+        globalMatched.get(bus.identificadorCoche) ||
+        resolveUnitScheduleMeta(model, matchInputs[i], nowSec, state.lastRealGpsByUnit);
       if (meta) applyScheduleMetaToCityBus(bus, meta);
     }
   }
   return missingAssetLines;
 }
 
-function reconcileCityFleetSim(buses = []) {
+function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
   const nowMs = Date.now();
   const seenKeys = new Set();
 
@@ -2391,8 +2412,13 @@ function reconcileCityFleetSim(buses = []) {
       }
     }
 
-    const dirConfirmed = dirSource === 'vector' || dirSource === 'trail' || dirSource === 'schedule' || dirSource === 'reversal';
-    if (dirConfirmed && branch.bandera) {
+    const dirConfirmed =
+      dirSource === 'vector' ||
+      dirSource === 'trail' ||
+      dirSource === 'lane' ||
+      dirSource === 'schedule' ||
+      dirSource === 'reversal';
+    if ((dirConfirmed || !ambiguous) && branch.bandera) {
       bus.realBandera = branch.bandera;
       bus.realBanderaColor = branch.color || getLineColor(bus.descripcionLinea);
     }
@@ -2456,15 +2482,17 @@ function reconcileCityFleetSim(buses = []) {
     }
   }
 
-  for (const k of cityFleetSim.keys()) {
-    if (!seenKeys.has(k)) cityFleetSim.delete(k);
+  if (!keepOtherKeys) {
+    for (const k of cityFleetSim.keys()) {
+      if (!seenKeys.has(k) && !k.startsWith('track:')) cityFleetSim.delete(k);
+    }
   }
 }
 
-function stepCityFleetSim(dtSec) {
-  if (!state.simulateMode || !state.allFleetMode) return;
-  for (let i = 0; i < state.allFleetBuses.length; i++) {
-    const bus = state.allFleetBuses[i];
+function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
+  if (!state.simulateMode || !Array.isArray(busesList) || busesList.length === 0) return;
+  for (let i = 0; i < busesList.length; i++) {
+    const bus = busesList[i];
     const sim = cityFleetSim.get(bus.key);
     if (!sim || sim.isStopped || sim.speedMps <= 0.1 || !sim.branch) continue;
 
@@ -2774,13 +2802,16 @@ async function locateFleetUnitOnMap({
     const serviceSpan = startHHMM && endHHMM ? `${startHHMM}–${endHHMM}` : '';
     const bCoche = String(raw.coche || raw.identificadorCoche || coche || '').trim();
     const gpsRaw = raw.ultimaFechaHoraGPS || raw.lastGps || lastGps || '';
-    return {
+    const fallbackBandera = raw.descripcionBandera || raw.bandera || bandera || `Línea ${resolvedLineName}`;
+    const matchedBranch = meta?.trip?.branch || null;
+    const obj = {
       key: `track:${numCod}:${bCoche || choferNombre || 'unit'}`,
       codigoLinea: numCod,
       descripcionLinea: resolvedLineName,
-      descripcionBandera: raw.descripcionBandera || raw.bandera || bandera || `Línea ${resolvedLineName}`,
-      realBandera: raw.descripcionBandera || raw.bandera || bandera || `Línea ${resolvedLineName}`,
-      realBanderaColor: getLineColor(resolvedLineName),
+      descripcionBandera: fallbackBandera,
+      realBandera: matchedBranch?.bandera || fallbackBandera,
+      realBanderaColor: matchedBranch?.color || getLineColor(resolvedLineName),
+      _matchedBranch: matchedBranch,
       identificadorCoche: bCoche,
       choferNombre: raw.choferNombre || choferNombre || '',
       choferLegajo: raw.choferLegajo || choferLegajo || '',
@@ -2791,6 +2822,8 @@ async function locateFleetUnitOnMap({
       routeMeters: 0,
       lat: hasCoords ? bLat : null,
       lng: hasCoords ? bLng : null,
+      rawLat: hasCoords ? bLat : null,
+      rawLng: hasCoords ? bLng : null,
       ultimaFechaHoraGPS: gpsRaw,
       gpsTimeOnly: formatGpsTimeOnly(gpsRaw),
       lastSeenLabel,
@@ -2808,19 +2841,42 @@ async function locateFleetUnitOnMap({
       isFreeTracked: true,
       isPredicted: false
     };
+    // Resolve the bus's true current BANDERA from physical GPS vector, trail, carriageway lane, or schedule
+    // (NEVER showing the queried anchor stop's bandera when the bus is physically heading the opposite way!)
+    if (hasCoords && branches.length > 0) {
+      const gpsMs = parseGpsTimestampMs(gpsRaw);
+      const rec = bCoche
+        ? recordUnitGpsFix(`${numCod}-c${bCoche}`, numCod, bCoche, bLat, bLng, gpsRaw, Date.now())
+        : null;
+      const picked = pickCityBusBranch(obj, branches, rec, gpsMs);
+      if (picked?.branch?.bandera) {
+        obj._matchedBranch = picked.branch;
+        obj.realBandera = picked.branch.bandera;
+        obj.realBanderaColor = picked.branch.color || getLineColor(resolvedLineName);
+      }
+    }
+    return obj;
   };
 
   // Resolve initial metadata & render immediately if coordinates exist
   const initialMeta =
-    serviceMeta ||
-    resolveUnitScheduleMeta(model, {
-      lat,
-      lng,
-      bandera,
-      lastGps,
-      desvioSec,
-      desvioRaw
-    });
+    (serviceMeta?.trip ? serviceMeta : null) ||
+    resolveUnitScheduleMeta(
+      model,
+      {
+        coche,
+        lat,
+        lng,
+        bandera,
+        lastGps,
+        desvioSec,
+        desvioRaw,
+        enLineaAhora
+      },
+      getArgentinaSecOfDay(),
+      state.lastRealGpsByUnit
+    ) ||
+    serviceMeta;
   const initBus = buildTrackedBusObj(
     { lat, lng, coche, choferNombre, choferLegajo, esAdaptado, bandera, lastGps, desvioRaw, desvioSec },
     initialMeta,
@@ -2841,6 +2897,7 @@ async function locateFleetUnitOnMap({
   state.trackedUnit = tracker;
 
   if (initBus.lat !== null && initBus.lng !== null) {
+    reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
     state.selectedBusKey = initBus.key;
     state.inspectorOpen = true;
     state.followSelectedBus = true;
@@ -2850,14 +2907,15 @@ async function locateFleetUnitOnMap({
     transitMap.updateBuses(tracker.buses, {
       filterLine: 'ALL',
       selectedBusKey: initBus.key,
-      simulateMode: false
+      simulateMode: state.simulateMode
     });
+    if (state.simulateMode) startSimLoop();
     transitMap.focusBus(initBus, 15.5);
   } else {
     showToast(`Buscando ubicación en vivo de ${choferNombre || `Coche #${coche}`} (${resolvedLineName})...`, 'info', 2200);
   }
 
-  // 2) Live Corridor Radar refresh function for this line (updates exact GPS position + service/vuelta!)
+  // 2) Live Corridor Radar refresh function for this line (updates exact GPS position + true BANDERA + service/vuelta!)
   const refreshTrackedLive = async (isFirst = false) => {
     if (!state.trackedUnit || state.trackedUnit.seq !== mySeq) return;
     const anchorStop = pickAnchorStop();
@@ -2870,13 +2928,17 @@ async function locateFleetUnitOnMap({
         ...(Array.isArray(liveRes?.data?.corridorFleet) ? liveRes.data.corridorFleet : [])
       ];
       const byCoche = new Map();
+      const nowRecordMs = Date.now();
       for (const a of rawList) {
         if (Number(a.codigoLinea) !== numCod) continue;
         const c = String(a.identificadorCoche || '').trim();
         const la = parseFloat(a.latitud);
         const ln = parseFloat(a.longitud);
         if (!c || Number.isNaN(la) || Number.isNaN(ln) || (la === 0 && ln === 0)) continue;
-        if (!byCoche.has(c)) byCoche.set(c, a);
+        if (!byCoche.has(c)) {
+          byCoche.set(c, a);
+          recordUnitGpsFix(`${numCod}-c${c}`, numCod, c, la, ln, String(a.ultimaFechaHoraGPS || '').trim(), nowRecordMs);
+        }
       }
       const liveUnits = Array.from(byCoche.values());
       const nowSec = getArgentinaSecOfDay();
@@ -2886,7 +2948,7 @@ async function locateFleetUnitOnMap({
 
       const liveBuses = liveUnits.map((u) => {
         const c = String(u.identificadorCoche || '').trim();
-        const meta = matchedMap.get(c) || resolveUnitScheduleMeta(model, u, nowSec);
+        const meta = matchedMap.get(c) || resolveUnitScheduleMeta(model, u, nowSec, state.lastRealGpsByUnit);
         return buildTrackedBusObj(u, meta, true);
       });
 
@@ -2904,6 +2966,7 @@ async function locateFleetUnitOnMap({
         tracker.bus = found;
         tracker.coche = found.identificadorCoche || tracker.coche;
         tracker.buses = liveBuses;
+        reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
         state.selectedBusKey = found.key;
         state.inspectorOpen = true;
         if (isFirst) state.followSelectedBus = true;
@@ -2913,8 +2976,9 @@ async function locateFleetUnitOnMap({
         transitMap.updateBuses(tracker.buses, {
           filterLine: 'ALL',
           selectedBusKey: found.key,
-          simulateMode: false
+          simulateMode: state.simulateMode
         });
+        if (state.simulateMode) startSimLoop();
         if (isFirst) {
           transitMap.focusBus(found, 15.5);
           const srvTxt = found.serviceNumber ? `Servicio ${found.serviceNumber}` : '';
@@ -2940,13 +3004,17 @@ async function locateFleetUnitOnMap({
           }
           if (liveBuses.length > 0) {
             tracker.buses = liveBuses;
-            transitMap.updateBuses(liveBuses, { filterLine: 'ALL', selectedBusKey: null, simulateMode: false });
+            reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
+            transitMap.updateBuses(liveBuses, { filterLine: 'ALL', selectedBusKey: null, simulateMode: state.simulateMode });
+            if (state.simulateMode) startSimLoop();
           }
         } else {
           // Keep last-known pin + also show any other currently live buses of the line
           const merged = [initBus, ...liveBuses.filter((b) => b.key !== initBus.key)];
           tracker.buses = merged;
-          transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: initBus.key, simulateMode: false });
+          reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
+          transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: initBus.key, simulateMode: state.simulateMode });
+          if (state.simulateMode) startSimLoop();
         }
       }
     } catch {
@@ -3137,12 +3205,10 @@ function reconcileWithSchedulePrediction(
           }
         }
 
-        // If this is a cold-start Poll 1 on a shared two-way street (no `prevGpsFix` heading vector yet,
-        // or trajectory direction was only inferred by ETA without GPS trail) and the spatial-temporal
-        // schedule anchor proves the bus is on a different BANDERA/leg, refine its trajectory immediately!
+        // Whenever trajectory direction was only inferred by ETA (not yet confirmed by a moving GPS trail)
+        // and the spatial-temporal schedule anchor proves the bus is on a different BANDERA/leg, refine immediately!
         if (
           !b.isNextLap &&
-          !b.prevGpsFix &&
           (!b.directionSource || b.directionSource === 'eta') &&
           m.trip &&
           b.stopProj &&
@@ -5364,6 +5430,22 @@ function renderLineFlotaView() {
 
   let listHtml = '';
   if (fv.tab === 'coches') {
+    const resolveFlotaBandera = (latVal, lngVal, cocheId, srvMeta, fallbackBand) => {
+      const la = parseFloat(latVal);
+      const ln = parseFloat(lngVal);
+      const lineBranches = model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
+      if (!Number.isNaN(la) && !Number.isNaN(ln) && (la !== 0 || ln !== 0) && lineBranches.length > 0) {
+        const rec = cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
+        const picked = pickCityBusBranch(
+          { rawLat: la, rawLng: ln, _matchedBranch: srvMeta?.trip?.branch || null },
+          lineBranches,
+          rec,
+          null
+        );
+        if (picked?.branch?.bandera) return picked.branch.bandera;
+      }
+      return srvMeta?.trip?.branch?.bandera || fallbackBand || `Línea ${linea.descripcion}`;
+    };
     if (visibleCoches.length === 0) {
       listHtml = `
         <div class="empty-state">
@@ -5386,6 +5468,7 @@ function renderLineFlotaView() {
               const isLiveNow = Boolean(c.enLineaAhora);
               const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
               const srvMeta = resolveCarMeta(c);
+              const realBanderaTxt = resolveFlotaBandera(c.lastLat, c.lastLng, c.coche, srvMeta, c.lastBandera);
               const driverTxt = c.lastChoferNombre
                 ? `${c.lastChoferNombre}${c.lastChoferLegajo ? ` (${c.lastChoferLegajo})` : ''}`
                 : '';
@@ -5399,7 +5482,7 @@ function renderLineFlotaView() {
                 esAdaptado: Boolean(c.esAdaptado),
                 lat: c.lastLat,
                 lng: c.lastLng,
-                bandera: c.lastBandera || '',
+                bandera: realBanderaTxt,
                 lastGps: c.lastGps || '',
                 lastStopId: c.lastStopId || '',
                 desvioRaw: c.lastDesvioRaw || '',
@@ -5437,7 +5520,7 @@ function renderLineFlotaView() {
                         <span>${driverTxt ? `${isLiveNow ? 'Chofer' : 'Últ. chofer'}: <strong>${escapeHtml(c.lastChoferNombre)}</strong>${c.lastChoferLegajo ? ` <span class="legajo-chip">${escapeHtml(c.lastChoferLegajo)}</span>` : ''}` : 'Chofer s/d'}</span>
                       </div>
                       <div class="flota-row-foot">
-                        <span class="flota-bandera-txt">${escapeHtml(c.lastBandera || `Línea ${linea.descripcion}`)}</span>
+                        <span class="flota-bandera-txt">${escapeHtml(realBanderaTxt)}</span>
                         <span class="flota-map-cue">${escapeHtml(seen.whenShort)} · Mapa ›</span>
                       </div>
                     </div>
@@ -5450,6 +5533,22 @@ function renderLineFlotaView() {
       `;
     }
   } else if (fv.tab === 'choferes') {
+    const resolveFlotaBandera = (latVal, lngVal, cocheId, srvMeta, fallbackBand) => {
+      const la = parseFloat(latVal);
+      const ln = parseFloat(lngVal);
+      const lineBranches = model?.branches || state.routeBranchesCache.get(Number(linea.codigo)) || [];
+      if (!Number.isNaN(la) && !Number.isNaN(ln) && (la !== 0 || ln !== 0) && lineBranches.length > 0) {
+        const rec = cocheId ? state.lastRealGpsByUnit.get(`${linea.codigo}-c${cocheId}`) : null;
+        const picked = pickCityBusBranch(
+          { rawLat: la, rawLng: ln, _matchedBranch: srvMeta?.trip?.branch || null },
+          lineBranches,
+          rec,
+          null
+        );
+        if (picked?.branch?.bandera) return picked.branch.bandera;
+      }
+      return srvMeta?.trip?.branch?.bandera || fallbackBand || `Línea ${linea.descripcion}`;
+    };
     if (visibleChoferes.length === 0) {
       listHtml = `
         <div class="empty-state">
@@ -5472,6 +5571,7 @@ function renderLineFlotaView() {
               const isLiveNow = Boolean(d.enLineaAhora);
               const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
               const srvMeta = resolveDriverMeta(d);
+              const realBanderaTxt = resolveFlotaBandera(d.lastLat, d.lastLng, d.lastCoche, srvMeta, d.lastBandera);
               const targetIdx = clickTargets.length;
               clickTargets.push({
                 codLinea: linea.codigo,
@@ -5482,7 +5582,7 @@ function renderLineFlotaView() {
                 esAdaptado: Boolean(d.lastEsAdaptado),
                 lat: d.lastLat,
                 lng: d.lastLng,
-                bandera: d.lastBandera || '',
+                bandera: realBanderaTxt,
                 lastGps: d.lastGps || '',
                 lastStopId: d.lastStopId || '',
                 desvioRaw: d.lastDesvioRaw || '',
@@ -5516,7 +5616,7 @@ function renderLineFlotaView() {
                         <span class="flota-last-coche">${isLiveNow ? 'Coche actual' : 'Último coche'}: <strong>#${escapeHtml(d.lastCoche || '—')}</strong>${d.lastEsAdaptado ? ' <span class="adapted-icon-badge">♿</span>' : ''}</span>
                       </div>
                       <div class="flota-row-foot">
-                        <span class="flota-bandera-txt">${escapeHtml(d.lastBandera || `Línea ${linea.descripcion}`)}</span>
+                        <span class="flota-bandera-txt">${escapeHtml(realBanderaTxt)}</span>
                         <span class="flota-map-cue">${escapeHtml(seen.whenShort)} · Mapa ›</span>
                       </div>
                     </div>
@@ -7002,6 +7102,15 @@ function bindEvents() {
         await fetchArribos(false);
         if (state.arribos.length > 0) startSimLoop();
       }
+      if (state.trackedUnit?.buses?.length > 0) {
+        reconcileCityFleetSim(state.trackedUnit.buses, { keepOtherKeys: true });
+        transitMap.updateBuses(state.trackedUnit.buses, {
+          filterLine: 'ALL',
+          selectedBusKey: state.selectedBusKey,
+          simulateMode: true
+        });
+        startSimLoop();
+      }
       if (state.allFleetMode && state.allFleetBuses.length > 0) {
         reconcileCityFleetSim(state.allFleetBuses);
         transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey });
@@ -7018,6 +7127,19 @@ function bindEvents() {
         } else {
           await fetchArribos(false);
         }
+      }
+      if (state.trackedUnit?.buses?.length > 0) {
+        for (const b of state.trackedUnit.buses) {
+          if (typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
+            b.lat = b.rawLat;
+            b.lng = b.rawLng;
+          }
+        }
+        transitMap.updateBuses(state.trackedUnit.buses, {
+          filterLine: 'ALL',
+          selectedBusKey: state.selectedBusKey,
+          simulateMode: false
+        });
       }
       if (state.allFleetMode && state.allFleetBuses.length > 0) {
         for (const b of state.allFleetBuses) {
@@ -7095,9 +7217,9 @@ function bindEvents() {
       choferNombre: bus.choferNombre,
       choferLegajo: bus.choferLegajo,
       esAdaptado: bus.esAdaptado,
-      lat: bus.lat,
-      lng: bus.lng,
-      bandera: bus.descripcionBandera,
+      lat: bus.rawLat ?? bus.lat,
+      lng: bus.rawLng ?? bus.lng,
+      bandera: bus.realBandera || bus.descripcionBandera,
       lastGps: bus.ultimaFechaHoraGPS,
       lastStopId: bus.lastStopId,
       desvioRaw: bus.desvio?.raw || '',
