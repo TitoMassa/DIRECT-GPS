@@ -285,6 +285,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.9',
+    date: '22/11/2026 · 09:50 hs',
+    items: [
+      '<strong>Recuperación de turnos históricos en Servicios:</strong> se amplió la validación de viajes históricos para aceptar registros tomados dentro de la ventana real del turno (por ejemplo observaciones previas al retorno de cabecera), recuperando choferes de días anteriores incluso cuando vuelven a trabajar hoy en la misma línea.'
+    ]
+  },
+  {
     version: 'v2.4.8',
     date: '22/11/2026 · 09:25 hs',
     items: [
@@ -5422,8 +5429,17 @@ function buildFlotaDayAssignments({
         const tr = model.tripByKey.get(t.tripKey);
         if (!tr?.blockId || !t.coche) return false;
         const tObsSec = obsSecFromRecord(t.ultimaGps, t.updatedAt);
-        if (tObsSec !== null && (tObsSec < tr.startSec - 25 * 60 || tObsSec > tr.endSec + 35 * 60)) {
-          return false;
+        const bi = model.blockInfoById?.get(tr.blockId);
+        if (tObsSec !== null) {
+          const inTripWindow = tObsSec >= tr.startSec - 25 * 60 && tObsSec <= tr.endSec + 35 * 60;
+          const inShiftBlockWindow = Boolean(
+            bi &&
+              tObsSec >= bi.startSec - 20 * 60 &&
+              tObsSec <= bi.endSec + 35 * 60 &&
+              tObsSec >= tr.startSec - 120 * 60 &&
+              tObsSec <= tr.endSec + 35 * 60
+          );
+          if (!inTripWindow && !inShiftBlockWindow) return false;
         }
         return true;
       })
