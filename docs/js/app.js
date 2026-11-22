@@ -5838,6 +5838,7 @@ function renderLineFlotaView() {
   const {
     blockAssignMap,
     validDayTrips: validTodayTrips,
+    normDriverName,
     isSameDriver
   } = buildFlotaDayAssignments({
     model,
