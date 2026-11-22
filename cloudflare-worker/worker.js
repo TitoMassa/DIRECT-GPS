@@ -673,6 +673,31 @@ export class FleetMemory {
       );
       CREATE INDEX IF NOT EXISTS idx_learned_shift_line ON learned_shift_transitions (codigo_linea, tipo_dia);
 
+      CREATE TABLE IF NOT EXISTS fleet_daily_obs (
+        day_key TEXT NOT NULL,
+        codigo_linea INTEGER NOT NULL,
+        coche TEXT NOT NULL,
+        driver_key TEXT NOT NULL,
+        chofer_nombre TEXT DEFAULT '',
+        chofer_legajo TEXT DEFAULT '',
+        es_adaptado INTEGER DEFAULT 0,
+        last_bandera TEXT DEFAULT '',
+        last_gps TEXT DEFAULT '',
+        last_stop_id TEXT DEFAULT '',
+        last_lat REAL,
+        last_lng REAL,
+        last_desvio_sec INTEGER DEFAULT 0,
+        last_desvio_raw TEXT DEFAULT '',
+        last_trip_key TEXT DEFAULT '',
+        last_service_num INTEGER DEFAULT 0,
+        last_turno_idx INTEGER DEFAULT 0,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        seen_count INTEGER DEFAULT 1,
+        PRIMARY KEY (day_key, codigo_linea, coche, driver_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_obs_day_line ON fleet_daily_obs (day_key, codigo_linea);
+
       CREATE TABLE IF NOT EXISTS roster_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -1087,6 +1112,55 @@ export class FleetMemory {
         mergedCount
       );
     }
+
+    // Preserve daily per-(coche, driver) shift history for the 7-day Servicios timeline
+    const obsDriverKey = driver ? driver.key : '_car';
+    this.sql.exec(
+      `INSERT INTO fleet_daily_obs (
+        day_key, codigo_linea, coche, driver_key,
+        chofer_nombre, chofer_legajo, es_adaptado,
+        last_bandera, last_gps, last_stop_id,
+        last_lat, last_lng, last_desvio_sec, last_desvio_raw,
+        last_trip_key, last_service_num, last_turno_idx,
+        first_seen_at, last_seen_at, seen_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      ON CONFLICT(day_key, codigo_linea, coche, driver_key) DO UPDATE SET
+        chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE fleet_daily_obs.chofer_nombre END,
+        chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE fleet_daily_obs.chofer_legajo END,
+        es_adaptado = MAX(fleet_daily_obs.es_adaptado, excluded.es_adaptado),
+        last_bandera = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_bandera != '' THEN excluded.last_bandera ELSE fleet_daily_obs.last_bandera END,
+        last_gps = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_gps != '' THEN excluded.last_gps ELSE fleet_daily_obs.last_gps END,
+        last_stop_id = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_stop_id != '' THEN excluded.last_stop_id ELSE fleet_daily_obs.last_stop_id END,
+        last_lat = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lat IS NOT NULL THEN excluded.last_lat ELSE COALESCE(fleet_daily_obs.last_lat, excluded.last_lat) END,
+        last_lng = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_lng IS NOT NULL THEN excluded.last_lng ELSE COALESCE(fleet_daily_obs.last_lng, excluded.last_lng) END,
+        last_desvio_sec = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_sec ELSE fleet_daily_obs.last_desvio_sec END,
+        last_desvio_raw = CASE WHEN excluded.last_seen_at >= fleet_daily_obs.last_seen_at AND excluded.last_desvio_raw != '' THEN excluded.last_desvio_raw ELSE fleet_daily_obs.last_desvio_raw END,
+        last_trip_key = CASE WHEN excluded.last_trip_key != '' THEN excluded.last_trip_key ELSE fleet_daily_obs.last_trip_key END,
+        last_service_num = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_service_num ELSE fleet_daily_obs.last_service_num END,
+        last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_daily_obs.last_turno_idx END,
+        first_seen_at = MIN(fleet_daily_obs.first_seen_at, excluded.first_seen_at),
+        last_seen_at = MAX(fleet_daily_obs.last_seen_at, excluded.last_seen_at),
+        seen_count = fleet_daily_obs.seen_count + 1`,
+      effectiveDayKey,
+      cod,
+      coche,
+      obsDriverKey,
+      dNombre,
+      dLegajo,
+      esAdaptado,
+      bandera,
+      ultimaGps,
+      stopId,
+      lat,
+      lng,
+      desvioSec,
+      desvioRaw,
+      tripKey,
+      serviceNum,
+      turnoIdx,
+      obsMs,
+      obsMs
+    );
   }
 
   /**
@@ -1406,9 +1480,10 @@ export class FleetMemory {
   }
 
   _pruneOld(nowMs) {
-    const cutoff = nowMs - 4 * 86400 * 1000;
+    const historyCutoff = nowMs - (ROSTER_RETENTION_DAYS + 1) * 86400 * 1000;
     const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
-    this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', cutoff);
+    this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', historyCutoff);
+    this.sql.exec('DELETE FROM fleet_daily_obs WHERE last_seen_at < ?', historyCutoff);
     this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
     this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
     this.sql.exec('DELETE FROM fleet_cars WHERE last_seen_at < ?', rosterCutoff);
@@ -1648,6 +1723,9 @@ export class FleetMemory {
       const unitByCoche = new Map();
       for (const u of unitRows) unitByCoche.set(u.coche, u);
 
+      const rawDayParam = String(url.searchParams.get('dayKey') || '').trim();
+      const selectedDayKey = /^\d{4}-\d{2}-\d{2}$/.test(rawDayParam) ? rawDayParam : todayKey;
+
       const todayTripRows = this.sql
         .exec(
           `SELECT trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, es_adaptado,
@@ -1659,6 +1737,62 @@ export class FleetMemory {
           codLinea
         )
         .toArray();
+
+      const dayTripRows =
+        selectedDayKey === todayKey
+          ? todayTripRows
+          : this.sql
+              .exec(
+                `SELECT trip_key, turno_hora, coche, chofer_nombre, chofer_legajo, es_adaptado,
+                        desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+                 FROM trip_assignments
+                 WHERE day_key = ? AND codigo_linea = ?
+                 ORDER BY updated_at DESC`,
+                selectedDayKey,
+                codLinea
+              )
+              .toArray();
+
+      const dayObsRows = this.sql
+        .exec(
+          `SELECT day_key, coche, driver_key, chofer_nombre, chofer_legajo, es_adaptado,
+                  last_bandera, last_gps, last_stop_id, last_lat, last_lng,
+                  last_desvio_sec, last_desvio_raw, last_trip_key, last_service_num, last_turno_idx,
+                  first_seen_at, last_seen_at, seen_count
+           FROM fleet_daily_obs
+           WHERE day_key = ? AND codigo_linea = ?
+           ORDER BY last_seen_at DESC`,
+          selectedDayKey,
+          codLinea
+        )
+        .toArray();
+
+      const daysSet = new Set([todayKey]);
+      for (const r of this.sql
+        .exec(
+          `SELECT DISTINCT day_key FROM trip_assignments WHERE codigo_linea = ? AND updated_at >= ?`,
+          codLinea,
+          minTs
+        )
+        .toArray()) {
+        if (r.day_key) daysSet.add(r.day_key);
+      }
+      for (const r of this.sql
+        .exec(
+          `SELECT DISTINCT day_key FROM fleet_daily_obs WHERE codigo_linea = ? AND last_seen_at >= ?`,
+          codLinea,
+          minTs
+        )
+        .toArray()) {
+        if (r.day_key) daysSet.add(r.day_key);
+      }
+      for (const r of carRows) {
+        if (r.last_day_key) daysSet.add(r.last_day_key);
+      }
+      for (const r of drvRows) {
+        if (r.last_day_key) daysSet.add(r.last_day_key);
+      }
+      const daysWithData = Array.from(daysSet).sort().reverse();
 
       const sameDriverLoose = (legA, nameA, legB, nameB) => {
         const lA = String(legA || '').trim().toUpperCase();
@@ -1768,7 +1902,7 @@ export class FleetMemory {
           return a.choferNombre.localeCompare(b.choferNombre, 'es');
         });
 
-      const todayTrips = todayTripRows.map((t) => ({
+      const mapTripRow = (t) => ({
         tripKey: t.trip_key,
         turnoHora: t.turno_hora,
         coche: t.coche,
@@ -1782,6 +1916,29 @@ export class FleetMemory {
         lng: t.lng,
         stopId: t.stop_id || '',
         updatedAt: t.updated_at
+      });
+      const todayTrips = todayTripRows.map(mapTripRow);
+      const dayTrips = selectedDayKey === todayKey ? todayTrips : dayTripRows.map(mapTripRow);
+      const dayObs = dayObsRows.map((o) => ({
+        dayKey: o.day_key,
+        coche: o.coche,
+        driverKey: o.driver_key,
+        choferNombre: o.chofer_nombre || '',
+        choferLegajo: o.chofer_legajo || '',
+        esAdaptado: Boolean(o.es_adaptado),
+        lastBandera: o.last_bandera || '',
+        lastGps: o.last_gps || '',
+        lastStopId: o.last_stop_id || '',
+        lastLat: Number.isFinite(Number(o.last_lat)) ? Number(o.last_lat) : null,
+        lastLng: Number.isFinite(Number(o.last_lng)) ? Number(o.last_lng) : null,
+        lastDesvioSec: Number(o.last_desvio_sec) || 0,
+        lastDesvioRaw: o.last_desvio_raw || '',
+        lastTripKey: o.last_trip_key || '',
+        lastServiceNum: Number(o.last_service_num) || 0,
+        lastTurnoIdx: Number(o.last_turno_idx) || 0,
+        firstSeenAt: o.first_seen_at,
+        lastSeenAt: o.last_seen_at,
+        seenCount: o.seen_count || 1
       }));
 
       const descripcionLinea =
@@ -1795,11 +1952,16 @@ export class FleetMemory {
         codigoLinea: codLinea,
         descripcionLinea,
         dayKey: todayKey,
+        selectedDayKey,
+        isHistoricalDay: selectedDayKey !== todayKey,
         retentionDays: ROSTER_RETENTION_DAYS,
+        daysWithData,
         meta: this._getRosterMetaSummary(),
         capacity,
         learnedTransitions: [],
         todayTrips,
+        dayTrips,
+        dayObs,
         coches,
         choferes
       });
@@ -2826,10 +2988,14 @@ export default {
       if (pathname === '/api/flota' && request.method === 'GET') {
         const codLinea = Number(searchParams.get('codLinea'));
         if (!codLinea) return jsonResponse({ error: 'Falta codLinea' }, 400);
+        const dayKeyParam = String(searchParams.get('dayKey') || '').trim();
         const stub = getFleetStub(env);
         if (stub) {
           try {
-            const doRes = await stub.fetch(`https://fleet-memory/flota?codLinea=${encodeURIComponent(codLinea)}`);
+            const qs = `codLinea=${encodeURIComponent(codLinea)}${
+              /^\d{4}-\d{2}-\d{2}$/.test(dayKeyParam) ? `&dayKey=${encodeURIComponent(dayKeyParam)}` : ''
+            }`;
+            const doRes = await stub.fetch(`https://fleet-memory/flota?${qs}`);
             const data = await doRes.json();
             return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
           } catch {

@@ -1767,6 +1767,106 @@ input:focus-visible,
   flex-wrap: wrap;
 }
 
+.srv-day-nav {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 38px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+}
+
+.srv-day-arrow {
+  width: 38px;
+  height: 36px;
+  border-radius: calc(var(--radius-sm) - 2px);
+  border: 1px solid transparent;
+  background: var(--surface-0);
+  color: var(--text-1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.1s ease;
+}
+
+.srv-day-arrow:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.srv-day-arrow:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.srv-day-arrow:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+.srv-day-label {
+  min-width: 0;
+  padding: 3px 8px;
+  border: none;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--text-1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  cursor: default;
+  text-align: center;
+}
+
+.srv-day-label.is-historical {
+  cursor: pointer;
+}
+
+.srv-day-label.is-historical:hover {
+  background: var(--surface-2);
+}
+
+.srv-day-main {
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.srv-day-sub {
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.15;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.srv-day-label.is-historical .srv-day-sub {
+  color: var(--accent);
+}
+
+.srv-hist-note {
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-strong);
+  background: var(--surface-1);
+  color: var(--text-3);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
 .flota-scope-group {
   display: inline-flex;
   gap: 4px;

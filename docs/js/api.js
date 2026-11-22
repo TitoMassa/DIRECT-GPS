@@ -652,7 +652,12 @@ export const api = {
   // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite, never locally cached) ──
   flotaResumen: () => apiGet('/api/flota-resumen', null, 7000),
 
-  flotaLinea: (codLinea) => apiGet(`/api/flota?codLinea=${encodeURIComponent(codLinea)}`, null, 7000),
+  flotaLinea: (codLinea, dayKey = '') =>
+    apiGet(
+      `/api/flota?codLinea=${encodeURIComponent(codLinea)}${dayKey ? `&dayKey=${encodeURIComponent(dayKey)}` : ''}`,
+      null,
+      7000
+    ),
 
   flotaBuscar: (q) => apiGet(`/api/flota-buscar?q=${encodeURIComponent(q)}`, null, 5000),
 

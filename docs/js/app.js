@@ -134,6 +134,8 @@ const state = {
     data: null,
     schedSummary: null, // Cross-referenced from official timetable model for today
     model: null, // Full LineScheduleModel for resolving per-unit service/turno/vuelta
+    serviceDayOffset: 0, // 0 = hoy, 1 = ayer, ..., 6 = 6 días atrás
+    serviceDayCache: new Map(), // dayKey -> { dayTrips, dayObs, schedSummary, model, loading, error }
     loading: false,
     error: null
   },
@@ -264,6 +266,14 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.2',
+    date: '22/11/2026 · 05:10 hs',
+    items: [
+      '<strong>Historial de 7 días en Servicios:</strong> ahora podés retroceder y avanzar día por día con flechas rápidas (<strong>‹</strong> / <strong>›</strong>) dentro de <strong>Líneas → Servicios</strong> para revisar el diagrama y los choferes/coches que cubrieron cada turno en los últimos 7 días (adaptando automáticamente la grilla de Hábil, Sábado o Domingo de cada fecha).',
+      '<strong>Registro automático por día en el servidor:</strong> se amplió la retención de viajes y observaciones diarias por coche y chofer a 7 días completos.'
+    ]
+  },
   {
     version: 'v2.4.1',
     date: '21/11/2026 · 21:12 hs',
@@ -4768,6 +4778,524 @@ function renderLineasBreadcrumb() {
   });
 }
 
+const SHORT_DOW_ES = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+
+function shiftDayKey(dayKey, deltaDays) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || ''));
+  if (!m) return dayKey || getArgentinaDayKey();
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + Number(deltaDays || 0)));
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+function getTipoDiaForDayKey(dayKey) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || ''));
+  if (!m) return getArgentinaTodayTipo();
+  const dow = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
+  return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
+}
+
+function formatServiceDayNavLabel(dayKey, todayKey) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || ''));
+  const ddmm = m ? `${m[3]}/${m[2]}` : dayKey;
+  const dowIdx = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay() : 0;
+  const dowShort = SHORT_DOW_ES[dowIdx] || '';
+  const tipo = dowIdx === 0 ? 'domingo' : dowIdx === 6 ? 'sabado' : 'habil';
+  const tipoLabel = tipo === 'domingo' ? 'Domingo' : tipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  if (dayKey === todayKey) {
+    return { main: `Hoy · ${dowShort} ${ddmm}`, shortBadge: 'Hoy', tipo, tipoLabel };
+  }
+  if (dayKey === shiftDayKey(todayKey, -1)) {
+    return { main: `Ayer · ${dowShort} ${ddmm}`, shortBadge: 'Ayer', tipo, tipoLabel };
+  }
+  return { main: `${dowShort} ${ddmm}`, shortBadge: `${dowShort} ${ddmm}`, tipo, tipoLabel };
+}
+
+function buildFlotaDayAssignments({
+  model,
+  schedSummary,
+  trips = [],
+  dayObs = [],
+  allCoches = [],
+  allChoferes = [],
+  dayKey = '',
+  isToday = true,
+  nowSec = getArgentinaSecOfDay(),
+  liveMatchByCoche = new Map()
+}) {
+  const normDriverName = (name) =>
+    String(name || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/\.+$/, '')
+      .toUpperCase();
+
+  const isSameDriver = (legA, nameA, legB, nameB) => {
+    const lA = String(legA || '').trim().toUpperCase();
+    const lB = String(legB || '').trim().toUpperCase();
+    if (lA && lB) return lA === lB;
+    const nA = normDriverName(nameA);
+    const nB = normDriverName(nameB);
+    return Boolean(nA && nB && nA === nB);
+  };
+
+  const obsSecFromRecord = (gpsStr, tsMs) => {
+    const parsed = parseGpsStampSecOfDay(gpsStr);
+    if (parsed !== null) return parsed < 3 * 3600 ? parsed + 86400 : parsed;
+    if (typeof tsMs === 'number' && tsMs > 0) {
+      const art = new Date(tsMs - 3 * 3600 * 1000);
+      const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
+      return s < 3 * 3600 ? s + 86400 : s;
+    }
+    return null;
+  };
+
+  const getDriverKey = (leg, name) => {
+    const l = String(leg || '').trim().toUpperCase();
+    if (l) return `leg:${l}`;
+    const n = normDriverName(name);
+    return n ? `name:${n}` : '';
+  };
+
+  // Merge day-scoped cars & drivers from fleet_daily_obs + day-matching roster records
+  const carByNum = new Map();
+  const dayCars = [];
+  const seenCarNums = new Set();
+  for (const c of allCoches) {
+    if (isToday ? c.vistoHoy : c.lastDayKey === dayKey) {
+      const entry = isToday ? c : { ...c, enLineaAhora: false, vistoHoy: false };
+      carByNum.set(entry.coche, entry);
+      dayCars.push(entry);
+      seenCarNums.add(entry.coche);
+    }
+  }
+  for (const o of dayObs) {
+    if (!o.coche) continue;
+    if (!seenCarNums.has(o.coche)) {
+      const synthCar = {
+        coche: o.coche,
+        esAdaptado: Boolean(o.esAdaptado),
+        vistoHoy: isToday,
+        enLineaAhora: false,
+        lastChoferNombre: o.choferNombre || '',
+        lastChoferLegajo: o.choferLegajo || '',
+        lastBandera: o.lastBandera || '',
+        lastGps: o.lastGps || '',
+        lastStopId: o.lastStopId || '',
+        lastLat: o.lastLat,
+        lastLng: o.lastLng,
+        lastDesvioSec: o.lastDesvioSec || 0,
+        lastDesvioRaw: o.lastDesvioRaw || '',
+        lastTripKey: o.lastTripKey || '',
+        lastSeenAt: o.lastSeenAt,
+        lastDayKey: dayKey
+      };
+      carByNum.set(o.coche, synthCar);
+      dayCars.push(synthCar);
+      seenCarNums.add(o.coche);
+    }
+  }
+
+  const dayDrivers = [];
+  const seenDrvPairs = new Set();
+  for (const o of dayObs) {
+    if (!o.coche || (!o.choferNombre && !o.choferLegajo)) continue;
+    const pk = `${o.coche}|${getDriverKey(o.choferLegajo, o.choferNombre)}`;
+    if (seenDrvPairs.has(pk)) continue;
+    seenDrvPairs.add(pk);
+    const liveCar = isToday ? carByNum.get(o.coche) : null;
+    const isLiveThisDriver = Boolean(
+      isToday &&
+        liveCar?.enLineaAhora &&
+        isSameDriver(o.choferLegajo, o.choferNombre, liveCar.lastChoferLegajo, liveCar.lastChoferNombre)
+    );
+    dayDrivers.push({
+      choferNombre: o.choferNombre || '',
+      choferLegajo: o.choferLegajo || '',
+      lastCoche: o.coche,
+      lastEsAdaptado: Boolean(o.esAdaptado),
+      vistoHoy: isToday,
+      enLineaAhora: isLiveThisDriver,
+      lastBandera: o.lastBandera || '',
+      lastGps: o.lastGps || '',
+      lastStopId: o.lastStopId || '',
+      lastLat: o.lastLat,
+      lastLng: o.lastLng,
+      lastDesvioSec: o.lastDesvioSec || 0,
+      lastDesvioRaw: o.lastDesvioRaw || '',
+      lastTripKey: o.lastTripKey || '',
+      firstSeenAt: o.firstSeenAt,
+      lastSeenAt: o.lastSeenAt,
+      lastDayKey: dayKey,
+      seenCount: o.seenCount || 1
+    });
+  }
+  for (const d of allChoferes) {
+    if (!(isToday ? d.vistoHoy : d.lastDayKey === dayKey) || !d.lastCoche) continue;
+    const pk = `${d.lastCoche}|${getDriverKey(d.choferLegajo, d.choferNombre)}`;
+    if (seenDrvPairs.has(pk)) continue;
+    seenDrvPairs.add(pk);
+    dayDrivers.push(isToday ? d : { ...d, enLineaAhora: false, vistoHoy: false });
+  }
+
+  const evalNowSec = isToday ? nowSec : 26 * 3600;
+  const nowSvcSec = evalNowSec < 3 * 3600 ? evalNowSec + 86400 : evalNowSec;
+
+  const validDayTrips = model?.tripByKey
+    ? trips.filter((t) => {
+        const tr = model.tripByKey.get(t.tripKey);
+        if (!tr?.blockId || !t.coche) return false;
+        const tObsSec = obsSecFromRecord(t.ultimaGps, t.updatedAt);
+        if (tObsSec !== null && (tObsSec < tr.startSec - 25 * 60 || tObsSec > tr.endSec + 35 * 60)) {
+          return false;
+        }
+        return true;
+      })
+    : [];
+
+  const blockAssignMap = new Map();
+  if (!model) {
+    return { blockAssignMap, validDayTrips, carByNum, normDriverName, isSameDriver };
+  }
+
+  const candidatesByBlock = new Map();
+
+  const findPrevTurnoInfo = (bi) => {
+    if (!bi || !bi.serviceNumber || (bi.turnoIndex || 1) <= 1) return null;
+    for (const other of model.blockInfoById?.values() || []) {
+      if (other.serviceNumber === bi.serviceNumber && other.turnoIndex === bi.turnoIndex - 1) {
+        return other;
+      }
+    }
+    return null;
+  };
+
+  const addCandidate = (blockId, coche, entry) => {
+    if (!blockId || !coche) return;
+    const bi = model.blockInfoById?.get(blockId);
+    if (!bi) return;
+    let byCar = candidatesByBlock.get(blockId);
+    if (!byCar) {
+      byCar = new Map();
+      candidatesByBlock.set(blockId, byCar);
+    }
+    const prev = byCar.get(coche);
+    const mergedCount = (prev?.tripCount || 0) + (entry.tripDelta || 0);
+    const liveMeta = isToday ? liveMatchByCoche.get(coche) || null : null;
+    const liveBlockId = liveMeta?.blockInfo?.blockId || '';
+    const inTurnoWindow = nowSvcSec >= bi.startSec - 15 * 60 && nowSvcSec <= bi.endSec + 25 * 60;
+    const isLiveOnBlock = Boolean(
+      isToday && entry.carEnLinea && (liveBlockId ? liveBlockId === blockId : inTurnoWindow)
+    );
+
+    const driverVotes = prev?.driverVotes ? new Map(prev.driverVotes) : new Map();
+    const dName = String(entry.choferNombre || '').trim();
+    const dLeg = String(entry.choferLegajo || '').trim();
+    if (dName) {
+      const dKey = dLeg ? `leg:${dLeg.toUpperCase()}` : `name:${normDriverName(dName)}`;
+      const prevVote = driverVotes.get(dKey) || { nombre: dName, legajo: dLeg, weight: 0, latestAt: 0 };
+      prevVote.weight += entry.driverWeight || 1;
+      prevVote.latestAt = Math.max(prevVote.latestAt, entry.updatedAt || 0);
+      if (!prevVote.legajo && dLeg) prevVote.legajo = dLeg;
+      driverVotes.set(dKey, prevVote);
+    }
+    let bestDriver = null;
+    for (const v of driverVotes.values()) {
+      if (!bestDriver || v.weight > bestDriver.weight || (v.weight === bestDriver.weight && v.latestAt > bestDriver.latestAt)) {
+        bestDriver = v;
+      }
+    }
+
+    byCar.set(coche, {
+      blockId,
+      startSec: bi.startSec,
+      endSec: bi.endSec,
+      coche,
+      driverVotes,
+      choferNombre: bestDriver?.nombre || prev?.choferNombre || '',
+      choferLegajo: bestDriver?.legajo || prev?.choferLegajo || '',
+      esAdaptado: Boolean(entry.esAdaptado || prev?.esAdaptado),
+      enLineaAhora: isLiveOnBlock,
+      lat: entry.lat ?? prev?.lat ?? null,
+      lng: entry.lng ?? prev?.lng ?? null,
+      lastGps: entry.lastGps || prev?.lastGps || '',
+      lastStopId: entry.lastStopId || prev?.lastStopId || '',
+      bandera: entry.bandera || prev?.bandera || '',
+      lapNumber: isLiveOnBlock
+        ? liveMeta?.lapNumber || entry.lapNumber || prev?.lapNumber || null
+        : entry.lapNumber || prev?.lapNumber || null,
+      shiftLaps: bi.shiftLaps || entry.shiftLaps || prev?.shiftLaps || null,
+      desvioRaw: entry.desvioRaw || prev?.desvioRaw || '',
+      desvioSec: entry.desvioRaw ? entry.desvioSec : prev?.desvioSec ?? entry.desvioSec ?? 0,
+      tripCount: mergedCount,
+      updatedAt: Math.max(prev?.updatedAt || 0, entry.updatedAt || 0)
+    });
+  };
+
+  // 1) Ingest validated day trip_assignments
+  const driverValidatedBlockMap = new Map();
+  for (const t of validDayTrips) {
+    const tr = model.tripByKey?.get(t.tripKey);
+    if (!tr?.blockId || !t.coche) continue;
+    const bi = model.blockInfoById?.get(tr.blockId);
+    const carRec = carByNum.get(t.coche);
+    const carObsSec = carRec ? obsSecFromRecord(carRec.lastGps, carRec.lastSeenAt) : null;
+    const carInThisBlock = Boolean(
+      bi && carObsSec !== null && carObsSec >= bi.startSec - 15 * 60 && carObsSec <= bi.endSec + 20 * 60
+    );
+    const dk = getDriverKey(t.choferLegajo, t.choferNombre);
+    if (dk) {
+      let byBlk = driverValidatedBlockMap.get(dk);
+      if (!byBlk) {
+        byBlk = new Map();
+        driverValidatedBlockMap.set(dk, byBlk);
+      }
+      const prevB = byBlk.get(tr.blockId) || { count: 0, latestAt: 0 };
+      prevB.count += 1;
+      prevB.latestAt = Math.max(prevB.latestAt, t.updatedAt || 0);
+      byBlk.set(tr.blockId, prevB);
+    }
+    addCandidate(tr.blockId, t.coche, {
+      choferNombre: t.choferNombre || (carInThisBlock ? carRec?.lastChoferNombre || '' : ''),
+      choferLegajo: t.choferLegajo || (carInThisBlock ? carRec?.lastChoferLegajo || '' : ''),
+      driverWeight: t.choferNombre ? 2 : 1,
+      esAdaptado: Boolean(t.esAdaptado || carRec?.esAdaptado),
+      carEnLinea: Boolean(isToday && carRec?.enLineaAhora),
+      lat: carInThisBlock ? (carRec?.lastLat ?? t.lat ?? null) : (t.lat ?? carRec?.lastLat ?? null),
+      lng: carInThisBlock ? (carRec?.lastLng ?? t.lng ?? null) : (t.lng ?? carRec?.lastLng ?? null),
+      lastGps: carInThisBlock ? (carRec?.lastGps || t.ultimaGps || '') : (t.ultimaGps || carRec?.lastGps || ''),
+      lastStopId: carInThisBlock ? (carRec?.lastStopId || t.stopId || '') : (t.stopId || carRec?.lastStopId || ''),
+      bandera: carInThisBlock ? (carRec?.lastBandera || tr.branch?.bandera || '') : (tr.branch?.bandera || carRec?.lastBandera || ''),
+      lapNumber: tr.lapNumber,
+      shiftLaps: tr.shiftLaps,
+      desvioRaw: carInThisBlock ? (carRec?.lastDesvioRaw || t.desvioRaw || '') : (t.desvioRaw || ''),
+      desvioSec: carInThisBlock ? (carRec?.lastDesvioSec ?? t.desvioSec ?? 0) : (t.desvioSec ?? 0),
+      tripDelta: 1,
+      updatedAt: t.updatedAt || 0
+    });
+  }
+
+  // 2) Ingest day drivers (from fleet_daily_obs & fleet_drivers)
+  for (const d of dayDrivers) {
+    const dk = getDriverKey(d.choferLegajo, d.choferNombre);
+    const valByBlk = !d.enLineaAhora && dk ? driverValidatedBlockMap.get(dk) : null;
+    let bId = '';
+    let dMeta = null;
+    let fromValidatedTrips = false;
+    if (valByBlk && valByBlk.size > 0) {
+      let bestB = null;
+      for (const [blkId, info] of valByBlk.entries()) {
+        if (!bestB || info.count > bestB.count || (info.count === bestB.count && info.latestAt > bestB.latestAt)) {
+          bestB = { blkId, ...info };
+        }
+      }
+      if (bestB) {
+        bId = bestB.blkId;
+        fromValidatedTrips = true;
+      }
+    }
+    if (!bId) {
+      dMeta =
+        (isToday && d.enLineaAhora && liveMatchByCoche.has(d.lastCoche) ? liveMatchByCoche.get(d.lastCoche) : null) ||
+        resolveUnitScheduleMeta(model, d, evalNowSec, isToday ? state.lastRealGpsByUnit : null);
+      bId = dMeta?.blockInfo?.blockId || '';
+    }
+    if (!bId) continue;
+    let bi = model.blockInfoById?.get(bId);
+    const dObsSec = obsSecFromRecord(d.lastGps, d.lastSeenAt);
+    if (!fromValidatedTrips && bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 35 * 60)) {
+      continue;
+    }
+    let reassignedToPrev = false;
+    if (!fromValidatedTrips && !d.enLineaAhora && bi && dObsSec !== null && dObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
+      const hasTripsInBlock = validDayTrips.some((t) => {
+        const tr = model.tripByKey?.get(t.tripKey);
+        return tr?.blockId === bId && isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre);
+      });
+      if (!hasTripsInBlock) {
+        const prevBi = findPrevTurnoInfo(bi);
+        if (prevBi && dObsSec >= prevBi.endSec - 20 * 60 && dObsSec <= prevBi.endSec + 35 * 60) {
+          bId = prevBi.blockId;
+          bi = prevBi;
+          reassignedToPrev = true;
+        } else {
+          continue;
+        }
+      }
+    }
+    const carRec = carByNum.get(d.lastCoche);
+    addCandidate(bId, d.lastCoche, {
+      choferNombre: d.choferNombre || '',
+      choferLegajo: d.choferLegajo || '',
+      driverWeight: d.enLineaAhora ? 3 : reassignedToPrev ? 1 : 2,
+      esAdaptado: Boolean(d.lastEsAdaptado || carRec?.esAdaptado),
+      carEnLinea: Boolean(isToday && d.enLineaAhora && carRec?.enLineaAhora),
+      lat: d.lastLat ?? carRec?.lastLat ?? null,
+      lng: d.lastLng ?? carRec?.lastLng ?? null,
+      lastGps: d.lastGps || '',
+      lastStopId: d.lastStopId || '',
+      bandera: d.lastBandera || '',
+      lapNumber: reassignedToPrev ? null : dMeta?.lapNumber || null,
+      shiftLaps: bi?.shiftLaps || dMeta?.shiftLaps || null,
+      desvioRaw: d.lastDesvioRaw || '',
+      desvioSec: d.lastDesvioSec || 0,
+      tripDelta: d.enLineaAhora ? 2 : Math.min(3, Math.max(1, Math.round((d.seenCount || 1) / 4))),
+      updatedAt: d.lastSeenAt || 0
+    });
+  }
+
+  // 3) Ingest day cars
+  for (const c of dayCars) {
+    const m =
+      (isToday && c.enLineaAhora ? liveMatchByCoche.get(c.coche) : null) ||
+      resolveUnitScheduleMeta(model, c, evalNowSec, isToday ? state.lastRealGpsByUnit : null);
+    let bId = m?.blockInfo?.blockId;
+    if (!bId) continue;
+    let bi = model.blockInfoById?.get(bId);
+    const cObsSec = obsSecFromRecord(c.lastGps, c.lastSeenAt);
+    let reassignedToPrev = false;
+    if (!c.enLineaAhora && bi && cObsSec !== null && cObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
+      const hasTripsInBlock = validDayTrips.some((t) => {
+        const tr = model.tripByKey?.get(t.tripKey);
+        return tr?.blockId === bId && t.coche === c.coche;
+      });
+      if (!hasTripsInBlock) {
+        const prevBi = findPrevTurnoInfo(bi);
+        if (prevBi && cObsSec >= prevBi.endSec - 20 * 60 && cObsSec <= prevBi.endSec + 35 * 60) {
+          bId = prevBi.blockId;
+          bi = prevBi;
+          reassignedToPrev = true;
+        } else {
+          continue;
+        }
+      }
+    }
+    addCandidate(bId, c.coche, {
+      choferNombre: c.lastChoferNombre || '',
+      choferLegajo: c.lastChoferLegajo || '',
+      driverWeight: c.enLineaAhora ? 3 : 1,
+      esAdaptado: Boolean(c.esAdaptado),
+      carEnLinea: Boolean(isToday && c.enLineaAhora),
+      lat: c.lastLat,
+      lng: c.lastLng,
+      lastGps: c.lastGps,
+      lastStopId: c.lastStopId,
+      bandera: c.lastBandera,
+      lapNumber: reassignedToPrev ? null : m.lapNumber,
+      shiftLaps: bi?.shiftLaps || m.shiftLaps,
+      desvioRaw: c.lastDesvioRaw || '',
+      desvioSec: c.lastDesvioSec || 0,
+      tripDelta: c.enLineaAhora ? 3 : 1,
+      updatedAt: c.lastSeenAt || 0
+    });
+  }
+
+  // Flatten and resolve globally: highest-confidence claims its block without simultaneous collisions
+  const allCands = [];
+  for (const byCar of candidatesByBlock.values()) {
+    for (const cand of byCar.values()) allCands.push(cand);
+  }
+  allCands.sort((a, b) => {
+    if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
+    if (b.tripCount !== a.tripCount) return b.tripCount - a.tripCount;
+    return (b.updatedAt || 0) - (a.updatedAt || 0);
+  });
+
+  const claimedWindowsByCoche = new Map();
+  const claimedWindowsByDriver = [];
+  for (const cand of allCands) {
+    if (blockAssignMap.has(cand.blockId)) continue;
+    const used = claimedWindowsByCoche.get(cand.coche) || [];
+    const carOverlaps = used.some((w) => {
+      const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
+      const sameDrv = isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre);
+      const maxAllowedOverlapSec = sameDrv || (!cand.choferNombre && !w.choferNombre) ? 20 * 60 : 45 * 60;
+      return overlapSec > maxAllowedOverlapSec;
+    });
+    if (carOverlaps) continue;
+    const driverOverlaps =
+      cand.choferLegajo || cand.choferNombre
+        ? claimedWindowsByDriver.some((w) => {
+            if (!isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre)) return false;
+            const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
+            return overlapSec > 25 * 60;
+          })
+        : false;
+    if (driverOverlaps) continue;
+    blockAssignMap.set(cand.blockId, cand);
+    used.push({
+      startSec: cand.startSec,
+      endSec: cand.endSec,
+      choferLegajo: cand.choferLegajo,
+      choferNombre: cand.choferNombre
+    });
+    claimedWindowsByCoche.set(cand.coche, used);
+    if (cand.choferLegajo || cand.choferNombre) {
+      claimedWindowsByDriver.push({
+        startSec: cand.startSec,
+        endSec: cand.endSec,
+        choferLegajo: cand.choferLegajo,
+        choferNombre: cand.choferNombre
+      });
+    }
+  }
+
+  // 4) Same-car driver-change relevo clue for T1
+  for (const srv of schedSummary?.services || []) {
+    const turnos = srv.turnos || [];
+    for (let ti = 1; ti < turnos.length; ti++) {
+      const curT = turnos[ti];
+      const prevT = turnos[ti - 1];
+      const curAssign = blockAssignMap.get(curT.blockId);
+      if (!curAssign?.coche || blockAssignMap.has(prevT.blockId)) continue;
+      const priorDriver = dayDrivers.find((d) => {
+        if (d.lastCoche !== curAssign.coche) return false;
+        if (!d.choferLegajo && !d.choferNombre) return false;
+        if (isSameDriver(d.choferLegajo, d.choferNombre, curAssign.choferLegajo, curAssign.choferNombre)) return false;
+        const alreadyClaimed = claimedWindowsByDriver.some((w) => {
+          if (!isSameDriver(d.choferLegajo, d.choferNombre, w.choferLegajo, w.choferNombre)) return false;
+          const overlapSec = Math.min(prevT.endSec, w.endSec) - Math.max(prevT.startSec, w.startSec);
+          return overlapSec > 25 * 60;
+        });
+        if (alreadyClaimed) return false;
+        const dObs = obsSecFromRecord(d.lastGps, d.lastSeenAt);
+        return dObs !== null && dObs >= prevT.startSec - 15 * 60 && dObs <= prevT.endSec + 35 * 60;
+      });
+      if (priorDriver) {
+        blockAssignMap.set(prevT.blockId, {
+          blockId: prevT.blockId,
+          startSec: prevT.startSec,
+          endSec: prevT.endSec,
+          coche: curAssign.coche,
+          choferNombre: priorDriver.choferNombre || '',
+          choferLegajo: priorDriver.choferLegajo || '',
+          esAdaptado: Boolean(priorDriver.lastEsAdaptado || curAssign.esAdaptado),
+          enLineaAhora: false,
+          lat: priorDriver.lastLat ?? curAssign.lat ?? null,
+          lng: priorDriver.lastLng ?? curAssign.lng ?? null,
+          lastGps: priorDriver.lastGps || '',
+          lastStopId: priorDriver.lastStopId || '',
+          bandera: priorDriver.lastBandera || curAssign.bandera || '',
+          lapNumber: null,
+          shiftLaps: prevT.shiftLaps,
+          desvioRaw: priorDriver.lastDesvioRaw || '',
+          desvioSec: priorDriver.lastDesvioSec || 0,
+          tripCount: 1,
+          updatedAt: priorDriver.lastSeenAt || 0
+        });
+        claimedWindowsByDriver.push({
+          startSec: prevT.startSec,
+          endSec: prevT.endSec,
+          choferLegajo: priorDriver.choferLegajo || '',
+          choferNombre: priorDriver.choferNombre || ''
+        });
+      }
+    }
+  }
+
+  return { blockAssignMap, validDayTrips, carByNum, normDriverName, isSameDriver };
+}
+
 function renderLineFlotaView() {
   const linea = state.drill.linea;
   if (!linea) return;
@@ -4791,7 +5319,7 @@ function renderLineFlotaView() {
     return;
   }
 
-  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayKey: getArgentinaDayKey(), retentionDays: 7, meta: {} };
+  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayObs: [], dayKey: getArgentinaDayKey(), retentionDays: 7, meta: {} };
   const todayKey = data.dayKey || getArgentinaDayKey();
   const retentionDays = data.retentionDays || 7;
   const meta = data.meta || {};
@@ -4800,6 +5328,7 @@ function renderLineFlotaView() {
   const allCoches = Array.isArray(data.coches) ? data.coches : [];
   const allChoferes = Array.isArray(data.choferes) ? data.choferes : [];
   const todayTrips = Array.isArray(data.todayTrips) ? data.todayTrips : [];
+  const todayDayObs = Array.isArray(data.dayObs) && (!data.selectedDayKey || data.selectedDayKey === todayKey) ? data.dayObs : [];
 
   // Globally match currently live cars to unique services so live cards never collide
   const liveCoches = allCoches.filter((c) => c.enLineaAhora);
@@ -4807,408 +5336,22 @@ function renderLineFlotaView() {
     ? matchFreeFleetUnitsToModel(model, liveCoches, nowSec, state.lastRealGpsByUnit)
     : new Map();
 
-  const carByNum = new Map();
-  for (const c of allCoches) carByNum.set(c.coche, c);
-
-  const resolveRawCarMeta = (c) =>
-    (c.enLineaAhora ? liveMatchByCoche.get(c.coche) : null) || resolveUnitScheduleMeta(model, c, nowSec);
-
-  const normDriverName = (name) =>
-    String(name || '')
-      .trim()
-      .replace(/\s+/g, ' ')
-      .replace(/\.+$/, '')
-      .toUpperCase();
-
-  const isSameDriver = (legA, nameA, legB, nameB) => {
-    const lA = String(legA || '').trim().toUpperCase();
-    const lB = String(legB || '').trim().toUpperCase();
-    if (lA && lB) return lA === lB;
-    const nA = normDriverName(nameA);
-    const nB = normDriverName(nameB);
-    return Boolean(nA && nB && nA === nB);
-  };
-
-  // Build map of blockId -> best today car/driver observation FIRST as the single source of truth
-  // shared across Servicios, Choferes, and Coches tabs. Enforces three physical invariants:
-  //  1) A turno is marked "En línea" ONLY if that car is currently matched to THAT turno (never on finished morning turnos!).
-  //  2) The same physical car cannot be assigned to two truly simultaneous turnos on the same day, while preserving
-  //     relevos and brief cross-service boundary handoffs between DIFFERENT drivers (e.g. T1 ending 14:09 / T2 starting 13:58).
-  //  3) Driver attribution is strictly scoped per turno (using driver votes from trips & fleet_drivers observed inside THAT turno's window),
-  //     so a T2 relevo driver (e.g. GOMEZ R. on #3093) NEVER overwrites T1's driver (e.g. ROMERO L. on #3093)!
-  const obsSecFromRecord = (gpsStr, tsMs) => {
-    const parsed = parseGpsStampSecOfDay(gpsStr);
-    if (parsed !== null) return parsed < 3 * 3600 ? parsed + 86400 : parsed;
-    if (typeof tsMs === 'number' && tsMs > 0) {
-      const art = new Date(tsMs - 3 * 3600 * 1000);
-      const s = art.getUTCHours() * 3600 + art.getUTCMinutes() * 60 + art.getUTCSeconds();
-      return s < 3 * 3600 ? s + 86400 : s;
-    }
-    return null;
-  };
-
-  // Filter out stale/future trip_assignments recorded outside the trip's actual active window
-  // (e.g. a morning driver near terminal accidentally linked to an upcoming T2 departure 60-90m later).
-  const validTodayTrips = model?.tripByKey
-    ? todayTrips.filter((t) => {
-        const tr = model.tripByKey.get(t.tripKey);
-        if (!tr?.blockId || !t.coche) return false;
-        const tObsSec = obsSecFromRecord(t.ultimaGps, t.updatedAt);
-        if (tObsSec !== null && (tObsSec < tr.startSec - 25 * 60 || tObsSec > tr.endSec + 35 * 60)) {
-          return false;
-        }
-        return true;
-      })
-    : [];
-
-  const blockAssignMap = new Map();
-  if (model) {
-    const nowSvcSec = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
-    const candidatesByBlock = new Map(); // blockId -> Map<coche, candidate>
-
-    const findPrevTurnoInfo = (bi) => {
-      if (!bi || !bi.serviceNumber || (bi.turnoIndex || 1) <= 1) return null;
-      for (const other of model.blockInfoById?.values() || []) {
-        if (other.serviceNumber === bi.serviceNumber && other.turnoIndex === bi.turnoIndex - 1) {
-          return other;
-        }
-      }
-      return null;
-    };
-
-    const addCandidate = (blockId, coche, entry) => {
-      if (!blockId || !coche) return;
-      const bi = model.blockInfoById?.get(blockId);
-      if (!bi) return;
-      let byCar = candidatesByBlock.get(blockId);
-      if (!byCar) {
-        byCar = new Map();
-        candidatesByBlock.set(blockId, byCar);
-      }
-      const prev = byCar.get(coche);
-      const mergedCount = (prev?.tripCount || 0) + (entry.tripDelta || 0);
-      const liveMeta = liveMatchByCoche.get(coche) || null;
-      const liveBlockId = liveMeta?.blockInfo?.blockId || '';
-      const inTurnoWindow = nowSvcSec >= bi.startSec - 15 * 60 && nowSvcSec <= bi.endSec + 25 * 60;
-      const isLiveOnBlock = Boolean(
-        entry.carEnLinea && (liveBlockId ? liveBlockId === blockId : inTurnoWindow)
-      );
-
-      // Per-turno driver voting so a late-login or relevo never overwrites the real driver of this turno
-      const driverVotes = prev?.driverVotes ? new Map(prev.driverVotes) : new Map();
-      const dName = String(entry.choferNombre || '').trim();
-      const dLeg = String(entry.choferLegajo || '').trim();
-      if (dName) {
-        const dKey = dLeg ? `leg:${dLeg.toUpperCase()}` : `name:${normDriverName(dName)}`;
-        const prevVote = driverVotes.get(dKey) || { nombre: dName, legajo: dLeg, weight: 0, latestAt: 0 };
-        prevVote.weight += entry.driverWeight || 1;
-        prevVote.latestAt = Math.max(prevVote.latestAt, entry.updatedAt || 0);
-        if (!prevVote.legajo && dLeg) prevVote.legajo = dLeg;
-        driverVotes.set(dKey, prevVote);
-      }
-      let bestDriver = null;
-      for (const v of driverVotes.values()) {
-        if (!bestDriver || v.weight > bestDriver.weight || (v.weight === bestDriver.weight && v.latestAt > bestDriver.latestAt)) {
-          bestDriver = v;
-        }
-      }
-
-      const next = {
-        blockId,
-        startSec: bi.startSec,
-        endSec: bi.endSec,
-        coche,
-        driverVotes,
-        choferNombre: bestDriver?.nombre || prev?.choferNombre || '',
-        choferLegajo: bestDriver?.legajo || prev?.choferLegajo || '',
-        esAdaptado: Boolean(entry.esAdaptado || prev?.esAdaptado),
-        enLineaAhora: isLiveOnBlock,
-        lat: entry.lat ?? prev?.lat ?? null,
-        lng: entry.lng ?? prev?.lng ?? null,
-        lastGps: entry.lastGps || prev?.lastGps || '',
-        lastStopId: entry.lastStopId || prev?.lastStopId || '',
-        bandera: entry.bandera || prev?.bandera || '',
-        lapNumber: isLiveOnBlock
-          ? liveMeta?.lapNumber || entry.lapNumber || prev?.lapNumber || null
-          : entry.lapNumber || prev?.lapNumber || null,
-        shiftLaps: bi.shiftLaps || entry.shiftLaps || prev?.shiftLaps || null,
-        desvioRaw: entry.desvioRaw || prev?.desvioRaw || '',
-        desvioSec: entry.desvioRaw ? entry.desvioSec : prev?.desvioSec ?? entry.desvioSec ?? 0,
-        tripCount: mergedCount,
-        updatedAt: Math.max(prev?.updatedAt || 0, entry.updatedAt || 0)
-      };
-      byCar.set(coche, next);
-    };
-
-    // 1) Ingest validated today's trip_assignments (strictly keeping each trip's OWN driver, never carRec's later relevo driver!)
-    const driverValidatedBlockMap = new Map(); // driverKey -> Map<blockId, { count, latestAt }>
-    const getDriverKey = (leg, name) => {
-      const l = String(leg || '').trim().toUpperCase();
-      if (l) return `leg:${l}`;
-      const n = normDriverName(name);
-      return n ? `name:${n}` : '';
-    };
-    for (const t of validTodayTrips) {
-      const tr = model.tripByKey?.get(t.tripKey);
-      if (!tr?.blockId || !t.coche) continue;
-      const bi = model.blockInfoById?.get(tr.blockId);
-      const carRec = carByNum.get(t.coche);
-      const carObsSec = carRec ? obsSecFromRecord(carRec.lastGps, carRec.lastSeenAt) : null;
-      const carInThisBlock = Boolean(
-        bi && carObsSec !== null && carObsSec >= bi.startSec - 15 * 60 && carObsSec <= bi.endSec + 20 * 60
-      );
-      const dk = getDriverKey(t.choferLegajo, t.choferNombre);
-      if (dk) {
-        let byBlk = driverValidatedBlockMap.get(dk);
-        if (!byBlk) {
-          byBlk = new Map();
-          driverValidatedBlockMap.set(dk, byBlk);
-        }
-        const prevB = byBlk.get(tr.blockId) || { count: 0, latestAt: 0 };
-        prevB.count += 1;
-        prevB.latestAt = Math.max(prevB.latestAt, t.updatedAt || 0);
-        byBlk.set(tr.blockId, prevB);
-      }
-      addCandidate(tr.blockId, t.coche, {
-        choferNombre: t.choferNombre || (carInThisBlock ? carRec?.lastChoferNombre || '' : ''),
-        choferLegajo: t.choferLegajo || (carInThisBlock ? carRec?.lastChoferLegajo || '' : ''),
-        driverWeight: t.choferNombre ? 2 : 1,
-        esAdaptado: Boolean(t.esAdaptado || carRec?.esAdaptado),
-        carEnLinea: Boolean(carRec?.enLineaAhora),
-        lat: carInThisBlock ? (carRec?.lastLat ?? t.lat ?? null) : (t.lat ?? carRec?.lastLat ?? null),
-        lng: carInThisBlock ? (carRec?.lastLng ?? t.lng ?? null) : (t.lng ?? carRec?.lastLng ?? null),
-        lastGps: carInThisBlock ? (carRec?.lastGps || t.ultimaGps || '') : (t.ultimaGps || carRec?.lastGps || ''),
-        lastStopId: carInThisBlock ? (carRec?.lastStopId || t.stopId || '') : (t.stopId || carRec?.lastStopId || ''),
-        bandera: carInThisBlock ? (carRec?.lastBandera || tr.branch?.bandera || '') : (tr.branch?.bandera || carRec?.lastBandera || ''),
-        lapNumber: tr.lapNumber,
-        shiftLaps: tr.shiftLaps,
-        desvioRaw: carInThisBlock ? (carRec?.lastDesvioRaw || t.desvioRaw || '') : (t.desvioRaw || ''),
-        desvioSec: carInThisBlock ? (carRec?.lastDesvioSec ?? t.desvioSec ?? 0) : (t.desvioSec ?? 0),
-        tripDelta: 1,
-        updatedAt: t.updatedAt || 0
-      });
-    }
-
-    // 2) Ingest today's drivers directly from fleet_drivers (captures finished T1 relevo drivers even if same car is now on T2!)
-    for (const d of allChoferes.filter((x) => x.vistoHoy && x.lastCoche)) {
-      const dk = getDriverKey(d.choferLegajo, d.choferNombre);
-      const valByBlk = !d.enLineaAhora && dk ? driverValidatedBlockMap.get(dk) : null;
-      let bId = '';
-      let dMeta = null;
-      let fromValidatedTrips = false;
-      if (valByBlk && valByBlk.size > 0) {
-        let bestB = null;
-        for (const [blkId, info] of valByBlk.entries()) {
-          if (!bestB || info.count > bestB.count || (info.count === bestB.count && info.latestAt > bestB.latestAt)) {
-            bestB = { blkId, ...info };
-          }
-        }
-        if (bestB) {
-          bId = bestB.blkId;
-          fromValidatedTrips = true;
-        }
-      }
-      if (!bId) {
-        dMeta =
-          (d.enLineaAhora && liveMatchByCoche.has(d.lastCoche) ? liveMatchByCoche.get(d.lastCoche) : null) ||
-          resolveUnitScheduleMeta(model, d, nowSec);
-        bId = dMeta?.blockInfo?.blockId || '';
-      }
-      if (!bId) continue;
-      let bi = model.blockInfoById?.get(bId);
-      const dObsSec = obsSecFromRecord(d.lastGps, d.lastSeenAt);
-      if (!fromValidatedTrips && bi && dObsSec !== null && (dObsSec < bi.startSec - 20 * 60 || dObsSec > bi.endSec + 35 * 60)) {
-        continue;
-      }
-      let reassignedToPrev = false;
-      // Guard against a stray end-of-morning-shift ping (e.g. 14:08) falsely claiming an ongoing afternoon turno (13:58-21:55).
-      // If that ping lands right after the same service's previous turno (e.g. T1 ending 13:45), re-attribute it to T1 instead!
-      if (!fromValidatedTrips && !d.enLineaAhora && bi && dObsSec !== null && dObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
-        const hasTripsInBlock = validTodayTrips.some((t) => {
-          const tr = model.tripByKey?.get(t.tripKey);
-          return tr?.blockId === bId && isSameDriver(d.choferLegajo, d.choferNombre, t.choferLegajo, t.choferNombre);
-        });
-        if (!hasTripsInBlock) {
-          const prevBi = findPrevTurnoInfo(bi);
-          if (prevBi && dObsSec >= prevBi.endSec - 20 * 60 && dObsSec <= prevBi.endSec + 35 * 60) {
-            bId = prevBi.blockId;
-            bi = prevBi;
-            reassignedToPrev = true;
-          } else {
-            continue;
-          }
-        }
-      }
-      const carRec = carByNum.get(d.lastCoche);
-      addCandidate(bId, d.lastCoche, {
-        choferNombre: d.choferNombre || '',
-        choferLegajo: d.choferLegajo || '',
-        driverWeight: d.enLineaAhora ? 3 : reassignedToPrev ? 1 : 2,
-        esAdaptado: Boolean(d.lastEsAdaptado || carRec?.esAdaptado),
-        carEnLinea: Boolean(d.enLineaAhora && carRec?.enLineaAhora),
-        lat: d.lastLat ?? carRec?.lastLat ?? null,
-        lng: d.lastLng ?? carRec?.lastLng ?? null,
-        lastGps: d.lastGps || '',
-        lastStopId: d.lastStopId || '',
-        bandera: d.lastBandera || '',
-        lapNumber: reassignedToPrev ? null : dMeta?.lapNumber || null,
-        shiftLaps: bi?.shiftLaps || dMeta?.shiftLaps || null,
-        desvioRaw: d.lastDesvioRaw || '',
-        desvioSec: d.lastDesvioSec || 0,
-        tripDelta: d.enLineaAhora ? 2 : 1,
-        updatedAt: d.lastSeenAt || 0
-      });
-    }
-
-    // 3) Ingest today's cars (matching their current / latest position to its exact turno)
-    for (const c of allCoches.filter((x) => x.vistoHoy)) {
-      const m = resolveRawCarMeta(c);
-      let bId = m?.blockInfo?.blockId;
-      if (!bId) continue;
-      let bi = model.blockInfoById?.get(bId);
-      const cObsSec = obsSecFromRecord(c.lastGps, c.lastSeenAt);
-      let reassignedToPrev = false;
-      if (!c.enLineaAhora && bi && cObsSec !== null && cObsSec <= bi.startSec + 25 * 60 && nowSvcSec >= bi.startSec + 60 * 60) {
-        const hasTripsInBlock = validTodayTrips.some((t) => {
-          const tr = model.tripByKey?.get(t.tripKey);
-          return tr?.blockId === bId && t.coche === c.coche;
-        });
-        if (!hasTripsInBlock) {
-          const prevBi = findPrevTurnoInfo(bi);
-          if (prevBi && cObsSec >= prevBi.endSec - 20 * 60 && cObsSec <= prevBi.endSec + 35 * 60) {
-            bId = prevBi.blockId;
-            bi = prevBi;
-            reassignedToPrev = true;
-          } else {
-            continue;
-          }
-        }
-      }
-      addCandidate(bId, c.coche, {
-        choferNombre: c.lastChoferNombre || '',
-        choferLegajo: c.lastChoferLegajo || '',
-        driverWeight: c.enLineaAhora ? 3 : 1,
-        esAdaptado: Boolean(c.esAdaptado),
-        carEnLinea: Boolean(c.enLineaAhora),
-        lat: c.lastLat,
-        lng: c.lastLng,
-        lastGps: c.lastGps,
-        lastStopId: c.lastStopId,
-        bandera: c.lastBandera,
-        lapNumber: reassignedToPrev ? null : m.lapNumber,
-        shiftLaps: bi?.shiftLaps || m.shiftLaps,
-        desvioRaw: c.lastDesvioRaw || '',
-        desvioSec: c.lastDesvioSec || 0,
-        tripDelta: c.enLineaAhora ? 3 : 1,
-        updatedAt: c.lastSeenAt || 0
-      });
-    }
-
-    // Flatten and resolve globally: highest-confidence (live on block -> most trips -> freshest) claims its block;
-    // reject truly simultaneous turno claims by the same car or same driver while allowing brief boundary handoffs.
-    const allCands = [];
-    for (const byCar of candidatesByBlock.values()) {
-      for (const cand of byCar.values()) allCands.push(cand);
-    }
-    allCands.sort((a, b) => {
-      if (a.enLineaAhora !== b.enLineaAhora) return a.enLineaAhora ? -1 : 1;
-      if (b.tripCount !== a.tripCount) return b.tripCount - a.tripCount;
-      return (b.updatedAt || 0) - (a.updatedAt || 0);
-    });
-
-    const claimedWindowsByCoche = new Map(); // coche -> Array<{ startSec, endSec, choferLegajo, choferNombre }>
-    const claimedWindowsByDriver = []; // Array<{ startSec, endSec, choferLegajo, choferNombre }>
-    for (const cand of allCands) {
-      if (blockAssignMap.has(cand.blockId)) continue;
-      const used = claimedWindowsByCoche.get(cand.coche) || [];
-      const carOverlaps = used.some((w) => {
-        const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
-        const sameDrv = isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre);
-        const maxAllowedOverlapSec = sameDrv || (!cand.choferNombre && !w.choferNombre) ? 20 * 60 : 45 * 60;
-        return overlapSec > maxAllowedOverlapSec;
-      });
-      if (carOverlaps) continue;
-      const driverOverlaps =
-        cand.choferLegajo || cand.choferNombre
-          ? claimedWindowsByDriver.some((w) => {
-              if (!isSameDriver(cand.choferLegajo, cand.choferNombre, w.choferLegajo, w.choferNombre)) return false;
-              const overlapSec = Math.min(cand.endSec, w.endSec) - Math.max(cand.startSec, w.startSec);
-              return overlapSec > 25 * 60;
-            })
-          : false;
-      if (driverOverlaps) continue;
-      blockAssignMap.set(cand.blockId, cand);
-      used.push({
-        startSec: cand.startSec,
-        endSec: cand.endSec,
-        choferLegajo: cand.choferLegajo,
-        choferNombre: cand.choferNombre
-      });
-      claimedWindowsByCoche.set(cand.coche, used);
-      if (cand.choferLegajo || cand.choferNombre) {
-        claimedWindowsByDriver.push({
-          startSec: cand.startSec,
-          endSec: cand.endSec,
-          choferLegajo: cand.choferLegajo,
-          choferNombre: cand.choferNombre
-        });
-      }
-    }
-
-    // 4) Same-car driver-change relevo clue: if a service's T2 is assigned to car #X with Driver B,
-    // and T1 has no assignment yet, check if another unassigned driver A was seen today on #X during T1!
-    for (const srv of fv.schedSummary?.services || []) {
-      const turnos = srv.turnos || [];
-      for (let ti = 1; ti < turnos.length; ti++) {
-        const curT = turnos[ti];
-        const prevT = turnos[ti - 1];
-        const curAssign = blockAssignMap.get(curT.blockId);
-        if (!curAssign?.coche || blockAssignMap.has(prevT.blockId)) continue;
-        const priorDriver = allChoferes.find((d) => {
-          if (!d.vistoHoy || d.lastCoche !== curAssign.coche) return false;
-          if (!d.choferLegajo && !d.choferNombre) return false;
-          if (isSameDriver(d.choferLegajo, d.choferNombre, curAssign.choferLegajo, curAssign.choferNombre)) return false;
-          const alreadyClaimed = claimedWindowsByDriver.some((w) => {
-            if (!isSameDriver(d.choferLegajo, d.choferNombre, w.choferLegajo, w.choferNombre)) return false;
-            const overlapSec = Math.min(prevT.endSec, w.endSec) - Math.max(prevT.startSec, w.startSec);
-            return overlapSec > 25 * 60;
-          });
-          if (alreadyClaimed) return false;
-          const dObs = obsSecFromRecord(d.lastGps, d.lastSeenAt);
-          return dObs !== null && dObs >= prevT.startSec - 15 * 60 && dObs <= prevT.endSec + 35 * 60;
-        });
-        if (priorDriver) {
-          blockAssignMap.set(prevT.blockId, {
-            blockId: prevT.blockId,
-            startSec: prevT.startSec,
-            endSec: prevT.endSec,
-            coche: curAssign.coche,
-            choferNombre: priorDriver.choferNombre || '',
-            choferLegajo: priorDriver.choferLegajo || '',
-            esAdaptado: Boolean(priorDriver.lastEsAdaptado || curAssign.esAdaptado),
-            enLineaAhora: false,
-            lat: priorDriver.lastLat ?? curAssign.lat ?? null,
-            lng: priorDriver.lastLng ?? curAssign.lng ?? null,
-            lastGps: priorDriver.lastGps || '',
-            lastStopId: priorDriver.lastStopId || '',
-            bandera: priorDriver.lastBandera || curAssign.bandera || '',
-            lapNumber: null,
-            shiftLaps: prevT.shiftLaps,
-            desvioRaw: priorDriver.lastDesvioRaw || '',
-            desvioSec: priorDriver.lastDesvioSec || 0,
-            tripCount: 1,
-            updatedAt: priorDriver.lastSeenAt || 0
-          });
-          claimedWindowsByDriver.push({
-            startSec: prevT.startSec,
-            endSec: prevT.endSec,
-            choferLegajo: priorDriver.choferLegajo || '',
-            choferNombre: priorDriver.choferNombre || ''
-          });
-        }
-      }
-    }
-  }
+  const {
+    blockAssignMap,
+    validDayTrips: validTodayTrips,
+    isSameDriver
+  } = buildFlotaDayAssignments({
+    model,
+    schedSummary: fv.schedSummary,
+    trips: todayTrips,
+    dayObs: todayDayObs,
+    allCoches,
+    allChoferes,
+    dayKey: todayKey,
+    isToday: true,
+    nowSec,
+    liveMatchByCoche
+  });
 
   const packBlockAssignMeta = (assign) => {
     const bi = assign?.blockId ? model?.blockInfoById?.get(assign.blockId) : null;
@@ -5401,18 +5544,46 @@ function renderLineFlotaView() {
       })
     : scopeChoferes;
 
-  const allServices = Array.isArray(fv.schedSummary?.services) ? fv.schedSummary.services : [];
+  const maxDayOffset = Math.max(0, retentionDays - 1);
+  const serviceDayOffset = Math.max(0, Math.min(maxDayOffset, Number(fv.serviceDayOffset) || 0));
+  const selectedServiceDayKey = shiftDayKey(todayKey, -serviceDayOffset);
+  const isHistoricalSrvDay = serviceDayOffset > 0;
+  const serviceDayEntry = isHistoricalSrvDay ? fv.serviceDayCache?.get(selectedServiceDayKey) || null : null;
+  const srvDayLoading = Boolean(isHistoricalSrvDay && (!serviceDayEntry || serviceDayEntry.loading));
+  const srvDayError = isHistoricalSrvDay ? serviceDayEntry?.error || null : null;
+
+  const activeSrvSchedSummary = isHistoricalSrvDay ? serviceDayEntry?.schedSummary || null : fv.schedSummary;
+  const activeSrvModel = isHistoricalSrvDay ? serviceDayEntry?.model || null : model;
+  const activeSrvAssignMap = isHistoricalSrvDay
+    ? serviceDayEntry && !serviceDayEntry.loading && activeSrvModel
+      ? buildFlotaDayAssignments({
+          model: activeSrvModel,
+          schedSummary: activeSrvSchedSummary,
+          trips: serviceDayEntry.dayTrips || [],
+          dayObs: serviceDayEntry.dayObs || [],
+          allCoches,
+          allChoferes,
+          dayKey: selectedServiceDayKey,
+          isToday: false,
+          nowSec: 26 * 3600,
+          liveMatchByCoche: new Map()
+        }).blockAssignMap
+      : new Map()
+    : blockAssignMap;
+
+  const allServices = Array.isArray(activeSrvSchedSummary?.services) ? activeSrvSchedSummary.services : [];
   const visibleServices = query
     ? allServices.filter((s) => {
         const turnosTxt = (s.turnos || [])
           .map((t) => {
-            const a = blockAssignMap.get(t.blockId);
+            const a = activeSrvAssignMap.get(t.blockId);
             return `${formatSecHHMM(t.startSec)} ${formatSecHHMM(t.endSec)} ${a?.coche || ''} ${a?.choferNombre || ''}`;
           })
           .join(' ');
         return `servicio ${s.serviceNumber} ${turnosTxt}`.toLowerCase().includes(query);
       })
     : allServices;
+  const dayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
 
   const lastScanClock = formatRosterClockArt(meta.lastCronAt || meta.lastCycleAt);
   const autoMetaText = lastScanClock
@@ -5629,81 +5800,106 @@ function renderLineFlotaView() {
       `;
     }
   } else {
-    // TAB 3: SERVICIOS — Clean start/end schedule per service & turno + assigned car & driver today
-    if (visibleServices.length === 0) {
+    // TAB 3: SERVICIOS — Start/end schedule per service & turno + 7-day historical shift browser
+    if (srvDayLoading) {
+      listHtml = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
+    } else if (srvDayError) {
+      listHtml = `
+        <div class="empty-state">
+          <h3>No se pudo cargar ${escapeHtml(dayNavInfo.main)}</h3>
+          <p>${escapeHtml(srvDayError)}</p>
+          <button type="button" id="btn-srv-day-retry" class="secondary-action-btn">Reintentar</button>
+        </div>
+      `;
+    } else if (visibleServices.length === 0) {
       listHtml = `
         <div class="empty-state">
           <h3>${query ? 'Sin servicios coincidentes' : 'Sin horarios programados'}</h3>
-          <p>${query ? 'Probá con otro número de servicio, horario, coche o chofer.' : 'Esta línea no tiene grilla horaria fija publicada.'}</p>
+          <p>${query ? 'Probá con otro número de servicio, horario, coche o chofer.' : `Esta línea no tiene grilla horaria fija publicada para ${dayNavInfo.tipoLabel}.`}</p>
         </div>
       `;
     } else {
+      const assignedCount = activeSrvAssignMap.size;
+      const histNoticeHtml =
+        isHistoricalSrvDay && assignedCount === 0
+          ? `<div class="srv-hist-note">Sin registros guardados para ${escapeHtml(dayNavInfo.main)} · Mostrando diagrama programado (${escapeHtml(dayNavInfo.tipoLabel)}).</div>`
+          : '';
       listHtml = `
-        <ul class="flota-list" role="list" aria-label="Servicios y horarios de línea ${escapeHtml(linea.descripcion)}">
+        ${histNoticeHtml}
+        <ul class="flota-list" role="list" aria-label="Servicios y horarios de línea ${escapeHtml(linea.descripcion)}, ${escapeHtml(dayNavInfo.main)}">
           ${visibleServices
             .map((s) => {
               const turnosHtml = (s.turnos || [])
                 .map((t) => {
                   const startHH = formatSecHHMM(t.startSec);
                   const endHH = formatSecHHMM(t.endSec);
-                  const assign = blockAssignMap.get(t.blockId) || null;
-                  const isLiveNow = Boolean(assign?.enLineaAhora);
+                  const assign = activeSrvAssignMap.get(t.blockId) || null;
+                  const isLiveNow = !isHistoricalSrvDay && Boolean(assign?.enLineaAhora);
                   const regimeTxt = t.isCortado ? 'Cortado' : t.isRelevoEnLinea ? 'Relevo' : 'Corrido';
                   const lapsTxt = t.shiftLaps ? formatShiftLaps(t.shiftLaps) : '';
                   const lapLiveTxt =
                     isLiveNow && assign?.lapNumber
                       ? `Vta ${formatLapNumber(assign.lapNumber)}${t.shiftLaps ? `/${formatLapNumber(t.shiftLaps)}` : ''}`
                       : '';
-                  let assignHtml = `<span class="srv-turno-unassigned">Sin registro hoy</span>`;
+                  let assignHtml = `<span class="srv-turno-unassigned">${isHistoricalSrvDay ? 'Sin registro' : 'Sin registro hoy'}</span>`;
                   let btnOpen = `<div class="srv-turno-row">`;
                   let btnClose = `</div>`;
 
                   if (assign) {
-                    const targetIdx = clickTargets.length;
-                    clickTargets.push({
-                      codLinea: linea.codigo,
-                      lineName: linea.descripcion,
-                      coche: assign.coche,
-                      choferNombre: assign.choferNombre,
-                      choferLegajo: assign.choferLegajo,
-                      esAdaptado: assign.esAdaptado,
-                      lat: assign.lat,
-                      lng: assign.lng,
-                      bandera: assign.bandera,
-                      lastGps: assign.lastGps,
-                      lastStopId: assign.lastStopId,
-                      desvioRaw: assign.desvioRaw,
-                      desvioSec: assign.desvioSec,
-                      enLineaAhora: isLiveNow,
-                      lastSeenLabel: isLiveNow ? 'En línea' : 'Hoy',
-                      serviceMeta: {
-                        serviceNumber: s.serviceNumber,
-                        turnoIndex: t.turnoIndex,
-                        serviceTurnosCount: s.turnos.length,
-                        lapNumber: assign.lapNumber,
-                        shiftLaps: t.shiftLaps,
-                        isCortado: t.isCortado,
-                        isRelevoEnLinea: t.isRelevoEnLinea,
-                        startHHMM: startHH,
-                        endHHMM: endHH
-                      }
-                    });
                     const drvLabel = assign.choferNombre
                       ? ` · ${escapeHtml(assign.choferNombre)}`
                       : '';
-                    assignHtml = `
-                      <span class="srv-turno-assigned">
-                        <strong>#${escapeHtml(assign.coche)}</strong>${drvLabel}
-                      </span>
-                      <span class="flota-status-pill ${isLiveNow ? 'is-live' : 'is-today'}">${escapeHtml(
-                        isLiveNow ? (lapLiveTxt ? `En línea · ${lapLiveTxt}` : 'En línea') : 'Hoy · Mapa ›'
-                      )}</span>
-                    `;
-                    const srLbl = `Servicio ${s.serviceNumber}, Turno ${t.turnoIndex} de ${startHH} a ${endHH}, ${lapsTxt}. Coche ${assign.coche}${
-                      assign.choferNombre ? `, chofer ${assign.choferNombre}` : ''
-                    }${isLiveNow ? ', en línea ahora' : ''}. Tocá para ver en el mapa.`;
-                    btnOpen = `<button type="button" class="srv-turno-row is-clickable ${isLiveNow ? 'is-live' : ''}" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srLbl)}">`;
-                    btnClose = `</button>`;
+                    if (isHistoricalSrvDay) {
+                      assignHtml = `
+                        <span class="srv-turno-assigned">
+                          <strong>#${escapeHtml(assign.coche)}</strong>${drvLabel}
+                        </span>
+                        <span class="flota-status-pill is-recent">${escapeHtml(dayNavInfo.shortBadge)}</span>
+                      `;
+                    } else {
+                      const targetIdx = clickTargets.length;
+                      clickTargets.push({
+                        codLinea: linea.codigo,
+                        lineName: linea.descripcion,
+                        coche: assign.coche,
+                        choferNombre: assign.choferNombre,
+                        choferLegajo: assign.choferLegajo,
+                        esAdaptado: assign.esAdaptado,
+                        lat: assign.lat,
+                        lng: assign.lng,
+                        bandera: assign.bandera,
+                        lastGps: assign.lastGps,
+                        lastStopId: assign.lastStopId,
+                        desvioRaw: assign.desvioRaw,
+                        desvioSec: assign.desvioSec,
+                        enLineaAhora: isLiveNow,
+                        lastSeenLabel: isLiveNow ? 'En línea' : 'Hoy',
+                        serviceMeta: {
+                          serviceNumber: s.serviceNumber,
+                          turnoIndex: t.turnoIndex,
+                          serviceTurnosCount: s.turnos.length,
+                          lapNumber: assign.lapNumber,
+                          shiftLaps: t.shiftLaps,
+                          isCortado: t.isCortado,
+                          isRelevoEnLinea: t.isRelevoEnLinea,
+                          startHHMM: startHH,
+                          endHHMM: endHH
+                        }
+                      });
+                      assignHtml = `
+                        <span class="srv-turno-assigned">
+                          <strong>#${escapeHtml(assign.coche)}</strong>${drvLabel}
+                        </span>
+                        <span class="flota-status-pill ${isLiveNow ? 'is-live' : 'is-today'}">${escapeHtml(
+                          isLiveNow ? (lapLiveTxt ? `En línea · ${lapLiveTxt}` : 'En línea') : 'Hoy · Mapa ›'
+                        )}</span>
+                      `;
+                      const srLbl = `Servicio ${s.serviceNumber}, Turno ${t.turnoIndex} de ${startHH} a ${endHH}, ${lapsTxt}. Coche ${assign.coche}${
+                        assign.choferNombre ? `, chofer ${assign.choferNombre}` : ''
+                      }${isLiveNow ? ', en línea ahora' : ''}. Tocá para ver en el mapa.`;
+                      btnOpen = `<button type="button" class="srv-turno-row is-clickable ${isLiveNow ? 'is-live' : ''}" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srLbl)}">`;
+                      btnClose = `</button>`;
+                    }
                   }
 
                   return `
@@ -5834,12 +6030,22 @@ function renderLineFlotaView() {
     `;
   }
 
+  const canGoPrevDay = serviceDayOffset < maxDayOffset;
+  const canGoNextDay = serviceDayOffset > 0;
   const scopeBarHtml =
     fv.tab === 'servicios'
       ? `
-      <div class="flota-scope-bar">
-        <span class="mono-meta">Inicio y fin de cada turno · Tocá un servicio activo para ver en el mapa</span>
-        <span class="mono-meta">${activeCount} srv.</span>
+      <div class="srv-day-nav" role="group" aria-label="Historial de servicios de los últimos ${retentionDays} días">
+        <button type="button" id="btn-srv-prev-day" class="srv-day-arrow" ${canGoPrevDay ? '' : 'disabled'} title="Día anterior" aria-label="Día anterior">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <button type="button" id="btn-srv-today-reset" class="srv-day-label ${isHistoricalSrvDay ? 'is-historical' : ''}" title="${isHistoricalSrvDay ? 'Tocá para volver a hoy' : 'Servicios de hoy'}" aria-live="polite">
+          <span class="srv-day-main">${escapeHtml(dayNavInfo.main)}</span>
+          <span class="srv-day-sub">${escapeHtml(dayNavInfo.tipoLabel)}${srvDayLoading ? ' · Cargando...' : ` · ${activeCount} srv.`}${isHistoricalSrvDay ? ' · Volver a hoy' : ''}</span>
+        </button>
+        <button type="button" id="btn-srv-next-day" class="srv-day-arrow" ${canGoNextDay ? '' : 'disabled'} title="Día siguiente" aria-label="Día siguiente">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
       </div>
     `
       : `
@@ -5851,6 +6057,9 @@ function renderLineFlotaView() {
         <span class="mono-meta">${query ? `${activeCount} de ${activeScopeTotal}` : `${activeCount} reg.`}</span>
       </div>
     `;
+
+  const todaySrvCount = Array.isArray(fv.schedSummary?.services) ? fv.schedSummary.services.length : 0;
+  const tabSrvCount = fv.tab === 'servicios' && !srvDayLoading ? allServices.length : todaySrvCount;
 
   el.lineasContent.innerHTML = `
     <div class="flota-view">
@@ -5875,7 +6084,7 @@ function renderLineFlotaView() {
       <div class="flota-tabs-bar flota-tabs-3" role="tablist" aria-label="Ver coches, choferes o servicios">
         <button type="button" class="flota-tab-btn ${fv.tab === 'coches' ? 'active' : ''}" data-flota-tab="coches" role="tab" aria-selected="${fv.tab === 'coches'}" tabindex="${fv.tab === 'coches' ? '0' : '-1'}">Coches (${scopeCoches.length})</button>
         <button type="button" class="flota-tab-btn ${fv.tab === 'choferes' ? 'active' : ''}" data-flota-tab="choferes" role="tab" aria-selected="${fv.tab === 'choferes'}" tabindex="${fv.tab === 'choferes' ? '0' : '-1'}">Choferes (${scopeChoferes.length})</button>
-        <button type="button" class="flota-tab-btn ${fv.tab === 'servicios' ? 'active' : ''}" data-flota-tab="servicios" role="tab" aria-selected="${fv.tab === 'servicios'}" tabindex="${fv.tab === 'servicios' ? '0' : '-1'}">Servicios (${allServices.length})</button>
+        <button type="button" class="flota-tab-btn ${fv.tab === 'servicios' ? 'active' : ''}" data-flota-tab="servicios" role="tab" aria-selected="${fv.tab === 'servicios'}" tabindex="${fv.tab === 'servicios' ? '0' : '-1'}">Servicios (${tabSrvCount})</button>
       </div>
 
       ${scopeBarHtml}
@@ -5886,7 +6095,33 @@ function renderLineFlotaView() {
 
   document.getElementById('btn-flota-refresh')?.addEventListener('click', () => {
     haptic('light');
-    openLineFlota(linea, { force: true, announceLoad: true });
+    if (fv.tab === 'servicios' && fv.serviceDayOffset > 0) {
+      fv.serviceDayCache?.delete(selectedServiceDayKey);
+      loadServiceHistoryDay(linea, fv.serviceDayOffset, { force: true });
+    } else {
+      openLineFlota(linea, { force: true, announceLoad: true });
+    }
+  });
+
+  document.getElementById('btn-srv-prev-day')?.addEventListener('click', () => {
+    if (serviceDayOffset >= maxDayOffset) return;
+    haptic('light');
+    loadServiceHistoryDay(linea, serviceDayOffset + 1);
+  });
+  document.getElementById('btn-srv-next-day')?.addEventListener('click', () => {
+    if (serviceDayOffset <= 0) return;
+    haptic('light');
+    loadServiceHistoryDay(linea, serviceDayOffset - 1);
+  });
+  document.getElementById('btn-srv-today-reset')?.addEventListener('click', () => {
+    if (serviceDayOffset === 0) return;
+    haptic('light');
+    loadServiceHistoryDay(linea, 0);
+  });
+  document.getElementById('btn-srv-day-retry')?.addEventListener('click', () => {
+    haptic('light');
+    fv.serviceDayCache?.delete(selectedServiceDayKey);
+    loadServiceHistoryDay(linea, serviceDayOffset, { force: true });
   });
 
   const subTabs = Array.from(el.lineasContent.querySelectorAll('[data-flota-tab]'));
@@ -5897,7 +6132,7 @@ function renderLineFlotaView() {
       state.flotaView.tab = next;
       haptic('light');
       renderLineFlotaView();
-      const count = next === 'coches' ? scopeCoches.length : next === 'choferes' ? scopeChoferes.length : allServices.length;
+      const count = next === 'coches' ? scopeCoches.length : next === 'choferes' ? scopeChoferes.length : tabSrvCount;
       announce(
         next === 'coches'
           ? `Lista de coches de línea ${linea.descripcion}: ${count} ${count === 1 ? 'coche' : 'coches'}.`
@@ -5940,7 +6175,7 @@ function renderLineFlotaView() {
   });
 }
 
-async function computeLineScheduledFleetSummary(codLinea) {
+async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null) {
   const num = Number(codLinea);
   if (!num) return null;
   try {
@@ -5958,12 +6193,83 @@ async function computeLineScheduledFleetSummary(codLinea) {
       state.horariosArchiveCache.set(num, horFile || null);
     }
     if (!branches?.length || !horFile) return null;
-    const todayTipo = getArgentinaTodayTipo();
-    const model = buildLineScheduleModel(num, branches, horFile, todayTipo);
+    const targetTipo = tipoDiaOverride || getArgentinaTodayTipo();
+    const model = buildLineScheduleModel(num, branches, horFile, targetTipo);
     if (!model?.fleetSummary) return null;
     return { ...model.fleetSummary, tipoDia: model.tipoDia, _model: model };
   } catch {
     return null;
+  }
+}
+
+async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
+  const fv = state.flotaView;
+  if (!linea || state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+  const retentionDays = fv.data?.retentionDays || 7;
+  const maxOffset = Math.max(0, retentionDays - 1);
+  const clamped = Math.max(0, Math.min(maxOffset, Number(dayOffset) || 0));
+  fv.serviceDayOffset = clamped;
+  if (!(fv.serviceDayCache instanceof Map)) fv.serviceDayCache = new Map();
+
+  const todayKey = fv.data?.dayKey || getArgentinaDayKey();
+  if (clamped === 0) {
+    renderLineFlotaView();
+    const nav = formatServiceDayNavLabel(todayKey, todayKey);
+    announce(`Servicios de ${nav.main}.`);
+    return;
+  }
+
+  const targetDayKey = shiftDayKey(todayKey, -clamped);
+  const targetTipo = getTipoDiaForDayKey(targetDayKey);
+  const cached = fv.serviceDayCache.get(targetDayKey);
+  if (cached && !cached.loading && !cached.error && !force) {
+    renderLineFlotaView();
+    const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
+    announce(`Historial de servicios: ${nav.main}, ${nav.tipoLabel}.`);
+    return;
+  }
+
+  fv.serviceDayCache.set(targetDayKey, {
+    dayTrips: [],
+    dayObs: [],
+    schedSummary: cached?.schedSummary || null,
+    model: cached?.model || null,
+    loading: true,
+    error: null
+  });
+  renderLineFlotaView();
+
+  try {
+    const [res, schedSummary] = await Promise.all([
+      api.flotaLinea(linea.codigo, targetDayKey),
+      computeLineScheduledFleetSummary(linea.codigo, targetTipo)
+    ]);
+    if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+    const d = res?.data || {};
+    fv.serviceDayCache.set(targetDayKey, {
+      dayTrips: Array.isArray(d.dayTrips) ? d.dayTrips : [],
+      dayObs: Array.isArray(d.dayObs) ? d.dayObs : [],
+      schedSummary,
+      model: schedSummary?._model || null,
+      loading: false,
+      error: null
+    });
+    renderLineFlotaView();
+    const nav = formatServiceDayNavLabel(targetDayKey, todayKey);
+    announce(`Historial de servicios: ${nav.main}, ${nav.tipoLabel}.`);
+  } catch (err) {
+    if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
+    fv.serviceDayCache.set(targetDayKey, {
+      dayTrips: [],
+      dayObs: [],
+      schedSummary: null,
+      model: null,
+      loading: false,
+      error: err?.isOffline
+        ? 'Conectate a internet para consultar el historial de días anteriores.'
+        : err?.message || 'No se pudo cargar el historial de este día.'
+    });
+    renderLineFlotaView();
   }
 }
 
@@ -5978,6 +6284,8 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
       data: null,
       schedSummary: null,
       model: null,
+      serviceDayOffset: 0,
+      serviceDayCache: new Map(),
       loading: true,
       error: null
     };
@@ -5986,6 +6294,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     if (force) {
       state.flotaView.loading = true;
       state.flotaView.error = null;
+      state.flotaView.serviceDayCache = new Map();
     }
   }
   renderLineasBreadcrumb();
@@ -5998,7 +6307,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     ]);
     const data = res?.data;
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
-    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], retentionDays: 7, meta: {} };
+    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 7, meta: {} };
     state.flotaView.schedSummary = schedSummary;
     state.flotaView.model = schedSummary?._model || null;
     state.flotaView.loading = false;
