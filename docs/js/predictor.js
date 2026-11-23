@@ -1437,7 +1437,8 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       const s0 = curTrips[0].startSec;
       const eLast = curTrips[curTrips.length - 1].endSec;
       const remDur = eLast - s0;
-      if (remDur <= MAX_SINGLE_SHIFT_SEC) break;
+      const effMaxSingle = curTrips.length <= 5 ? 8.50 * 3600 : MAX_SINGLE_SHIFT_SEC;
+      if (remDur <= effMaxSingle) break;
 
       const targetDur = typicalShiftSec;
       const isDoubleRun = remDur >= 11.2 * 3600;
