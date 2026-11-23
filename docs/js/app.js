@@ -1362,7 +1362,62 @@ function applyLiveHorariosSnapshot(snapshot, { refreshActiveViews = false } = {}
       enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
     }
   }
+  systemDayTipoCache.clear();
   return true;
+}
+
+const systemDayTipoCache = new Map(); // `${dayKey}:${sig}:${archCount}` -> { tipo, tipoLabel, isOverride }
+
+function resolveSystemDayTipo(dayKey) {
+  const calTipo = getTipoDiaForDayKey(dayKey);
+  const defaultLabel = calTipo === 'domingo' ? 'Domingo' : calTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  const dayData = state.liveHorariosDays?.[dayKey];
+  if (!dayData || !dayData.lineas) {
+    return { tipo: calTipo, tipoLabel: defaultLabel, isOverride: false };
+  }
+  const cacheKey = `${dayKey}:${state.liveHorariosSig}:${state.horariosArchiveCache.size}`;
+  if (systemDayTipoCache.has(cacheKey)) return systemDayTipoCache.get(cacheKey);
+
+  const votes = { domingo: 0, sabado: 0, habil: 0, custom: 0 };
+  let evaluated = 0;
+  let overrideVotes = 0;
+
+  for (const [codStr, liveLine] of Object.entries(dayData.lineas)) {
+    const cod = Number(codStr);
+    const arch = state.horariosArchiveCache.get(cod);
+    if (!arch) continue;
+    const res = resolveLiveHorariosForDay(arch, liveLine, calTipo, dayKey);
+    if (res.mode === 'archive' || res.mode === 'archive-pending') continue;
+    evaluated++;
+    const bucket = String(res.tipoDia).startsWith('live_') ? 'custom' : res.tipoDia;
+    if (votes[bucket] !== undefined) votes[bucket]++;
+    if (res.isLiveOverride) overrideVotes++;
+  }
+
+  let result = { tipo: calTipo, tipoLabel: defaultLabel, isOverride: false };
+  if (evaluated > 0 && overrideVotes > 0 && (overrideVotes >= 2 || overrideVotes / evaluated >= 0.5)) {
+    let bestBucket = calTipo;
+    let bestCount = votes[calTipo] || 0;
+    for (const [b, cnt] of Object.entries(votes)) {
+      if (cnt > bestCount) {
+        bestCount = cnt;
+        bestBucket = b;
+      }
+    }
+    if (bestBucket !== calTipo) {
+      const label =
+        bestBucket === 'domingo'
+          ? 'Domingo / Feriado'
+          : bestBucket === 'sabado'
+            ? 'Sábado / Feriado'
+            : bestBucket === 'custom'
+              ? 'Horario especial'
+              : 'Lun–Vie';
+      result = { tipo: bestBucket, tipoLabel: label, isOverride: true };
+    }
+  }
+  systemDayTipoCache.set(cacheKey, result);
+  return result;
 }
 
 async function syncLiveHorariosSilent({ refreshActiveViews = true } = {}) {
@@ -3376,8 +3431,9 @@ function formatEventsDayNavLabel(dayKey, todayKey, offset = 0) {
   const ddmm = m ? `${m[3]}/${m[2]}` : dayKey;
   const dowIdx = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay() : 0;
   const dowShort = SHORT_DOW_ES[dowIdx] || '';
-  const tipo = dowIdx === 0 ? 'domingo' : dowIdx === 6 ? 'sabado' : 'habil';
-  const tipoLabel = tipo === 'domingo' ? 'Domingo' : tipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  const sysDay = resolveSystemDayTipo(dayKey);
+  const tipo = sysDay.tipo;
+  const tipoLabel = sysDay.tipoLabel;
   if (offset === 0 || dayKey === todayKey) {
     return { main: `Hoy · ${dowShort} ${ddmm}`, shortBadge: 'Hoy', tipo, tipoLabel };
   }
@@ -3939,11 +3995,16 @@ async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false
   }
   try {
     const allCodes = (state.lineas || []).map((l) => Number(l.codigo)).filter(Boolean);
+    const needLiveSync = !state.liveHorariosDays || Object.keys(state.liveHorariosDays).length === 0;
     const [, bundleRes] = await Promise.all([
       ensureScheduleAssetsLoaded(allCodes),
-      api.getOfflineBundleCached({ maxAgeMs: forceBundle ? 0 : 20000, force: forceBundle })
+      api.getOfflineBundleCached({ maxAgeMs: forceBundle ? 0 : 20000, force: forceBundle }),
+      needLiveSync ? syncLiveHorariosSilent({ refreshActiveViews: false }) : Promise.resolve()
     ]);
     if (mySeq !== eventsLoadSeq || !state.eventsModalOpen) return;
+    if (bundleRes?.data?.liveHorarios) {
+      applyLiveHorariosSnapshot(bundleRes.data.liveHorarios, { refreshActiveViews: false });
+    }
     state.eventsBundle = bundleRes?.data || state.eventsBundle;
     state.eventsBundleSavedAt = Number(bundleRes?.savedAt) || Date.now();
     state.eventsIsOfflineCache = Boolean(bundleRes?.isOfflineCache);
@@ -5250,7 +5311,8 @@ function lookupSlotBlockMeta(slotMetaByHora, hora, minuteOfDay) {
 }
 
 function computeHorariosLiveMatch(ctx) {
-  const todayTipo = getArgentinaTodayTipo();
+  const effToday = resolveEffectiveLineHorarios(ctx.codLinea, getArgentinaDayKey());
+  const todayTipo = effToday.tipoDia || getArgentinaTodayTipo();
   const isTodayScheme = ctx.tipoDia === todayTipo;
   const nowArt = getArgentinaNow();
   const nowRawMin = nowArt.getUTCHours() * 60 + nowArt.getUTCMinutes();
@@ -6135,8 +6197,9 @@ function formatServiceDayNavLabel(dayKey, todayKey) {
   const ddmm = m ? `${m[3]}/${m[2]}` : dayKey;
   const dowIdx = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay() : 0;
   const dowShort = SHORT_DOW_ES[dowIdx] || '';
-  const tipo = dowIdx === 0 ? 'domingo' : dowIdx === 6 ? 'sabado' : 'habil';
-  const tipoLabel = tipo === 'domingo' ? 'Domingo' : tipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  const sysDay = resolveSystemDayTipo(dayKey);
+  const tipo = sysDay.tipo;
+  const tipoLabel = sysDay.tipoLabel;
   if (dayKey === todayKey) {
     return { main: `Hoy · ${dowShort} ${ddmm}`, shortBadge: 'Hoy', tipo, tipoLabel };
   }
@@ -8441,7 +8504,8 @@ function renderLineRecorridoView() {
 
   const nowSecRaw = getArgentinaSecOfDay();
   const nowSvcSec = nowSecRaw < 3 * 3600 ? nowSecRaw + 86400 : nowSecRaw;
-  const isTodayTipo = rv.tipoDia === getArgentinaTodayTipo();
+  const effTodayRec = resolveEffectiveLineHorarios(linea.codigo, getArgentinaDayKey());
+  const isTodayTipo = rv.tipoDia === (effTodayRec.tipoDia || getArgentinaTodayTipo());
 
   // Identify current/next trip index for instant highlighting and "Ir a ahora" scroll
   let currentTripIdx = -1;
