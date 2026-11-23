@@ -319,6 +319,16 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.4.16',
+    date: '23/11/2026 · 13:20 hs',
+    items: [
+      '<strong>Desvío GPS 100% real en coches en vivo:</strong> el simulador ya nunca sobrescribe ni inventa desvíos horarios en colectivos con señal de SmartMovePro (como el falso <code>-23:19</code> cuando un GPS queda congelado), manteniendo siempre el desvío real del satélite y bloqueando solo saltos espurios (como <code>+69:53</code> o <code>-50:xx</code>).',
+      '<strong>Sin retrocesos bruscos cada 10 s y soporte para horas de 1 dígito:</strong> se corrigió la lectura de marcas GPS matutinas de un dígito (por ejemplo <code>7:10:34</code>) tanto en la app como en el servidor, se conservó la antigüedad real de GPS congelados (>2 h) y se eliminó el avance/retroceso cada 10 segundos en unidades detenidas o con GPS trabado.',
+      '<strong>Mejor detección de mano contraria en avenidas divididas:</strong> se amplió el bloqueo espacial de mano opuesta para que un tiempo corto erróneo del servidor nunca oculte el turno real ni la calzada física correcta.',
+      '<strong>Eventos consistentes en fines de semana y feriados:</strong> las líneas que solo circulan en días hábiles (como la <strong>109B</strong>) ya no generan eventos fantasma en sábados ni domingos sin escaneo previo (domingo y feriado coinciden exactamente en 177 eventos).'
+    ]
+  },
+  {
     version: 'v2.4.15',
     date: '23/11/2026 · 11:55 hs',
     items: [
@@ -4604,7 +4614,22 @@ function reconcileWithSchedulePrediction(
       });
       for (const b of buses) {
         const m = matches.get(b.key);
-        if (!m) continue;
+        if (!m) {
+          if (!b.isNextLap && b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
+            const impliedSpeedMps =
+              b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
+            if (impliedSpeedMps > 13.5) {
+              const estSec = Math.max(Math.round(b.routeMeters / 10.5), Math.round(b.routeMeters / 5.8));
+              const estMin = Math.max(1, Math.round(estSec / 60));
+              b.eta = parseEtaMinutes(`${estMin} min`);
+              b.etaSecondsRemaining = estSec;
+              b.tiempoRaw = `${estMin} min`;
+              b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
+              b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
+            }
+          }
+          continue;
+        }
         matchedTrips.add(m.tripKey);
         liveBusByTrip.set(m.tripKey, b);
         completedSet.delete(`${cod}:${m.tripKey}`); // bus is actively approaching, definitely not completed
@@ -4849,18 +4874,6 @@ function reconcileWithSchedulePrediction(
             state.sessionObservedTrips.set(`${cod}:${recTripKey}`, rec);
             seenReports.push(rec);
           }
-        }
-      } else if (!b.isNextLap && b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
-        const impliedSpeedMps =
-          b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
-        if (impliedSpeedMps > 13.5) {
-          const estSec = Math.max(Math.round(b.routeMeters / 10.5), Math.round(b.routeMeters / 5.8));
-          const estMin = Math.max(1, Math.round(estSec / 60));
-          b.eta = parseEtaMinutes(`${estMin} min`);
-          b.etaSecondsRemaining = estSec;
-          b.tiempoRaw = `${estMin} min`;
-          b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
-          b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
         }
       }
     }
