@@ -44,7 +44,8 @@ import {
   formatShiftLapsSpoken,
   resolveUnitScheduleMeta,
   matchFreeFleetUnitsToModel,
-  resolveLiveHorariosForDay
+  resolveLiveHorariosForDay,
+  sanitizeLiveDesvio
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -1534,7 +1535,7 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
         if (ageSec >= 3 && ageSec <= 180) memPrev = lastServer;
       }
 
-      if (memUnit?.dirBandera && memUnit.updatedAt && now - memUnit.updatedAt <= 8 * 60 * 1000) {
+      if (memUnit?.dirBandera && memUnit.updatedAt && now - memUnit.updatedAt <= 3.5 * 60 * 1000) {
         initConfirmedDir = {
           bandera: String(memUnit.dirBandera).trim(),
           confidence: 0.72,
@@ -1553,9 +1554,10 @@ function recordUnitGpsFix(baseId, codLinea, coche, lat, lng, gpsRaw, now = Date.
     hist = {
       latest: curFix,
       prev: memPrev,
-      prevMoving: prevMovingCand && movedMem >= 20 ? prevMovingCand : null,
+      prevMoving: prevMovingCand && movedMem >= 18 ? prevMovingCand : null,
       trail: initTrail,
-      confirmedDir: initConfirmedDir
+      confirmedDir: initConfirmedDir,
+      lastGoodDesvio: null
     };
     state.lastRealGpsByUnit.set(baseId, hist);
   } else {
@@ -2887,7 +2889,7 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
   if (prevFix && typeof prevFix.lat === 'number' && typeof prevFix.lng === 'number') {
     const dtPrev = gpsMs && prevFix.gpsMs ? (gpsMs - prevFix.gpsMs) / 1000 : 30;
     const moved = distanceMeters(prevFix.lat, prevFix.lng, lat, lng) ?? 0;
-    if (dtPrev >= 4 && dtPrev <= 240 && moved >= 22 && moved <= Math.max(2500, dtPrev * 32)) {
+    if (dtPrev >= 4 && dtPrev <= 240 && moved >= 18 && moved <= Math.max(2500, dtPrev * 32)) {
       let bestFwd = null;
       let bestFwdScore = Infinity;
       for (const b of branches) {
@@ -2896,7 +2898,7 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
         const pPrev = projectOnPolyline(b.pts, b.cum, prevFix.lat, prevFix.lng);
         if (!pPrev || pPrev.perp > 260) continue;
         const deltaAlong = pCur.along - pPrev.along;
-        if (deltaAlong >= Math.max(10, moved * 0.35)) {
+        if (deltaAlong >= Math.max(8, moved * 0.35)) {
           const score = pCur.perp + pPrev.perp * 0.5 - Math.min(80, deltaAlong * 0.15);
           if (score < bestFwdScore) {
             bestFwdScore = score;
@@ -2908,9 +2910,14 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
     }
   }
 
-  // Layer 2: Confirmed multi-point GPS trail direction wins when bus is near that branch
+  // Layer 2: Fresh multi-point local GPS trail direction (NEVER stale server-persisted dirBandera!)
   const confirmedDir = rec?.confirmedDir;
-  if (confirmedDir && typeof confirmedDir.branchIndex === 'number' && branches[confirmedDir.branchIndex]) {
+  if (
+    confirmedDir &&
+    !confirmedDir.fromServer &&
+    typeof confirmedDir.branchIndex === 'number' &&
+    branches[confirmedDir.branchIndex]
+  ) {
     const cb = branches[confirmedDir.branchIndex];
     const cp = projectOnPolyline(cb.pts, cb.cum, lat, lng);
     if (cp && cp.perp <= 260) return { branch: cb, proj: cp, dirSource: 'trail', ambiguous: false };
@@ -2926,12 +2933,12 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
   }
   projs.sort((a, b) => a.proj.perp - b.proj.perp);
 
-  // Layer 3: Distinct physical carriageway / one-way street (e.g. Av. Pedro Ferré north vs south, or one-way streets)
+  // Layer 3: Distinct physical carriageway / one-way street (e.g. Av. Independencia, Av. Pedro Ferré, 3 de Abril)
   if (projs.length > 0) {
     const best = projs[0];
     const secondPerp = projs.length > 1 ? projs[1].proj.perp : Infinity;
     const nearTerm = best.proj.along <= 180 || (best.branch.totalLen || 0) - best.proj.along <= 180;
-    if (!nearTerm && best.proj.perp <= 35 && (projs.length === 1 || secondPerp - best.proj.perp >= 10)) {
+    if (!nearTerm && best.proj.perp <= 28 && (projs.length === 1 || secondPerp - best.proj.perp >= 9)) {
       return { branch: best.branch, proj: best.proj, dirSource: 'lane', ambiguous: false };
     }
   }
@@ -2942,7 +2949,18 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
     if (mp && mp.perp <= 260) return { branch: bus._matchedBranch, proj: mp, dirSource: 'schedule', ambiguous: false };
   }
 
-  // Layer 5: Pure closest branch without stop-bandera distortion (flagged ambiguous if 2+ branches overlap within 100m)
+  // Layer 5: Server-persisted confirmedDir (only if schedule didn't resolve and server hint is fresh)
+  if (confirmedDir && confirmedDir.fromServer && confirmedDir.bandera) {
+    const matched = branches.find(
+      (b) => b.bandera && b.bandera.toUpperCase() === confirmedDir.bandera.toUpperCase()
+    );
+    if (matched) {
+      const cp = projectOnPolyline(matched.pts, matched.cum, lat, lng);
+      if (cp && cp.perp <= 260) return { branch: matched, proj: cp, dirSource: 'persisted', ambiguous: false };
+    }
+  }
+
+  // Layer 6: Pure closest branch without stop-bandera distortion (flagged ambiguous if 2+ branches overlap within 100m)
   if (projs.length === 0) return null;
   const nearCount = projs.filter((p) => p.proj.perp <= 100).length;
   return {
@@ -2977,6 +2995,7 @@ function applyScheduleMetaToCityBus(bus, meta) {
 function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
   const byLine = new Map();
   const missingAssetLines = [];
+  const nowMs = Date.now();
   for (const bus of buses) {
     const cod = Number(bus.codigoLinea);
     if (!byLine.has(cod)) byLine.set(cod, []);
@@ -3011,6 +3030,26 @@ function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
         globalMatched.get(bus.identificadorCoche) ||
         resolveUnitScheduleMeta(model, matchInputs[i], nowSec, state.lastRealGpsByUnit);
       if (meta) applyScheduleMetaToCityBus(bus, meta);
+
+      // Sanitize intermittent SmartMovePro opposite-direction desvio glitches (e.g. -01:39 -> -50:xx) in Modo Libre too!
+      if (bus.desvio && bus.identificadorCoche) {
+        const unitHist = state.lastRealGpsByUnit.get(`${cod}-c${bus.identificadorCoche}`);
+        const gpsClock = parseGpsStampSecOfDay(bus.ultimaFechaHoraGPS) ?? nowSec;
+        const san = sanitizeLiveDesvio(
+          bus.desvio,
+          meta?.trip || null,
+          bus.rawLat ?? bus.lat,
+          bus.rawLng ?? bus.lng,
+          gpsClock,
+          unitHist?.lastGoodDesvio || null,
+          nowMs
+        );
+        if (san.wasGlitch) {
+          bus.desvio = san.desvio;
+        } else if (san.isGood && unitHist) {
+          unitHist.lastGoodDesvio = { sec: bus.desvio.seconds, raw: bus.desvio.raw, ts: nowMs };
+        }
+      }
     }
   }
   return missingAssetLines;
@@ -4591,41 +4630,122 @@ function reconcileWithSchedulePrediction(
           }
         }
 
-        // Whenever trajectory direction was only inferred by ETA (not yet confirmed by a moving GPS trail)
-        // and the spatial-temporal schedule anchor proves the bus is on a different BANDERA/leg, refine immediately!
+        // 1) Sanitize intermittent SmartMovePro opposite-direction desvio glitches (e.g. -01:39 flickering to -50:xx)
+        //    and refine trajectory + BANDERA + impossible ETA whenever global schedule lock proves the true physical leg!
+        const unitHist =
+          !b.isNextLap && b.identificadorCoche
+            ? state.lastRealGpsByUnit.get(`${cod}-c${b.identificadorCoche}`) || null
+            : null;
+        const gpsClock = !b.isNextLap ? parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec : nowSec;
+        const trueActiveTrip = m.activeTrip || m.trip;
+
+        if (!b.isNextLap && b.desvio) {
+          const san = sanitizeLiveDesvio(
+            b.desvio,
+            trueActiveTrip,
+            b.lat,
+            b.lng,
+            gpsClock,
+            unitHist?.lastGoodDesvio || null,
+            nowMs
+          );
+          if (san.wasGlitch) {
+            b.desvio = san.desvio;
+          } else if (san.isGood && unitHist) {
+            unitHist.lastGoodDesvio = { sec: b.desvio.seconds, raw: b.desvio.raw, ts: nowMs };
+          }
+        }
+
+        // Refine trajectory whenever global spatial-temporal lock proves the bus is physically on a different
+        // BANDERA/leg — NEVER let stale server-persisted `dirBandera` or bogus SmartMovePro ETA block correction!
+        // Only a fresh multi-point local GPS trail (`directionSource === 'trail'`) overrides schedule geometry.
+        let resolvedPhysicalTrip = trueActiveTrip;
         if (
           !b.isNextLap &&
-          (!b.directionSource || b.directionSource === 'eta') &&
           m.trip &&
           b.stopProj &&
           typeof b.lat === 'number' &&
           typeof b.lng === 'number'
         ) {
-          const gpsClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec;
-          const liveAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, b.desvio?.seconds || 0);
-          const anchorDiffers =
-            liveAnchor &&
-            liveAnchor.branch &&
-            !liveAnchor.atOriginTerminal &&
-            ((liveAnchor.legDepth >= 1 && b.trajectory?.leg === 'direct') ||
-              (liveAnchor.branch.bandera && b.realBandera && liveAnchor.branch.bandera !== b.realBandera));
-          if (anchorDiffers) {
-            const refinedTraj = buildTrajectoryFromBranchAlong(
-              liveAnchor.branch,
-              liveAnchor.along,
-              m.trip.branch,
-              b.stopProj,
-              {
-                isAtTerminal: Boolean(b.trajectory?.isAtTerminal),
-                etaSec: b.etaSecondsRemaining || 600
+          const safeCleanDesvio = Math.abs(b.desvio?.seconds || 0) <= 38 * 60 ? (b.desvio?.seconds || 0) : 0;
+          const liveAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, safeCleanDesvio, {
+            prevFix: b.prevGpsFix
+          });
+          const candTrip =
+            m.activeLegDepth >= 1 && m.activeTrip?.branch
+              ? m.activeTrip
+              : liveAnchor?.trip?.branch && !liveAnchor.atOriginTerminal
+                ? liveAnchor.trip
+                : trueActiveTrip;
+          if (candTrip?.branch) {
+            resolvedPhysicalTrip = candTrip;
+            const resProj = projectOnPolyline(candTrip.branch.pts, candTrip.branch.cum, b.lat, b.lng);
+            const resLegDepth =
+              candTrip === m.trip ? 0 : candTrip === m.trip.prevTrip ? 1 : Math.max(1, m.activeLegDepth || 1);
+            const freshTrailLocksCurrent =
+              b.directionSource === 'trail' &&
+              b.confirmedDirectionBandera &&
+              b.realBandera &&
+              b.confirmedDirectionBandera === b.realBandera;
+            const dirDiffers =
+              resProj &&
+              resProj.perp <= 260 &&
+              resProj.along > 220 &&
+              ((resLegDepth >= 1 && b.trajectory?.leg === 'direct') ||
+                (candTrip.branch.bandera && b.realBandera && candTrip.branch.bandera !== b.realBandera));
+
+            if (dirDiffers && !freshTrailLocksCurrent) {
+              const refinedTraj = buildTrajectoryFromBranchAlong(
+                candTrip.branch,
+                resProj.along,
+                m.trip.branch,
+                b.stopProj,
+                {
+                  isAtTerminal: Boolean(b.trajectory?.isAtTerminal),
+                  etaSec: b.etaSecondsRemaining || 600
+                }
+              );
+              if (refinedTraj) {
+                b.trajectory = refinedTraj;
+                b.routeMeters = refinedTraj.totalMeters;
+                b.isOppositeLeg = Boolean(refinedTraj.isOppositeLeg);
+                b.realBandera = refinedTraj.realBandera || candTrip.branch.bandera || b.realBandera;
+                b.realBanderaColor = refinedTraj.realBanderaColor || candTrip.branch.color || b.realBanderaColor;
+                b.directionSource = 'schedule';
+                b.confirmedDirectionBandera = b.realBandera;
+                if (unitHist?.confirmedDir?.fromServer && unitHist.confirmedDir.bandera !== b.realBandera) {
+                  unitHist.confirmedDir = null;
+                }
               }
-            );
-            if (refinedTraj) {
-              b.trajectory = refinedTraj;
-              b.routeMeters = refinedTraj.totalMeters;
-              b.isOppositeLeg = Boolean(refinedTraj.isOppositeLeg);
-              b.realBandera = refinedTraj.realBandera || liveAnchor.branch.bandera || b.realBandera;
-              b.realBanderaColor = refinedTraj.realBanderaColor || liveAnchor.branch.color || b.realBanderaColor;
+            }
+          }
+
+          // If this bus is physically on the opposite leg (detected by lane, GPS trail, OR schedule lock)
+          // and SmartMovePro gave a bogus short ETA (e.g. 12 min for 21 km = 105 km/h!), recompute an accurate
+          // ETA from the matched schedule pass time & sanitized desvio!
+          if (b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
+            const effNowSvc = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
+            const impliedSpeedMps =
+              b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
+            const schedRemSec =
+              typeof m.targetStopSec === 'number'
+                ? m.targetStopSec - (b.desvio?.seconds || 0) - effNowSvc
+                : null;
+            const validSchedRem = schedRemSec !== null && schedRemSec >= 120 && schedRemSec <= 4 * 3600;
+            const etaMismatchSec =
+              validSchedRem && b.eta?.valid ? Math.abs(schedRemSec - b.eta.minutes * 60) : 0;
+
+            if (impliedSpeedMps > 13.5 || etaMismatchSec >= 20 * 60) {
+              const minPhysSec = Math.round(b.routeMeters / 10.5);
+              const estSec = validSchedRem
+                ? Math.max(minPhysSec, Math.round(schedRemSec))
+                : Math.max(minPhysSec, Math.round(b.routeMeters / 5.8));
+              const estMin = Math.max(1, Math.round(estSec / 60));
+              b.eta = parseEtaMinutes(`${estMin} min`);
+              b.etaSecondsRemaining = estSec;
+              b.tiempoRaw = `${estMin} min`;
+              b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
+              b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
             }
           }
         }
@@ -4640,21 +4760,24 @@ function reconcileWithSchedulePrediction(
 
         // Persist last-seen online vehicle, GPS position trail & confirmed direction into central FleetMemory
         if (!b.isNextLap && b.identificadorCoche) {
-          const unitHist = state.lastRealGpsByUnit.get(`${cod}-c${b.identificadorCoche}`);
           const compactTrail = Array.isArray(unitHist?.trail)
             ? unitHist.trail
                 .slice(-6)
                 .map((pt) => [Number(pt.lat.toFixed(6)), Number(pt.lng.toFixed(6)), pt.gpsMs || pt.ts || nowMs])
             : [];
-          const dirBandera =
-            b.confirmedDirectionBandera || unitHist?.confirmedDir?.bandera || '';
+          const hasTrustedDir =
+            b.directionSource === 'trail' || b.directionSource === 'lane' || b.directionSource === 'schedule';
+          const dirBandera = hasTrustedDir
+            ? b.confirmedDirectionBandera || b.realBandera || ''
+            : !unitHist?.confirmedDir?.fromServer
+              ? unitHist?.confirmedDir?.bandera || ''
+              : '';
 
           // Resolve the trip the bus is PHYSICALLY driving right now (not a future leg / next-turno trip approaching stopId!)
-          const gpsClock = parseGpsStampSecOfDay(b.ultimaFechaHoraGPS) ?? nowSec;
           const gpsSvcSec = gpsClock < 3 * 3600 ? gpsClock + 86400 : gpsClock;
-          let recTrip = m.trip;
-          if (m.trip && typeof b.lat === 'number' && typeof b.lng === 'number') {
-            const safeDesvio = Math.abs(b.desvio?.seconds || 0) <= 40 * 60 ? (b.desvio?.seconds || 0) : 0;
+          let recTrip = resolvedPhysicalTrip || m.trip;
+          if (recTrip === m.trip && m.trip && typeof b.lat === 'number' && typeof b.lng === 'number') {
+            const safeDesvio = Math.abs(b.desvio?.seconds || 0) <= 38 * 60 ? (b.desvio?.seconds || 0) : 0;
             const curAnchor = buildGpsAnchorForTrip(m.trip, b.lat, b.lng, gpsClock, safeDesvio);
             if (curAnchor?.trip && curAnchor.legDepth >= 1) {
               recTrip = curAnchor.trip;
@@ -4750,7 +4873,9 @@ function reconcileWithSchedulePrediction(
 
   // ULT. GPS (blue mode): show ONLY static last GPS positions without schedule-synthesized units
   if (!state.simulateMode) {
-    return syncNextLapCardsToPrimary(liveBuses);
+    return syncNextLapCardsToPrimary(liveBuses).sort(
+      (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
+    );
   }
 
   // EN VIVO (green mode): synthesize realistic street-following buses for active turns without live GPS

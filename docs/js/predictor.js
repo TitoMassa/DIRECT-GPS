@@ -2488,89 +2488,134 @@ function scoreBusAgainstCandidate(
   busNormBandera,
   getProjForBranch
 ) {
-  const desvioSec = bus.desvio?.seconds || 0;
+  const rawDesvioSec = bus.desvio?.seconds || 0;
   const hasDesvio = bus.desvio && bus.desvio.status !== 'none';
+  // Ignore extreme SmartMovePro direction-flip / between-shifts desvio spikes (> 38 min)
+  const safeDesvioSec = Math.abs(rawDesvioSec) <= 38 * 60 ? rawDesvioSec : 0;
   const stickyTripKey = stickyRec?.tripKey || null;
   const stickyService = stickyRec?.serviceNumber || null;
   const isStickyTrip = Boolean(stickyTripKey && item.trip.tripKey === stickyTripKey);
   const isStickyService = Boolean(stickyService && item.trip.serviceNumber === stickyService);
+  const gpsClockRaw = parseGpsStampSecOfDay(bus.ultimaFechaHoraGPS || '');
   const effNow = toServiceSec(nowSec);
+  const effClock = gpsClockRaw !== null && Math.abs(toServiceSec(gpsClockRaw) - effNow) <= 10 * 60 ? toServiceSec(gpsClockRaw) : effNow;
 
+  const dirSrc = bus.trajectory?.directionSource || '';
+  const isFreshPhysicalDir = dirSrc === 'trail' || dirSrc === 'heading';
+  const isLaneDir = dirSrc === 'lane';
+  const isPersistedDir = dirSrc === 'persisted';
   const confirmedBranch =
-    !bus.trajectory?.isAtTerminal &&
-    (bus.trajectory?.directionSource === 'trail' || bus.trajectory?.directionSource === 'persisted')
+    !bus.trajectory?.isAtTerminal && (isFreshPhysicalDir || isLaneDir || isPersistedDir)
       ? bus.trajectory.confirmedBranch
       : null;
 
-  // ── Signal A: Exact spatial-temporal match using GPS coordinate + SmartMovePro desvio ──
-  // Independent of SmartMovePro's noisy ETA and works even if the bus is 30 min late or 15 min early!
+  // ── Signal A: Multi-leg exact spatial-temporal match across (trip, prevTrip, prevTrip.prevTrip) ──
+  // Always tests ALL 3 physical legs regardless of SmartMovePro's noisy ETA so a bogus ETA on a
+  // shared two-way avenue (e.g. Av. Independencia) can NEVER blind the matcher to the opposite branch!
   let spatialDiffSec = Infinity;
-  if (typeof bus.lat === 'number' && typeof bus.lng === 'number' && hasDesvio) {
-    const tEff = effNow + desvioSec;
-    const leg = bus.trajectory?.leg;
-    const isOpp = leg === 'previous_leg' || bus.isOppositeLeg;
-    const isFullCycle = leg === 'full_cycle' || bus.isNextCycle || bus.isNextLap;
+  let activeTrip = item.trip;
+  let activeLegDepth = 0;
 
-    const testTripSpatial = (tr) => {
-      if (!tr) return Infinity;
-      const proj = getProjForBranch(tr.branch);
-      if (!proj || proj.perp > 160) return Infinity;
-      const schedAtBus = getTripSecAtAlong(tr, proj.along);
-      if (schedAtBus === null) return Infinity;
-      let d = Math.abs(schedAtBus - tEff);
-      if (d > 43200) d = Math.abs(d - 86400);
-      // Multi-point GPS trail direction penalty: prevent matching opposite-direction trips on two-way avenues
-      if (confirmedBranch && tr.branch !== confirmedBranch) {
-        const nearTerminal = proj.along <= 240 || (tr.branch.totalLen || 0) - proj.along <= 240;
-        if (!nearTerminal) d += 9 * 60;
+  if (typeof bus.lat === 'number' && typeof bus.lng === 'number') {
+    const legCands = [{ tr: item.trip, depth: 0 }];
+    if (item.trip.prevTrip) {
+      legCands.push({ tr: item.trip.prevTrip, depth: 1 });
+      if (item.trip.prevTrip.prevTrip) {
+        legCands.push({ tr: item.trip.prevTrip.prevTrip, depth: 2 });
       }
-      return d;
+    }
+
+    // Measure minimum perpendicular distance across candidate branches for divided-avenue carriageway detection
+    let minCandPerp = Infinity;
+    const candProjs = legCands.map((c) => {
+      const p = getProjForBranch(c.tr.branch);
+      if (p && p.perp <= 180 && p.perp < minCandPerp) minCandPerp = p.perp;
+      return { ...c, proj: p };
+    });
+
+    const evalAtClock = (evalSec, clockBiasSec = 0) => {
+      let best = { score: Infinity, tr: item.trip, depth: 0 };
+      for (const c of candProjs) {
+        const proj = c.proj;
+        if (!proj || proj.perp > 180) continue;
+        // Skip clearly expired trips (> 22 min past end) unless bus is parked at terminal
+        const nearTerminal = proj.along <= 240 || Math.max(0, (c.tr.branch.totalLen || 0) - proj.along) <= 240;
+        const schedAtBus = getTripSecAtAlong(c.tr, proj.along);
+        if (schedAtBus === null) continue;
+        let d = Math.abs(schedAtBus - evalSec);
+        if (d > 43200) d = Math.abs(d - 86400);
+        if (d > 26 * 60) continue;
+
+        let penalty = clockBiasSec;
+        // Expired-trip guard: heavily penalize trips that already finished > 18 min ago
+        if (!nearTerminal && effClock > c.tr.endSec + 18 * 60) {
+          penalty += 14 * 60;
+        }
+        // Pre-departure mid-route guard: cannot be mid-route on a trip that hasn't started yet
+        if (!nearTerminal && c.depth === 0 && effClock < c.tr.startSec - 4 * 60) {
+          penalty += 12 * 60;
+        }
+        // Physical direction consensus: fresh GPS trail > divided carriageway > stale persisted
+        if (confirmedBranch && !nearTerminal) {
+          if (c.tr.branch === confirmedBranch) {
+            penalty -= isFreshPhysicalDir ? 75 : isLaneDir ? 45 : 20;
+          } else {
+            penalty += isFreshPhysicalDir ? 11 * 60 : isLaneDir ? 5 * 60 : 90;
+          }
+        }
+        // Divided avenue carriageway offset (Av. Independencia, Av. Ferré, Av. 3 de Abril)
+        if (!nearTerminal && minCandPerp <= 28 && proj.perp >= minCandPerp + 9) {
+          penalty += 240;
+        }
+        penalty += Math.min(180, proj.perp * 1.1);
+
+        const total = Math.max(0, d + penalty);
+        if (total < best.score) {
+          best = { score: total, tr: c.tr, depth: c.depth };
+        }
+      }
+      return best;
     };
 
-    if (isFullCycle) {
-      spatialDiffSec = Math.min(
-        testTripSpatial(item.trip.prevTrip?.prevTrip),
-        testTripSpatial(item.trip.prevTrip)
-      );
-    } else if (isOpp) {
-      spatialDiffSec = Math.min(
-        testTripSpatial(item.trip.prevTrip),
-        testTripSpatial(item.trip.prevTrip?.prevTrip)
-      );
-    } else if (bus.trajectory?.isAtTerminal) {
-      spatialDiffSec = Math.min(
-        testTripSpatial(item.trip),
-        testTripSpatial(item.trip.prevTrip)
-      );
-    } else {
-      spatialDiffSec =
-        effNow < item.trip.startSec - 120 && item.trip.prevTrip
-          ? Math.min(testTripSpatial(item.trip), testTripSpatial(item.trip.prevTrip))
-          : testTripSpatial(item.trip);
+    const desvioEval = evalAtClock(effClock + safeDesvioSec, 0);
+    let chosen = desvioEval;
+    // Dual-clock anti-glitch check: if SmartMovePro sent a suspiciously large desvio (>= 16 min or > 38 min),
+    // ALSO test raw GPS clock so a -50:xx opposite-direction glitch NEVER hijacks the match!
+    if (Math.abs(rawDesvioSec) >= 16 * 60 || !hasDesvio) {
+      const rawBias = hasDesvio && Math.abs(rawDesvioSec) <= 38 * 60 ? 90 : 0;
+      const rawEval = evalAtClock(effClock, rawBias);
+      if (rawEval.score < chosen.score) {
+        chosen = rawEval;
+      }
     }
+    spatialDiffSec = chosen.score;
+    activeTrip = chosen.tr;
+    activeLegDepth = chosen.depth;
   }
 
   // ── Signal B: ETA + Desvio match (`Now + ETA + Desvio` vs `targetStopSec`) ──
   let etaDiffSec = Infinity;
   if (bus.eta && bus.eta.valid !== false && typeof bus.eta.minutes === 'number' && bus.eta.minutes <= 240) {
-    const expectedSec = effNow + bus.eta.minutes * 60 + desvioSec;
+    const expectedSec = effNow + bus.eta.minutes * 60 + safeDesvioSec;
     let d = Math.abs(item.stSec - expectedSec);
     if (d > 43200) d = Math.abs(d - 86400);
     etaDiffSec = d;
   }
 
-  // Combine both signals: spatial-temporal dominates when available (exact even at ±35 min off-schedule!)
+  // Combine both signals: spatial-temporal dominates when tight (NEVER let a bogus SmartMovePro ETA
+  // from a confused two-way avenue kill a <= 5 min spatial-temporal lock on the true active branch!)
   let bestRawDiff;
   let maxAllowed;
   if (spatialDiffSec <= 15 * 60) {
-    if (etaDiffSec < Infinity && etaDiffSec > 45 * 60) return null;
+    const strongSpatialLock = spatialDiffSec <= 5 * 60 || (activeLegDepth >= 1 && spatialDiffSec <= 9 * 60);
+    if (!strongSpatialLock && etaDiffSec < Infinity && etaDiffSec > 45 * 60) return null;
     bestRawDiff = spatialDiffSec;
     maxAllowed = isStickyTrip || isStickyService ? 18 * 60 : 15 * 60;
   } else {
     if (etaDiffSec === Infinity) return null;
     let baseTolMin = (bus.eta?.minutes || 0) >= 35 || !hasDesvio ? 18 : 14;
     if (bus.esExtendido || bus.isOppositeLeg) baseTolMin += 5;
-    if (Math.abs(desvioSec) >= 6 * 60) baseTolMin += 5;
+    if (Math.abs(safeDesvioSec) >= 6 * 60) baseTolMin += 5;
     maxAllowed = isStickyTrip || isStickyService ? Math.max(baseTolMin * 60, 22 * 60) : baseTolMin * 60;
     bestRawDiff = etaDiffSec;
   }
@@ -2599,7 +2644,9 @@ function scoreBusAgainstCandidate(
 
   return {
     rawScore,
-    effScore: Math.max(0, rawScore - hysteresisBonus)
+    effScore: Math.max(0, rawScore - hysteresisBonus),
+    activeTrip,
+    activeLegDepth
   };
 }
 
@@ -2637,8 +2684,8 @@ function scoreCorridorPeerAgainstService(
   }
   const hasDesvio = Boolean(parsedDesvio && parsedDesvio.status !== 'none');
   const rawDesvioSec = parsedDesvio?.seconds || 0;
-  // Clamp/ignore absurd terminal-wait desvios (e.g. +135:00 while parked between shifts)
-  const desvioSec = Math.abs(rawDesvioSec) <= 40 * 60 ? rawDesvioSec : 0;
+  // Clamp/ignore absurd terminal-wait or SmartMovePro opposite-direction flip desvios (> 38 min)
+  const desvioSec = Math.abs(rawDesvioSec) <= 38 * 60 ? rawDesvioSec : 0;
 
   const effNow = toServiceSec(nowSec);
   const uClockRaw = parseGpsStampSecOfDay(ultimaGps);
@@ -2651,9 +2698,8 @@ function scoreCorridorPeerAgainstService(
       : null;
   const uClock = uClockRaw !== null ? toServiceSec(uClockRaw) : fallbackClock !== null ? toServiceSec(fallbackClock) : effNow;
   // Ignore stale fixes older than maxAgeSec
-  if (Math.abs(effNow - uClock) > maxAgeSec && Math.abs(effNow - uClock) < 20 * 3600) return null;
+  if (Math.abs(effNow - uClock) > maxAgeSec && Math.abs(effNow - uClock) < 20 * 60 * 60) return null;
 
-  const tEff = uClock + desvioSec;
   const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
 
   // Resolve direction from multi-point GPS trail!
@@ -2662,54 +2708,76 @@ function scoreCorridorPeerAgainstService(
         currentFix: { lat: uLat, lng: uLng, ts: Date.now() }
       })
     : null;
+  const isFreshTrail = trailDir?.source === 'trail';
   if (!hasDesvio && !trailDir && !allowWithoutDesvio) return null;
 
   const projByBranch = new Map();
-  const getProj = (b) => {
-    if (!projByBranch.has(b)) projByBranch.set(b, projectOnPolyline(b.pts, b.cum, uLat, uLng));
-    return projByBranch.get(b);
-  };
+  let minBranchPerp = Infinity;
+  for (const b of model.branches) {
+    const p = projectOnPolyline(b.pts, b.cum, uLat, uLng);
+    projByBranch.set(b, p);
+    if (p && p.perp <= maxPerp && p.perp < minBranchPerp) minBranchPerp = p.perp;
+  }
 
-  let bestTrip = null;
-  let bestRaw = maxRawSec;
+  const evalPeerAtClock = (evalClockSec, clockBiasSec = 0) => {
+    let bestTrip = null;
+    let bestRaw = maxRawSec;
 
-  for (const tr of serviceTrips) {
-    // Skip trips far outside the current time window
-    if (tEff < tr.startSec - 18 * 60 || tEff > tr.endSec + 18 * 60) continue;
-    const proj = getProj(tr.branch);
-    if (!proj || proj.perp > maxPerp) continue;
+    for (const tr of serviceTrips) {
+      if (evalClockSec < tr.startSec - 18 * 60 || evalClockSec > tr.endSec + 18 * 60) continue;
+      const proj = projByBranch.get(tr.branch);
+      if (!proj || proj.perp > maxPerp) continue;
 
-    const sched = getTripSecAtAlong(tr, proj.along);
-    if (sched === null) continue;
-    let d = Math.abs(sched - tEff);
-    if (d > 43200) d = Math.abs(d - 86400);
+      const sched = getTripSecAtAlong(tr, proj.along);
+      if (sched === null) continue;
+      let d = Math.abs(sched - evalClockSec);
+      if (d > 43200) d = Math.abs(d - 86400);
 
-    // Direction check from multi-point trail (or 2-point fallback)
-    if (trailDir?.branch) {
-      const nearTerminal = proj.along <= 240 || (tr.branch.totalLen || 0) - proj.along <= 240;
-      if (trailDir.branch === tr.branch) {
-        d = Math.max(0, d - 45);
-      } else if (!nearTerminal) {
-        d += 12 * 60;
+      const nearTerminal = proj.along <= 240 || Math.max(0, (tr.branch.totalLen || 0) - proj.along) <= 240;
+      let penalty = clockBiasSec;
+
+      if (!nearTerminal && uClock > tr.endSec + 18 * 60) {
+        penalty += 12 * 60;
+      }
+
+      if (trailDir?.branch && !nearTerminal) {
+        if (trailDir.branch === tr.branch) {
+          penalty -= isFreshTrail ? 75 : 20;
+        } else {
+          penalty += isFreshTrail ? 12 * 60 : 120;
+        }
+      }
+
+      // Divided avenue / one-way street physical lane offset beats queried-stop bandera!
+      if (!nearTerminal && minBranchPerp <= 28 && proj.perp >= minBranchPerp + 9) {
+        penalty += 240;
+      }
+      penalty += proj.perp * 1.1;
+
+      const nb = normalizeBandera(tr.branch.bandera);
+      if (!isFreshTrail && uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) {
+        penalty += 10;
+      }
+
+      const score = Math.max(0, d + penalty);
+      if (score < bestRaw) {
+        bestRaw = score;
+        bestTrip = tr;
       }
     }
+    return bestTrip ? { trip: bestTrip, rawScore: bestRaw, effScore: bestRaw } : null;
+  };
 
-    // Physical carriageway distance matters far more than SmartMovePro's queried-stop bandera label!
-    d += proj.perp * 1.1;
-
-    const nb = normalizeBandera(tr.branch.bandera);
-    if (!trailDir?.branch && uNormBandera && nb && uNormBandera !== nb && !uNormBandera.includes(nb) && !nb.includes(uNormBandera)) {
-      d += 10;
-    }
-
-    if (d < bestRaw) {
-      bestRaw = d;
-      bestTrip = tr;
+  let best = evalPeerAtClock(uClock + desvioSec, 0);
+  if (Math.abs(rawDesvioSec) >= 16 * 60) {
+    const rawBias = Math.abs(rawDesvioSec) <= 38 * 60 ? 90 : 0;
+    const rawCand = evalPeerAtClock(uClock, rawBias);
+    if (rawCand && (!best || rawCand.rawScore < best.rawScore)) {
+      best = rawCand;
     }
   }
 
-  if (!bestTrip) return null;
-  return { trip: bestTrip, rawScore: bestRaw, effScore: bestRaw };
+  return best;
 }
 
 /**
@@ -2832,7 +2900,11 @@ export function matchLiveBusesToTrips(
         if (res && res.effScore < bestEff) {
           bestEff = res.effScore;
           bestRaw = res.rawScore;
-          bestItem = item;
+          bestItem = {
+            ...item,
+            activeTrip: res.activeTrip || item.trip,
+            activeLegDepth: res.activeLegDepth || 0
+          };
         }
       }
       if (bestItem) {
@@ -2924,6 +2996,8 @@ export function matchLiveBusesToTrips(
 
     const matchInfo = {
       trip: bestItem.trip,
+      activeTrip: bestItem.activeTrip || bestItem.trip,
+      activeLegDepth: bestItem.activeLegDepth || 0,
       tripKey: bestItem.trip.tripKey,
       prevTripKey: bestItem.trip.prevTrip?.tripKey || null,
       serviceNumber: bestItem.trip.serviceNumber || null,
@@ -2974,7 +3048,11 @@ export function matchLiveBusesToTrips(
         const res = scoreBusAgainstCandidate(bus, item, nowSec, null, null, busNormBandera, getProjForBranch);
         if (res && res.rawScore < bestScore) {
           bestScore = res.rawScore;
-          bestItem = item;
+          bestItem = {
+            ...item,
+            activeTrip: res.activeTrip || item.trip,
+            activeLegDepth: res.activeLegDepth || 0
+          };
         }
       }
     }
@@ -2985,7 +3063,11 @@ export function matchLiveBusesToTrips(
         const res = scoreBusAgainstCandidate(bus, item, nowSec, null, null, busNormBandera, getProjForBranch);
         if (res && res.rawScore < bestScore) {
           bestScore = res.rawScore;
-          bestItem = item;
+          bestItem = {
+            ...item,
+            activeTrip: res.activeTrip || item.trip,
+            activeLegDepth: res.activeLegDepth || 0
+          };
         }
       }
     }
@@ -3958,8 +4040,8 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
       parsedDesvio = { seconds: unit.lastDesvioSec };
     }
     const rawDesvioSec = parsedDesvio?.seconds || 0;
-    // Ignore absurd terminal-wait desvios (e.g. +135:00 while parked between morning and afternoon shifts)
-    const safeDesvioSec = Math.abs(rawDesvioSec) <= 40 * 60 ? rawDesvioSec : 0;
+    // Ignore absurd terminal-wait or SmartMovePro opposite-direction desvios (> 38 min)
+    const safeDesvioSec = Math.abs(rawDesvioSec) <= 38 * 60 ? rawDesvioSec : 0;
     const uNormBandera = normalizeBandera(unit.descripcionBandera || unit.bandera || unit.lastBandera || '');
 
     // Resolve multi-point GPS trail direction if available
@@ -3971,6 +4053,7 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
     const trailDir = unitHist
       ? resolveTrailDirection(unitHist, model.branches, { currentFix: { lat: uLat, lng: uLng, ts: Date.now() } })
       : null;
+    const isFreshTrail = trailDir?.source === 'trail';
 
     // Precompute perpendicular distance on each branch to detect divided avenues & parallel one-way streets
     const branchProjs = new Map();
@@ -4005,16 +4088,21 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
           : false;
 
         // SmartMovePro's `descripcionBandera` reflects the QUERIED STOP, not the bus's physical direction!
-        // Never let a queried-stop label override actual GPS trail or physical carriageway geometry.
+        // Prioritize fresh physical GPS trail > divided-avenue carriageway > weak persisted hint.
         let dirPenalty = 0;
         if (trailDir?.branch) {
-          if (trailDir.branch === b) dirPenalty -= 60;
-          else if (!nearTerminal) dirPenalty += 10 * 60;
-        } else if (proj && minPerp <= 35 && proj.perp >= minPerp + 12 && !nearTerminal) {
-          // Divided avenue (e.g. Av. Pedro Ferré, 3 de Abril) or parallel one-way street: penalize wrong lane
-          dirPenalty += 240;
+          if (trailDir.branch === b) {
+            dirPenalty -= isFreshTrail ? 75 : 20;
+          } else if (!nearTerminal) {
+            dirPenalty += isFreshTrail ? 11 * 60 : 120;
+          }
         } else if (uNormBandera && !banderaMatch) {
           dirPenalty += 10;
+        }
+        // Divided avenue carriageway offset (Av. Independencia, Av. Pedro Ferré, Av. 3 de Abril):
+        // always enforce even against stale persisted server direction!
+        if (!isFreshTrail && proj && minPerp <= 28 && proj.perp >= minPerp + 9 && !nearTerminal) {
+          dirPenalty += 240;
         }
         const distPenalty = proj ? proj.perp * 1.2 : 0;
 
@@ -4029,7 +4117,12 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
           if (schedSec === null) continue;
           const timeErr = Math.abs(evalClockSec - schedSec);
           if (timeErr > 28 * 60) continue;
-          const score = Math.max(0, timeErr + dirPenalty + distPenalty);
+          let extraPenalty = 0;
+          // Expired-trip guard: a bus mid-route cannot belong to a trip that ended > 18 min before its own GPS clock
+          if (!nearTerminal && uClock > tr.endSec + 18 * 60) {
+            extraPenalty += 12 * 60;
+          }
+          const score = Math.max(0, timeErr + dirPenalty + distPenalty + extraPenalty);
           if (score < bestScore) {
             bestScore = score;
             bestTrip = tr;
@@ -4042,6 +4135,17 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
 
     const tEff = uClock + safeDesvioSec;
     let picked = findBestSpatialTrip(tEff);
+
+    // Dual-clock anti-glitch check: if SmartMovePro emitted a large opposite-direction desvio
+    // (e.g. -50:xx or -35:xx on a two-way corridor), ALSO evaluate raw GPS clock `uClock`
+    // so a transient desvio glitch cannot hijack Flota/Inspector/Modo Libre onto an expired trip!
+    if (Math.abs(rawDesvioSec) >= 16 * 60) {
+      const rawPick = findBestSpatialTrip(uClock);
+      const rawBias = Math.abs(rawDesvioSec) <= 38 * 60 ? 90 : 0;
+      if (rawPick && (!picked || rawPick.score + rawBias < picked.score)) {
+        picked = rawPick;
+      }
+    }
 
     // For offline/finished drivers parked at terminal with positive wait desvio (e.g. +13:07 for the next T2 shift),
     // check if raw GPS clock uClock cleanly matches the end of the T1 shift they just finished!
@@ -4192,3 +4296,93 @@ export function matchFreeFleetUnitsToModel(model, units = [], nowSec = getArgent
   return result;
 }
 
+/**
+ * Detects and sanitizes intermittent SmartMovePro opposite-direction `desvioHorario` glitches
+ * (e.g. a bus genuinely at `-01:39` flickering to `-50:xx` when SmartMovePro momentarily snaps
+ * its GPS to the opposite branch on a shared two-way corridor like Av. Independencia or Av. Ferré).
+ *
+ * Uses two independent sanity checks so genuine gradual delays (e.g. `-18:00`) are NEVER suppressed:
+ *  A) Sudden jump >= 15 min into an extreme |desvio| >= 20 min vs a recent clean GPS desvio (<= 5 min old),
+ *     contradicting the resolved active trip's scheduled time at the bus's coordinates.
+ *  B) Even on the very first poll (no history), when the resolved active trip places the bus within
+ *     +/- 16 min of schedule while SmartMovePro claims an extreme |desvio| >= 22 min differing by >= 15 min.
+ */
+export function sanitizeLiveDesvio(
+  rawDesvio,
+  activeTrip,
+  lat,
+  lng,
+  gpsClockSec,
+  prevGoodDesvio = null,
+  nowMs = Date.now()
+) {
+  if (!rawDesvio || rawDesvio.status === 'none') {
+    return { desvio: rawDesvio, wasGlitch: false, isGood: false };
+  }
+  const rawSec = typeof rawDesvio.seconds === 'number' && Number.isFinite(rawDesvio.seconds) ? rawDesvio.seconds : 0;
+
+  // Compute schedule-implied desvio at the bus's physical position on its resolved active trip
+  let impliedSec = null;
+  if (
+    activeTrip &&
+    activeTrip.branch?.pts?.length >= 2 &&
+    typeof lat === 'number' &&
+    typeof lng === 'number' &&
+    !Number.isNaN(lat) &&
+    !Number.isNaN(lng) &&
+    Number.isFinite(gpsClockSec)
+  ) {
+    const proj = projectOnPolyline(activeTrip.branch.pts, activeTrip.branch.cum, lat, lng);
+    if (proj && proj.perp <= 260) {
+      const schedAtBus = getTripSecAtAlong(activeTrip, proj.along);
+      if (schedAtBus !== null) {
+        let d = schedAtBus - toServiceSec(gpsClockSec);
+        if (d > 43200) d -= 86400;
+        if (d < -43200) d += 86400;
+        impliedSec = Math.round(d);
+      }
+    }
+  }
+
+  const hasFreshPrev = Boolean(
+    prevGoodDesvio &&
+      typeof prevGoodDesvio.sec === 'number' &&
+      Number.isFinite(prevGoodDesvio.sec) &&
+      (!prevGoodDesvio.ts || nowMs - prevGoodDesvio.ts <= 5 * 60 * 1000)
+  );
+
+  const jumpVsPrev =
+    hasFreshPrev &&
+    Math.abs(rawSec - prevGoodDesvio.sec) >= 15 * 60 &&
+    Math.abs(rawSec) >= 20 * 60 &&
+    Math.abs(prevGoodDesvio.sec) <= 22 * 60 &&
+    (impliedSec === null || Math.abs(rawSec - impliedSec) >= 12 * 60);
+
+  const jumpVsSchedule =
+    impliedSec !== null &&
+    Math.abs(impliedSec) <= 16 * 60 &&
+    Math.abs(rawSec) >= 22 * 60 &&
+    Math.abs(rawSec - impliedSec) >= 15 * 60;
+
+  if (jumpVsPrev || jumpVsSchedule) {
+    let cleanSec;
+    if (hasFreshPrev && (impliedSec === null || Math.abs(prevGoodDesvio.sec - impliedSec) <= 5 * 60)) {
+      cleanSec = prevGoodDesvio.sec;
+    } else if (impliedSec !== null) {
+      cleanSec = impliedSec;
+    } else {
+      cleanSec = prevGoodDesvio.sec;
+    }
+    const cleanRaw = formatDesvioFromSec(cleanSec);
+    const cleanObj = {
+      ...parseDesvioHorario(cleanRaw),
+      sanitized: true,
+      rawGlitch: rawDesvio.raw || ''
+    };
+    return { desvio: cleanObj, wasGlitch: true, isGood: false };
+  }
+
+  const isGood =
+    Math.abs(rawSec) <= 32 * 60 && (impliedSec === null || Math.abs(rawSec - impliedSec) <= 15 * 60);
+  return { desvio: rawDesvio, wasGlitch: false, isGood };
+}

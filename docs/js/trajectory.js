@@ -532,7 +532,7 @@ export function resolveTrailDirection(
         })
       : fixes;
 
-  // Compact near-stationary jitter points (< 14 m apart) so red-light waits keep the moving trail intact
+  // Compact near-stationary jitter points (< 12 m apart) so red-light waits keep the moving trail intact
   const movingPts = [];
   for (const f of recentFixes) {
     if (movingPts.length === 0) {
@@ -540,7 +540,7 @@ export function resolveTrailDirection(
     } else {
       const prev = movingPts[movingPts.length - 1];
       const d = distanceMeters(prev.lat, prev.lng, f.lat, f.lng) || 0;
-      if (d >= 14) {
+      if (d >= 12) {
         movingPts.push(f);
       }
     }
@@ -552,14 +552,14 @@ export function resolveTrailDirection(
     const segDirs = [];
     for (let i = 1; i < pts.length; i++) {
       const d = distanceMeters(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng) || 0;
-      if (d < 14) continue;
+      if (d < 12) continue;
       totalSpan += d;
       const dir = unitVector(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng);
       if (dir) {
         segDirs.push({ idx: i, dist: d, dir, recency: 0.55 + 0.45 * (i / Math.max(1, pts.length - 1)) });
       }
     }
-    if (totalSpan < 22 || segDirs.length === 0) return null;
+    if (totalSpan < 18 || segDirs.length === 0) return null;
 
     const scored = [];
     for (const b of branches) {
@@ -679,7 +679,7 @@ export function resolveTrailDirection(
         : confirmedDir.ts && latestFix.ts
           ? latestFix.ts - confirmedDir.ts
           : 0;
-    const maxPersist = confirmedDir.fromServer ? Math.max(persistMaxAgeMs, 8 * 60 * 1000) : persistMaxAgeMs;
+    const maxPersist = confirmedDir.fromServer ? Math.min(persistMaxAgeMs, 3.5 * 60 * 1000) : persistMaxAgeMs;
     if (dirAgeMs >= -60000 && dirAgeMs <= maxPersist) {
       const normTarget = normalizeBanderaLite(confirmedDir.bandera);
       const matchedBranch = branches.find((b) => normalizeBanderaLite(b.bandera) === normTarget);
@@ -870,12 +870,38 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     return 'previous_leg';
   };
 
-  // Signal 2: Combine GPS trail direction + ETA vs Route Distance Consistency across all 3 hypotheses
+  // Signal 2: Combine GPS trail direction + divided-avenue carriageway + ETA vs Route Distance Consistency
   let leg = 'direct';
   const hasOpposite = Boolean(oppositeBranch && busOnOpp && busOnOpp.perp < 650);
+  const nearOppTerm =
+    hasOpposite &&
+    (busOnOpp.along <= 200 || Math.max(0, (oppositeBranch.totalLen || 0) - busOnOpp.along) <= 200);
+  const physicallyOnOppLane =
+    hasOpposite &&
+    !nearOppTerm &&
+    busOnOpp &&
+    busOnStop &&
+    busOnOpp.perp <= 28 &&
+    busOnOpp.perp + 9 < busOnStop.perp;
+  const isFreshPhysicalTrail = directionSource === 'trail' || directionSource === 'heading';
 
   if (headingDir === 'opp' && hasOpposite) {
     leg = 'previous_leg';
+  } else if (headingDir === 'stop' && isFreshPhysicalTrail) {
+    if (directDist === Infinity) {
+      leg = 'full_cycle';
+    } else if (etaMin >= 25 && Math.abs(estCycleMin - etaMin) + 12 < Math.abs(estDirectMin - etaMin)) {
+      leg = 'full_cycle';
+    } else {
+      leg = 'direct';
+    }
+  } else if (physicallyOnOppLane) {
+    // Divided avenue (Av. Independencia, Av. Ferré, Av. 3 de Abril) or one-way street:
+    // physical opposite carriageway beats both bogus SmartMovePro ETA and stale persisted dirBandera!
+    leg = 'previous_leg';
+    confirmedBranch = oppositeBranch;
+    directionSource = 'lane';
+    directionConfidence = Math.max(directionConfidence, 0.72);
   } else if (headingDir === 'stop') {
     if (directDist === Infinity) {
       leg = 'full_cycle';
@@ -894,18 +920,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
       const directImplausiblySlow = etaMin >= 7 && directDist < etaMin * 105;
       const indirectMatchesBetter = Math.abs(bestIndirectEst - etaMin) + 3 < Math.abs(estDirectMin - etaMin);
 
-      // On divided avenues (e.g. Av. Pedro Ferré, 3 de Abril, Independencia) or parallel one-way streets,
-      // a bus clearly snapped to the opposite carriageway (`perp <= 30m` and >= 12m closer than stopBranch)
-      // is physically driving the opposite BANDERA regardless of distance to the queried stop!
-      const physicallyOnOppLane =
-        bestIndirect === 'previous_leg' &&
-        busOnOpp &&
-        busOnStop &&
-        busOnOpp.perp <= 30 &&
-        busOnOpp.perp + 12 < busOnStop.perp &&
-        etaMin >= 5;
-
-      if ((directImplausiblySlow && indirectMatchesBetter) || physicallyOnOppLane) {
+      if (directImplausiblySlow && indirectMatchesBetter) {
         leg = bestIndirect;
       }
     }
