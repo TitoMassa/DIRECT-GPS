@@ -4850,6 +4850,18 @@ function reconcileWithSchedulePrediction(
             seenReports.push(rec);
           }
         }
+      } else if (!b.isNextLap && b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
+        const impliedSpeedMps =
+          b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
+        if (impliedSpeedMps > 13.5) {
+          const estSec = Math.max(Math.round(b.routeMeters / 10.5), Math.round(b.routeMeters / 5.8));
+          const estMin = Math.max(1, Math.round(estSec / 60));
+          b.eta = parseEtaMinutes(`${estMin} min`);
+          b.etaSecondsRemaining = estSec;
+          b.tiempoRaw = `${estMin} min`;
+          b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
+          b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
+        }
       }
     }
   }

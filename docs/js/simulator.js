@@ -24,7 +24,7 @@ function isCompatibleLegTransition(prevLeg, newLeg) {
  */
 export function parseGpsTimestampMs(raw = '') {
   const clean = String(raw || '').trim();
-  const m = clean.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  const m = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
   if (!m) return null;
   const [, dd, mm, yyyy, hh, mi, ss] = m;
   return Date.UTC(
@@ -269,9 +269,11 @@ export class BusSimulator {
       }
 
       // ── Case 2: Live GPS unit ──
-      const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS);
+      const gpsRaw = String(bus.ultimaFechaHoraGPS || '').trim();
+      const gpsMs = parseGpsTimestampMs(gpsRaw);
       const rawAgeSec = gpsMs ? (nowMs - gpsMs) / 1000 : 0;
-      const gpsAgeSec = rawAgeSec >= 0 && rawAgeSec < 7200 ? rawAgeSec : 0;
+      const gpsAgeSec = rawAgeSec >= 0 ? Math.min(rawAgeSec, 86400) : 0;
+      const isAncientFrozenGps = gpsAgeSec > 25 * 60;
       const priorCadence = clamp(prev?.observedGpsIntervalSec || 28, 14, 55);
       const staleThresholdSec = Math.max(65, priorCadence * 1.75);
       const isStaleTracker = gpsAgeSec > staleThresholdSec;
@@ -294,19 +296,21 @@ export class BusSimulator {
         );
         // Record when this bus was first observed at (anchorLat, anchorLng); use GPS timestamp if already aging
         const initialStationarySince =
-          gpsMs && gpsMs < nowMs && nowMs - gpsMs < 7200000 ? gpsMs : nowMs;
+          gpsMs && gpsMs < nowMs && nowMs - gpsMs < 86400000 ? gpsMs : nowMs;
         const alreadyFrozen3Min =
           applyPositions &&
           !isAtTerminal &&
           gpsAgeSec >= STATIONARY_OFFLINE_THRESHOLD_SEC &&
           Boolean(bus.scheduledTrip && bus.stopProj);
 
-        const initAnchor = alreadyFrozen3Min
-          ? buildGpsAnchorForTrip(bus.scheduledTrip, bus.lat, bus.lng, nowSec, aheadSec, {
-              prevFix: bus.prevGpsFix || null,
-              preferredLeg: newTraj.leg || null
-            })
-          : null;
+        // If GPS froze > 25 min ago (e.g. 6 hours stale), do NOT anchor at the ancient frozen spot!
+        const initAnchor =
+          alreadyFrozen3Min && !isAncientFrozenGps
+            ? buildGpsAnchorForTrip(bus.scheduledTrip, bus.lat, bus.lng, nowSec, aheadSec, {
+                prevFix: bus.prevGpsFix || null,
+                preferredLeg: newTraj.leg || null
+              })
+            : null;
 
         const entry = {
           mode: alreadyFrozen3Min ? 'schedule' : 'gps',
@@ -319,6 +323,7 @@ export class BusSimulator {
           anchorLng: bus.lng,
           stationarySinceMs: initialStationarySince,
           lastGpsMs: gpsMs,
+          lastGpsRaw: gpsRaw,
           lastGpsPollMs: nowMs,
           lastRealRem: newRealRem,
           lastRealLat: bus.lat,
@@ -365,7 +370,7 @@ export class BusSimulator {
         prev.stationarySinceMs = nowMs;
         prev.scheduleAnchor = null;
       } else if (prev.stationarySinceMs === null) {
-        prev.stationarySinceMs = gpsMs && gpsMs < nowMs && nowMs - gpsMs < 7200000 ? gpsMs : nowMs;
+        prev.stationarySinceMs = gpsMs && gpsMs < nowMs && nowMs - gpsMs < 86400000 ? gpsMs : nowMs;
       }
 
       const stationarySec = prev.stationarySinceMs !== null ? (nowMs - prev.stationarySinceMs) / 1000 : 0;
@@ -381,7 +386,10 @@ export class BusSimulator {
         (stationarySec >= STATIONARY_OFFLINE_THRESHOLD_SEC || gpsAgeSec >= STATIONARY_OFFLINE_THRESHOLD_SEC);
 
       if (lostGpsMidRoute) {
-        if (prev.mode !== 'schedule' || !prev.scheduleAnchor) {
+        if (isAncientFrozenGps) {
+          // Ancient (>25 min) frozen GPS: clear stale anchor so schedule mode tracks the live scheduled position smoothly
+          prev.scheduleAnchor = null;
+        } else if (prev.mode !== 'schedule' || !prev.scheduleAnchor) {
           // Transition at >= 3 min: anchor RIGHT AT the bus's exact visual/GPS spot (0 m jump!)
           // starting at `nowSec` so it smoothly pulls away from there and recovers delay gradually!
           const curSample = sampleTrajectory(prev.activeTraj, prev.walkedMeters);
@@ -435,10 +443,12 @@ export class BusSimulator {
           : Math.abs(prev.lastRealRem - newRealRem);
       const movedFromLastReal = Math.max(Math.abs(prev.lastRealRem - newRealRem), straightFromLastReal);
       const gpsTimeDeltaSec = gpsMs && prev.lastGpsMs ? (gpsMs - prev.lastGpsMs) / 1000 : null;
-      const isSameGpsTimestamp = gpsTimeDeltaSec !== null && gpsTimeDeltaSec < 2;
+      const isSameGpsTimestamp =
+        (gpsTimeDeltaSec !== null && gpsTimeDeltaSec < 2) ||
+        Boolean(gpsRaw && prev.lastGpsRaw && gpsRaw === prev.lastGpsRaw && movedFromLastReal < 5);
       const isFreshFix =
         (gpsTimeDeltaSec !== null && gpsTimeDeltaSec >= 3) ||
-        (gpsTimeDeltaSec === null && movedFromLastReal >= 8) ||
+        (gpsTimeDeltaSec === null && !isSameGpsTimestamp && movedFromLastReal >= 8) ||
         recoveredFromSchedule;
 
       // 1. Update real velocity & reporting cadence ONLY on genuinely fresh GPS fixes
@@ -502,6 +512,7 @@ export class BusSimulator {
 
         prev.hasConfirmedFix = true;
         prev.lastGpsMs = gpsMs ?? prev.lastGpsMs;
+        if (gpsRaw) prev.lastGpsRaw = gpsRaw;
         prev.lastGpsPollMs = nowMs;
         prev.lastRealRem = newRealRem;
         prev.lastRealLat = bus.lat;
@@ -642,7 +653,9 @@ export class BusSimulator {
           }
 
           st.etaSecondsRemaining = ev.etaSec;
-          if (updateEta && st.scheduleAnchor && Number.isFinite(ev.effectiveOffsetSec)) {
+          // NEVER invent/overwrite `bus.desvio` on live SmartMovePro buses (keep real GPS desvio intact!)
+          // Only pure timetable-predicted units (`bus.isPredicted`) derive gradual desvio from `ev.effectiveOffsetSec`.
+          if (updateEta && bus.isPredicted && st.scheduleAnchor && Number.isFinite(ev.effectiveOffsetSec)) {
             bus.desvio = parseDesvioHorario(formatDesvioFromSec(ev.effectiveOffsetSec));
           }
         }

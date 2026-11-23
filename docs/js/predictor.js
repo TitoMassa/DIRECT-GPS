@@ -2592,7 +2592,7 @@ function scoreBusAgainstCandidate(
   let bestRawDiff;
   let maxAllowed;
   if (spatialDiffSec <= 15 * 60) {
-    const strongSpatialLock = spatialDiffSec <= 5 * 60 || (activeLegDepth >= 1 && spatialDiffSec <= 9 * 60);
+    const strongSpatialLock = spatialDiffSec <= 5 * 60 || (activeLegDepth >= 1 && spatialDiffSec <= 14 * 60);
     if (!strongSpatialLock && etaDiffSec < Infinity && etaDiffSec > 45 * 60) return null;
     bestRawDiff = spatialDiffSec;
     maxAllowed = isStickyTrip || isStickyService ? 18 * 60 : 15 * 60;

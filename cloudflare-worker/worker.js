@@ -217,9 +217,9 @@ function parseSoapHoraPasoToServiceEntry(raw = '', fallbackDateIso = '') {
   let hh = 0;
   let mm = 0;
   let ss = 0;
-  const dmY = clean.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
+  const dmY = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (dmY) {
-    calDate = `${dmY[3]}-${dmY[2]}-${dmY[1]}`;
+    calDate = `${dmY[3]}-${String(dmY[2]).padStart(2, '0')}-${String(dmY[1]).padStart(2, '0')}`;
     hh = parseInt(dmY[4], 10);
     mm = parseInt(dmY[5], 10);
     ss = parseInt(dmY[6] || '0', 10);
@@ -367,7 +367,7 @@ const LINE_STOPS_TTL_MS = 6 * 3600 * 1000;
 const PROBE_ARRIBOS_TTL_MS = 18 * 1000;
 
 function parseGpsStampMs(raw = '') {
-  const m = String(raw || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  const m = String(raw || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
   if (!m) return 0;
   return Date.UTC(
     parseInt(m[3], 10),
