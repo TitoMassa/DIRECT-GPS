@@ -3758,10 +3758,6 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
       busTarget: ev.target
     });
 
-    const ctaHtml = ev.target
-      ? `<span class="ev-map-cta">Ver chip #${escapeHtml(ev.target.coche)} ›</span>`
-      : `<span class="ev-meta-txt">Ver servicios ›</span>`;
-
     htmlParts.push(`
       <div class="ev-item ${phaseCls}" role="listitem">
         <div class="ev-time-col" aria-hidden="true">
@@ -3783,7 +3779,6 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
             <div class="ev-actors">${actorsHtml}</div>
             <div class="ev-card-foot">
               <span class="ev-meta-txt">${escapeHtml(ev.metaText)}</span>
-              ${ctaHtml}
             </div>
           </button>
         </div>
