@@ -7259,7 +7259,11 @@ function renderLineFlotaView() {
         return `servicio ${s.serviceNumber} ${turnosTxt}`.toLowerCase().includes(query);
       })
     : allServices;
-  const dayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
+  const rawDayNavInfo = formatServiceDayNavLabel(selectedServiceDayKey, todayKey);
+  const effectiveLiveTipoLabel = (isHistoricalSrvDay ? activeSrvSchedSummary?.liveLabel : fv.schedSummary?.liveLabel) || '';
+  const dayNavInfo = effectiveLiveTipoLabel
+    ? { ...rawDayNavInfo, tipoLabel: effectiveLiveTipoLabel }
+    : rawDayNavInfo;
 
   // Real historical summary metrics for past days across Coches, Choferes & Servicios
   let histTotalTurnos = 0;
@@ -7778,7 +7782,7 @@ function renderLineFlotaView() {
     const tipoKey = sched?.tipoDia || cap?.tipoDia || getArgentinaTodayTipo();
     const tipoLabel =
       sched?.liveLabel ||
-      (tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : String(tipoKey).startsWith('live_') ? 'Especial · SOAP' : 'Lun–Vie');
+      (tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : String(tipoKey).startsWith('live_') ? 'Horario especial' : 'Lun–Vie');
     const schedTotal = sched?.totalServices || 0;
     const schedVal =
       schedTotal > 0

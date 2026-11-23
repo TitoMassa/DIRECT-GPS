@@ -311,7 +311,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
           isLiveOverride: true,
           liveCount: 0,
           lastScanAt,
-          labelOverride: 'Sin servicio · SOAP'
+          labelOverride: 'Sin servicio'
         };
       }
     }
@@ -423,7 +423,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
     const finalFile = clonedParadas
       ? { ...archiveFile, paradas: clonedParadas, _liveSig: `m:${dayKey}:${bestTipo}:${totalLiveItems}` }
       : archiveFile;
-    const tipoName = bestTipo === 'domingo' ? 'Domingo/Feriado' : bestTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    const tipoName = bestTipo === 'domingo' ? 'Domingo / Feriado' : bestTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
     return {
       horariosFile: finalFile,
       tipoDia: bestTipo,
@@ -432,7 +432,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
       isLiveOverride: isOverride,
       liveCount: totalLiveItems,
       lastScanAt,
-      labelOverride: isOverride ? `${tipoName} · SOAP` : 'SOAP en vivo'
+      labelOverride: isOverride ? tipoName : ''
     };
   }
 
@@ -521,7 +521,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
         isLiveOverride: true,
         liveCount: totalLiveItems,
         lastScanAt,
-        labelOverride: 'Especial · SOAP en vivo'
+        labelOverride: 'Horario especial'
       };
     }
   }

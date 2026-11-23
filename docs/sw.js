@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v64';
+const CACHE_NAME = 'direct-gps-v65';
 const DATA_CACHE = 'direct-gps-data-v4';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
