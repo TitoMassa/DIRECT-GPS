@@ -825,28 +825,56 @@ export const api = {
 
   getOfflineBundleCached: async ({ maxAgeMs = 25000, force = false } = {}) => {
     const now = Date.now();
-    const idbSnap = await readIdbValue('offline_bundle');
-    const idbTs = Number(idbSnap?.savedAt) || 0;
-    if (!force && idbSnap?.data && (isBrowserOffline() || now - idbTs < maxAgeMs)) {
+    if (!force && lastBundleMemSnap?.data && (isBrowserOffline() || now - lastBundleMemSnap.savedAt < maxAgeMs)) {
       return {
-        data: idbSnap.data,
-        savedAt: idbTs,
+        data: lastBundleMemSnap.data,
+        savedAt: lastBundleMemSnap.savedAt,
         isOfflineCache: isBrowserOffline()
       };
     }
+
+    let idbSnap = null;
+    if (!force || isBrowserOffline()) {
+      idbSnap = await readIdbValue('offline_bundle');
+      const idbTs = Number(idbSnap?.savedAt) || 0;
+      if (!force && idbSnap?.data && (isBrowserOffline() || now - idbTs < maxAgeMs)) {
+        lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
+        return {
+          data: idbSnap.data,
+          savedAt: idbTs,
+          isOfflineCache: isBrowserOffline()
+        };
+      }
+    }
+
     if (!isBrowserOffline()) {
       try {
         const res = await apiGet('/api/offline-bundle', null, 15000);
         if (res?.data) {
           const savedAt = Number(res.savedAt) || Date.now();
-          await persistOfflineBundleSnapshot(res.data, savedAt);
+          lastBundleMemSnap = { savedAt, data: res.data };
+          if (res.data.liveHorarios && typeof res.data.liveHorarios === 'object') {
+            mergeLiveHorariosPayload(res.data.liveHorarios, savedAt);
+          }
+          // Throttle heavy multi-store IndexedDB writes to once every 45s during 10s live polling
+          if (now - lastBundleIdbPersistMs >= 45000 || !idbSnap) {
+            lastBundleIdbPersistMs = now;
+            persistOfflineBundleSnapshot(res.data, savedAt).catch(() => {});
+          }
           return { data: res.data, savedAt, isOfflineCache: false };
         }
       } catch {
-        // Fall back to IDB snapshot below
+        // Fall back to memory/IDB snapshot below
       }
     }
+
+    if (lastBundleMemSnap?.data) {
+      return { data: lastBundleMemSnap.data, savedAt: lastBundleMemSnap.savedAt, isOfflineCache: true };
+    }
+    if (!idbSnap) idbSnap = await readIdbValue('offline_bundle');
     if (idbSnap?.data) {
+      const idbTs = Number(idbSnap.savedAt) || 0;
+      lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
       return { data: idbSnap.data, savedAt: idbTs, isOfflineCache: true };
     }
     return { data: null, savedAt: 0, isOfflineCache: isBrowserOffline() };
@@ -979,8 +1007,13 @@ function normalizeOfflineSearchText(str = '') {
     .trim();
 }
 
+let lastBundleMemSnap = null;
+let lastBundleIdbPersistMs = 0;
+
 async function persistOfflineBundleSnapshot(bundleData, savedAt = Date.now()) {
   if (!bundleData || typeof bundleData !== 'object') return;
+  lastBundleMemSnap = { savedAt, data: bundleData };
+  lastBundleIdbPersistMs = Date.now();
   await saveIdbValue('offline_bundle', { savedAt, data: bundleData });
 
   if (bundleData.liveHorarios && typeof bundleData.liveHorarios === 'object') {
@@ -1393,8 +1426,8 @@ export async function warmOfflineArchive({ forceBundle = false } = {}) {
   const waitIdle = (delayMs = 80) =>
     new Promise((resolve) => {
       setTimeout(() => {
-        if (typeof requestIdleCallback === 'function') {
-          requestIdleCallback(() => resolve(), { timeout: 500 });
+        if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+          window.requestIdleCallback(() => resolve(), { timeout: 500 });
         } else {
           resolve();
         }

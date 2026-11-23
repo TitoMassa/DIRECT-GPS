@@ -134,6 +134,7 @@ const state = {
   liveHorariosDays: {}, // dayKey -> { updatedAt, lineas: { [cod]: { stops, windowsScanned, windowHours, lastScanAt } } }
   liveHorariosMeta: null,
   liveHorariosSig: '',
+  activeServiceDayKey: getArgentinaDayKey(),
   lastRealGpsByUnit: new Map(), // baseId -> { latest, prev, prevMoving, trail[], confirmedDir }
   fleetMemory: { dayKey: '', stopSnapshot: null, trips: [], units: [] },
   fleetMemoryLastFetchMs: 0,
@@ -317,6 +318,32 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.4.15',
+    date: '23/11/2026 · 11:55 hs',
+    items: [
+      '<strong>Detección de dirección (bandera) de máxima precisión en todas las líneas:</strong> ahora combina movimiento GPS real, separación de carriles en avenidas doble mano (Independencia, Ferré, 3 de Abril), hora actual, horario programado y desvío para evitar confusiones de sentido y corregir automáticamente tiempos irreales cuando un coche viene por la mano contraria.',
+      '<strong>Desvío horario estable sin titileo:</strong> nuevo filtro inteligente que bloquea saltos falsos del servidor (como el cambio intermitente a <code>-50:xx</code> en avenidas compartidas) preservando siempre el desvío GPS real y los atrasos verdaderos.',
+      '<strong>Cierre nocturno sin turnos fantasma:</strong> se corrigió el cruce de medianoche (<code>00:00–02:59</code>) en cambios de tipo de día para no duplicar viajes ni generar turnos inexistentes (como el T3 en la 904C), cambiando de día prolijamente a las <code>03:00</code>.',
+      '<strong>Optimización y estabilidad general:</strong> cambio de día automático a las <code>03:00</code> sin recargar la app, reanudación fluida al volver del segundo plano (también al seguir un coche puntual), menor consumo de almacenamiento en Eventos cada 10 s y limpieza automática de cachés en memoria.'
+    ]
+  },
+  {
+    version: 'v2.4.14',
+    date: '23/11/2026 · 06:50 hs',
+    items: [
+      '<strong>Tarjetas unificadas en Horarios → Paradas:</strong> tocar cualquier parada abre directo el Radar (se eliminó el botón redundante y la lista duplicada de horarios) y cada horario muestra su servicio y vuelta (por ejemplo <code>05:00 S1 V1</code>).',
+      '<strong>Estabilidad en Radar:</strong> se corrigió un error interno que impedía cargar arribos y disparaba avisos intermitentes de conexión cada 10 s.'
+    ]
+  },
+  {
+    version: 'v2.4.13',
+    date: '23/11/2026 · 06:15 hs',
+    items: [
+      '<strong>Detección automática de feriados y horarios especiales 24/7:</strong> el servidor revisa los horarios programados de las 25 líneas cada 10 minutos (hoy y próximos días) y adapta automáticamente el diagrama en Radar, <strong>Eventos globales</strong>, <strong>Flota / Servicios</strong>, <strong>Horarios por parada</strong> y <strong>Recorridos</strong>, unificando la etiqueta <strong>Domingo / Feriado</strong> y detectando líneas sin servicio.',
+      '<strong>Mejoras en Eventos globales, Flota y Paradas:</strong> el scroll en Eventos ya no salta al actualizar cada 10 s (el botón <strong>Ahora</strong> centra cuando lo tocás), todos los títulos y horarios se muestran completos sin recortes, se habilitó avanzar hasta 7 días futuros en <strong>Flota / Servicios</strong> y se corrigió el ajuste de ancho en tarjetas de Paradas.'
+    ]
+  },
   {
     version: 'v2.4.12',
     date: '22/11/2026 · 12:35 hs',
@@ -930,17 +957,6 @@ function getSheetIndex() {
 function isBottomSheetLayout() {
   const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
   return window.innerWidth <= 860 && !isLandscapeRail;
-}
-
-function getSheetSnapHeights() {
-  const vh = window.innerHeight;
-  const header = document.querySelector('.top-bar');
-  const topClearance = header ? Math.ceil(header.getBoundingClientRect().bottom + 10) : 64;
-  return [
-    Math.min(170, Math.round(vh * 0.24)),
-    Math.round(vh * 0.47),
-    Math.max(300, vh - topClearance)
-  ];
 }
 
 function clearSheetInlineSize() {
@@ -1843,7 +1859,12 @@ function startSimLoop() {
 
       if (shouldSyncDom) {
         simLastDomMs = now;
-        if (hasStopWork) syncSimCardsDom();
+        if (hasStopWork) {
+          syncSimCardsDom();
+        } else if (state.inspectorOpen && state.selectedBusKey) {
+          const focused = getCurrentlySelectedBus();
+          if (focused) updateInspectorFields(focused);
+        }
       }
     }
     simRafId = requestAnimationFrame(frame);
@@ -3435,7 +3456,7 @@ function toggleAllFleetMode(forceState = null) {
     state.allFleetLoading = false;
     closeAllFleetRosterModal();
     cityFleetSim.clear();
-    if (!state.activeStop) stopSimLoop();
+    if (!state.activeStop && !state.trackedUnit) stopSimLoop();
     transitMap.clearAllFleetBuses();
     if (state.selectedBusKey?.startsWith('city:')) {
       closeBusInspector();
@@ -4025,8 +4046,11 @@ let eventsDeferredSilentRender = false;
 let eventsTouchReleaseTimer = null;
 
 let eventsLoadSeq = 0;
+let eventsSilentInFlight = false;
 async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false, silent = false } = {}) {
+  if (silent && eventsSilentInFlight) return;
   const mySeq = ++eventsLoadSeq;
+  if (silent) eventsSilentInFlight = true;
   if (!silent) {
     state.eventsLoading = true;
     eventsLastRenderedHtml = '';
@@ -4053,6 +4077,8 @@ async function loadEventsTimelineData({ forceBundle = false, scrollToNow = false
     if (mySeq !== eventsLoadSeq || !state.eventsModalOpen) return;
     state.eventsLoading = false;
     renderEventsTimeline({ scrollToNow: false, preserveScroll: silent });
+  } finally {
+    if (silent) eventsSilentInFlight = false;
   }
 }
 
@@ -4500,7 +4526,6 @@ function reconcileWithSchedulePrediction(
   }
 
   const nowSec = getArgentinaSecOfDay();
-  const todayTipo = getArgentinaTodayTipo();
   const todayDayKey = getArgentinaDayKey();
   const nowMs = Date.now();
   const completedStopKey = `${todayDayKey}:${stopId}`;
@@ -5209,10 +5234,15 @@ function announceArrivalsSummary({ isRefresh = false } = {}) {
   announce(`${prefix} ${countTxt} en camino. Próximo: línea ${first.descripcionLinea}, ${etaTxt}.`);
 }
 
+let arribosBgInFlightStop = '';
+
 async function fetchArribos(showSkeleton = false, { announceSummary = false, isRefresh = false } = {}) {
   if (!state.activeStop) return;
-  const mySeq = ++fetchSeq;
   const stopId = state.activeStop.id;
+  const isBgPoll = !showSkeleton && !announceSummary && !isRefresh;
+  if (isBgPoll && arribosBgInFlightStop === stopId) return;
+  const mySeq = ++fetchSeq;
+  if (isBgPoll) arribosBgInFlightStop = stopId;
 
   if (showSkeleton && !state.horariosOpen) {
     arrivalRowCache.clear();
@@ -5404,6 +5434,9 @@ async function fetchArribos(showSkeleton = false, { announceSummary = false, isR
     await renderOfflineOrFallback(showSkeleton, mySeq);
     if (announceSummary) announceArrivalsSummary({ isRefresh });
   } finally {
+    if (isBgPoll && arribosBgInFlightStop === stopId) {
+      arribosBgInFlightStop = '';
+    }
     if (mySeq === fetchSeq) {
       state.countdownSec = REFRESH_INTERVAL_SEC;
     }
@@ -7513,8 +7546,6 @@ function renderLineFlotaView() {
   const hoyChoferesCount = allChoferes.filter((d) => d.vistoHoy).length;
   const activeCount =
     fv.tab === 'coches' ? visibleCoches.length : fv.tab === 'choferes' ? visibleChoferes.length : visibleServices.length;
-  const activeScopeTotal =
-    fv.tab === 'coches' ? scopeCoches.length : fv.tab === 'choferes' ? scopeChoferes.length : allServices.length;
 
   const clickTargets = [];
 
@@ -9943,11 +9974,60 @@ function pauseRealtime() {
   }
 }
 
+let lastCachePruneMs = 0;
+
+function pruneRuntimeCaches(nowMs = Date.now()) {
+  if (nowMs - lastCachePruneMs < 55 * 1000) return;
+  lastCachePruneMs = nowMs;
+
+  // Purge stale downstream probe snapshots (> 5 min)
+  for (const [k, entry] of state.downstreamProbeCache.entries()) {
+    if (!entry || nowMs - (entry.ts || 0) > 5 * 60 * 1000) {
+      state.downstreamProbeCache.delete(k);
+    }
+  }
+
+  // Cap GPS trail history map so long-running PWA sessions stay lean in RAM
+  if (state.lastRealGpsByUnit.size > 260) {
+    for (const [k, hist] of state.lastRealGpsByUnit.entries()) {
+      const ts = hist?.latest?.ts || 0;
+      if (nowMs - ts > 90 * 60 * 1000) {
+        state.lastRealGpsByUnit.delete(k);
+      }
+    }
+  }
+}
+
+function ensureServiceDayRollover() {
+  const curDayKey = getArgentinaDayKey();
+  if (state.activeServiceDayKey === curDayKey) return false;
+
+  state.activeServiceDayKey = curDayKey;
+  state.sessionObservedTrips.clear();
+  state.stickyLiveTripByCoche.clear();
+  state.serviceEvidenceByCoche.clear();
+  state.completedTripsByStop.clear();
+  state.downstreamProbeCache.clear();
+  state.horariosByLineCache.clear();
+  eventsLineModelCache.clear();
+  systemDayTipoCache.clear();
+  if (state.flotaView?.serviceDayCache instanceof Map) {
+    state.flotaView.serviceDayCache.clear();
+  }
+  if (!state.isOffline) {
+    syncLiveHorariosSilent({ refreshActiveViews: true });
+    refreshOfflineBundleSilent({ force: true });
+  }
+  return true;
+}
+
 function resumeRealtime() {
   const wasPaused = state.isAppPaused;
   state.isAppPaused = false;
   document.body.classList.remove('app-paused');
   transitMap.invalidateSize();
+  ensureServiceDayRollover();
+  pruneRuntimeCaches();
   if (state.activeStop) {
     if (wasPaused) {
       state.countdownSec = REFRESH_INTERVAL_SEC;
@@ -9956,6 +10036,9 @@ function resumeRealtime() {
     if (state.simulateMode && state.arribos.length > 0) {
       startSimLoop();
     }
+  }
+  if (state.trackedUnit?.buses?.length > 0 && state.simulateMode) {
+    startSimLoop();
   }
   if (state.allFleetMode) {
     if (wasPaused) refreshAllFleetBuses({ fit: false, silent: true });
@@ -10138,6 +10221,8 @@ async function init() {
 
   setInterval(() => {
     if (state.isAppPaused) return;
+    ensureServiceDayRollover();
+    pruneRuntimeCaches();
 
     if (state.activeStop) {
       state.countdownSec -= 1;
