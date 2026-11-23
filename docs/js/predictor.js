@@ -729,14 +729,17 @@ function alignTerminalFIFO(
   const typicalLay = estimateTypicalTerminalLayover(arrivals, departures, longMode);
   const isImmediate = typicalLay <= 150;
 
-  const minLay = isInterurban ? -60 : isImmediate ? -120 : typicalLay >= 420 ? 90 : -30;
-  const maxLay = isInterurban
-    ? Math.max(60 * 60, typicalLay + 35 * 60)
-    : isInterprovincial
-      ? Math.max(36 * 60, typicalLay + 22 * 60)
-      : isImmediate
-        ? 11 * 60
-        : Math.max(20 * 60, Math.min(28 * 60, typicalLay + 11 * 60));
+  const minLay = isInterurban ? -60 : isImmediate ? -120 : -30;
+  const isSparseLongRoute = (isInterurban || isInterprovincial) && n <= 8 && m <= 8;
+  const maxLay = isSparseLongRoute
+    ? Math.max(90 * 60, typicalLay + 45 * 60)
+    : isInterurban
+      ? Math.max(60 * 60, typicalLay + 35 * 60)
+      : isInterprovincial
+        ? Math.max(36 * 60, typicalLay + 22 * 60)
+        : isImmediate
+          ? 11 * 60
+          : Math.max(20 * 60, Math.min(28 * 60, typicalLay + 11 * 60));
 
   const skipCost = isInterurban
     ? 2600

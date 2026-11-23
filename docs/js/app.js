@@ -321,13 +321,14 @@ const el = {
 const CHANGELOG_ENTRIES = [
   {
     version: 'v2.4.16',
-    date: '23/11/2026 · 13:45 hs',
+    date: '23/11/2026 · 15:58 hs',
     items: [
+      '<strong>Reconstrucción precisa de turnos de ~8 horas en todas las líneas:</strong> se corrigió el encadenado en cabecera para giros inmediatos (&lt; 1 min) y descansos largos en líneas interurbanas/interprovinciales de baja frecuencia, eliminando turnos partidos artificialmente en <strong>109A</strong> (domingo/feriado: turnos limpios de ~7h40–8h00 en lugar de 2h35 + 5h25), <strong>109C</strong> (2 turnos de 8h00) y <strong>904A</strong> (2 turnos de ~7h30).',
       '<strong>Simulación EN VIVO por horarios en Modo libre y Seguimiento individual:</strong> cuando un coche pasa más de 3 minutos sin señal GPS (en cualquier línea), ahora continúa moviéndose suavemente sobre su recorrido siguiendo el horario programado —incluyendo giros en cabecera y continuidad del servicio— en lugar de quedar quieto en su última posición.',
       '<strong>Desvío GPS 100% real en coches en vivo:</strong> el simulador ya nunca sobrescribe ni inventa desvíos horarios en colectivos con señal de SmartMovePro (como el falso <code>-23:19</code> cuando un GPS queda congelado), manteniendo siempre el desvío real del satélite y bloqueando solo saltos espurios (como <code>+69:53</code> o <code>-50:xx</code>).',
       '<strong>Sin retrocesos bruscos cada 10 s y soporte para horas de 1 dígito:</strong> se corrigió la lectura de marcas GPS matutinas de un dígito (por ejemplo <code>7:10:34</code>) tanto en la app como en el servidor, se conservó la antigüedad real de GPS congelados (>2 h) y se eliminó el avance/retroceso cada 10 segundos en unidades detenidas o con GPS trabado.',
       '<strong>Mejor detección de mano contraria en avenidas divididas:</strong> se amplió el bloqueo espacial de mano opuesta para que un tiempo corto erróneo del servidor nunca oculte el turno real ni la calzada física correcta.',
-      '<strong>Eventos consistentes en fines de semana y feriados:</strong> las líneas que solo circulan en días hábiles (como la <strong>109B</strong>) ya no generan eventos fantasma en sábados ni domingos sin escaneo previo (domingo y feriado coinciden exactamente en 177 eventos).'
+      '<strong>Eventos consistentes en fines de semana y feriados:</strong> las líneas que solo circulan en días hábiles (como la <strong>109B</strong>) ya no generan eventos fantasma en sábados ni domingos sin escaneo previo (domingo y feriado coinciden exactamente).'
     ]
   },
   {
