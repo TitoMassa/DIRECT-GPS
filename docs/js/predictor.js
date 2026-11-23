@@ -327,6 +327,16 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
     return windowHours.some((wh) => hh >= wh && hh < wh + 2);
   };
 
+  // Count daytime (03:00-23:59) live observations: SmartMovePro switches day-type strictly at 00:00
+  // calendar midnight (not 03:00 AM), so 00:00-02:59 of the next morning can reflect the NEXT day's diagram!
+  let daytimeLiveTotal = 0;
+  for (const items of liveByStop.values()) {
+    for (const it of items) {
+      if (it.sec < 86400) daytimeLiveTotal++;
+    }
+  }
+  const ignorePostMidnightInScore = daytimeLiveTotal >= 3;
+
   for (const tipo of candidates) {
     let liveMatched = 0;
     let liveExact = 0;
@@ -338,11 +348,15 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
       const archEntry = paradasMap[stopId];
       if (!archEntry) continue;
       const archAllSecs = extractArchiveStopSecs(archEntry[tipo]);
-      const liveSecs = liveItems.map((x) => x.sec);
+      const scoreLiveItems = ignorePostMidnightInScore
+        ? liveItems.filter((x) => x.sec < 86400)
+        : liveItems;
+      if (scoreLiveItems.length === 0) continue;
+      const liveSecs = scoreLiveItems.map((x) => x.sec);
       const minL = liveSecs[0] - 120;
       const maxL = liveSecs[liveSecs.length - 1] + 120;
 
-      for (const it of liveItems) {
+      for (const it of scoreLiveItems) {
         liveChecked++;
         const archForBand = it.bIdx >= 0 ? extractArchiveStopSecs(archEntry[tipo], it.bIdx) : archAllSecs;
         const poolSecs = archForBand.length > 0 ? archForBand : archAllSecs;
@@ -355,6 +369,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
 
       if (archAllSecs.length > 0) {
         for (const aSec of archAllSecs) {
+          if (ignorePostMidnightInScore && aSec >= 86400) continue;
           const covered = windowHours.length >= 2 ? inScannedWindows(aSec) : aSec >= minL && aSec <= maxL;
           if (!covered) continue;
           archInSpan++;
@@ -395,37 +410,16 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
     bestScore = scores.domingo || 0;
   }
 
-  // Case 1: High-confidence match to an existing archived diagram (e.g. holiday running domingo)
+  // Case 1: High-confidence match to an existing archived diagram (e.g. holiday running domingo).
+  // Return the intact, synchronized archive diagram WITHOUT injecting single-stop live extras:
+  // SmartMovePro switches diagrams at 00:00 calendar midnight (e.g. 00:39:36 vs 00:44:42 on 904C),
+  // and appending an anchor-stop time on top of the archive creates phantom duplicate trips and
+  // spurious half-lap Turnos (e.g. "T3 00:29-01:19"). Truly custom schedules fall through to Case 2.
   if (bestScore >= 0.72) {
     const isOverride = bestTipo !== fallbackTipo;
-    // Overlay any extra live SOAP times not already within 90s on observed stops (strictly non-destructive)
-    let clonedParadas = null;
-    for (const [stopId, liveItems] of liveByStop.entries()) {
-      const archEntry = paradasMap[stopId];
-      if (!archEntry) continue;
-      const baseList = Array.isArray(archEntry[bestTipo]) ? archEntry[bestTipo] : [];
-      const baseSecs = extractArchiveStopSecs(baseList);
-      const extras = [];
-      for (const it of liveItems) {
-        if (hasCloseTime(baseSecs, it.sec, 90) > 90) {
-          const bIdx = it.bIdx >= 0 ? it.bIdx : 0;
-          extras.push(bIdx ? `${it.hora}|${bIdx}` : it.hora);
-        }
-      }
-      if (extras.length > 0) {
-        if (!clonedParadas) clonedParadas = { ...paradasMap };
-        clonedParadas[stopId] = {
-          ...archEntry,
-          [bestTipo]: [...baseList, ...extras].sort()
-        };
-      }
-    }
-    const finalFile = clonedParadas
-      ? { ...archiveFile, paradas: clonedParadas, _liveSig: `m:${dayKey}:${bestTipo}:${totalLiveItems}` }
-      : archiveFile;
     const tipoName = bestTipo === 'domingo' ? 'Domingo / Feriado' : bestTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
     return {
-      horariosFile: finalFile,
+      horariosFile: archiveFile,
       tipoDia: bestTipo,
       mode: 'live-matched',
       matchedTipo: bestTipo,
