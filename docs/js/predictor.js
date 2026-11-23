@@ -4371,3 +4371,119 @@ export function sanitizeLiveDesvio(
     Math.abs(rawSec) <= 32 * 60 && (impliedSec === null || Math.abs(rawSec - impliedSec) <= 15 * 60);
   return { desvio: rawDesvio, wasGlitch: false, isGood };
 }
+
+/**
+ * Evaluates a free-roaming or individually tracked bus's real-time scheduled position `(branch, along, speedMps)`
+ * when its GPS signal has been absent/frozen (>= 3 min), advancing smoothly along its route polyline across
+ * turnarounds and relevo continuations of the same service (`serviceNumber`), while respecting cabecera waits
+ * and gradual delay recovery!
+ */
+export function evaluateFreeBusSchedulePos(
+  seedTrip,
+  model,
+  nowSec = getArgentinaSecOfDay(),
+  { desvioSec = 0, lastGpsSec = null, allowShiftContinuation = true } = {}
+) {
+  if (!seedTrip || !seedTrip.branch?.pts?.length) return null;
+
+  const effNow = toServiceSec(nowSec);
+  const safeDesvio = Math.abs(desvioSec || 0) <= 38 * 60 ? (desvioSec || 0) : 0;
+  const elapsedSec =
+    Number.isFinite(lastGpsSec) ? Math.max(0, effNow - toServiceSec(lastGpsSec)) : 0;
+  const baseOffset = computeGradualOffsetSec(safeDesvio, elapsedSec);
+
+  // Collect ordered trips of this service (or this shift block if continuation disabled)
+  let srvTrips = [];
+  if (model && Array.isArray(model.blocks) && seedTrip.serviceNumber) {
+    for (const blk of model.blocks) {
+      if (allowShiftContinuation) {
+        if (blk.serviceNumber === seedTrip.serviceNumber) srvTrips.push(...blk.trips);
+      } else if (blk.blockId === seedTrip.blockId) {
+        srvTrips.push(...blk.trips);
+      }
+    }
+  }
+  if (srvTrips.length === 0) {
+    // Fallback: walk prevTrip / nextTrip chain directly from seedTrip
+    let head = seedTrip;
+    let guard = 0;
+    while (head.prevTrip && guard++ < 25) head = head.prevTrip;
+    let cur = head;
+    guard = 0;
+    while (cur && guard++ < 50) {
+      srvTrips.push(cur);
+      cur = cur.nextTrip;
+    }
+  }
+  if (srvTrips.length === 0) srvTrips = [seedTrip];
+  srvTrips.sort((a, b) => a.startSec - b.startSec);
+
+  let seedIdx = srvTrips.findIndex((t) => t.tripKey === seedTrip.tripKey);
+  if (seedIdx < 0) seedIdx = 0;
+
+  // Propagate real offset forward across cabeceras:
+  // early advance (>0) resets to 0 at cabecera; late delay (<0) is absorbed by layover slack
+  const offsets = new Array(srvTrips.length).fill(0);
+  offsets[seedIdx] = baseOffset;
+  for (let i = seedIdx + 1; i < srvTrips.length; i++) {
+    const prevT = srvTrips[i - 1];
+    const curT = srvTrips[i];
+    const prevOff = offsets[i - 1];
+    if (prevOff >= 0) {
+      offsets[i] = 0;
+    } else {
+      const layover = Math.max(0, curT.startSec - prevT.endSec);
+      const absorbed = Math.max(0, layover - 60);
+      offsets[i] = Math.min(0, prevOff + absorbed);
+    }
+  }
+  for (let i = seedIdx - 1; i >= 0; i--) {
+    offsets[i] = baseOffset;
+  }
+
+  for (let i = 0; i < srvTrips.length; i++) {
+    const tr = srvTrips[i];
+    if (!tr.branch?.pts?.length || !tr.points?.length) continue;
+    const legOff = offsets[i];
+    const tLeg = effNow + legOff;
+
+    if (tLeg < tr.startSec) {
+      // Waiting at origin cabecera ahead of scheduled departure
+      return {
+        trip: tr,
+        branch: tr.branch,
+        along: tr.points[0].along ?? 0,
+        speedMps: 0,
+        isAtTerminal: true,
+        finished: false,
+        effectiveOffsetSec: 0
+      };
+    }
+    if (tLeg <= tr.endSec) {
+      const ev = evalPointsAtSec(tr.points, tLeg);
+      if (ev) {
+        return {
+          trip: tr,
+          branch: tr.branch,
+          along: ev.along,
+          speedMps: ev.speedMps,
+          isAtTerminal: ev.speedMps <= 0.05,
+          finished: false,
+          effectiveOffsetSec: legOff
+        };
+      }
+    }
+  }
+
+  const lastTrip = srvTrips[srvTrips.length - 1];
+  return {
+    trip: lastTrip,
+    branch: lastTrip.branch,
+    along: lastTrip.branch?.totalLen ?? 0,
+    speedMps: 0,
+    isAtTerminal: true,
+    finished: true,
+    effectiveOffsetSec: 0
+  };
+}
+

@@ -45,7 +45,8 @@ import {
   resolveUnitScheduleMeta,
   matchFreeFleetUnitsToModel,
   resolveLiveHorariosForDay,
-  sanitizeLiveDesvio
+  sanitizeLiveDesvio,
+  evaluateFreeBusSchedulePos
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -320,8 +321,9 @@ const el = {
 const CHANGELOG_ENTRIES = [
   {
     version: 'v2.4.16',
-    date: '23/11/2026 · 13:20 hs',
+    date: '23/11/2026 · 13:45 hs',
     items: [
+      '<strong>Simulación EN VIVO por horarios en Modo libre y Seguimiento individual:</strong> cuando un coche pasa más de 3 minutos sin señal GPS (en cualquier línea), ahora continúa moviéndose suavemente sobre su recorrido siguiendo el horario programado —incluyendo giros en cabecera y continuidad del servicio— en lugar de quedar quieto en su última posición.',
       '<strong>Desvío GPS 100% real en coches en vivo:</strong> el simulador ya nunca sobrescribe ni inventa desvíos horarios en colectivos con señal de SmartMovePro (como el falso <code>-23:19</code> cuando un GPS queda congelado), manteniendo siempre el desvío real del satélite y bloqueando solo saltos espurios (como <code>+69:53</code> o <code>-50:xx</code>).',
       '<strong>Sin retrocesos bruscos cada 10 s y soporte para horas de 1 dígito:</strong> se corrigió la lectura de marcas GPS matutinas de un dígito (por ejemplo <code>7:10:34</code>) tanto en la app como en el servidor, se conservó la antigüedad real de GPS congelados (>2 h) y se eliminó el avance/retroceso cada 10 segundos en unidades detenidas o con GPS trabado.',
       '<strong>Mejor detección de mano contraria en avenidas divididas:</strong> se amplió el bloqueo espacial de mano opuesta para que un tiempo corto erróneo del servidor nunca oculte el turno real ni la calzada física correcta.',
@@ -3002,10 +3004,12 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
   };
 }
 
-function applyScheduleMetaToCityBus(bus, meta) {
+function applyScheduleMetaToCityBus(bus, meta, model = null) {
   if (!meta) return;
   if (meta.trip?.branch) {
     bus._matchedBranch = meta.trip.branch;
+    bus._matchedTrip = meta.trip;
+    if (model) bus._scheduleModel = model;
     if (meta.trip.branch.bandera) {
       bus.realBandera = meta.trip.branch.bandera;
       bus.realBanderaColor = meta.trip.branch.color || getLineColor(bus.descripcionLinea);
@@ -3060,7 +3064,7 @@ function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
       const meta =
         globalMatched.get(bus.identificadorCoche) ||
         resolveUnitScheduleMeta(model, matchInputs[i], nowSec, state.lastRealGpsByUnit);
-      if (meta) applyScheduleMetaToCityBus(bus, meta);
+      if (meta) applyScheduleMetaToCityBus(bus, meta, model);
 
       // Sanitize intermittent SmartMovePro opposite-direction desvio glitches (e.g. -01:39 -> -50:xx) in Modo Libre too!
       if (bus.desvio && bus.identificadorCoche) {
@@ -3088,6 +3092,9 @@ function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
 
 function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
   const nowMs = Date.now();
+  const nowSec = getArgentinaSecOfDay(new Date(nowMs));
+  const effNowSvc = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
+  const todayKey = getArgentinaDayKey();
   const seenKeys = new Set();
 
   for (const bus of buses) {
@@ -3120,6 +3127,90 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
     let { branch, proj, dirSource, ambiguous } = picked;
     let gpsAlong = proj.along;
     const prevSim = cityFleetSim.get(bus.key);
+
+    // Schedule-driven continuation in EN VIVO mode whenever GPS has been silent/frozen >= 3 min (180 s)!
+    // Keeps every bus (Modo Libre & individual tracking across all 26 lines) smoothly following its exact
+    // scheduled route polyline and turnarounds instead of freezing at an old GPS fix.
+    if (state.simulateMode && gpsAgeSec >= 180 && branches.length > 0) {
+      const model =
+        bus._scheduleModel || buildEffectiveLineScheduleModel(bus.codigoLinea, branches, todayKey).model || null;
+      let seedTrip = bus._matchedTrip || null;
+      if (!seedTrip && model) {
+        const resolved = resolveUnitScheduleMeta(
+          model,
+          {
+            coche: bus.identificadorCoche,
+            lat: rawLat,
+            lng: rawLng,
+            bandera: bus.descripcionBandera,
+            ultimaFechaHoraGPS: bus.ultimaFechaHoraGPS,
+            desvioSec: bus.desvio?.seconds || 0,
+            enLineaAhora: Boolean(bus.enLineaAhora ?? true)
+          },
+          nowSec,
+          state.lastRealGpsByUnit
+        );
+        if (resolved?.trip) {
+          seedTrip = resolved.trip;
+          bus._matchedTrip = seedTrip;
+          bus._scheduleModel = model;
+        }
+      }
+
+      const isActiveUnit = bus.enLineaAhora !== false;
+      const shiftEndSec = seedTrip?.blockInfo?.endSec ?? seedTrip?.endSec ?? 0;
+      const isHistoricalFinished = !isActiveUnit && shiftEndSec > 0 && effNowSvc > shiftEndSec + 25 * 60;
+
+      if (seedTrip && !isHistoricalFinished) {
+        const lastGpsSec = parseGpsStampSecOfDay(bus.ultimaFechaHoraGPS);
+        const schedPos = evaluateFreeBusSchedulePos(seedTrip, model, nowSec, {
+          desvioSec: bus.desvio?.seconds || 0,
+          lastGpsSec,
+          allowShiftContinuation: isActiveUnit
+        });
+        if (schedPos && schedPos.branch && !schedPos.finished) {
+          bus.gpsLost = true;
+          bus.realBandera = schedPos.branch.bandera || bus.realBandera;
+          bus.realBanderaColor = schedPos.branch.color || getLineColor(bus.descripcionLinea);
+          if (schedPos.trip?.lapNumber) bus.lapNumber = schedPos.trip.lapNumber;
+          if (schedPos.trip?.turnoIndex) bus.turnoIndex = schedPos.trip.turnoIndex;
+
+          const curAlong =
+            prevSim &&
+            prevSim.mode === 'schedule' &&
+            prevSim.branch === schedPos.branch &&
+            Math.abs(schedPos.along - prevSim.along) <= 220
+              ? prevSim.along
+              : schedPos.along;
+
+          cityFleetSim.set(bus.key, {
+            mode: 'schedule',
+            seedTrip: schedPos.trip || seedTrip,
+            model,
+            desvioSec: bus.desvio?.seconds || 0,
+            lastGpsSec,
+            allowShiftContinuation: isActiveUnit,
+            branch: schedPos.branch,
+            along: curAlong,
+            gpsAlong,
+            expectedAlong: schedPos.along,
+            maxAlong: schedPos.branch.totalLen || curAlong,
+            speedMps: schedPos.speedMps,
+            lastGpsMs: gpsMs,
+            isStopped: schedPos.isAtTerminal || schedPos.speedMps <= 0.05
+          });
+
+          const pt = sampleBranchAtAlong(schedPos.branch, curAlong);
+          if (pt) {
+            bus.lat = pt.lat;
+            bus.lng = pt.lng;
+          }
+          continue;
+        }
+      }
+    }
+
+    bus.gpsLost = false;
 
     // Anti-backwards safety guard: if real GPS moved backwards along our chosen branch (> 55m),
     // immediately flip to the paired return BANDERA (or whichever nearby branch advances forward)!
@@ -3214,6 +3305,7 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
     curAlong = Math.max(0, Math.min(branch.totalLen, curAlong));
 
     cityFleetSim.set(bus.key, {
+      mode: 'gps',
       branch,
       along: curAlong,
       gpsAlong,
@@ -3245,10 +3337,72 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
 
 function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
   if (!state.simulateMode || !Array.isArray(busesList) || busesList.length === 0) return;
+  const nowSec = getArgentinaSecOfDay();
+
   for (let i = 0; i < busesList.length; i++) {
     const bus = busesList[i];
     const sim = cityFleetSim.get(bus.key);
-    if (!sim || sim.isStopped || sim.speedMps <= 0.1 || !sim.branch) continue;
+    if (!sim || !sim.branch) continue;
+
+    // ── Schedule-driven smooth 60fps motion when GPS is absent/frozen >= 3 min ──
+    if (sim.mode === 'schedule' && sim.seedTrip) {
+      const pos = evaluateFreeBusSchedulePos(sim.seedTrip, sim.model, nowSec, {
+        desvioSec: sim.desvioSec || 0,
+        lastGpsSec: sim.lastGpsSec ?? null,
+        allowShiftContinuation: Boolean(sim.allowShiftContinuation)
+      });
+      if (!pos || !pos.branch || pos.finished) {
+        sim.isStopped = true;
+        sim.speedMps = 0;
+        continue;
+      }
+
+      if (pos.branch !== sim.branch) {
+        sim.branch = pos.branch;
+        sim.along = pos.along;
+        sim.seedTrip = pos.trip || sim.seedTrip;
+        if (pos.branch.bandera) {
+          bus.realBandera = pos.branch.bandera;
+          bus.realBanderaColor = pos.branch.color || getLineColor(bus.descripcionLinea);
+        }
+        if (pos.trip?.lapNumber) bus.lapNumber = pos.trip.lapNumber;
+        if (pos.trip?.turnoIndex) bus.turnoIndex = pos.trip.turnoIndex;
+      } else {
+        sim.seedTrip = pos.trip || sim.seedTrip;
+        if (pos.trip?.lapNumber) bus.lapNumber = pos.trip.lapNumber;
+        if (pos.trip?.turnoIndex) bus.turnoIndex = pos.trip.turnoIndex;
+        if (pos.isAtTerminal && pos.speedMps <= 0.05) {
+          sim.isStopped = true;
+          sim.speedMps = 0;
+          if (Math.abs(pos.along - sim.along) > 1) {
+            sim.along = pos.along;
+          }
+        } else {
+          sim.isStopped = false;
+          const gap = pos.along - sim.along;
+          let effSpeed;
+          if (gap < -8) {
+            effSpeed = Math.max(0.4, pos.speedMps * 0.25);
+          } else {
+            effSpeed = Math.max(0.5, Math.min(25.0, pos.speedMps + Math.max(0, Math.min(6.0, gap / 4.0))));
+          }
+          sim.speedMps = effSpeed;
+          const nextAlong = Math.min(sim.branch.totalLen || pos.along, sim.along + effSpeed * dtSec);
+          if (nextAlong - sim.along < 0.005) continue;
+          sim.along = nextAlong;
+        }
+      }
+
+      const pt = sampleBranchAtAlong(sim.branch, sim.along);
+      if (pt) {
+        bus.lat = pt.lat;
+        bus.lng = pt.lng;
+        bus._posChanged = true;
+      }
+      continue;
+    }
+
+    if (sim.isStopped || sim.speedMps <= 0.1) continue;
 
     // Advance expectedAlong continuously at learned GPS speed so there is zero 7-second rubber-banding
     sim.expectedAlong = Math.min(sim.maxAlong, (sim.expectedAlong ?? sim.along) + sim.speedMps * dtSec);
@@ -4274,6 +4428,8 @@ async function locateFleetUnitOnMap({
       realBandera: matchedBranch?.bandera || fallbackBandera,
       realBanderaColor: matchedBranch?.color || getLineColor(resolvedLineName),
       _matchedBranch: matchedBranch,
+      _matchedTrip: meta?.trip || null,
+      _scheduleModel: model || null,
       identificadorCoche: bCoche,
       choferNombre: raw.choferNombre || choferNombre || '',
       choferLegajo: raw.choferLegajo || choferLegajo || '',
@@ -4478,6 +4634,17 @@ async function locateFleetUnitOnMap({
           transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: initBus.key, simulateMode: state.simulateMode });
           if (state.simulateMode) startSimLoop();
         }
+      } else if (tracker.bus && tracker.bus.lat !== null) {
+        // Tracked bus is currently absent from live GPS -> keep running smooth schedule-driven simulation!
+        const keptBus = tracker.bus;
+        const merged = [keptBus, ...liveBuses.filter((b) => b.key !== keptBus.key)];
+        tracker.buses = merged;
+        reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
+        transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: keptBus.key, simulateMode: state.simulateMode });
+        if (state.inspectorOpen && state.selectedBusKey === keptBus.key) {
+          updateInspectorFields(keptBus);
+        }
+        if (state.simulateMode) startSimLoop();
       }
     } catch {
       // Keep last-known pin on transient error
