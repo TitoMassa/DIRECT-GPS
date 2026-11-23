@@ -8654,10 +8654,10 @@ function renderLineRecorridoView() {
       </div>
     `;
   } else {
-    // ORDERED STOPS TIMELINE VIEW (full day schedule: past dimmed + next highlighted + future, horizontally scrollable)
+    // ORDERED STOPS TIMELINE VIEW (full day schedule: past dimmed + next highlighted + future, each chip with S# V#)
     const legendHtml = isTodayTipo
       ? `<span class="rec-legend-inline"><span class="rec-legend-dot is-passed"></span>Pasados · <span class="rec-legend-dot is-next"></span>Próximo</span>`
-      : `<span class="mono-meta">Tocá una parada para ver servicios</span>`;
+      : `<span class="mono-meta">Tocá una parada para abrir su radar</span>`;
     bodyHtml = `
       <div class="rec-matrix-toolbar">
         <span class="mono-meta">${visibleStops.length} paradas en orden · ${filteredTrips.length} vueltas</span>
@@ -8676,53 +8676,39 @@ function renderLineRecorridoView() {
               }))
               .filter((p) => p.sec !== null);
             const firstUpcoming = isTodayTipo ? passTimes.find((p) => p.sec >= nowSvcSec - 60) || null : null;
-            const isExpanded = rv.expandedStopId === st.id;
-            const previewHtml = passTimes
+            const chipsHtml = passTimes
               .map((p) => {
                 const passed = isTodayTipo && p.sec < nowSvcSec - 60;
                 const isNext = isTodayTipo && firstUpcoming !== null && p === firstUpcoming;
+                const metaParts = [];
+                if (p.srv) metaParts.push(`S${p.srv}`);
+                if (p.lap) metaParts.push(`V${formatLapNumber(p.lap)}`);
+                const metaTag = metaParts.length ? `<small>${escapeHtml(metaParts.join(' '))}</small>` : '';
                 return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}"${
                   isNext ? ' data-next-chip="1"' : ''
                 } title="${
                   p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
-                }">${formatSecHHMM(p.sec)}</span>`;
+                }">${formatSecHHMM(p.sec)}${metaTag}</span>`;
               })
               .join('');
-            const allTimesHtml = isExpanded
-              ? `
-                <div class="rec-stop-all-times">
-                  ${passTimes
-                    .map((p) => {
-                      const passed = isTodayTipo && p.sec < nowSvcSec - 60;
-                      const isNext = isTodayTipo && firstUpcoming !== null && p === firstUpcoming;
-                      return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}" title="${
-                        p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
-                      }">${formatSecHHMM(p.sec)}${p.srv ? `<small>S${p.srv}</small>` : ''}</span>`;
-                    })
-                    .join('')}
-                </div>
-              `
-              : '';
 
             return `
-              <div class="rec-stop-item ${isExpanded ? 'is-expanded' : ''}">
+              <div class="rec-stop-item">
                 <div class="rec-stop-rail" aria-hidden="true">
                   <span class="rec-stop-dot ${isTerminal ? 'is-terminal' : ''}"></span>
                 </div>
-                <div class="rec-stop-card">
+                <button type="button" class="rec-stop-card" data-open-stop="${escapeHtml(st.id)}" data-stop-name="${escapeHtml(st.descripcion)}" data-stop-lat="${st.lat}" data-stop-lng="${st.lng}" aria-label="Abrir radar en parada ${escapeHtml(st.descripcion)} (${escapeHtml(st.id)})">
                   <div class="rec-stop-head">
-                    <button type="button" class="rec-stop-toggle-btn" data-toggle-stop="${escapeHtml(st.id)}" aria-expanded="${isExpanded}">
+                    <div class="rec-stop-title-row">
                       <span class="rec-stop-num">#${origIdx}</span>
                       <span class="rec-stop-name">${escapeHtml(st.descripcion)}</span>
-                    </button>
-                    <button type="button" class="seg-btn seg-btn-xs rec-stop-radar-btn" data-open-stop="${escapeHtml(st.id)}" data-stop-name="${escapeHtml(st.descripcion)}" data-stop-lat="${st.lat}" data-stop-lng="${st.lng}" aria-label="Abrir radar en parada ${escapeHtml(st.descripcion)}">Radar</button>
+                    </div>
+                    <span class="code-badge">${escapeHtml(st.id)}</span>
                   </div>
                   <div class="rec-stop-preview-row">
-                    <span class="code-badge">${escapeHtml(st.id)}</span>
-                    <div class="rec-preview-chips">${previewHtml || '<span class="mono-meta">Sin horarios</span>'}</div>
+                    <div class="rec-preview-chips">${chipsHtml || '<span class="mono-meta">Sin horarios</span>'}</div>
                   </div>
-                  ${allTimesHtml}
-                </div>
+                </button>
               </div>
             `;
           })

@@ -3409,6 +3409,14 @@ input:focus-visible,
   max-width: 100%;
   box-sizing: border-box;
   overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.rec-stop-card:hover,
+.rec-stop-card:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface-2, var(--surface-1));
 }
 
 .rec-stop-head {
@@ -3417,6 +3425,19 @@ input:focus-visible,
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  width: 100%;
+}
+
+.rec-stop-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.rec-stop-head .code-badge {
+  flex-shrink: 0;
 }
 
 .rec-stop-radar-btn {
