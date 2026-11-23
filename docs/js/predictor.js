@@ -156,26 +156,17 @@ export function computeGradualOffsetSec(initialOffsetSec = 0, elapsedSec = 0) {
 }
 
 /**
- * Picks the best available day-type in a line's timetable archive.
- * Exact match first; if unavailable (e.g. Sunday before first Sunday scan), gracefully falls back.
+ * Checks whether `requestedTipo` has scheduled departures in a line's timetable archive.
+ * Does NOT fall back to `habil` when `sabado`/`domingo` is empty, because lines like 109B
+ * genuinely do not operate on Saturdays, Sundays, or holidays (avoiding phantom events/trips).
  */
 export function resolveAvailableTipoDia(horariosFile, requestedTipo = 'habil') {
   const paradas = horariosFile?.paradas;
   if (!paradas || typeof paradas !== 'object') return null;
 
-  const baseOrder =
-    requestedTipo === 'domingo'
-      ? ['domingo', 'sabado', 'habil']
-      : requestedTipo === 'sabado'
-        ? ['sabado', 'habil', 'domingo']
-        : ['habil', 'sabado', 'domingo'];
-  const fallbackOrder = baseOrder.includes(requestedTipo) ? baseOrder : [requestedTipo, ...baseOrder];
-
-  for (const tipo of fallbackOrder) {
-    for (const entry of Object.values(paradas)) {
-      if (Array.isArray(entry?.[tipo]) && entry[tipo].length > 0) {
-        return { tipo, exact: tipo === requestedTipo };
-      }
+  for (const entry of Object.values(paradas)) {
+    if (Array.isArray(entry?.[requestedTipo]) && entry[requestedTipo].length > 0) {
+      return { tipo: requestedTipo, exact: true };
     }
   }
   return null;
