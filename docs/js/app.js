@@ -4516,7 +4516,7 @@ function reconcileWithSchedulePrediction(
 
   for (const [cod, buses] of liveByLine.entries()) {
     const branches = state.routeBranchesCache.get(cod) || [];
-    const { model } = buildEffectiveLineScheduleModel(cod, branches, todayKey);
+    const { model } = buildEffectiveLineScheduleModel(cod, branches, todayDayKey);
 
     const matchedTrips = new Set();
     const matchedCoches = new Set();
@@ -4770,7 +4770,7 @@ function reconcileWithSchedulePrediction(
 
   for (const cod of targetLineCodes) {
     const branches = state.routeBranchesCache.get(cod) || [];
-    const effHor = resolveEffectiveLineHorarios(cod, todayKey);
+    const effHor = resolveEffectiveLineHorarios(cod, todayDayKey);
     const horFile = effHor.horariosFile;
     if (!branches.length || !horFile || !stopCoords) continue;
 
