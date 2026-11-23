@@ -389,8 +389,7 @@ async function buildOfflineDrillIndex(codLinea) {
   return { calles, streetMap };
 }
 
-async function getArchivedHorarios(stopId, codLinea, tipoDia) {
-  const file = await loadArchiveLine(codLinea);
+function formatArchivedHorariosFromFile(file, stopId, codLinea, tipoDia) {
   const list = file?.paradas?.[stopId]?.[tipoDia];
   if (!Array.isArray(list) || list.length === 0) return null;
   const banderas = Array.isArray(file.banderas) ? file.banderas : [];
@@ -427,6 +426,60 @@ async function getArchivedHorarios(stopId, codLinea, tipoDia) {
     horarios,
     frecuenciaMin: diffs.length ? diffs[Math.floor(diffs.length / 2)] : null
   };
+}
+
+async function getArchivedHorarios(stopId, codLinea, tipoDia) {
+  const file = await loadArchiveLine(codLinea);
+  return formatArchivedHorariosFromFile(file, stopId, codLinea, tipoDia);
+}
+
+// Non-destructive client cache of Worker's accumulated live SOAP schedules (never drops passed times)
+const liveHorariosState = {
+  days: {},
+  availableDays: [],
+  meta: null,
+  savedAt: 0
+};
+
+function mergeLiveHorariosPayload(payload, savedAt = Date.now()) {
+  if (!payload || typeof payload !== 'object') return liveHorariosState;
+  const incomingDays = payload.days && typeof payload.days === 'object' ? payload.days : {};
+  for (const [dk, dayObj] of Object.entries(incomingDays)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dk) || !dayObj || typeof dayObj !== 'object') continue;
+    const prevDay = liveHorariosState.days[dk] || { updatedAt: 0, lineas: {} };
+    const nextLineas = { ...prevDay.lineas };
+    for (const [cod, lObj] of Object.entries(dayObj.lineas || {})) {
+      const prevLine = nextLineas[cod] || { stops: {}, windowsScanned: 0, windowHours: [], lastScanAt: 0 };
+      const nextStops = { ...prevLine.stops };
+      for (const [sid, list] of Object.entries(lObj?.stops || {})) {
+        const union = new Set(Array.isArray(nextStops[sid]) ? nextStops[sid] : []);
+        for (const it of Array.isArray(list) ? list : []) union.add(it);
+        nextStops[sid] = Array.from(union).sort();
+      }
+      const winSet = new Set([
+        ...(Array.isArray(prevLine.windowHours) ? prevLine.windowHours : []),
+        ...(Array.isArray(lObj?.windowHours) ? lObj.windowHours : [])
+      ]);
+      nextLineas[cod] = {
+        stops: nextStops,
+        windowsScanned: Math.max(Number(prevLine.windowsScanned) || 0, Number(lObj?.windowsScanned) || 0),
+        windowHours: Array.from(winSet).sort((a, b) => a - b),
+        lastScanAt: Math.max(Number(prevLine.lastScanAt) || 0, Number(lObj?.lastScanAt) || 0)
+      };
+    }
+    liveHorariosState.days[dk] = {
+      updatedAt: Math.max(Number(prevDay.updatedAt) || 0, Number(dayObj.updatedAt) || 0),
+      lineas: nextLineas
+    };
+  }
+  const availSet = new Set([
+    ...Object.keys(liveHorariosState.days),
+    ...(Array.isArray(payload.availableDays) ? payload.availableDays : [])
+  ]);
+  liveHorariosState.availableDays = Array.from(availSet).sort().reverse().slice(0, 14);
+  if (payload.meta) liveHorariosState.meta = payload.meta;
+  liveHorariosState.savedAt = Math.max(liveHorariosState.savedAt, Number(savedAt) || Date.now());
+  return liveHorariosState;
 }
 
 // Deduplicate POST /api/fleet-seen writes per session
@@ -581,10 +634,64 @@ export const api = {
       return { data: [], source: 'fallback' };
     }),
 
-  horarios: async (idParada, codLinea, tipoDia = 'auto') => {
+  horariosLive: async ({ dayKey = '', all = true } = {}) => {
+    const params = [];
+    if (dayKey) params.push(`dayKey=${encodeURIComponent(dayKey)}`);
+    else if (all) params.push('days=all');
+    const qs = params.length ? `?${params.join('&')}` : '';
+
+    // Always hydrate from IDB first so previously accumulated passed times are preserved
+    if (liveHorariosState.savedAt === 0) {
+      const cached = await readIdbValue('live_horarios_all');
+      if (cached?.data) mergeLiveHorariosPayload(cached.data, cached.savedAt || Date.now());
+    }
+
+    if (!isBrowserOffline()) {
+      try {
+        const res = await apiGet(`/api/horarios-live${qs}`, null, 8000);
+        if (res?.data) {
+          const savedAt = Number(res.savedAt) || Date.now();
+          mergeLiveHorariosPayload(res.data, savedAt);
+          await saveIdbValue('live_horarios_all', {
+            savedAt: liveHorariosState.savedAt,
+            data: {
+              days: liveHorariosState.days,
+              availableDays: liveHorariosState.availableDays,
+              meta: liveHorariosState.meta
+            }
+          });
+          return { data: liveHorariosState, source: res.source || 'live-horarios', savedAt };
+        }
+      } catch {
+        // Fall back to accumulated IDB/in-memory cache
+      }
+    }
+    return {
+      data: liveHorariosState,
+      source: 'live-horarios-cache',
+      savedAt: liveHorariosState.savedAt,
+      isOfflineCache: true
+    };
+  },
+
+  getLiveHorariosCached: async () => {
+    if (liveHorariosState.savedAt === 0) {
+      const cached = await readIdbValue('live_horarios_all');
+      if (cached?.data) mergeLiveHorariosPayload(cached.data, cached.savedAt || Date.now());
+    }
+    return liveHorariosState;
+  },
+
+  horarios: async (idParada, codLinea, tipoDia = 'auto', { resolvedFile = null, resolvedTipoOverride = null } = {}) => {
     const cleanStop = String(idParada).toUpperCase();
-    const resolvedTipo = tipoDia === 'auto' ? getArgentinaTodayTipo() : tipoDia;
+    const resolvedTipo = resolvedTipoOverride || (tipoDia === 'auto' ? getArgentinaTodayTipo() : tipoDia);
     const cacheKey = `dgps_hor_v2_${cleanStop}_${codLinea}_${resolvedTipo}`;
+
+    // 0) If caller resolved a live-SOAP timetable file (e.g. holiday or custom schedule), use it first
+    if (resolvedFile) {
+      const fromLive = formatArchivedHorariosFromFile(resolvedFile, cleanStop, codLinea, resolvedTipo);
+      if (fromLive) return { data: fromLive, source: 'live-soap-resolved', archived: true };
+    }
 
     // 1) Permanent shared archive (scanned nightly by GitHub Actions, survives any cache clearing).
     const archived = await getArchivedHorarios(cleanStop, codLinea, resolvedTipo);
@@ -875,6 +982,18 @@ function normalizeOfflineSearchText(str = '') {
 async function persistOfflineBundleSnapshot(bundleData, savedAt = Date.now()) {
   if (!bundleData || typeof bundleData !== 'object') return;
   await saveIdbValue('offline_bundle', { savedAt, data: bundleData });
+
+  if (bundleData.liveHorarios && typeof bundleData.liveHorarios === 'object') {
+    mergeLiveHorariosPayload(bundleData.liveHorarios, savedAt);
+    await saveIdbValue('live_horarios_all', {
+      savedAt: liveHorariosState.savedAt,
+      data: {
+        days: liveHorariosState.days,
+        availableDays: liveHorariosState.availableDays,
+        meta: liveHorariosState.meta
+      }
+    });
+  }
 
   if (bundleData.resumen && Array.isArray(bundleData.resumen.lineas)) {
     const prevResumen = await readIdbValue('flota_resumen');

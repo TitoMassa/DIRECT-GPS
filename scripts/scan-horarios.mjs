@@ -156,22 +156,62 @@ async function getParadasLinea(codLinea) {
   return [...ids].sort();
 }
 
-/** Returns { ok, items:[{hora:'HH:MM:SS', bandera}] } for one stop/line/date (12 windows of 2h). */
-async function scanStopDay(stopId, codLinea, dateIso) {
+function horaToSec(hora = '') {
+  const m = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(hora || '').trim());
+  if (!m) return -1;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] || 0);
+}
+
+/**
+ * Returns { ok, partial, coveredRanges: [[fromSec, toSec]], items:[{hora:'HH:MM:SS', bandera}] }
+ * for one stop/line/date, strictly respecting SmartMovePro's [now+2m, now+47.5h] horizon.
+ */
+async function scanStopDay(stopId, codLinea, dateIso, validStartArtMs, validEndArtMs) {
+  const mDate = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateIso);
+  if (!mDate) return { ok: false, partial: true, coveredRanges: [], items: [] };
+  const baseDayMs = Date.UTC(Number(mDate[1]), Number(mDate[2]) - 1, Number(mDate[3]), 0, 0, 0);
+
   const items = [];
   const seen = new Set();
+  const coveredRanges = [];
+  let partial = false;
+
   for (let h = 0; h < 24; h += 2) {
+    const winStartMs = baseDayMs + h * 3600 * 1000;
+    const winEndMs = baseDayMs + (h + 1) * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000;
+
+    // Skip windows outside SmartMovePro's [now, +48h] publish range without treating them as empty
+    if (winEndMs <= validStartArtMs + 60 * 1000 || winStartMs >= validEndArtMs - 60 * 1000) {
+      partial = true;
+      continue;
+    }
+
+    const desdeMs = Math.max(winStartMs, validStartArtMs);
+    const hastaMs = Math.min(winEndMs, validEndArtMs, desdeMs + 119 * 60 * 1000 + 59 * 1000);
+    if (hastaMs - desdeMs < 120 * 1000) {
+      partial = true;
+      continue;
+    }
+    if (desdeMs > winStartMs + 60 * 1000 || hastaMs < winEndMs - 60 * 1000) {
+      partial = true;
+    }
+
+    const dDesde = new Date(desdeMs);
+    const dHasta = new Date(hastaMs);
+    const desdeIso = `${dateIso}T${pad(dDesde.getUTCHours())}:${pad(dDesde.getUTCMinutes())}:${pad(dDesde.getUTCSeconds())}`;
+    const hastaIso = `${dateIso}T${pad(dHasta.getUTCHours())}:${pad(dHasta.getUTCMinutes())}:${pad(dHasta.getUTCSeconds())}`;
+
     let res;
     try {
       res = await soap(
         'RecuperarHorariosProgramadosPorLineaParada',
         `<identificadorParada i:type="d:string">${escapeXml(stopId)}</identificadorParada>
          <codigoLineaParada i:type="d:int">${codLinea}</codigoLineaParada>
-         <fechaHoraDesde i:type="d:dateTime">${dateIso}T${pad(h)}:00:00</fechaHoraDesde>
-         <fechaHoraHasta i:type="d:dateTime">${dateIso}T${pad(h + 1)}:59:59</fechaHoraHasta>`
+         <fechaHoraDesde i:type="d:dateTime">${desdeIso}</fechaHoraDesde>
+         <fechaHoraHasta i:type="d:dateTime">${hastaIso}</fechaHoraHasta>`
       );
     } catch {
-      return { ok: false, items: [] };
+      return { ok: false, partial: true, coveredRanges: [], items: [] };
     }
     const list = Array.isArray(res?.HorariossProgramados)
       ? res.HorariossProgramados
@@ -179,9 +219,13 @@ async function scanStopDay(stopId, codLinea, dateIso) {
         ? res.HorariosProgramados
         : null;
     if (!list) {
-      if (Number(res?.CodigoEstado) === -1 && EMPTY_MSG.test(String(res?.MensajeEstado || ''))) continue;
-      return { ok: false, items: [] };
+      if (Number(res?.CodigoEstado) === -1 && EMPTY_MSG.test(String(res?.MensajeEstado || ''))) {
+        coveredRanges.push([Math.floor((desdeMs - baseDayMs) / 1000), Math.floor((hastaMs - baseDayMs) / 1000)]);
+        continue;
+      }
+      return { ok: false, partial: true, coveredRanges: [], items: [] };
     }
+    coveredRanges.push([Math.floor((desdeMs - baseDayMs) / 1000), Math.floor((hastaMs - baseDayMs) / 1000)]);
     for (const it of list) {
       const raw = String(it.HoraPaso || '').trim();
       const hora = (raw.split(' ')[1] || '').trim().slice(0, 8);
@@ -194,7 +238,52 @@ async function scanStopDay(stopId, codLinea, dateIso) {
     }
   }
   items.sort((a, b) => a.hora.localeCompare(b.hora) || a.bandera.localeCompare(b.bandera));
-  return { ok: true, items };
+  return { ok: true, partial, coveredRanges, items };
+}
+
+/**
+ * Non-destructive merge: preserves previously stored times outside covered windows
+ * (so elapsed morning times or evening times beyond +48h are NEVER erased).
+ */
+function mergeScheduleItems(prevList = [], freshResult) {
+  const prev = Array.isArray(prevList) ? prevList : [];
+  const fresh = Array.isArray(freshResult?.items) ? freshResult.items : [];
+  if (!fresh.length) return prev;
+
+  // Safety guard: never allow a sudden half-day truncation to wipe out evening trips
+  const prevLastSec = prev.reduce((mx, it) => Math.max(mx, horaToSec(it.hora)), -1);
+  const freshLastSec = fresh.reduce((mx, it) => Math.max(mx, horaToSec(it.hora)), -1);
+  const looksTruncated = prev.length >= 6 && prevLastSec >= 19 * 3600 && freshLastSec < 17 * 3600;
+
+  if (!freshResult.partial && !looksTruncated) {
+    return fresh;
+  }
+
+  const ranges = freshResult.coveredRanges || [];
+  const isCovered = (sec) => ranges.some(([from, to]) => sec >= from && sec <= to);
+
+  const merged = [];
+  const seen = new Set();
+  for (const it of prev) {
+    const sec = horaToSec(it.hora);
+    // Keep anything outside covered ranges, OR anything after freshLastSec if truncated
+    if (!isCovered(sec) || (looksTruncated && sec > freshLastSec + 60)) {
+      const k = `${it.hora}|${it.bandera}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        merged.push(it);
+      }
+    }
+  }
+  for (const it of fresh) {
+    const k = `${it.hora}|${it.bandera}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      merged.push(it);
+    }
+  }
+  merged.sort((a, b) => a.hora.localeCompare(b.hora) || a.bandera.localeCompare(b.bandera));
+  return merged;
 }
 
 async function readJson(file, fallback) {
@@ -271,7 +360,10 @@ async function getFeriados(years) {
 
 async function main() {
   const t0 = Date.now();
-  const nowArt = new Date(Date.now() - 3 * 3600 * 1000);
+  const nowArtMs = Date.now() - 3 * 3600 * 1000;
+  const nowArt = new Date(nowArtMs);
+  const validStartArtMs = nowArtMs + 2 * 60 * 1000;
+  const validEndArtMs = nowArtMs + 47.5 * 3600 * 1000;
   const dayStartUtcMs = Date.UTC(nowArt.getUTCFullYear(), nowArt.getUTCMonth(), nowArt.getUTCDate());
 
   const candidates = OFFSETS.map((off) => {
@@ -329,7 +421,7 @@ async function main() {
     await pool(
       jobs,
       async ({ stopId, t }) => {
-        const r = await scanStopDay(stopId, linea.codigo, t.iso);
+        const r = await scanStopDay(stopId, linea.codigo, t.iso, validStartArtMs, validEndArtMs);
         const prev = stored.get(stopId) || {};
         if (!r.ok) {
           stat.failed++;
@@ -341,9 +433,10 @@ async function main() {
           return;
         }
         const before = JSON.stringify(prev[t.tipo] || []);
-        prev[t.tipo] = r.items;
+        const merged = mergeScheduleItems(prev[t.tipo], r);
+        prev[t.tipo] = merged;
         stored.set(stopId, prev);
-        if (before === JSON.stringify(r.items)) stat.kept++;
+        if (before === JSON.stringify(merged)) stat.kept++;
         else stat.updated++;
       },
       CONCURRENCY

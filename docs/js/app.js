@@ -43,7 +43,8 @@ import {
   formatShiftLaps,
   formatShiftLapsSpoken,
   resolveUnitScheduleMeta,
-  matchFreeFleetUnitsToModel
+  matchFreeFleetUnitsToModel,
+  resolveLiveHorariosForDay
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -129,6 +130,9 @@ const state = {
   routeBranchesCache: new Map(),
   horariosArchiveCache: new Map(), // codLinea -> full horarios/<codLinea>.json
   horariosByLineCache: new Map(), // `${stopId}:${codLinea}:${tipoDia}` -> horarios[]
+  liveHorariosDays: {}, // dayKey -> { updatedAt, lineas: { [cod]: { stops, windowsScanned, windowHours, lastScanAt } } }
+  liveHorariosMeta: null,
+  liveHorariosSig: '',
   lastRealGpsByUnit: new Map(), // baseId -> { latest, prev, prevMoving, trail[], confirmedDir }
   fleetMemory: { dayKey: '', stopSnapshot: null, trips: [], units: [] },
   fleetMemoryLastFetchMs: 0,
@@ -1268,6 +1272,112 @@ async function ensureScheduleAssetsLoaded(lineCodes) {
         if (file) state.horariosArchiveCache.set(c, file);
       })
   ]);
+}
+
+function resolveEffectiveLineHorarios(codLinea, dayKey = getArgentinaDayKey(), explicitTipo = null) {
+  const num = Number(codLinea);
+  const archiveFile = state.horariosArchiveCache.get(num) || null;
+  const fallbackTipo = explicitTipo || getTipoDiaForDayKey(dayKey);
+  if (!archiveFile) {
+    return {
+      horariosFile: null,
+      tipoDia: fallbackTipo,
+      mode: 'archive',
+      matchedTipo: fallbackTipo,
+      isLiveOverride: false,
+      liveCount: 0,
+      lastScanAt: 0,
+      labelOverride: ''
+    };
+  }
+  if (explicitTipo) {
+    return {
+      horariosFile: archiveFile,
+      tipoDia: explicitTipo,
+      mode: 'explicit',
+      matchedTipo: explicitTipo,
+      isLiveOverride: false,
+      liveCount: 0,
+      lastScanAt: 0,
+      labelOverride: ''
+    };
+  }
+  const dayData = state.liveHorariosDays?.[dayKey] || null;
+  const liveLine = dayData?.lineas?.[String(num)] || null;
+  return resolveLiveHorariosForDay(archiveFile, liveLine, fallbackTipo, dayKey);
+}
+
+function buildEffectiveLineScheduleModel(codLinea, branches, dayKey = getArgentinaDayKey(), explicitTipo = null) {
+  const resolved = resolveEffectiveLineHorarios(codLinea, dayKey, explicitTipo);
+  if (!Array.isArray(branches) || branches.length === 0 || !resolved.horariosFile) {
+    return { model: null, resolved };
+  }
+  const model = buildLineScheduleModel(Number(codLinea), branches, resolved.horariosFile, resolved.tipoDia);
+  return { model, resolved };
+}
+
+function computeLiveHorariosSig(daysObj = {}) {
+  let parts = [];
+  for (const dk of Object.keys(daysObj || {}).sort()) {
+    const lMap = daysObj[dk]?.lineas || {};
+    let n = 0;
+    for (const l of Object.values(lMap)) {
+      for (const arr of Object.values(l?.stops || {})) n += Array.isArray(arr) ? arr.length : 0;
+      n += Number(l?.windowsScanned) || 0;
+    }
+    parts.push(`${dk}:${n}:${daysObj[dk]?.updatedAt || 0}`);
+  }
+  return parts.join('|');
+}
+
+function applyLiveHorariosSnapshot(snapshot, { refreshActiveViews = false } = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  const days = snapshot.days && typeof snapshot.days === 'object' ? snapshot.days : {};
+  const nextSig = computeLiveHorariosSig(days);
+  state.liveHorariosDays = days;
+  if (snapshot.meta) state.liveHorariosMeta = snapshot.meta;
+  if (nextSig === state.liveHorariosSig) return false;
+  state.liveHorariosSig = nextSig;
+
+  // Invalidate derived caches so all views immediately pick up newly scanned SOAP timetables
+  eventsLineModelCache.clear();
+  state.horariosByLineCache.clear();
+  if (state.flotaView?.serviceDayCache instanceof Map) {
+    state.flotaView.serviceDayCache.clear();
+  }
+
+  if (refreshActiveViews) {
+    if (state.drill.step === 'flota' && state.drill.linea) {
+      computeLineScheduledFleetSummary(state.drill.linea.codigo).then((summary) => {
+        if (state.drill.step === 'flota' && state.flotaView && summary) {
+          state.flotaView.schedSummary = summary;
+          renderLineFlotaView();
+        }
+      });
+    }
+    if (state.eventsModalOpen) {
+      renderEventsTimeline({ preserveScroll: true });
+    }
+    if (state.allFleetMode && Array.isArray(state.allFleetBuses) && state.allFleetBuses.length > 0) {
+      enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
+    }
+  }
+  return true;
+}
+
+async function syncLiveHorariosSilent({ refreshActiveViews = true } = {}) {
+  try {
+    const cached = await api.getLiveHorariosCached();
+    if (cached?.days && Object.keys(cached.days).length > 0) {
+      applyLiveHorariosSnapshot(cached, { refreshActiveViews: false });
+    }
+    const res = await api.horariosLive({ all: true });
+    if (res?.data) {
+      applyLiveHorariosSnapshot(res.data, { refreshActiveViews });
+    }
+  } catch {
+    // Non-fatal: archived timetables remain available
+  }
 }
 
 async function syncFleetMemory(lineCodes, { force = false, stopId = '' } = {}) {
@@ -2824,7 +2934,7 @@ function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
       missingAssetLines.push(cod);
       continue;
     }
-    const model = buildLineScheduleModel(cod, branches, horFile, todayTipo);
+    const { model } = buildEffectiveLineScheduleModel(cod, branches, getArgentinaDayKey());
     if (!model) continue;
     const matchInputs = lineBuses.map((bus) => ({
       identificadorCoche: bus.identificadorCoche,
@@ -3192,7 +3302,7 @@ async function openAllFleetBusInspector(busKey) {
   const branches = state.routeBranchesCache.get(bus.codigoLinea) || [];
   const horFile = state.horariosArchiveCache.get(bus.codigoLinea) || null;
   if (branches.length && horFile) {
-    const model = buildLineScheduleModel(bus.codigoLinea, branches, horFile, getArgentinaTodayTipo());
+    const { model } = buildEffectiveLineScheduleModel(bus.codigoLinea, branches, getArgentinaDayKey());
     const meta = resolveUnitScheduleMeta(
       model,
       {
@@ -3289,13 +3399,14 @@ function formatRelativeEventTime(diffSec) {
   return diffSec > 0 ? `en ${span}` : `hace ${span}`;
 }
 
-function getOrBuildEventsLineModel(codLinea, tipoDia) {
-  const key = `${codLinea}:${tipoDia}`;
+function getOrBuildEventsLineModel(codLinea, tipoDia, dayKey = '') {
+  const key = dayKey ? `${codLinea}:${dayKey}` : `${codLinea}:${tipoDia}`;
   if (eventsLineModelCache.has(key)) return eventsLineModelCache.get(key);
   const branches = state.routeBranchesCache.get(Number(codLinea)) || [];
-  const horFile = state.horariosArchiveCache.get(Number(codLinea)) || null;
-  if (!branches.length || !horFile) return null;
-  const model = buildLineScheduleModel(Number(codLinea), branches, horFile, tipoDia);
+  if (!branches.length) return null;
+  const { model } = dayKey
+    ? buildEffectiveLineScheduleModel(Number(codLinea), branches, dayKey)
+    : buildEffectiveLineScheduleModel(Number(codLinea), branches, getArgentinaDayKey(), tipoDia);
   eventsLineModelCache.set(key, model || null);
   return model || null;
 }
@@ -3318,7 +3429,7 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
     const cod = Number(linea?.codigo);
     if (!cod) continue;
     const lineName = String(linea.descripcion || `L${cod}`);
-    const model = getOrBuildEventsLineModel(cod, targetTipo);
+    const model = getOrBuildEventsLineModel(cod, targetTipo, targetDayKey);
     const services = Array.isArray(model?.fleetSummary?.services) ? model.fleetSummary.services : [];
     if (services.length === 0) continue;
 
@@ -3990,9 +4101,7 @@ async function locateFleetUnitOnMap({
   }
 
   const branches = state.routeBranchesCache.get(numCod) || [];
-  const horFile = state.horariosArchiveCache.get(numCod) || null;
-  const todayTipo = getArgentinaTodayTipo();
-  const model = branches.length && horFile ? buildLineScheduleModel(numCod, branches, horFile, todayTipo) : null;
+  const { model } = buildEffectiveLineScheduleModel(numCod, branches, getArgentinaDayKey());
 
   // Pick a strategic anchor stop on this line for live Corridor Radar sweeps
   const pickAnchorStop = () => {
@@ -4346,8 +4455,7 @@ function reconcileWithSchedulePrediction(
 
   for (const [cod, buses] of liveByLine.entries()) {
     const branches = state.routeBranchesCache.get(cod) || [];
-    const horFile = state.horariosArchiveCache.get(cod) || null;
-    const model = buildLineScheduleModel(cod, branches, horFile, todayTipo);
+    const { model } = buildEffectiveLineScheduleModel(cod, branches, todayKey);
 
     const matchedTrips = new Set();
     const matchedCoches = new Set();
@@ -4601,7 +4709,8 @@ function reconcileWithSchedulePrediction(
 
   for (const cod of targetLineCodes) {
     const branches = state.routeBranchesCache.get(cod) || [];
-    const horFile = state.horariosArchiveCache.get(cod) || null;
+    const effHor = resolveEffectiveLineHorarios(cod, todayKey);
+    const horFile = effHor.horariosFile;
     if (!branches.length || !horFile || !stopCoords) continue;
 
     const matchedTrips = liveMatchedTripKeysByLine.get(cod) || new Set();
@@ -4628,7 +4737,7 @@ function reconcileWithSchedulePrediction(
       stopCoords,
       branches,
       horariosFile: horFile,
-      tipoDia: todayTipo,
+      tipoDia: effHor.tipoDia,
       liveBuses: lineLive,
       downstreamBuses,
       fleetMemory: fleetMem,
@@ -4645,7 +4754,7 @@ function reconcileWithSchedulePrediction(
       stopCoords,
       branches,
       horariosFile: horFile,
-      tipoDia: todayTipo,
+      tipoDia: effHor.tipoDia,
       nowSec,
       liveMatchedTripKeys: matchedTrips,
       liveMatchedCoches: matchedCoches,
@@ -5471,10 +5580,15 @@ async function toggleHorariosView() {
   } else if (!state.horariosLineCode) {
     state.horariosLineCode = state.stopLinesList[0].codigo;
   }
-  await loadAndRenderHorarios(state.horariosLineCode, state.horariosTipoDia);
+  await ensureScheduleAssetsLoaded([state.horariosLineCode]);
+  const effToday = resolveEffectiveLineHorarios(state.horariosLineCode, getArgentinaDayKey());
+  if (effToday.tipoDia === 'habil' || effToday.tipoDia === 'sabado' || effToday.tipoDia === 'domingo') {
+    state.horariosTipoDia = effToday.tipoDia;
+  }
+  await loadAndRenderHorarios(state.horariosLineCode, state.horariosTipoDia, { autoLive: true });
 }
 
-async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) {
+async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia, { autoLive = false } = {}) {
   state.horariosLineCode = Number(codLinea);
   state.horariosTipoDia = tipoDia;
   state.horariosSelectedBlockId = null;
@@ -5528,10 +5642,14 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
   bindHorariosControls();
 
   try {
-    const [res] = await Promise.all([
-      api.horarios(stopId, state.horariosLineCode, state.horariosTipoDia),
-      ensureScheduleAssetsLoaded([state.horariosLineCode])
-    ]);
+    await ensureScheduleAssetsLoaded([state.horariosLineCode]);
+    const effLive = autoLive ? resolveEffectiveLineHorarios(state.horariosLineCode, getArgentinaDayKey()) : null;
+    const activeHorFile = effLive?.horariosFile || state.horariosArchiveCache.get(state.horariosLineCode) || null;
+    const activeTipoDia = effLive?.tipoDia || state.horariosTipoDia;
+    const res = await api.horarios(stopId, state.horariosLineCode, state.horariosTipoDia, {
+      resolvedFile: effLive?.isLiveOverride ? activeHorFile : null,
+      resolvedTipoOverride: effLive?.isLiveOverride ? activeTipoDia : null
+    });
     if (!state.activeStop || state.activeStop.id !== stopId || !state.horariosOpen) return;
 
     const data = res.data || {};
@@ -5539,21 +5657,21 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia) 
 
     // Reconstruct vehicle rotation blocks for this line & day type (FIFO DP + horarios cortados)
     const branches = state.routeBranchesCache.get(state.horariosLineCode) || [];
-    const horFile = state.horariosArchiveCache.get(state.horariosLineCode) || null;
+    const horFile = activeHorFile;
     const stopCoords =
       typeof state.activeStop.lat === 'number' && typeof state.activeStop.lng === 'number'
         ? { lat: state.activeStop.lat, lng: state.activeStop.lng }
         : null;
     const model =
       branches.length && horFile
-        ? buildLineScheduleModel(state.horariosLineCode, branches, horFile, state.horariosTipoDia)
+        ? buildLineScheduleModel(state.horariosLineCode, branches, horFile, activeTipoDia)
         : null;
     const blockData = model && stopCoords ? buildStopTimetableBlocks(model, stopId, stopCoords) : null;
 
     const ctx = {
       stopId,
       codLinea: state.horariosLineCode,
-      tipoDia: state.horariosTipoDia,
+      tipoDia: activeTipoDia,
       horarios,
       model,
       blockData
@@ -7645,7 +7763,7 @@ function renderLineFlotaView() {
     crossCardHtml = `
       <div class="flota-cross-card" role="region" aria-label="${isFutureSrvDay ? 'Resumen programado del día seleccionado' : 'Resumen histórico del día seleccionado'}">
         <div class="flota-cross-cell">
-          <span class="flota-cross-label">Programado · ${escapeHtml(dayNavInfo.tipoLabel)}</span>
+          <span class="flota-cross-label">Programado · ${escapeHtml(activeSrvSchedSummary?.liveLabel || dayNavInfo.tipoLabel)}</span>
           <span class="flota-cross-val">${escapeHtml(histSchedVal)}</span>
           <span class="flota-cross-sub">${escapeHtml(histSchedSub)}</span>
         </div>
@@ -7659,7 +7777,8 @@ function renderLineFlotaView() {
   } else if ((sched && sched.totalServices > 0) || hoyCochesCount > 0 || learnedTypicalToday > 0) {
     const tipoKey = sched?.tipoDia || cap?.tipoDia || getArgentinaTodayTipo();
     const tipoLabel =
-      tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : 'Lun–Vie';
+      sched?.liveLabel ||
+      (tipoKey === 'domingo' ? 'Domingo' : tipoKey === 'sabado' ? 'Sábado' : String(tipoKey).startsWith('live_') ? 'Especial · SOAP' : 'Lun–Vie');
     const schedTotal = sched?.totalServices || 0;
     const schedVal =
       schedTotal > 0
@@ -7859,7 +7978,7 @@ function renderLineFlotaView() {
   });
 }
 
-async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null) {
+async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null, dayKeyOverride = '') {
   const num = Number(codLinea);
   if (!num) return null;
   try {
@@ -7877,10 +7996,32 @@ async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null
       state.horariosArchiveCache.set(num, horFile || null);
     }
     if (!branches?.length || !horFile) return null;
-    const targetTipo = tipoDiaOverride || getArgentinaTodayTipo();
-    const model = buildLineScheduleModel(num, branches, horFile, targetTipo);
-    if (!model?.fleetSummary) return null;
-    return { ...model.fleetSummary, tipoDia: model.tipoDia, _model: model };
+    const effectiveDayKey = dayKeyOverride || getArgentinaDayKey();
+    const { model, resolved } = buildEffectiveLineScheduleModel(num, branches, effectiveDayKey);
+    if (!model?.fleetSummary) {
+      if (resolved?.mode === 'live-no-service') {
+        return {
+          totalServices: 0,
+          corridosCount: 0,
+          cortadosCount: 0,
+          relevoEnLineaCount: 0,
+          middayValleyCount: 0,
+          services: [],
+          tipoDia: resolved.tipoDia,
+          liveLabel: resolved.labelOverride,
+          isLiveOverride: true,
+          _model: null
+        };
+      }
+      return null;
+    }
+    return {
+      ...model.fleetSummary,
+      tipoDia: model.tipoDia,
+      liveLabel: resolved.labelOverride || '',
+      isLiveOverride: Boolean(resolved.isLiveOverride),
+      _model: model
+    };
   } catch {
     return null;
   }
@@ -7928,7 +8069,7 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
 
   try {
     if (isFutureDay) {
-      const schedSummary = await computeLineScheduledFleetSummary(linea.codigo, targetTipo);
+      const schedSummary = await computeLineScheduledFleetSummary(linea.codigo, targetTipo, targetDayKey);
       if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
       fv.serviceDayCache.set(targetDayKey, {
         dayTrips: [],
@@ -7949,7 +8090,7 @@ async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
 
     const [res, schedSummary] = await Promise.all([
       api.flotaLinea(linea.codigo, targetDayKey),
-      computeLineScheduledFleetSummary(linea.codigo, targetTipo)
+      computeLineScheduledFleetSummary(linea.codigo, targetTipo, targetDayKey)
     ]);
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
     const d = res?.data || {};
@@ -8175,9 +8316,20 @@ async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {
       state.routesVisible = true;
     }
 
-    const model = branches.length && horFile ? buildLineScheduleModel(num, branches, horFile, targetTipo) : null;
+    let effHorFile = horFile;
+    let effTipo = targetTipo;
+    if (!tipoDia && !sameLine && horFile) {
+      const resolved = resolveEffectiveLineHorarios(num, getArgentinaDayKey());
+      effHorFile = resolved.horariosFile || horFile;
+      effTipo = resolved.tipoDia || targetTipo;
+      if (effTipo === 'habil' || effTipo === 'sabado' || effTipo === 'domingo') {
+        state.recorridoView.tipoDia = effTipo;
+      }
+    }
+
+    const model = branches.length && effHorFile ? buildLineScheduleModel(num, branches, effHorFile, effTipo) : null;
     state.recorridoView.branches = branches;
-    state.recorridoView.horFile = horFile;
+    state.recorridoView.horFile = effHorFile;
     state.recorridoView.model = model;
     if (state.recorridoView.branchIdx >= branches.length) state.recorridoView.branchIdx = 0;
     state.recorridoView.loading = false;
@@ -9762,7 +9914,11 @@ async function init() {
   }
 
   try {
-    const [boot, cat] = await Promise.all([api.bootstrap(), api.catalogo().catch(() => null)]);
+    const [boot, cat] = await Promise.all([
+      api.bootstrap(),
+      api.catalogo().catch(() => null),
+      syncLiveHorariosSilent({ refreshActiveViews: false })
+    ]);
     state.catalogo = cat;
     state.lineas = Array.isArray(boot.lineas) && boot.lineas.length > 0 ? boot.lineas : cat?.lineas || [];
     state.quickStops = Array.isArray(boot.quickStops) ? boot.quickStops : [];
@@ -9774,10 +9930,11 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // Automatically cache routes, 24h schedules, 7-day fleet/services bundle, and Corrientes OSM map tiles on startup
+  // Automatically cache routes, 24h schedules, 7-day fleet/services bundle, live SOAP schedules (10m), and Corrientes OSM map tiles
   setTimeout(() => warmOfflineArchive(), 1500);
   setInterval(() => {
     if (!state.isAppPaused && !state.isOffline) {
+      syncLiveHorariosSilent({ refreshActiveViews: true });
       refreshOfflineBundleSilent();
     }
   }, 10 * 60 * 1000);

@@ -148,6 +148,105 @@ const FLEET_SCAN_TARGETS = [
 ];
 const CRON_FULL_CYCLE_MIN = Math.ceil(FLEET_SCAN_TARGETS.length / CRON_BATCH_SIZE) * CRON_SCAN_INTERVAL_MIN;
 
+// Continuous automatic SOAP timetable scanner (every 10 min across all 25 scheduled lines,
+// plus full-day lookahead across all 53 unique branch anchor stops; past times are NEVER deleted).
+// Tuple: [codigoLinea, stopId, isPrimary]
+const HORARIOS_ANCHOR_STOPS = [
+  [94, 'CT31217', 1], [94, 'CT31181', 0],
+  [96, 'CT315075', 1], [96, 'CT302', 0],
+  [97, 'CT31154', 1], [97, 'CT31181', 0],
+  [113, 'CT31448', 1], [113, 'CT31529', 0], [113, 'CT1398', 0],
+  [114, 'CT31211', 1], [114, 'CT31172', 0],
+  [115, 'CT31573', 1], [115, 'CT31193', 0],
+  [118, 'CT31210', 1], [118, 'CT1398', 0],
+  [132, 'CT31282', 1], [132, 'CT1398', 0],
+  [133, 'CT32255', 1], [133, 'CT1398V', 0],
+  [134, 'CT32246', 1], [134, 'CT32031', 0], [134, 'CT31944', 0],
+  [342, 'CT31211', 1], [342, 'CT13988V', 0],
+  [346, 'CT31436', 1], [346, 'CT31181', 0],
+  [347, 'CT31982', 1], [347, 'CT1398', 0],
+  [348, 'CT31172', 1], [348, 'CT1398', 0],
+  [350, 'CT31885', 1], [350, 'CT31181', 0],
+  [351, 'CT314422', 1], [351, 'CT31181', 0],
+  [352, 'CT32217', 1], [352, 'CT302', 0],
+  [353, 'CT31350', 1], [353, 'CT13988V', 0], [353, 'CT31171A', 0],
+  [356, 'CT31134', 1], [356, 'CT31187', 0],
+  [357, 'CT31134', 1], [357, 'CT311642', 0],
+  [433, 'RCH001', 1], [433, 'CT31181', 0],
+  [705, 'CT31292 VTA', 1], [705, 'CT13988V', 0],
+  [1037, 'CH485', 1], [1037, 'L9041001', 0],
+  [1038, 'CT131640', 1], [1038, 'CT224', 0],
+  [1039, 'CT131640', 1], [1039, 'CH115', 0]
+];
+const HORARIOS_PRIMARY_STOPS = HORARIOS_ANCHOR_STOPS.filter((a) => a[2] === 1);
+const HORARIOS_LIVE_INTERVAL_MIN = 10;
+const HORARIOS_DAY_SOAP_BUDGET = 22; // +20 fleet +2 DO = 44 <= 50 CF Free limit
+const HORARIOS_NIGHT_SOAP_BUDGET = 40; // fleet scan sleeps 01:30-04:30 ART -> 42 <= 50
+const HORARIOS_SCAN_CONCURRENCY = 4;
+const HORARIOS_WINDOW_ORDER = [8, 10, 12, 6, 14, 16, 18, 20, 4, 22, 0, 2];
+const HORARIOS_EMPTY_MSG_RE = /no se encuentran horarios/i;
+
+function shiftCalendarDayIso(dayIso, deltaDays) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayIso || ''));
+  if (!m) return dayIso;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + Number(deltaDays || 0)));
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+function getArgentinaCalendarDayIso(nowMs = Date.now()) {
+  const art = new Date(nowMs - 3 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${art.getUTCFullYear()}-${pad(art.getUTCMonth() + 1)}-${pad(art.getUTCDate())}`;
+}
+
+function formatArtIsoDateTime(artMs) {
+  const d = new Date(artMs);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+/**
+ * Parses SmartMovePro HoraPaso ("DD/MM/YYYY HH:MM:SS" or "YYYY-MM-DD HH:MM:SS") into
+ * { dayKey (03:00 ART service day), horaPaso ('HH:MM:SS') }.
+ */
+function parseSoapHoraPasoToServiceEntry(raw = '', fallbackDateIso = '') {
+  const clean = String(raw || '').trim();
+  if (!clean) return null;
+  let calDate = fallbackDateIso;
+  let hh = 0;
+  let mm = 0;
+  let ss = 0;
+  const dmY = clean.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (dmY) {
+    calDate = `${dmY[3]}-${dmY[2]}-${dmY[1]}`;
+    hh = parseInt(dmY[4], 10);
+    mm = parseInt(dmY[5], 10);
+    ss = parseInt(dmY[6] || '0', 10);
+  } else {
+    const iso = clean.match(/^(\d{4})-(\d{2})-(\d{2})[T\s]+(\d{2}):(\d{2})(?::(\d{2}))?/);
+    if (iso) {
+      calDate = `${iso[1]}-${iso[2]}-${iso[3]}`;
+      hh = parseInt(iso[4], 10);
+      mm = parseInt(iso[5], 10);
+      ss = parseInt(iso[6] || '0', 10);
+    } else {
+      const hm = clean.match(/(\d{2}):(\d{2})(?::(\d{2}))?/);
+      if (!hm || !calDate) return null;
+      hh = parseInt(hm[1], 10);
+      mm = parseInt(hm[2], 10);
+      ss = parseInt(hm[3] || '0', 10);
+    }
+  }
+  if (!calDate || hh > 23 || mm > 59 || ss > 59) return null;
+  const pad = (n) => String(n).padStart(2, '0');
+  const dayKey = hh < 3 ? shiftCalendarDayIso(calDate, -1) : calDate;
+  return {
+    dayKey,
+    horaPaso: `${pad(hh)}:${pad(mm)}:${pad(ss)}`
+  };
+}
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -430,6 +529,53 @@ async function soapRequest(method, bodyInnerXml) {
   const match = xml.match(new RegExp(`<${method}Result>([\\s\\S]*?)</${method}Result>`));
   if (!match) throw new Error('SOAP_EMPTY_RESULT');
   return JSON.parse(unescapeXml(match[1]));
+}
+
+async function fetchHorariosWindowSoap(stopId, codLinea, desdeIso, hastaIso) {
+  const cleanStop = String(stopId || '').trim().toUpperCase();
+  const lineNum = Number(codLinea);
+  if (!cleanStop || !lineNum || REMOVED_LINE_CODES.has(lineNum)) {
+    return { ok: false, empty: true, items: [] };
+  }
+  const fallbackDate = String(desdeIso || '').slice(0, 10);
+  const res = await soapRequest(
+    'RecuperarHorariosProgramadosPorLineaParada',
+    `<usuario i:type="d:string">${SOAP_USER}</usuario>
+     <clave i:type="d:string">${SOAP_PASS}</clave>
+     <identificadorParada i:type="d:string">${escapeXml(cleanStop)}</identificadorParada>
+     <codigoLineaParada i:type="d:int">${lineNum}</codigoLineaParada>
+     <fechaHoraDesde i:type="d:dateTime">${escapeXml(desdeIso)}</fechaHoraDesde>
+     <fechaHoraHasta i:type="d:dateTime">${escapeXml(hastaIso)}</fechaHoraHasta>`
+  );
+  const list = Array.isArray(res?.HorariossProgramados)
+    ? res.HorariossProgramados
+    : Array.isArray(res?.HorariosProgramados)
+      ? res.HorariosProgramados
+      : null;
+  if (!list) {
+    if (Number(res?.CodigoEstado) === -1 && HORARIOS_EMPTY_MSG_RE.test(String(res?.MensajeEstado || ''))) {
+      return { ok: true, empty: true, items: [] };
+    }
+    return { ok: false, empty: false, items: [] };
+  }
+  const seen = new Set();
+  const items = [];
+  for (const it of list) {
+    const parsed = parseSoapHoraPasoToServiceEntry(it?.HoraPaso, fallbackDate);
+    if (!parsed) continue;
+    const bandera = String(it?.DescripcionBandera || '').trim();
+    const k = `${parsed.dayKey}|${parsed.horaPaso}|${bandera}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    items.push({
+      dayKey: parsed.dayKey,
+      codigoLinea: lineNum,
+      stopId: cleanStop,
+      horaPaso: parsed.horaPaso,
+      bandera
+    });
+  }
+  return { ok: true, empty: items.length === 0, items };
 }
 
 async function getLineas() {
@@ -718,6 +864,29 @@ export class FleetMemory {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS live_horarios_daily (
+        day_key TEXT NOT NULL,
+        codigo_linea INTEGER NOT NULL,
+        stop_id TEXT NOT NULL,
+        hora_paso TEXT NOT NULL,
+        bandera TEXT NOT NULL DEFAULT '',
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        PRIMARY KEY (day_key, codigo_linea, stop_id, hora_paso, bandera)
+      );
+      CREATE INDEX IF NOT EXISTS idx_live_hor_day_line ON live_horarios_daily (day_key, codigo_linea);
+
+      CREATE TABLE IF NOT EXISTS live_horarios_windows (
+        day_key TEXT NOT NULL,
+        codigo_linea INTEGER NOT NULL,
+        stop_id TEXT NOT NULL,
+        window_hour INTEGER NOT NULL,
+        items_count INTEGER DEFAULT 0,
+        scanned_at INTEGER NOT NULL,
+        PRIMARY KEY (day_key, codigo_linea, stop_id, window_hour)
+      );
+      CREATE INDEX IF NOT EXISTS idx_live_hor_win_day ON live_horarios_windows (day_key, codigo_linea);
     `);
 
     // Idempotent schema migrations for existing Durable Object instances
@@ -1530,9 +1699,113 @@ export class FleetMemory {
     }));
   }
 
+  _buildLiveHorariosPayload(dayKeys = [], codLineaFilter = 0, stopIdFilter = '') {
+    const cleanDays = Array.from(new Set((dayKeys || []).map((d) => String(d || '').trim()).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))));
+    const cleanLine = Number(codLineaFilter) || 0;
+    const cleanStop = String(stopIdFilter || '').trim().toUpperCase();
+
+    const availRows = this.sql
+      .exec(
+        `SELECT DISTINCT day_key FROM (
+           SELECT day_key FROM live_horarios_daily
+           UNION
+           SELECT day_key FROM live_horarios_windows
+         ) ORDER BY day_key DESC LIMIT 14`
+      )
+      .toArray();
+    const availableDays = availRows.map((r) => r.day_key);
+
+    const targetDays = cleanDays.length > 0 ? cleanDays : availableDays;
+    const days = {};
+    if (targetDays.length > 0) {
+      const ph = targetDays.map(() => '?').join(',');
+      const itemParams = [...targetDays];
+      let itemSql = `SELECT day_key, codigo_linea, stop_id, hora_paso, bandera, last_seen_at
+                     FROM live_horarios_daily
+                     WHERE day_key IN (${ph})`;
+      if (cleanLine) {
+        itemSql += ' AND codigo_linea = ?';
+        itemParams.push(cleanLine);
+      }
+      if (cleanStop) {
+        itemSql += ' AND stop_id = ?';
+        itemParams.push(cleanStop);
+      }
+      itemSql += ' ORDER BY day_key, codigo_linea, stop_id, hora_paso';
+
+      const winParams = [...targetDays];
+      let winSql = `SELECT day_key, codigo_linea, stop_id, window_hour, items_count, scanned_at
+                    FROM live_horarios_windows
+                    WHERE day_key IN (${ph})`;
+      if (cleanLine) {
+        winSql += ' AND codigo_linea = ?';
+        winParams.push(cleanLine);
+      }
+      if (cleanStop) {
+        winSql += ' AND stop_id = ?';
+        winParams.push(cleanStop);
+      }
+
+      const ensureLine = (dayKey, cod) => {
+        if (!days[dayKey]) days[dayKey] = { updatedAt: 0, lineas: {} };
+        const key = String(cod);
+        if (!days[dayKey].lineas[key]) {
+          days[dayKey].lineas[key] = { stops: {}, windowsScanned: 0, windowHours: [], lastScanAt: 0 };
+        }
+        return days[dayKey].lineas[key];
+      };
+
+      const itemRows = this.sql.exec(itemSql, ...itemParams).toArray();
+      for (const r of itemRows) {
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const lineObj = ensureLine(r.day_key, cod);
+        if (!lineObj.stops[r.stop_id]) lineObj.stops[r.stop_id] = [];
+        const val = r.bandera ? `${r.hora_paso}|${r.bandera}` : r.hora_paso;
+        lineObj.stops[r.stop_id].push(val);
+        const ts = Number(r.last_seen_at) || 0;
+        if (ts > lineObj.lastScanAt) lineObj.lastScanAt = ts;
+        if (ts > days[r.day_key].updatedAt) days[r.day_key].updatedAt = ts;
+      }
+
+      const winHourSets = new Map();
+      const winRows = this.sql.exec(winSql, ...winParams).toArray();
+      for (const r of winRows) {
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const lineObj = ensureLine(r.day_key, cod);
+        lineObj.windowsScanned += 1;
+        const sKey = `${r.day_key}:${cod}`;
+        if (!winHourSets.has(sKey)) winHourSets.set(sKey, new Set());
+        winHourSets.get(sKey).add(Number(r.window_hour));
+        const ts = Number(r.scanned_at) || 0;
+        if (ts > lineObj.lastScanAt) lineObj.lastScanAt = ts;
+        if (ts > days[r.day_key].updatedAt) days[r.day_key].updatedAt = ts;
+      }
+      for (const [sKey, hSet] of winHourSets.entries()) {
+        const [dk, cod] = sKey.split(':');
+        if (days[dk]?.lineas?.[cod]) {
+          days[dk].lineas[cod].windowHours = Array.from(hSet).sort((a, b) => a - b);
+        }
+      }
+    }
+
+    return {
+      availableDays,
+      days,
+      meta: {
+        lastHorariosScanAt: Number(this._getMeta('last_horarios_scan_at', 0)) || 0,
+        totalHorariosScans: Number(this._getMeta('total_horarios_scans', 0)) || 0,
+        intervalMin: HORARIOS_LIVE_INTERVAL_MIN,
+        anchorStops: HORARIOS_ANCHOR_STOPS.length
+      }
+    };
+  }
+
   _pruneOld(nowMs) {
     const historyCutoff = nowMs - (ROSTER_RETENTION_DAYS + 1) * 86400 * 1000;
     const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
+    const cutoffDayKey = shiftCalendarDayIso(getArgentinaDayKey(nowMs), -(ROSTER_RETENTION_DAYS + 1));
     this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', historyCutoff);
     this.sql.exec('DELETE FROM fleet_daily_obs WHERE last_seen_at < ?', historyCutoff);
     this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
@@ -1541,6 +1814,9 @@ export class FleetMemory {
     this.sql.exec('DELETE FROM fleet_drivers WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_capacity_daily WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
     this.sql.exec('DELETE FROM learned_shift_transitions WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
+    // Keep 7+ days of history + today + future (+1/+2) live SOAP schedules; never delete today's passed times!
+    this.sql.exec('DELETE FROM live_horarios_daily WHERE day_key < ?', cutoffDayKey);
+    this.sql.exec('DELETE FROM live_horarios_windows WHERE day_key < ?', cutoffDayKey);
   }
 
   async fetch(request) {
@@ -1556,6 +1832,119 @@ export class FleetMemory {
         lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || 0,
         lastPruneDay: String(this._getMeta('last_prune_day', '') || ''),
         totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/horarios-scan-state') {
+      const calToday = getArgentinaCalendarDayIso(nowMs);
+      const calTomorrow = shiftCalendarDayIso(calToday, 1);
+      const rows = this.sql
+        .exec(
+          `SELECT day_key, codigo_linea, stop_id, window_hour, scanned_at
+           FROM live_horarios_windows
+           WHERE day_key IN (?, ?, ?)`,
+          todayKey,
+          calToday,
+          calTomorrow
+        )
+        .toArray();
+      return Response.json({
+        liveCursor: Number(this._getMeta('horarios_live_cursor', 0)) || 0,
+        lastHorariosScanAt: Number(this._getMeta('last_horarios_scan_at', 0)) || 0,
+        scannedWindows: rows.map((r) => [r.day_key, r.codigo_linea, r.stop_id, r.window_hour, r.scanned_at])
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/horarios-ingest') {
+      const body = await request.json().catch(() => ({}));
+      const entries = Array.isArray(body.entries) ? body.entries : [];
+      const windows = Array.isArray(body.windows) ? body.windows : [];
+      const ts = Number(body.scannedAt) || nowMs;
+      let inserted = 0;
+
+      // Strictly additive non-destructive UPSERT: passed SOAP times are NEVER removed!
+      for (const e of entries) {
+        const dk = String(e.dayKey || '').trim();
+        const cod = Number(e.codigoLinea);
+        const stopId = String(e.stopId || '').trim().toUpperCase();
+        const horaPaso = String(e.horaPaso || '').trim();
+        const bandera = String(e.bandera || '').trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dk) || !cod || REMOVED_LINE_CODES.has(cod) || !stopId || !/^\d{2}:\d{2}:\d{2}$/.test(horaPaso)) {
+          continue;
+        }
+        this.sql.exec(
+          `INSERT INTO live_horarios_daily (
+            day_key, codigo_linea, stop_id, hora_paso, bandera, first_seen_at, last_seen_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(day_key, codigo_linea, stop_id, hora_paso, bandera) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at`,
+          dk,
+          cod,
+          stopId,
+          horaPaso,
+          bandera,
+          ts,
+          ts
+        );
+        inserted++;
+      }
+
+      for (const w of windows) {
+        const dk = String(w.dayKey || '').trim();
+        const cod = Number(w.codigoLinea);
+        const stopId = String(w.stopId || '').trim().toUpperCase();
+        const wh = Number(w.windowHour);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dk) || !cod || REMOVED_LINE_CODES.has(cod) || !stopId || !Number.isInteger(wh) || wh < 0 || wh > 23) {
+          continue;
+        }
+        this.sql.exec(
+          `INSERT INTO live_horarios_windows (
+            day_key, codigo_linea, stop_id, window_hour, items_count, scanned_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(day_key, codigo_linea, stop_id, window_hour) DO UPDATE SET
+            items_count = MAX(live_horarios_windows.items_count, excluded.items_count),
+            scanned_at = excluded.scanned_at`,
+          dk,
+          cod,
+          stopId,
+          wh,
+          Math.max(0, Number(w.itemsCount) || 0),
+          ts
+        );
+      }
+
+      if (Number.isInteger(body.nextLiveCursor)) {
+        this._setMeta('horarios_live_cursor', body.nextLiveCursor);
+      }
+      if (!body.passiveOnly) {
+        this._setMeta('last_horarios_scan_at', ts);
+        const prevScans = Number(this._getMeta('total_horarios_scans', 0)) || 0;
+        this._setMeta('total_horarios_scans', prevScans + 1);
+      }
+
+      return Response.json({ ok: true, inserted, windowsUpdated: windows.length, scannedAt: ts });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/horarios-live') {
+      const rawDay = String(url.searchParams.get('dayKey') || '').trim();
+      const rawDays = String(url.searchParams.get('days') || '').trim();
+      const codLinea = Number(url.searchParams.get('codLinea')) || 0;
+      const stopId = String(url.searchParams.get('idParada') || '').trim().toUpperCase();
+      let dayKeys = [];
+      if (rawDay && /^\d{4}-\d{2}-\d{2}$/.test(rawDay)) {
+        dayKeys = [rawDay];
+      } else if (rawDays === 'all') {
+        dayKeys = [];
+      } else {
+        const calToday = getArgentinaCalendarDayIso(nowMs);
+        const calTomorrow = shiftCalendarDayIso(calToday, 1);
+        dayKeys = [todayKey, calToday, calTomorrow];
+      }
+      const payload = this._buildLiveHorariosPayload(dayKeys, codLinea, stopId);
+      return Response.json({
+        dayKey: todayKey,
+        calendarToday: getArgentinaCalendarDayIso(nowMs),
+        ...payload
       });
     }
 
@@ -2438,6 +2827,8 @@ export class FleetMemory {
         a.descripcionLinea.localeCompare(b.descripcionLinea, 'es', { numeric: true })
       );
 
+      const liveHorarios = this._buildLiveHorariosPayload([], 0, '');
+
       return Response.json({
         dayKey: todayKey,
         retentionDays: ROSTER_RETENTION_DAYS,
@@ -2450,7 +2841,8 @@ export class FleetMemory {
           lineas: resumenLineas
         },
         activeUnits,
-        lines
+        lines,
+        liveHorarios
       });
     }
 
@@ -3258,6 +3650,240 @@ export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn
   };
 }
 
+const LIVE_HORARIOS_TTL_MS = 55000;
+const liveHorariosCache = new Map(); // cacheKey -> { ts, data }
+
+/**
+ * Continuous automatic SOAP timetable scanner (runs on every 5-min Cloudflare Cron tick).
+ * - Priority 1 (every 10 min): scans ALL 25 scheduled lines' primary anchor stop for [now+2m, now+2h01m].
+ * - Priority 2 (background catch-up): fills ALL 53 branch anchor stops across all future 2h windows
+ *   for today & tomorrow (round-robin by peak daytime windows first, then full-day sweep).
+ * - Strictly additive: NEVER deletes passed times that SOAP stops returning!
+ * - Stays safely under Cloudflare Workers Free 50-subrequest limit (<= 44 daytime, <= 43 night).
+ */
+export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWindowFn = fetchHorariosWindowSoap) {
+  const stub = getFleetStub(env);
+  if (!stub) {
+    return { skipped: true, reason: 'no-durable-object', soapCalls: 0, entriesFound: 0 };
+  }
+
+  const artMs = nowMs - 3 * 3600 * 1000;
+  const art = new Date(artMs);
+  const artMinOfDay = art.getUTCHours() * 60 + art.getUTCMinutes();
+  const isNightQuiet = artMinOfDay >= 90 && artMinOfDay < 270;
+  const soapBudget = isNightQuiet ? HORARIOS_NIGHT_SOAP_BUDGET : HORARIOS_DAY_SOAP_BUDGET;
+
+  let liveCursor = 0;
+  const scannedMap = new Map();
+  try {
+    const stRes = await stub.fetch('https://fleet-memory/horarios-scan-state');
+    if (stRes.ok) {
+      const st = await stRes.json();
+      if (Number.isInteger(st?.liveCursor)) liveCursor = st.liveCursor;
+      for (const row of st?.scannedWindows || []) {
+        if (!Array.isArray(row) || row.length < 5) continue;
+        scannedMap.set(`${row[0]}|${row[1]}|${row[2]}|${row[3]}`, Number(row[4]) || 0);
+      }
+    }
+  } catch {
+    // Non-fatal: proceed with cursor 0
+  }
+
+  const safeStartArtMs = artMs + 2 * 60 * 1000;
+  const safeHorizonArtMs = artMs + 47.5 * 3600 * 1000;
+  const calToday = getArgentinaCalendarDayIso(nowMs);
+  const calTomorrow = shiftCalendarDayIso(calToday, 1);
+
+  const jobs = [];
+  const jobKeys = new Set();
+
+  // Priority 1: Live 10-minute rolling sweep across ALL 25 scheduled lines (13 on tick 0, 12 on tick 1)
+  const half = Math.ceil(HORARIOS_PRIMARY_STOPS.length / 2);
+  const normCursor = liveCursor % 2 === 1 ? 1 : 0;
+  const nextLiveCursor = normCursor === 0 ? 1 : 0;
+  const p1Slice =
+    normCursor === 0
+      ? HORARIOS_PRIMARY_STOPS.slice(0, half)
+      : HORARIOS_PRIMARY_STOPS.slice(half);
+
+  let p1StartMs = safeStartArtMs;
+  const p1StartDate = new Date(p1StartMs);
+  const p1DayEndMs = Date.UTC(
+    p1StartDate.getUTCFullYear(),
+    p1StartDate.getUTCMonth(),
+    p1StartDate.getUTCDate(),
+    23,
+    59,
+    59
+  );
+  let p1EndMs = Math.min(p1DayEndMs, p1StartMs + 119 * 60 * 1000);
+  if (p1EndMs - p1StartMs < 3 * 60 * 1000) {
+    p1StartMs = p1DayEndMs + 1000;
+    p1EndMs = p1StartMs + 119 * 60 * 1000;
+  }
+  const p1DesdeIso = formatArtIsoDateTime(p1StartMs);
+  const p1HastaIso = formatArtIsoDateTime(p1EndMs);
+
+  for (const [cod, stopId] of p1Slice) {
+    const jk = `${cod}|${stopId}|${p1DesdeIso}|${p1HastaIso}`;
+    if (jobKeys.has(jk)) continue;
+    jobKeys.add(jk);
+    jobs.push({
+      cod,
+      stopId,
+      desdeIso: p1DesdeIso,
+      hastaIso: p1HastaIso,
+      recordWindow: null
+    });
+  }
+
+  // Priority 2: Full-day lookahead + return branches across all 53 anchor stops (today + tomorrow)
+  const remaining = Math.max(0, soapBudget - jobs.length);
+  if (remaining > 0) {
+    const buckets = {
+      unscannedTodayPrimary: [],
+      unscannedTodaySecondary: [],
+      unscannedTomorrowPrimary: [],
+      unscannedTomorrowSecondary: [],
+      staleToday: [],
+      staleTomorrow: []
+    };
+
+    const orderedAnchors = [
+      ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] === 1),
+      ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] !== 1)
+    ];
+
+    for (const calDate of [calToday, calTomorrow]) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(calDate);
+      if (!m) continue;
+      const baseDayMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0);
+      const isTodayCal = calDate === calToday;
+
+      for (const h of HORARIOS_WINDOW_ORDER) {
+        const winStartMs = baseDayMs + h * 3600 * 1000;
+        const winEndMs = baseDayMs + (h + 1) * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000;
+        if (winEndMs <= safeStartArtMs + 120 * 1000) continue; // Already passed
+        if (winStartMs >= safeHorizonArtMs - 120 * 1000) continue; // Beyond SmartMovePro 48h horizon
+
+        const desdeMs = Math.max(winStartMs, safeStartArtMs);
+        const hastaMs = Math.min(winEndMs, safeHorizonArtMs, desdeMs + 119 * 60 * 1000);
+        if (hastaMs - desdeMs < 120 * 1000) continue;
+
+        // Only mark the 2-hour window fully covered if it reaches the end of the 2-hour block
+        const fullEndCovered = hastaMs >= winEndMs - 120 * 1000;
+        const windowDayKey = h < 3 ? shiftCalendarDayIso(calDate, -1) : calDate;
+        const desdeIso = formatArtIsoDateTime(desdeMs);
+        const hastaIso = formatArtIsoDateTime(hastaMs);
+
+        for (const [cod, stopId, isPrimary] of orderedAnchors) {
+          const wKey = `${windowDayKey}|${cod}|${stopId}|${h}`;
+          const scannedAt = scannedMap.get(wKey) || 0;
+          const item = {
+            cod,
+            stopId,
+            desdeIso,
+            hastaIso,
+            scannedAt,
+            recordWindow: fullEndCovered ? { dayKey: windowDayKey, codigoLinea: cod, stopId, windowHour: h } : null
+          };
+
+          if (!scannedAt) {
+            if (isTodayCal) {
+              if (isPrimary) buckets.unscannedTodayPrimary.push(item);
+              else buckets.unscannedTodaySecondary.push(item);
+            } else if (fullEndCovered) {
+              if (isPrimary) buckets.unscannedTomorrowPrimary.push(item);
+              else buckets.unscannedTomorrowSecondary.push(item);
+            }
+          } else if (isTodayCal && nowMs - scannedAt >= 55 * 60 * 1000) {
+            buckets.staleToday.push(item);
+          } else if (!isTodayCal && fullEndCovered && nowMs - scannedAt >= 180 * 60 * 1000) {
+            buckets.staleTomorrow.push(item);
+          }
+        }
+      }
+    }
+
+    buckets.staleToday.sort((a, b) => a.scannedAt - b.scannedAt);
+    buckets.staleTomorrow.sort((a, b) => a.scannedAt - b.scannedAt);
+
+    const queue = [
+      ...buckets.unscannedTodayPrimary,
+      ...buckets.unscannedTodaySecondary,
+      ...buckets.unscannedTomorrowPrimary,
+      ...buckets.unscannedTomorrowSecondary,
+      ...buckets.staleToday,
+      ...buckets.staleTomorrow
+    ];
+
+    for (const q of queue) {
+      if (jobs.length >= soapBudget) break;
+      const jk = `${q.cod}|${q.stopId}|${q.desdeIso}|${q.hastaIso}`;
+      if (jobKeys.has(jk)) continue;
+      jobKeys.add(jk);
+      jobs.push(q);
+    }
+  }
+
+  const entryMap = new Map();
+  const recordedWindows = [];
+  let succeeded = 0;
+
+  for (let i = 0; i < jobs.length; i += HORARIOS_SCAN_CONCURRENCY) {
+    const wave = jobs.slice(i, i + HORARIOS_SCAN_CONCURRENCY);
+    const results = await Promise.all(
+      wave.map((job) =>
+        fetchWindowFn(job.stopId, job.cod, job.desdeIso, job.hastaIso)
+          .then((r) => ({ job, r }))
+          .catch(() => ({ job, r: { ok: false, empty: false, items: [] } }))
+      )
+    );
+    for (const { job, r } of results) {
+      if (!r?.ok) continue;
+      succeeded++;
+      for (const it of r.items || []) {
+        const ek = `${it.dayKey}|${it.codigoLinea}|${it.stopId}|${it.horaPaso}|${it.bandera}`;
+        if (!entryMap.has(ek)) entryMap.set(ek, it);
+      }
+      if (job.recordWindow) {
+        recordedWindows.push({
+          ...job.recordWindow,
+          itemsCount: (r.items || []).length
+        });
+      }
+    }
+  }
+
+  const entries = Array.from(entryMap.values());
+  try {
+    await stub.fetch('https://fleet-memory/horarios-ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entries,
+        windows: recordedWindows,
+        nextLiveCursor,
+        scannedAt: nowMs
+      })
+    });
+    liveHorariosCache.clear();
+    offlineBundleCache = { ts: 0, data: null };
+  } catch {
+    // Non-fatal
+  }
+
+  return {
+    skipped: false,
+    isNightQuiet,
+    soapCalls: jobs.length,
+    succeeded,
+    entriesFound: entries.length,
+    windowsRecorded: recordedWindows.length,
+    nextLiveCursor
+  };
+}
+
 // 22 directed multi-line hub stops (codLinea='000') covering ALL 26 active Corrientes + Chaco-Corrientes
 // lines in BOTH Ida & Vuelta directions (< 25 subrequests, safely under Cloudflare Workers Free cap).
 const LIVE_CITY_HUB_STOPS = [
@@ -3468,7 +4094,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.2',
+          version: '2.3',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {
@@ -3477,7 +4103,63 @@ export default {
             retentionDays: ROSTER_RETENTION_DAYS,
             targets: FLEET_SCAN_TARGETS.length
           },
+          autoHorariosScan: {
+            intervalMin: HORARIOS_LIVE_INTERVAL_MIN,
+            primaryLines: HORARIOS_PRIMARY_STOPS.length,
+            anchorStops: HORARIOS_ANCHOR_STOPS.length,
+            nonDestructive: true
+          },
           timestamp: Date.now()
+        });
+      }
+
+      if (pathname === '/api/horarios-live' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const cacheKey = url.search || '?default';
+        const hit = liveHorariosCache.get(cacheKey);
+        if (hit && nowMs - hit.ts < LIVE_HORARIOS_TTL_MS) {
+          return jsonResponse({
+            data: hit.data,
+            source: 'live-horarios-edge',
+            savedAt: hit.ts
+          });
+        }
+        const stub = getFleetStub(env);
+        if (stub) {
+          try {
+            const doRes = await stub.fetch(`https://fleet-memory/horarios-live${url.search}`);
+            if (doRes.ok) {
+              const data = await doRes.json();
+              liveHorariosCache.set(cacheKey, { ts: nowMs, data });
+              if (liveHorariosCache.size > 24) {
+                const firstKey = liveHorariosCache.keys().next().value;
+                if (firstKey) liveHorariosCache.delete(firstKey);
+              }
+              return jsonResponse({
+                data,
+                source: 'live-horarios-do',
+                savedAt: nowMs
+              });
+            }
+          } catch {
+            // Fall through to empty payload
+          }
+        }
+        return jsonResponse({
+          data: {
+            dayKey: getArgentinaDayKey(nowMs),
+            calendarToday: getArgentinaCalendarDayIso(nowMs),
+            availableDays: [],
+            days: {},
+            meta: {
+              lastHorariosScanAt: 0,
+              totalHorariosScans: 0,
+              intervalMin: HORARIOS_LIVE_INTERVAL_MIN,
+              anchorStops: HORARIOS_ANCHOR_STOPS.length
+            }
+          },
+          source: 'live-horarios-empty',
+          savedAt: nowMs
         });
       }
 
@@ -4148,6 +4830,7 @@ export default {
 
         const seen = new Set();
         const horarios = [];
+        const ingestEntries = [];
         for (const r of results) {
           const list = Array.isArray(r?.HorariossProgramados)
             ? r.HorariossProgramados
@@ -4156,21 +4839,83 @@ export default {
               : [];
           for (const item of list) {
             const rawPaso = String(item.HoraPaso || '').trim();
-            if (!rawPaso || seen.has(rawPaso)) continue;
-            seen.add(rawPaso);
-            const timePart = (rawPaso.split(' ')[1] || '').trim();
-            const hhmm = timePart.slice(0, 5);
+            const parsed = parseSoapHoraPasoToServiceEntry(rawPaso, dateIsoPrefix);
+            if (!parsed) continue;
+            const bandera = String(item.DescripcionBandera || '').trim();
+            const dedupKey = `${parsed.horaPaso}|${bandera}`;
+            if (seen.has(dedupKey)) continue;
+            seen.add(dedupKey);
+            const hhmm = parsed.horaPaso.slice(0, 5);
             const [hh = '0', mm = '0'] = hhmm.split(':');
             horarios.push({
               codigoLinea: Number(item.CodigoLinea) || lineNum,
               identificadorParada: item.IdentificadorParada || stopId,
-              bandera: String(item.DescripcionBandera || '').trim(),
-              horaPaso: rawPaso,
+              bandera,
+              horaPaso: rawPaso || `${dateIsoPrefix} ${parsed.horaPaso}`,
               hora: hhmm,
               minuteOfDay: parseInt(hh, 10) * 60 + parseInt(mm, 10)
             });
+            ingestEntries.push({
+              dayKey: parsed.dayKey,
+              codigoLinea: lineNum,
+              stopId,
+              horaPaso: parsed.horaPaso,
+              bandera
+            });
           }
         }
+
+        // Preserve earlier schedules from the same day that SOAP no longer returns once elapsed
+        const stub = getFleetStub(env);
+        if (stub) {
+          if (targetOffset === 0) {
+            try {
+              const histRes = await stub.fetch(
+                `https://fleet-memory/horarios-live?dayKey=${encodeURIComponent(dateIsoPrefix)}&codLinea=${lineNum}&idParada=${encodeURIComponent(stopId)}`
+              );
+              if (histRes.ok) {
+                const histJson = await histRes.json();
+                const storedList = histJson?.days?.[dateIsoPrefix]?.lineas?.[String(lineNum)]?.stops?.[stopId] || [];
+                for (const raw of storedList) {
+                  const [horaPaso, ...bandParts] = String(raw).split('|');
+                  const bandera = bandParts.join('|');
+                  const dedupKey = `${horaPaso}|${bandera}`;
+                  if (!horaPaso || seen.has(dedupKey)) continue;
+                  seen.add(dedupKey);
+                  const hhmm = horaPaso.slice(0, 5);
+                  const [hh = '0', mm = '0'] = hhmm.split(':');
+                  horarios.push({
+                    codigoLinea: lineNum,
+                    identificadorParada: stopId,
+                    bandera,
+                    horaPaso: `${dateIsoPrefix} ${horaPaso}`,
+                    hora: hhmm,
+                    minuteOfDay: parseInt(hh, 10) * 60 + parseInt(mm, 10)
+                  });
+                }
+              }
+            } catch {
+              // Non-fatal
+            }
+          }
+          if (ingestEntries.length > 0) {
+            const persistTask = stub
+              .fetch('https://fleet-memory/horarios-ingest', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  entries: ingestEntries,
+                  windows: [],
+                  passiveOnly: true,
+                  scannedAt: Date.now()
+                })
+              })
+              .catch(() => null);
+            if (ctx?.waitUntil) ctx.waitUntil(persistTask);
+            else await persistTask;
+          }
+        }
+
         horarios.sort((a, b) => a.minuteOfDay - b.minuteOfDay);
 
         const diffs = [];
@@ -4188,7 +4933,7 @@ export default {
             tipoDia: requestedTipo === 'hoy' ? todayTipo : requestedTipo,
             fechaConsultada: dateIsoPrefix,
             available: true,
-            partial: targetOffset === 0,
+            partial: targetOffset === 0 && horarios.length === 0,
             horarios,
             frecuenciaMin
           },
@@ -4415,7 +5160,19 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    const task = runScheduledFleetScan(env, event?.scheduledTime || Date.now());
+    const ts = event?.scheduledTime || Date.now();
+    const task = (async () => {
+      try {
+        await runScheduledFleetScan(env, ts);
+      } catch {
+        // Non-fatal: always continue to live SOAP timetable scanner
+      }
+      try {
+        await runScheduledHorariosScan(env, ts);
+      } catch {
+        // Non-fatal
+      }
+    })();
     if (ctx?.waitUntil) {
       ctx.waitUntil(task);
     } else {

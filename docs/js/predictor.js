@@ -163,12 +163,13 @@ export function resolveAvailableTipoDia(horariosFile, requestedTipo = 'habil') {
   const paradas = horariosFile?.paradas;
   if (!paradas || typeof paradas !== 'object') return null;
 
-  const fallbackOrder =
+  const baseOrder =
     requestedTipo === 'domingo'
       ? ['domingo', 'sabado', 'habil']
       : requestedTipo === 'sabado'
         ? ['sabado', 'habil', 'domingo']
         : ['habil', 'sabado', 'domingo'];
+  const fallbackOrder = baseOrder.includes(requestedTipo) ? baseOrder : [requestedTipo, ...baseOrder];
 
   for (const tipo of fallbackOrder) {
     for (const entry of Object.values(paradas)) {
@@ -178,6 +179,354 @@ export function resolveAvailableTipoDia(horariosFile, requestedTipo = 'habil') {
     }
   }
   return null;
+}
+
+function formatSecToHHMMSS(sec) {
+  const norm = ((Math.round(sec) % 86400) + 86400) % 86400;
+  const hh = Math.floor(norm / 3600);
+  const mm = Math.floor((norm % 3600) / 60);
+  const ss = norm % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+}
+
+function resolveBanderaIdxInArchive(banderas = [], rawBandera = '') {
+  if (!rawBandera || !Array.isArray(banderas) || banderas.length === 0) return -1;
+  const nb = normalizeBandera(rawBandera);
+  if (!nb) return -1;
+  for (let i = 0; i < banderas.length; i++) {
+    const ab = normalizeBandera(banderas[i]);
+    if (ab && (ab === nb || ab.includes(nb) || nb.includes(ab))) return i;
+  }
+  return -1;
+}
+
+function extractArchiveStopSecs(rawList = [], filterBandIdx = -1) {
+  const secs = [];
+  for (const raw of rawList || []) {
+    const [timeStr, idxStr = '0'] = String(raw).split('|');
+    const bIdx = Number(idxStr) || 0;
+    if (filterBandIdx >= 0 && bIdx !== filterBandIdx) continue;
+    const s = parseTimeToSec(timeStr);
+    if (s !== null) secs.push(toServiceSec(s));
+  }
+  secs.sort((a, b) => a - b);
+  return secs;
+}
+
+function hasCloseTime(sortedSecs, targetSec, tolSec = 90) {
+  let lo = 0;
+  let hi = sortedSecs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const diff = sortedSecs[mid] - targetSec;
+    if (Math.abs(diff) <= tolSec) return Math.abs(diff);
+    if (diff < 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return Infinity;
+}
+
+/**
+ * Resolves the effective schedule for a line on a specific service day using accumulated
+ * live SOAP observations (non-destructive, refreshed every 10 min by the Worker):
+ *  1. If live SOAP matches an archived diagram (e.g. holiday Monday running 'domingo'),
+ *     returns that full-line diagram overlaid with any extra live SOAP trips.
+ *  2. If live SOAP has a custom schedule not matching habil/sabado/domingo, projects the
+ *     live anchor-stop departures across all route stops using archived travel-time deltas.
+ *  3. If live SOAP proves a line has 0 service across scanned daytime windows (e.g. 109B on
+ *     a holiday), returns an empty no-service schedule instead of falling back to habil.
+ */
+export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTipo = 'habil', dayKey = '') {
+  const baseResult = {
+    horariosFile: archiveFile,
+    tipoDia: fallbackTipo,
+    mode: 'archive',
+    matchedTipo: fallbackTipo,
+    isLiveOverride: false,
+    liveCount: 0,
+    lastScanAt: 0,
+    labelOverride: ''
+  };
+  if (!archiveFile || !liveLineData || typeof liveLineData !== 'object') return baseResult;
+
+  const liveStopsObj = liveLineData.stops && typeof liveLineData.stops === 'object' ? liveLineData.stops : {};
+  const banderas = Array.isArray(archiveFile.banderas) ? [...archiveFile.banderas] : [];
+  const paradasMap = archiveFile.paradas || {};
+  const windowHours = Array.isArray(liveLineData.windowHours) ? liveLineData.windowHours : [];
+  const windowsScanned = Number(liveLineData.windowsScanned) || 0;
+  const lastScanAt = Number(liveLineData.lastScanAt) || 0;
+
+  // Parse all live SOAP entries per stop
+  const liveByStop = new Map(); // stopId -> [{ hora, sec, bandera, bIdx }]
+  let totalLiveItems = 0;
+  for (const [rawStopId, rawList] of Object.entries(liveStopsObj)) {
+    const stopId = String(rawStopId || '').trim().toUpperCase();
+    if (!stopId || !Array.isArray(rawList) || rawList.length === 0) continue;
+    const parsed = [];
+    const seen = new Set();
+    for (const raw of rawList) {
+      const [horaPart, ...bandParts] = String(raw).split('|');
+      const secRaw = parseTimeToSec(horaPart);
+      if (secRaw === null) continue;
+      const bandera = bandParts.join('|').trim();
+      const bIdx = resolveBanderaIdxInArchive(banderas, bandera);
+      const hora = horaPart.length === 5 ? `${horaPart}:00` : horaPart.slice(0, 8);
+      const k = `${hora}|${bIdx >= 0 ? bIdx : bandera}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      parsed.push({ hora, sec: toServiceSec(secRaw), bandera, bIdx });
+    }
+    if (parsed.length > 0) {
+      parsed.sort((a, b) => a.sec - b.sec);
+      liveByStop.set(stopId, parsed);
+      totalLiveItems += parsed.length;
+    }
+  }
+
+  // Case 0: Scanned >= 5 daytime 2h windows and SOAP returned 0 departures (e.g. 109B on holiday)
+  const daytimeHours = windowHours.filter((h) => h >= 6 && h <= 18);
+  if (totalLiveItems === 0) {
+    if (daytimeHours.length >= 5) {
+      const inDaytimeWin = (sec) => {
+        const hh = Math.floor((sec % 86400) / 3600);
+        return daytimeHours.some((wh) => hh >= wh && hh < wh + 2);
+      };
+      let fallbackExpected = 0;
+      let domingoExpected = 0;
+      for (const entry of Object.values(paradasMap)) {
+        for (const s of extractArchiveStopSecs(entry?.[fallbackTipo])) {
+          if (inDaytimeWin(s)) fallbackExpected++;
+        }
+        for (const s of extractArchiveStopSecs(entry?.domingo)) {
+          if (inDaytimeWin(s)) domingoExpected++;
+        }
+      }
+      if (fallbackExpected >= 4 && domingoExpected === 0) {
+        return {
+          horariosFile: { ...archiveFile, paradas: {}, _liveSig: `nosrv:${dayKey}:${daytimeHours.length}` },
+          tipoDia: 'domingo',
+          mode: 'live-no-service',
+          matchedTipo: 'domingo',
+          isLiveOverride: true,
+          liveCount: 0,
+          lastScanAt,
+          labelOverride: 'Sin servicio · SOAP'
+        };
+      }
+    }
+    return { ...baseResult, lastScanAt };
+  }
+
+  // Score each archived diagram ('habil' | 'sabado' | 'domingo') against live SOAP observations
+  const candidates = ['habil', 'sabado', 'domingo'];
+  const scores = {};
+  const inScannedWindows = (sec) => {
+    if (windowHours.length === 0) return false;
+    const hh = Math.floor((sec % 86400) / 3600);
+    return windowHours.some((wh) => hh >= wh && hh < wh + 2);
+  };
+
+  for (const tipo of candidates) {
+    let liveMatched = 0;
+    let liveExact = 0;
+    let liveChecked = 0;
+    let archInSpan = 0;
+    let archMatched = 0;
+
+    for (const [stopId, liveItems] of liveByStop.entries()) {
+      const archEntry = paradasMap[stopId];
+      if (!archEntry) continue;
+      const archAllSecs = extractArchiveStopSecs(archEntry[tipo]);
+      const liveSecs = liveItems.map((x) => x.sec);
+      const minL = liveSecs[0] - 120;
+      const maxL = liveSecs[liveSecs.length - 1] + 120;
+
+      for (const it of liveItems) {
+        liveChecked++;
+        const archForBand = it.bIdx >= 0 ? extractArchiveStopSecs(archEntry[tipo], it.bIdx) : archAllSecs;
+        const poolSecs = archForBand.length > 0 ? archForBand : archAllSecs;
+        const dist = hasCloseTime(poolSecs, it.sec, 90);
+        if (dist <= 90) {
+          liveMatched++;
+          if (dist <= 15) liveExact++;
+        }
+      }
+
+      if (archAllSecs.length > 0) {
+        for (const aSec of archAllSecs) {
+          const covered = windowHours.length >= 2 ? inScannedWindows(aSec) : aSec >= minL && aSec <= maxL;
+          if (!covered) continue;
+          archInSpan++;
+          if (hasCloseTime(liveSecs, aSec, 90) <= 90) archMatched++;
+        }
+      }
+    }
+
+    if (liveChecked === 0) {
+      scores[tipo] = 0;
+      continue;
+    }
+    const precision = liveMatched / liveChecked;
+    const exactBonus = (liveExact / liveChecked) * 0.03;
+    const recall = archInSpan >= 2 ? archMatched / archInSpan : precision;
+    const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+    scores[tipo] = f1 + exactBonus;
+  }
+
+  let bestTipo = fallbackTipo;
+  let bestScore = scores[fallbackTipo] || 0;
+  for (const tipo of candidates) {
+    if ((scores[tipo] || 0) > bestScore) {
+      bestScore = scores[tipo] || 0;
+      bestTipo = tipo;
+    }
+  }
+  // Tie-breakers: prefer fallbackTipo if nearly tied; on weekday holiday when sabado==domingo, prefer domingo
+  if (Math.abs((scores[fallbackTipo] || 0) - bestScore) <= 0.025) {
+    bestTipo = fallbackTipo;
+    bestScore = scores[fallbackTipo] || 0;
+  } else if (
+    fallbackTipo === 'habil' &&
+    bestTipo === 'sabado' &&
+    Math.abs((scores.domingo || 0) - bestScore) <= 0.025
+  ) {
+    bestTipo = 'domingo';
+    bestScore = scores.domingo || 0;
+  }
+
+  // Case 1: High-confidence match to an existing archived diagram (e.g. holiday running domingo)
+  if (bestScore >= 0.72) {
+    const isOverride = bestTipo !== fallbackTipo;
+    // Overlay any extra live SOAP times not already within 90s on observed stops (strictly non-destructive)
+    let clonedParadas = null;
+    for (const [stopId, liveItems] of liveByStop.entries()) {
+      const archEntry = paradasMap[stopId];
+      if (!archEntry) continue;
+      const baseList = Array.isArray(archEntry[bestTipo]) ? archEntry[bestTipo] : [];
+      const baseSecs = extractArchiveStopSecs(baseList);
+      const extras = [];
+      for (const it of liveItems) {
+        if (hasCloseTime(baseSecs, it.sec, 90) > 90) {
+          const bIdx = it.bIdx >= 0 ? it.bIdx : 0;
+          extras.push(bIdx ? `${it.hora}|${bIdx}` : it.hora);
+        }
+      }
+      if (extras.length > 0) {
+        if (!clonedParadas) clonedParadas = { ...paradasMap };
+        clonedParadas[stopId] = {
+          ...archEntry,
+          [bestTipo]: [...baseList, ...extras].sort()
+        };
+      }
+    }
+    const finalFile = clonedParadas
+      ? { ...archiveFile, paradas: clonedParadas, _liveSig: `m:${dayKey}:${bestTipo}:${totalLiveItems}` }
+      : archiveFile;
+    const tipoName = bestTipo === 'domingo' ? 'Domingo/Feriado' : bestTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    return {
+      horariosFile: finalFile,
+      tipoDia: bestTipo,
+      mode: 'live-matched',
+      matchedTipo: bestTipo,
+      isLiveOverride: isOverride,
+      liveCount: totalLiveItems,
+      lastScanAt,
+      labelOverride: isOverride ? `${tipoName} · SOAP` : 'SOAP en vivo'
+    };
+  }
+
+  // Case 2: Custom live SOAP timetable (doesn't match habil/sabado/domingo) -> project across all stops
+  if (totalLiveItems >= 4 || windowsScanned >= 4) {
+    const customTipo = `live_${dayKey || 'hoy'}`;
+    const synthParadas = {};
+    const numBanderas = Math.max(1, banderas.length);
+
+    for (let bi = 0; bi < numBanderas; bi++) {
+      // Pick the live anchor stop with the most observations for this bandera
+      let anchorId = null;
+      let anchorItems = [];
+      for (const [stopId, items] of liveByStop.entries()) {
+        const matching = items.filter((it) => it.bIdx === bi || (numBanderas === 1 && it.bIdx < 0));
+        if (matching.length > anchorItems.length && paradasMap[stopId]) {
+          anchorId = stopId;
+          anchorItems = matching;
+        }
+      }
+      if (!anchorId || anchorItems.length === 0) continue;
+
+      // Pick the richest archived diagram at anchorId to measure median travel-time deltas to every stop
+      let refTipo = 'habil';
+      let refAnchorSecs = [];
+      for (const t of candidates) {
+        const s = extractArchiveStopSecs(paradasMap[anchorId]?.[t], bi);
+        if (s.length > refAnchorSecs.length) {
+          refTipo = t;
+          refAnchorSecs = s;
+        }
+      }
+      if (refAnchorSecs.length === 0) continue;
+
+      for (const [stopId, entry] of Object.entries(paradasMap)) {
+        const refStopSecs = extractArchiveStopSecs(entry?.[refTipo], bi);
+        if (refStopSecs.length === 0) continue;
+
+        let targetSecs;
+        const directLive = liveByStop.get(stopId)?.filter((it) => it.bIdx === bi || (numBanderas === 1 && it.bIdx < 0));
+        if (directLive && directLive.length >= Math.max(2, Math.floor(anchorItems.length * 0.6))) {
+          targetSecs = directLive.map((it) => it.sec);
+        } else {
+          // Compute median travel-time delta between stopId and anchorId
+          const deltas = [];
+          for (const aSec of refAnchorSecs) {
+            let bestD = null;
+            for (const sSec of refStopSecs) {
+              const d = sSec - aSec;
+              if (Math.abs(d) <= 5400 && (bestD === null || Math.abs(d) < Math.abs(bestD))) {
+                bestD = d;
+              }
+            }
+            if (bestD !== null) deltas.push(bestD);
+          }
+          if (deltas.length === 0) continue;
+          deltas.sort((a, b) => a - b);
+          const medDelta = deltas[Math.floor(deltas.length / 2)];
+          targetSecs = anchorItems.map((it) => it.sec + medDelta);
+        }
+
+        if (!synthParadas[stopId]) synthParadas[stopId] = { ...entry, [customTipo]: [] };
+        for (const sec of targetSecs) {
+          const hhmmss = formatSecToHHMMSS(sec);
+          synthParadas[stopId][customTipo].push(bi ? `${hhmmss}|${bi}` : hhmmss);
+        }
+      }
+    }
+
+    for (const st of Object.values(synthParadas)) {
+      if (Array.isArray(st[customTipo])) {
+        st[customTipo] = Array.from(new Set(st[customTipo])).sort();
+      }
+    }
+
+    if (Object.keys(synthParadas).length > 0) {
+      return {
+        horariosFile: {
+          ...archiveFile,
+          paradas: synthParadas,
+          _liveSig: `c:${dayKey}:${totalLiveItems}:${lastScanAt}`
+        },
+        tipoDia: customTipo,
+        mode: 'live-custom',
+        matchedTipo: customTipo,
+        isLiveOverride: true,
+        liveCount: totalLiveItems,
+        lastScanAt,
+        labelOverride: 'Especial · SOAP en vivo'
+      };
+    }
+  }
+
+  return { ...baseResult, liveCount: totalLiveItems, lastScanAt };
 }
 
 /**
@@ -503,7 +852,9 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     byTipo = new Map();
     modelCacheByBranches.set(branches, byTipo);
   }
-  const cacheKey = `${codLinea}:${resolved.tipo}`;
+  const cacheKey = horariosFile._liveSig
+    ? `${codLinea}:${resolved.tipo}:${horariosFile._liveSig}`
+    : `${codLinea}:${resolved.tipo}`;
   if (byTipo.has(cacheKey)) {
     return byTipo.get(cacheKey);
   }
