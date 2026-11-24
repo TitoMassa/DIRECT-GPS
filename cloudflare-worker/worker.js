@@ -713,6 +713,46 @@ export class FleetMemory {
     this.env = env;
     this.sql = ctx.storage.sql;
     this._ready = false;
+    // In-memory write-dedup caches: avoid redundant SQLite rows_written on identical/frequent polls
+    // while ALWAYS writing immediately on any new car, driver, relief, route, service or schedule change.
+    this._rosterWriteCache = new Map();
+    this._unitWriteCache = new Map();
+    this._tripWriteCache = new Map();
+    this._capacityWriteCache = new Map();
+    this._stopSnapWriteCache = new Map();
+    this._horariosWindowCache = new Map();
+  }
+
+  _shouldWrite(cacheMap, key, sig, nowMs, minIntervalMs, maxEntries = 2500) {
+    const prev = cacheMap.get(key);
+    if (prev && prev.sig === sig && nowMs - prev.ts < minIntervalMs) {
+      return false;
+    }
+    if (cacheMap.size >= maxEntries && !cacheMap.has(key)) {
+      cacheMap.clear();
+    }
+    cacheMap.set(key, { sig, ts: nowMs });
+    return true;
+  }
+
+  _shouldWriteUnit(cod, coche, u, dayKey, nowMs, minSameSigMs = 120000, minPassiveMoveMs = 0) {
+    const lat = Number(u.lat);
+    const lng = Number(u.lng);
+    const latR = Number.isFinite(lat) ? lat.toFixed(4) : '';
+    const lngR = Number.isFinite(lng) ? lng.toFixed(4) : '';
+    const coreSig = `${dayKey}|${u.tripKey || ''}|${u.choferNombre || ''}|${u.choferLegajo || ''}|${u.bandera || ''}|${u.dirBandera || ''}`;
+    const fullSig = `${coreSig}|${u.ultimaGps || ''}|${latR}|${lngR}|${u.desvioRaw || ''}`;
+    const key = `${cod}:${coche}`;
+    const prev = this._unitWriteCache.get(key);
+    if (prev) {
+      if (prev.fullSig === fullSig && nowMs - prev.ts < minSameSigMs) return false;
+      if (minPassiveMoveMs > 0 && prev.coreSig === coreSig && nowMs - prev.ts < minPassiveMoveMs) return false;
+    }
+    if (this._unitWriteCache.size >= 2500 && !this._unitWriteCache.has(key)) {
+      this._unitWriteCache.clear();
+    }
+    this._unitWriteCache.set(key, { coreSig, fullSig, ts: nowMs });
+    return true;
   }
 
   _ensureSchema() {
@@ -1137,6 +1177,12 @@ export class FleetMemory {
     const dLegajo = driver ? driver.legajo : '';
     const dRaw = driver ? driver.raw : '';
 
+    const rosterKey = `${effectiveDayKey}:${cod}:${coche}`;
+    const rosterSig = `${driver?.driverKey || ''}|${dNombre}|${dLegajo}|${bandera}|${tripKey}|${serviceNum}|${turnoIdx}|${lapNum}|${esAdaptado}`;
+    if (!this._shouldWrite(this._rosterWriteCache, rosterKey, rosterSig, nowMs, 4 * 60 * 1000)) {
+      return;
+    }
+
     this.sql.exec(
       `INSERT INTO fleet_cars (
         codigo_linea, coche, descripcion_linea, es_adaptado,
@@ -1436,6 +1482,12 @@ export class FleetMemory {
       const totalUnique = Number(r.total_today) || 0;
       const activeNow = Number(r.active_now) || 0;
       if (!cod || totalUnique <= 0) continue;
+
+      const capKey = `${todayKey}:${cod}`;
+      const capSig = `${activeNow}|${totalUnique}|${tipoDia}`;
+      if (!this._shouldWrite(this._capacityWriteCache, capKey, capSig, nowMs, 10 * 60 * 1000, 500)) {
+        continue;
+      }
 
       this.sql.exec(
         `INSERT INTO fleet_capacity_daily (
@@ -1863,7 +1915,8 @@ export class FleetMemory {
       const ts = Number(body.scannedAt) || nowMs;
       let inserted = 0;
 
-      // Strictly additive non-destructive UPSERT: passed SOAP times are NEVER removed!
+      // Strictly additive non-destructive INSERT OR IGNORE: passed SOAP times are NEVER removed,
+      // and already-recorded rows incur 0 rows_written on Cloudflare Durable Objects SQLite!
       for (const e of entries) {
         const dk = String(e.dayKey || '').trim();
         const cod = Number(e.codigoLinea);
@@ -1874,11 +1927,9 @@ export class FleetMemory {
           continue;
         }
         this.sql.exec(
-          `INSERT INTO live_horarios_daily (
+          `INSERT OR IGNORE INTO live_horarios_daily (
             day_key, codigo_linea, stop_id, hora_paso, bandera, first_seen_at, last_seen_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(day_key, codigo_linea, stop_id, hora_paso, bandera) DO UPDATE SET
-            last_seen_at = excluded.last_seen_at`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           dk,
           cod,
           stopId,
@@ -1898,6 +1949,17 @@ export class FleetMemory {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dk) || !cod || REMOVED_LINE_CODES.has(cod) || !stopId || !Number.isInteger(wh) || wh < 0 || wh > 23) {
           continue;
         }
+        const itemsCnt = Math.max(0, Number(w.itemsCount) || 0);
+        const winKey = `${dk}:${cod}:${stopId}:${wh}`;
+        const prevWin = this._horariosWindowCache.get(winKey);
+        if (prevWin && prevWin.itemsCnt >= itemsCnt && nowMs - prevWin.ts < 2 * 3600 * 1000) {
+          continue;
+        }
+        if (this._horariosWindowCache.size >= 4000 && !this._horariosWindowCache.has(winKey)) {
+          this._horariosWindowCache.clear();
+        }
+        this._horariosWindowCache.set(winKey, { itemsCnt, ts: nowMs });
+
         this.sql.exec(
           `INSERT INTO live_horarios_windows (
             day_key, codigo_linea, stop_id, window_hour, items_count, scanned_at
@@ -1909,7 +1971,7 @@ export class FleetMemory {
           cod,
           stopId,
           wh,
-          Math.max(0, Number(w.itemsCount) || 0),
+          itemsCnt,
           ts
         );
       }
@@ -1963,44 +2025,46 @@ export class FleetMemory {
           const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
           const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
           const ultimaGps = String(u.ultimaGps || '').trim();
-          const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
-          this.sql.exec(
-            `INSERT INTO unit_last_seen (
-              codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
-            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(codigo_linea, coche) DO UPDATE SET
-              day_key = excluded.day_key,
-              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
-              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
-              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
-              es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
-              desvio_sec = excluded.desvio_sec,
-              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
-              bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
-              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
-              lat = COALESCE(excluded.lat, unit_last_seen.lat),
-              lng = COALESCE(excluded.lng, unit_last_seen.lng),
-              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
-              gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-              updated_at = excluded.updated_at`,
-            cod,
-            coche,
-            todayKey,
-            String(u.choferNombre || '').trim(),
-            String(u.choferLegajo || '').trim(),
-            String(u.choferRaw || '').trim(),
-            u.esAdaptado ? 1 : 0,
-            Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
-            String(u.desvioRaw || '').trim(),
-            String(u.bandera || '').trim(),
-            ultimaGps,
-            lat,
-            lng,
-            String(u.stopId || '').trim().toUpperCase(),
-            mergedTrail,
-            nowMs
-          );
+          if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 120000, 0)) {
+            const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
+            this.sql.exec(
+              `INSERT INTO unit_last_seen (
+                codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+                es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+              ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+                day_key = excluded.day_key,
+                chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+                chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+                chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+                es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
+                desvio_sec = excluded.desvio_sec,
+                desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+                bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+                ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+                lat = COALESCE(excluded.lat, unit_last_seen.lat),
+                lng = COALESCE(excluded.lng, unit_last_seen.lng),
+                stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+                gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+                updated_at = excluded.updated_at`,
+              cod,
+              coche,
+              todayKey,
+              String(u.choferNombre || '').trim(),
+              String(u.choferLegajo || '').trim(),
+              String(u.choferRaw || '').trim(),
+              u.esAdaptado ? 1 : 0,
+              Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+              String(u.desvioRaw || '').trim(),
+              String(u.bandera || '').trim(),
+              ultimaGps,
+              lat,
+              lng,
+              String(u.stopId || '').trim().toUpperCase(),
+              mergedTrail,
+              nowMs
+            );
+          }
           this._upsertRosterUnit(u, nowMs, todayKey);
           touchedLines.add(cod);
           count++;
@@ -2019,7 +2083,6 @@ export class FleetMemory {
           this._setMeta('last_cycle_at', nowMs);
           const prevSweeps = Number(this._getMeta('total_sweeps', 0)) || 0;
           this._setMeta('total_sweeps', prevSweeps + 1);
-          this._pruneOld(nowMs);
         }
       }
 
@@ -3058,46 +3121,48 @@ export class FleetMemory {
         const lat = Number.isFinite(u.lat) ? u.lat : null;
         const lng = Number.isFinite(u.lng) ? u.lng : null;
         const ultimaGps = String(u.ultimaGps || '').trim();
-        const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
-        this.sql.exec(
-          `INSERT INTO unit_last_seen (
-            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
-            day_key = excluded.day_key,
-            trip_key = CASE WHEN excluded.trip_key != '' THEN excluded.trip_key ELSE unit_last_seen.trip_key END,
-            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
-            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
-            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
-            es_adaptado = excluded.es_adaptado,
-            desvio_sec = excluded.desvio_sec,
-            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
-            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
-            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
-            lat = COALESCE(excluded.lat, unit_last_seen.lat),
-            lng = COALESCE(excluded.lng, unit_last_seen.lng),
-            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
-            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-            updated_at = excluded.updated_at`,
-          cod,
-          coche,
-          todayKey,
-          String(u.tripKey || '').trim(),
-          String(u.choferNombre || '').trim(),
-          String(u.choferLegajo || '').trim(),
-          String(u.choferRaw || '').trim(),
-          u.esAdaptado ? 1 : 0,
-          Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
-          String(u.desvioRaw || '').trim(),
-          String(u.bandera || '').trim(),
-          ultimaGps,
-          lat,
-          lng,
-          String(u.stopId || '').trim().toUpperCase(),
-          mergedTrail,
-          nowMs
-        );
+        if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 120000, 35000)) {
+          const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
+          this.sql.exec(
+            `INSERT INTO unit_last_seen (
+              codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+              day_key = excluded.day_key,
+              trip_key = CASE WHEN excluded.trip_key != '' THEN excluded.trip_key ELSE unit_last_seen.trip_key END,
+              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+              es_adaptado = excluded.es_adaptado,
+              desvio_sec = excluded.desvio_sec,
+              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+              bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+              lat = COALESCE(excluded.lat, unit_last_seen.lat),
+              lng = COALESCE(excluded.lng, unit_last_seen.lng),
+              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+              gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+              updated_at = excluded.updated_at`,
+            cod,
+            coche,
+            todayKey,
+            String(u.tripKey || '').trim(),
+            String(u.choferNombre || '').trim(),
+            String(u.choferLegajo || '').trim(),
+            String(u.choferRaw || '').trim(),
+            u.esAdaptado ? 1 : 0,
+            Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+            String(u.desvioRaw || '').trim(),
+            String(u.bandera || '').trim(),
+            ultimaGps,
+            lat,
+            lng,
+            String(u.stopId || '').trim().toUpperCase(),
+            mergedTrail,
+            nowMs
+          );
+        }
         this._upsertRosterUnit(u, nowMs, todayKey);
         touchedLines.add(cod);
         count++;
@@ -3107,16 +3172,23 @@ export class FleetMemory {
       }
       if (body.stopSnapshot && body.stopSnapshot.idParada) {
         const sid = String(body.stopSnapshot.idParada).trim().toUpperCase();
-        this.sql.exec(
-          `INSERT INTO stop_last_arribos (stop_id, payload_json, updated_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(stop_id) DO UPDATE SET
-             payload_json = excluded.payload_json,
-             updated_at = excluded.updated_at`,
-          sid,
-          JSON.stringify(body.stopSnapshot),
-          nowMs
-        );
+        const prevSnapTs = this._stopSnapWriteCache.get(sid) || 0;
+        if (nowMs - prevSnapTs >= 60000) {
+          if (this._stopSnapWriteCache.size >= 1000 && !this._stopSnapWriteCache.has(sid)) {
+            this._stopSnapWriteCache.clear();
+          }
+          this._stopSnapWriteCache.set(sid, nowMs);
+          this.sql.exec(
+            `INSERT INTO stop_last_arribos (stop_id, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(stop_id) DO UPDATE SET
+               payload_json = excluded.payload_json,
+               updated_at = excluded.updated_at`,
+            sid,
+            JSON.stringify(body.stopSnapshot),
+            nowMs
+          );
+        }
       }
       return Response.json({ ok: true, count });
     }
@@ -3140,7 +3212,6 @@ export class FleetMemory {
         const ultimaGps = String(e.ultimaGps || '').trim();
         const dirBandera = String(e.dirBandera || '').trim();
         const supersededTripKey = String(e.supersededTripKey || '').trim();
-        const mergedTrail = this._mergeUnitTrail(cod, coche, e.gpsTrail, lat, lng, ultimaGps, nowMs);
 
         // Self-correction cleanup: if global matching moved this car off an earlier misassigned service,
         // remove the stale trip_assignments row if it still points to this same car!
@@ -3154,84 +3225,91 @@ export class FleetMemory {
           );
         }
 
-        this.sql.exec(
-          `INSERT INTO trip_assignments (
-            day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
-            chofer_raw, es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(day_key, codigo_linea, trip_key) DO UPDATE SET
-            turno_hora = CASE WHEN excluded.turno_hora != '' THEN excluded.turno_hora ELSE trip_assignments.turno_hora END,
-            coche = excluded.coche,
-            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE trip_assignments.chofer_nombre END,
-            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE trip_assignments.chofer_legajo END,
-            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE trip_assignments.chofer_raw END,
-            es_adaptado = excluded.es_adaptado,
-            desvio_sec = excluded.desvio_sec,
-            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE trip_assignments.desvio_raw END,
-            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE trip_assignments.ultima_gps END,
-            lat = COALESCE(excluded.lat, trip_assignments.lat),
-            lng = COALESCE(excluded.lng, trip_assignments.lng),
-            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE trip_assignments.stop_id END,
-            updated_at = excluded.updated_at`,
-          dayKey,
-          cod,
-          tripKey,
-          String(e.turnoHora || '').trim(),
-          coche,
-          String(e.choferNombre || '').trim(),
-          String(e.choferLegajo || '').trim(),
-          String(e.choferRaw || '').trim(),
-          e.esAdaptado ? 1 : 0,
-          desvioSec,
-          String(e.desvioRaw || '').trim(),
-          ultimaGps,
-          lat,
-          lng,
-          String(e.stopId || '').trim().toUpperCase(),
-          nowMs
-        );
+        const tripCacheKey = `${dayKey}:${cod}:${tripKey}`;
+        const tripSig = `${coche}|${String(e.choferNombre || '').trim()}|${String(e.choferLegajo || '').trim()}|${String(e.turnoHora || '').trim()}`;
+        if (this._shouldWrite(this._tripWriteCache, tripCacheKey, tripSig, nowMs, 5 * 60 * 1000)) {
+          this.sql.exec(
+            `INSERT INTO trip_assignments (
+              day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
+              chofer_raw, es_adaptado, desvio_sec, desvio_raw, ultima_gps, lat, lng, stop_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day_key, codigo_linea, trip_key) DO UPDATE SET
+              turno_hora = CASE WHEN excluded.turno_hora != '' THEN excluded.turno_hora ELSE trip_assignments.turno_hora END,
+              coche = excluded.coche,
+              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE trip_assignments.chofer_nombre END,
+              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE trip_assignments.chofer_legajo END,
+              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE trip_assignments.chofer_raw END,
+              es_adaptado = excluded.es_adaptado,
+              desvio_sec = excluded.desvio_sec,
+              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE trip_assignments.desvio_raw END,
+              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE trip_assignments.ultima_gps END,
+              lat = COALESCE(excluded.lat, trip_assignments.lat),
+              lng = COALESCE(excluded.lng, trip_assignments.lng),
+              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE trip_assignments.stop_id END,
+              updated_at = excluded.updated_at`,
+            dayKey,
+            cod,
+            tripKey,
+            String(e.turnoHora || '').trim(),
+            coche,
+            String(e.choferNombre || '').trim(),
+            String(e.choferLegajo || '').trim(),
+            String(e.choferRaw || '').trim(),
+            e.esAdaptado ? 1 : 0,
+            desvioSec,
+            String(e.desvioRaw || '').trim(),
+            ultimaGps,
+            lat,
+            lng,
+            String(e.stopId || '').trim().toUpperCase(),
+            nowMs
+          );
+        }
 
-        this.sql.exec(
-          `INSERT INTO unit_last_seen (
-            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, dir_bandera, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
-            day_key = excluded.day_key,
-            trip_key = excluded.trip_key,
-            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
-            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
-            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
-            es_adaptado = excluded.es_adaptado,
-            desvio_sec = excluded.desvio_sec,
-            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
-            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
-            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
-            lat = COALESCE(excluded.lat, unit_last_seen.lat),
-            lng = COALESCE(excluded.lng, unit_last_seen.lng),
-            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
-            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-            dir_bandera = CASE WHEN excluded.dir_bandera != '' THEN excluded.dir_bandera ELSE unit_last_seen.dir_bandera END,
-            updated_at = excluded.updated_at`,
-          cod,
-          coche,
-          dayKey,
-          tripKey,
-          String(e.choferNombre || '').trim(),
-          String(e.choferLegajo || '').trim(),
-          String(e.choferRaw || '').trim(),
-          e.esAdaptado ? 1 : 0,
-          desvioSec,
-          String(e.desvioRaw || '').trim(),
-          String(e.bandera || '').trim(),
-          ultimaGps,
-          lat,
-          lng,
-          String(e.stopId || '').trim().toUpperCase(),
-          mergedTrail,
-          dirBandera,
-          nowMs
-        );
+        if (this._shouldWriteUnit(cod, coche, { ...e, tripKey, dirBandera }, dayKey, nowMs, 120000, 35000)) {
+          const mergedTrail = this._mergeUnitTrail(cod, coche, e.gpsTrail, lat, lng, ultimaGps, nowMs);
+          this.sql.exec(
+            `INSERT INTO unit_last_seen (
+              codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, dir_bandera, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+              day_key = excluded.day_key,
+              trip_key = excluded.trip_key,
+              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+              es_adaptado = excluded.es_adaptado,
+              desvio_sec = excluded.desvio_sec,
+              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+              bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+              lat = COALESCE(excluded.lat, unit_last_seen.lat),
+              lng = COALESCE(excluded.lng, unit_last_seen.lng),
+              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+              gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+              dir_bandera = CASE WHEN excluded.dir_bandera != '' THEN excluded.dir_bandera ELSE unit_last_seen.dir_bandera END,
+              updated_at = excluded.updated_at`,
+            cod,
+            coche,
+            dayKey,
+            tripKey,
+            String(e.choferNombre || '').trim(),
+            String(e.choferLegajo || '').trim(),
+            String(e.choferRaw || '').trim(),
+            e.esAdaptado ? 1 : 0,
+            desvioSec,
+            String(e.desvioRaw || '').trim(),
+            String(e.bandera || '').trim(),
+            ultimaGps,
+            lat,
+            lng,
+            String(e.stopId || '').trim().toUpperCase(),
+            mergedTrail,
+            dirBandera,
+            nowMs
+          );
+        }
         this._upsertRosterUnit({ ...e, codigoLinea: cod, coche }, nowMs, dayKey);
         touchedLines.add(cod);
         count++;
@@ -3240,7 +3318,6 @@ export class FleetMemory {
       if (touchedLines.size > 0) {
         this._updateLiveCapacity(nowMs, dayKey, Array.from(touchedLines));
       }
-      if (Math.random() < 0.05) this._pruneOld(nowMs);
       return Response.json({ ok: true, count, dayKey });
     }
 
@@ -4101,7 +4178,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.3',
+          version: '2.4',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {
