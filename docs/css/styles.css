@@ -216,10 +216,12 @@ input:focus-visible,
    App Shell & Full-Bleed Map Canvas
    ========================================================================== */
 .app-shell {
-  position: relative;
-  width: 100vw;
-  height: 100dvh;
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: var(--app-h, 100dvh);
   overflow: hidden;
+  isolation: isolate;
 }
 
 .map-canvas {
@@ -618,6 +620,9 @@ input:focus-visible,
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: nowrap;
   padding: 7px 12px 5px;
   background: var(--surface-0);
   border-bottom: 1px solid var(--border);
@@ -631,7 +636,8 @@ input:focus-visible,
 }
 
 .dock-grab-pill {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 48px;
   display: flex;
   justify-content: center;
   align-items: center;
@@ -656,6 +662,8 @@ input:focus-visible,
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
+  white-space: nowrap;
   gap: 5px;
   min-width: 66px;
   height: 26px;
@@ -4809,7 +4817,7 @@ button.ev-card:hover {
    ========================================================================== */
 @media (max-width: 860px) {
   :root {
-    --sheet-cur-h: 52dvh;
+    --sheet-cur-h: calc(var(--app-h, 100dvh) * 0.52);
   }
 
   .app-shell.dock-peek {
@@ -4817,7 +4825,7 @@ button.ev-card:hover {
   }
 
   .app-shell.dock-expanded {
-    --sheet-cur-h: 84dvh;
+    --sheet-cur-h: calc(var(--app-h, 100dvh) * 0.84);
   }
 
   .desktop-only-btn,
@@ -4831,6 +4839,8 @@ button.ev-card:hover {
     left: calc(8px + var(--safe-left));
     right: calc(8px + var(--safe-right));
     width: auto;
+    max-width: none;
+    transform: none;
     padding: 8px 10px 9px;
     border-radius: 18px;
     box-shadow: var(--shadow-float);
@@ -4882,10 +4892,13 @@ button.ev-card:hover {
 
   /* Floating Top Map Pills sit cleanly right under the mobile top capsule */
   .map-hud-top {
-    top: calc(108px + var(--safe-top));
+    top: var(--top-bar-bottom, calc(108px + var(--safe-top)));
     left: calc(10px + var(--safe-left));
     right: auto;
+    max-width: calc(100% - 20px - var(--safe-left) - var(--safe-right));
+    z-index: 460;
     gap: 6px;
+    transform: translateZ(0);
     transition: opacity 0.18s ease, transform 0.18s ease;
   }
 
@@ -4907,7 +4920,9 @@ button.ev-card:hover {
     right: 0;
     bottom: 0;
     width: 100%;
+    max-width: 100%;
     height: var(--sheet-live-h, var(--sheet-cur-h)) !important;
+    transform: none;
     border: none;
     border-top: 1px solid var(--border-strong);
     border-radius: 22px 22px 0 0;
@@ -4944,6 +4959,7 @@ button.ev-card:hover {
     right: calc(10px + var(--safe-right));
     bottom: calc(var(--sheet-live-h, var(--sheet-cur-h)) + 10px);
     gap: 6px;
+    transform: translateZ(0);
     transition: bottom 0.24s var(--ease), opacity 0.16s ease;
   }
 
@@ -4970,6 +4986,7 @@ button.ev-card:hover {
     border-radius: 18px;
     padding: 10px 12px;
     gap: 7px;
+    transform: translateZ(0);
     transition: bottom 0.24s var(--ease), opacity 0.16s ease;
   }
 
@@ -4984,11 +5001,11 @@ button.ev-card:hover {
   }
 
   .rec-matrix-wrap {
-    max-height: 44dvh;
+    max-height: calc(var(--app-h, 100dvh) * 0.44);
   }
 
   .app-shell.dock-expanded .rec-matrix-wrap {
-    max-height: 58dvh;
+    max-height: calc(var(--app-h, 100dvh) * 0.58);
   }
 
   /* Bottom-sheet style modals on phones for effortless one-hand reach */
@@ -5006,7 +5023,7 @@ button.ev-card:hover {
   }
 
   .toast-container {
-    top: calc(102px + var(--safe-top));
+    top: var(--top-bar-bottom, calc(102px + var(--safe-top)));
     left: 12px;
     right: 12px;
     align-items: center;

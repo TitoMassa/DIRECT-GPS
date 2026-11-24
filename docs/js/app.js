@@ -333,6 +333,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.5.2',
+    date: '24/11/2026 · 15:45 hs',
+    items: [
+      '<strong>Corrección de interfaz al minimizar y volver a abrir la app:</strong> se resolvió el problema en celulares Android/PWA donde al regresar del segundo plano desaparecían los botones flotantes (<strong>Eventos</strong> y <strong>En calle</strong>), la barra arrastrable del menú quedaba desplazada a la izquierda o el panel se veía incompleto. Ahora la app recalcula automáticamente el viewport real (<code>--app-h</code> y posición de cabecera), cancela gestos interrumpidos y fuerza la recomposición limpia del mapa y todas las capas flotantes al volver.'
+    ]
+  },
+  {
     version: 'v2.5.1',
     date: '24/11/2026 · 14:40 hs',
     items: [
@@ -1223,6 +1230,91 @@ function clearSheetInlineSize() {
   el.appShell?.style.removeProperty('--sheet-live-h');
 }
 
+let cancelSheetDragFn = () => clearSheetInlineSize();
+let viewportRecoveryTimers = [];
+
+function cancelActiveSheetDrag() {
+  cancelSheetDragFn();
+}
+
+function isSoftKeyboardLikelyOpen() {
+  const active = document.activeElement;
+  const isTextInput =
+    active &&
+    (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
+  if (!isTextInput || !window.visualViewport) return false;
+  return window.visualViewport.height > 0 && window.visualViewport.height < window.innerHeight * 0.78;
+}
+
+function syncViewportLayout({ forceRepaint = false } = {}) {
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  if (vw <= 0 || vh <= 0) return;
+
+  // Reset any stray viewport scroll offset introduced by Android Chrome when minimizing/restoring
+  if (window.scrollX !== 0 || window.scrollY !== 0) {
+    window.scrollTo(0, 0);
+  }
+  if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
+  if (document.documentElement.scrollLeft !== 0) document.documentElement.scrollLeft = 0;
+  if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
+  if (document.body.scrollLeft !== 0) document.body.scrollLeft = 0;
+
+  if (!isSoftKeyboardLikelyOpen()) {
+    document.documentElement.style.setProperty('--app-h', `${Math.round(vh)}px`);
+  }
+
+  const topBar = document.querySelector('.top-bar');
+  if (topBar && isBottomSheetLayout()) {
+    const rect = topBar.getBoundingClientRect();
+    if (rect.height > 20) {
+      const hudTop = Math.min(196, Math.max(86, Math.ceil(rect.bottom + 8)));
+      document.documentElement.style.setProperty('--top-bar-bottom', `${hudTop}px`);
+    }
+  } else {
+    document.documentElement.style.removeProperty('--top-bar-bottom');
+  }
+
+  cancelActiveSheetDrag();
+  setSheetIndex(getSheetIndex(), { silent: true });
+  if (state.inspectorOpen) syncInspectorLayoutHeight();
+
+  if (forceRepaint) {
+    // Work around Android Chrome/Samsung WebView bug where fixed + backdrop-filter layers
+    // disappear or clip partially after the EGL GPU surface is recreated on app resume.
+    const floatingLayers = [
+      topBar,
+      document.querySelector('.map-hud-top'),
+      document.querySelector('.map-controls'),
+      el.dock,
+      el.busInspector
+    ].filter(Boolean);
+    floatingLayers.forEach((node) => {
+      node.style.willChange = 'transform, opacity';
+    });
+    void document.body.offsetHeight;
+    requestAnimationFrame(() => {
+      floatingLayers.forEach((node) => {
+        node.style.willChange = '';
+      });
+      transitMap.invalidateSize();
+    });
+  } else {
+    requestAnimationFrame(() => transitMap.invalidateSize());
+  }
+}
+
+function scheduleViewportRecovery({ forceRepaint = false } = {}) {
+  for (const tid of viewportRecoveryTimers) clearTimeout(tid);
+  viewportRecoveryTimers = [];
+  syncViewportLayout({ forceRepaint });
+  // Android system bars and app-resume animations settle 120–360ms after visibilitychange/pageshow
+  viewportRecoveryTimers.push(
+    setTimeout(() => syncViewportLayout({ forceRepaint }), 140),
+    setTimeout(() => syncViewportLayout({ forceRepaint: false }), 360)
+  );
+}
+
 function setSheetIndex(idx = 1, { silent = false } = {}) {
   clearSheetInlineSize();
   const clamped = Math.max(0, Math.min(2, Number(idx) || 0));
@@ -1281,23 +1373,42 @@ function setupMobileSheet() {
   const handle = el.dockDragHandle;
   if (handle) {
     let dragging = false;
+    let activePointerId = null;
     let startY = 0;
     let startH = 0;
     let lastY = 0;
     let lastT = 0;
     let velocityY = 0;
 
+    cancelSheetDragFn = () => {
+      if (dragging && activePointerId !== null) {
+        try {
+          handle.releasePointerCapture?.(activePointerId);
+        } catch {
+          // ignore if pointer already ended
+        }
+      }
+      dragging = false;
+      activePointerId = null;
+      clearSheetInlineSize();
+    };
+
     handle.addEventListener('pointerdown', (e) => {
       if (!isBottomSheetLayout()) return;
       if (e.target.closest('button')) return;
       dragging = true;
+      activePointerId = e.pointerId;
       startY = e.clientY;
       lastY = e.clientY;
       lastT = performance.now();
       velocityY = 0;
       startH = el.dock.getBoundingClientRect().height;
       el.dock.classList.add('is-dragging');
-      handle.setPointerCapture?.(e.pointerId);
+      try {
+        handle.setPointerCapture?.(e.pointerId);
+      } catch {
+        // ignore capture errors
+      }
     });
 
     handle.addEventListener('pointermove', (e) => {
@@ -1318,7 +1429,12 @@ function setupMobileSheet() {
     const finishDrag = (e) => {
       if (!dragging) return;
       dragging = false;
-      handle.releasePointerCapture?.(e.pointerId);
+      activePointerId = null;
+      try {
+        handle.releasePointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
       const vh = window.innerHeight || 800;
       const curH = el.dock.getBoundingClientRect().height;
       const ratio = curH / vh;
@@ -1343,12 +1459,12 @@ function setupMobileSheet() {
 
     handle.addEventListener('pointerup', finishDrag);
     handle.addEventListener('pointercancel', finishDrag);
+    handle.addEventListener('lostpointercapture', () => {
+      if (dragging) cancelActiveSheetDrag();
+    });
   }
 
-  window.addEventListener('resize', () => {
-    clearSheetInlineSize();
-    requestAnimationFrame(() => transitMap.invalidateSize());
-  });
+  syncViewportLayout({ forceRepaint: false });
 }
 
 // ============================================================================
@@ -10953,8 +11069,20 @@ function bindEvents() {
   });
 
   window.addEventListener('resize', () => {
-    if (state.inspectorOpen) syncInspectorLayoutHeight();
+    scheduleViewportRecovery({ forceRepaint: false });
   });
+
+  window.addEventListener('orientationchange', () => {
+    scheduleViewportRecovery({ forceRepaint: true });
+  });
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      if (!isSoftKeyboardLikelyOpen()) {
+        syncViewportLayout({ forceRepaint: false });
+      }
+    });
+  }
 
   window.addEventListener('offline', () => {
     state.isOffline = true;
@@ -10983,16 +11111,39 @@ function bindEvents() {
     }
   });
 
-  // Pause kinematic simulation and animations when tab/app is hidden to save battery
+  // Pause kinematic simulation and animations when tab/app is hidden to save battery,
+  // and force full viewport + GPU layer recovery when returning from Android/PWA background
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) pauseRealtime();
     else resumeRealtime();
+  });
+
+  window.addEventListener('pagehide', () => {
+    pauseRealtime();
+  });
+
+  window.addEventListener('pageshow', () => {
+    if (!document.hidden) resumeRealtime();
+  });
+
+  window.addEventListener('blur', () => {
+    cancelActiveSheetDrag();
+  });
+
+  window.addEventListener('focus', () => {
+    if (document.hidden) return;
+    if (state.isAppPaused || document.body.classList.contains('app-paused')) {
+      resumeRealtime();
+    } else {
+      scheduleViewportRecovery({ forceRepaint: true });
+    }
   });
 
   setupMobileSheet();
 }
 
 function pauseRealtime() {
+  cancelActiveSheetDrag();
   stopSimLoop();
   document.body.classList.add('app-paused');
   if (state.armedAlerts.size === 0) {
@@ -11051,7 +11202,7 @@ function resumeRealtime() {
   const wasPaused = state.isAppPaused;
   state.isAppPaused = false;
   document.body.classList.remove('app-paused');
-  transitMap.invalidateSize();
+  scheduleViewportRecovery({ forceRepaint: true });
   ensureServiceDayRollover();
   pruneRuntimeCaches();
   if (state.activeStop) {
