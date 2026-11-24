@@ -64,7 +64,8 @@ import {
   notifyArrival,
   onPwaInstallAvailable,
   promptPwaInstall,
-  isPwaInstalled
+  isPwaInstalled,
+  parseDeepLink
 } from './native.js';
 
 const busSimulator = new BusSimulator();
@@ -124,8 +125,11 @@ const state = {
   eventsTimerId: null,
   eventsClickTargets: [],
 
-  themeColor: '#10141c',
+  themeColor: '#12161a',
   dockExpanded: false,
+  sheetIndex: 1, // 0 = peek (mapa), 1 = half, 2 = full
+  desktopCollapsed: false,
+  lineFamilyFilter: 'ALL',
 
   // Offline archives & system FleetMemory caches
   catalogo: null,
@@ -199,13 +203,18 @@ const state = {
 const el = {
   appShell: document.getElementById('app-shell'),
   dock: document.getElementById('transit-dock'),
+  dockDragHandle: document.getElementById('dock-drag-handle'),
+  btnDockPeek: document.getElementById('btn-dock-peek'),
   btnDockSize: document.getElementById('btn-dock-size'),
   dockSizeLabel: document.getElementById('dock-size-label'),
+  btnDesktopCollapse: document.getElementById('btn-desktop-collapse'),
+  btnDesktopReopen: document.getElementById('btn-desktop-reopen'),
   tabs: document.querySelectorAll('.dock-tab'),
   panels: document.querySelectorAll('.dock-panel'),
 
   btnBrandHome: document.getElementById('btn-brand-home'),
   globalSearch: document.getElementById('global-search-input'),
+  btnSearchClear: document.getElementById('btn-search-clear'),
   searchDropdown: document.getElementById('global-search-dropdown'),
   btnLiveMode: document.getElementById('btn-live-mode'),
   signalLabel: document.getElementById('signal-label'),
@@ -232,6 +241,7 @@ const el = {
 
   lineasBreadcrumb: document.getElementById('lineas-breadcrumb'),
   lineasFilterInput: document.getElementById('lineas-filter-input'),
+  btnLineasFilterClear: document.getElementById('btn-lineas-filter-clear'),
   lineasContent: document.getElementById('lineas-content'),
 
   btnLocateMe: document.getElementById('btn-locate-me'),
@@ -240,6 +250,8 @@ const el = {
   cercanasList: document.getElementById('cercanas-list'),
 
   favoritasList: document.getElementById('favoritas-list'),
+  favCountPill: document.getElementById('fav-count-pill'),
+  tabFavDot: document.getElementById('tab-fav-dot'),
 
   busInspector: document.getElementById('bus-inspector'),
   inspLineBadge: document.getElementById('insp-line-badge'),
@@ -319,6 +331,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.5.0',
+    date: '23/11/2026 · 23:55 hs',
+    items: [
+      '<strong>Rework visual y espacial completo (Edición Táctil Espacial):</strong> nueva arquitectura de islas flotantes translúcidas sobre el mapa a pantalla completa en escritorio (con opción de ocultar el panel para ver el mapa al 100 %), nueva tipografía geométrica y monoespaciada (<strong>Plus Jakarta Sans</strong> + <strong>JetBrains Mono</strong>) y nueva paleta base <strong>Carbón Mineral + Esmeralda Señal</strong> compatible con los 14 temas predefinidos, <strong>Negro AMOLED</strong> y selector de color libre.',
+      '<strong>Panel móvil interactivo de 3 niveles con arrastre táctil:</strong> ahora podés deslizar la barra superior del panel con el dedo o usar los accesos rápidos <strong>Mapa</strong> (vista despejada), mitad y <strong>Ampliar</strong>, sin ocultar ningún botón en pantallas compactas.',
+      '<strong>Tablero de arribos, inicio y menú de Líneas más intuitivos:</strong> tarjetas de arribo rediseñadas con placa de línea esmaltada y visor digital de minutos, pantalla de inicio con accesos directos a GPS, <strong>Flota en calle (Modo libre)</strong> y paradas troncales rápidas, filtro por familia de líneas (<code>102</code>–<code>904</code>), barra de pestañas integrada dentro de cada línea (<strong>Horarios · Servicios · Flota · Calles</strong>), píldoras superiores etiquetadas en el mapa (<strong>Eventos</strong> y <strong>En calle</strong>) y tarjetas de Cercanas/Favoritas clicables en toda su superficie.',
+      '<strong>Auditoría integral y control de rutina:</strong> se corrigió el anclaje físico de tramos previos en predicción GPS, los colores de desvío horario en la lista en vivo de Modo libre, el sondeo en vivo al rastrear coches sin parada previa, el corte de día de servicio a las <code>03:00</code> en modo offline y horarios nocturnos, la limpieza diaria del espejo IndexedDB, los accesos directos PWA (<code>?tab=lineas</code> y <code>?tab=cercanas</code>), el escapado seguro en marcadores del mapa y la paridad completa del servidor local y flujo de actualización automática.'
+    ]
+  },
   {
     version: 'v2.4.16',
     date: '23/11/2026 · 15:58 hs',
@@ -597,34 +619,34 @@ function showToast(message, type = 'info', duration = 3200, { silent = false } =
 }
 
 // ============================================================================
-// Theme: Free UI Background Color + Pure AMOLED + Automatic WCAG Contrast
+// Theme: Tactile Spatial Palette + Pure AMOLED + Automatic WCAG Contrast
 // ============================================================================
 const THEME_PRESETS = [
+  { name: 'Carbón Mineral', hex: '#12161a', tag: 'Predet.' },
   { name: 'Negro AMOLED', hex: '#000000', tag: 'AMOLED' },
   { name: 'Obsidiana', hex: '#10141c', tag: 'Oscuro' },
-  { name: 'Grafito', hex: '#18181b', tag: 'Oscuro' },
-  { name: 'Azul Noche', hex: '#0b192c', tag: 'Oscuro' },
-  { name: 'Índigo Profundo', hex: '#161233', tag: 'Oscuro' },
-  { name: 'Verde Bosque', hex: '#0b1f18', tag: 'Oscuro' },
-  { name: 'Bordó Oscuro', hex: '#240d15', tag: 'Oscuro' },
+  { name: 'Grafito Cálido', hex: '#18181b', tag: 'Oscuro' },
+  { name: 'Verde Río', hex: '#0b1d17', tag: 'Oscuro' },
+  { name: 'Azul Atlántico', hex: '#0b192c', tag: 'Oscuro' },
   { name: 'Café Espresso', hex: '#1d1511', tag: 'Oscuro' },
+  { name: 'Terracota Noche', hex: '#231114', tag: 'Oscuro' },
+  { name: 'Papel Técnico', hex: '#f4f7fa', tag: 'Claro' },
   { name: 'Blanco Puro', hex: '#ffffff', tag: 'Claro' },
-  { name: 'Hielo Claro', hex: '#eef2f7', tag: 'Claro' },
-  { name: 'Crema Cálido', hex: '#f7f3ea', tag: 'Claro' },
-  { name: 'Celeste Suave', hex: '#e8f3ff', tag: 'Claro' },
+  { name: 'Arena Cálida', hex: '#f7f3ea', tag: 'Claro' },
   { name: 'Menta Suave', hex: '#e8f8f0', tag: 'Claro' },
-  { name: 'Lavanda Suave', hex: '#f1ecff', tag: 'Claro' }
+  { name: 'Celeste Suave', hex: '#e8f3ff', tag: 'Claro' },
+  { name: 'Piedra Clara', hex: '#edf0f4', tag: 'Claro' }
 ];
 
 function normalizeHexColor(raw) {
   const s = String(raw || '').trim().toLowerCase();
-  if (s === 'dark') return '#10141c';
-  if (s === 'light') return '#ffffff';
+  if (s === 'dark') return '#12161a';
+  if (s === 'light') return '#f4f7fa';
   if (/^#[0-9a-f]{6}$/.test(s)) return s;
   if (/^#[0-9a-f]{3}$/.test(s)) {
     return `#${s[1]}${s[1]}${s[2]}${s[2]}${s[3]}${s[3]}`;
   }
-  return '#10141c';
+  return '#12161a';
 }
 
 function hexToRgb(hex) {
@@ -667,6 +689,7 @@ function applyTheme(colorOrLegacy) {
   const contrastWithBlack = (lum + 0.05) / 0.055;
   const isLight = contrastWithBlack > contrastWithWhite;
   const isAmoled = hex === '#000000';
+  const rgb = hexToRgb(hex);
 
   const root = document.documentElement;
   root.setAttribute('data-theme', isLight ? 'light' : 'dark');
@@ -675,72 +698,96 @@ function applyTheme(colorOrLegacy) {
     ? {
         '--bg-canvas': '#000000',
         '--surface-0': '#000000',
-        '--surface-1': '#0d0d0d',
-        '--surface-2': '#171717',
-        '--surface-hover': '#212121',
-        '--surface-active': '#2b2b2b',
-        '--border': 'rgba(255, 255, 255, 0.13)',
+        '--surface-1': '#0d0f11',
+        '--surface-2': '#171a1d',
+        '--surface-3': '#202529',
+        '--surface-hover': '#1d2125',
+        '--surface-active': '#282d33',
+        '--surface-glass': 'rgba(0, 0, 0, 0.90)',
+        '--border': 'rgba(255, 255, 255, 0.14)',
         '--border-strong': 'rgba(255, 255, 255, 0.26)',
+        '--inset-rim': 'inset 0 1px 0 rgba(255, 255, 255, 0.08)',
         '--text-1': '#ffffff',
         '--text-2': 'rgba(255, 255, 255, 0.80)',
         '--text-3': 'rgba(255, 255, 255, 0.58)',
-        '--accent': '#38bdf8',
-        '--accent-soft': 'rgba(56, 189, 248, 0.18)',
+        '--accent': '#10b981',
+        '--accent-soft': 'rgba(16, 185, 129, 0.20)',
+        '--accent-ink': '#021b12',
+        '--info': '#22d3ee',
+        '--info-soft': 'rgba(34, 211, 238, 0.18)',
         '--ok': '#22c55e',
         '--ok-soft': 'rgba(34, 197, 94, 0.18)',
         '--warn': '#fbbf24',
         '--warn-soft': 'rgba(251, 191, 36, 0.18)',
         '--late': '#fb7185',
         '--late-soft': 'rgba(251, 113, 133, 0.18)',
-        '--shadow-float': '0 12px 32px -8px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.7)',
-        '--shadow-sm': '0 2px 10px rgba(0, 0, 0, 0.65)'
+        '--shadow-island': '0 22px 48px -12px rgba(0, 0, 0, 0.92), 0 4px 14px rgba(0, 0, 0, 0.78)',
+        '--shadow-float': '0 14px 34px -8px rgba(0, 0, 0, 0.88), 0 2px 6px rgba(0, 0, 0, 0.72)',
+        '--shadow-md': '0 8px 20px -4px rgba(0, 0, 0, 0.78)',
+        '--shadow-sm': '0 2px 10px rgba(0, 0, 0, 0.68)'
       }
     : isLight
       ? {
-          '--bg-canvas': mixHex(hex, '#000000', 0.055),
+          '--bg-canvas': mixHex(hex, '#0f172a', 0.06),
           '--surface-0': hex,
-          '--surface-1': mixHex(hex, '#000000', 0.045),
-          '--surface-2': mixHex(hex, '#000000', 0.09),
-          '--surface-hover': mixHex(hex, '#000000', 0.13),
-          '--surface-active': mixHex(hex, '#000000', 0.18),
-          '--border': 'rgba(10, 15, 26, 0.13)',
-          '--border-strong': 'rgba(10, 15, 26, 0.25)',
-          '--text-1': '#0a0f1a',
-          '--text-2': 'rgba(10, 15, 26, 0.76)',
-          '--text-3': 'rgba(10, 15, 26, 0.58)',
-          '--accent': '#0369a1',
-          '--accent-soft': 'rgba(3, 105, 161, 0.14)',
+          '--surface-1': mixHex(hex, '#0f172a', 0.042),
+          '--surface-2': mixHex(hex, '#0f172a', 0.085),
+          '--surface-3': mixHex(hex, '#0f172a', 0.13),
+          '--surface-hover': mixHex(hex, '#0f172a', 0.115),
+          '--surface-active': mixHex(hex, '#0f172a', 0.165),
+          '--surface-glass': `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.90)`,
+          '--border': 'rgba(12, 19, 32, 0.10)',
+          '--border-strong': 'rgba(12, 19, 32, 0.20)',
+          '--inset-rim': 'inset 0 1px 0 rgba(255, 255, 255, 0.82)',
+          '--text-1': '#0c1320',
+          '--text-2': 'rgba(12, 19, 32, 0.76)',
+          '--text-3': 'rgba(12, 19, 32, 0.56)',
+          '--accent': '#059669',
+          '--accent-soft': 'rgba(5, 150, 105, 0.14)',
+          '--accent-ink': '#ffffff',
+          '--info': '#0284c7',
+          '--info-soft': 'rgba(2, 132, 199, 0.13)',
           '--ok': '#15803d',
           '--ok-soft': 'rgba(21, 128, 61, 0.14)',
           '--warn': '#b45309',
           '--warn-soft': 'rgba(180, 83, 9, 0.14)',
           '--late': '#be123c',
           '--late-soft': 'rgba(190, 18, 60, 0.14)',
-          '--shadow-float': '0 12px 30px -8px rgba(10, 15, 26, 0.18), 0 2px 6px rgba(10, 15, 26, 0.09)',
-          '--shadow-sm': '0 2px 8px rgba(10, 15, 26, 0.10)'
+          '--shadow-island': '0 18px 42px -12px rgba(12, 19, 32, 0.20), 0 4px 12px rgba(12, 19, 32, 0.08)',
+          '--shadow-float': '0 12px 30px -8px rgba(12, 19, 32, 0.17), 0 2px 6px rgba(12, 19, 32, 0.08)',
+          '--shadow-md': '0 6px 18px -4px rgba(12, 19, 32, 0.14)',
+          '--shadow-sm': '0 2px 8px rgba(12, 19, 32, 0.09)'
         }
       : {
-          '--bg-canvas': mixHex(hex, '#000000', 0.18),
+          '--bg-canvas': mixHex(hex, '#000000', 0.22),
           '--surface-0': hex,
-          '--surface-1': mixHex(hex, '#ffffff', 0.065),
-          '--surface-2': mixHex(hex, '#ffffff', 0.12),
-          '--surface-hover': mixHex(hex, '#ffffff', 0.175),
-          '--surface-active': mixHex(hex, '#ffffff', 0.23),
-          '--border': 'rgba(255, 255, 255, 0.12)',
-          '--border-strong': 'rgba(255, 255, 255, 0.24)',
-          '--text-1': '#ffffff',
-          '--text-2': 'rgba(255, 255, 255, 0.80)',
-          '--text-3': 'rgba(255, 255, 255, 0.60)',
-          '--accent': '#38bdf8',
-          '--accent-soft': 'rgba(56, 189, 248, 0.18)',
+          '--surface-1': mixHex(hex, '#ffffff', 0.055),
+          '--surface-2': mixHex(hex, '#ffffff', 0.105),
+          '--surface-3': mixHex(hex, '#ffffff', 0.155),
+          '--surface-hover': mixHex(hex, '#ffffff', 0.135),
+          '--surface-active': mixHex(hex, '#ffffff', 0.19),
+          '--surface-glass': `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.88)`,
+          '--border': 'rgba(255, 255, 255, 0.10)',
+          '--border-strong': 'rgba(255, 255, 255, 0.20)',
+          '--inset-rim': 'inset 0 1px 0 rgba(255, 255, 255, 0.065)',
+          '--text-1': '#f5f7fa',
+          '--text-2': 'rgba(245, 247, 250, 0.78)',
+          '--text-3': 'rgba(245, 247, 250, 0.56)',
+          '--accent': '#10b981',
+          '--accent-soft': 'rgba(16, 185, 129, 0.17)',
+          '--accent-ink': '#031c13',
+          '--info': '#06b6d4',
+          '--info-soft': 'rgba(6, 182, 212, 0.17)',
           '--ok': '#4ade80',
-          '--ok-soft': 'rgba(74, 222, 128, 0.18)',
+          '--ok-soft': 'rgba(74, 222, 128, 0.17)',
           '--warn': '#fbbf24',
-          '--warn-soft': 'rgba(251, 191, 36, 0.18)',
+          '--warn-soft': 'rgba(251, 191, 36, 0.17)',
           '--late': '#fb7185',
           '--late-soft': 'rgba(251, 113, 133, 0.18)',
-          '--shadow-float': '0 12px 32px -8px rgba(0, 0, 0, 0.62), 0 1px 4px rgba(0, 0, 0, 0.36)',
-          '--shadow-sm': '0 2px 10px rgba(0, 0, 0, 0.34)'
+          '--shadow-island': '0 20px 48px -12px rgba(0, 0, 0, 0.68), 0 4px 14px rgba(0, 0, 0, 0.42)',
+          '--shadow-float': '0 14px 34px -8px rgba(0, 0, 0, 0.62), 0 2px 8px rgba(0, 0, 0, 0.36)',
+          '--shadow-md': '0 8px 22px -4px rgba(0, 0, 0, 0.48)',
+          '--shadow-sm': '0 3px 10px rgba(0, 0, 0, 0.34)'
         };
 
   for (const [prop, val] of Object.entries(vars)) {
@@ -849,7 +896,16 @@ function toggleActiveStopFavorite() {
 }
 
 function renderFavorites() {
-  if (state.favorites.length === 0) {
+  const count = state.favorites.length;
+  if (el.favCountPill) {
+    el.favCountPill.textContent = String(count);
+    el.favCountPill.classList.toggle('hidden', count === 0);
+  }
+  if (el.tabFavDot) {
+    el.tabFavDot.classList.toggle('hidden', count === 0);
+  }
+
+  if (count === 0) {
     el.favoritasList.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon" aria-hidden="true">★</div>
@@ -865,13 +921,13 @@ function renderFavorites() {
       (f) => {
         const displayLabel = f.alias ? `${f.alias}, ${f.nombre || f.id}` : f.nombre || f.id;
         return `
-      <div class="stop-list-card" data-fav-id="${escapeHtml(f.id)}">
+      <div class="stop-list-card is-card-clickable" data-fav-id="${escapeHtml(f.id)}">
         <div class="stop-card-top">
-          <div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
             <span class="code-badge">${escapeHtml(f.id)}</span>
-            ${f.alias ? `<span class="pilot-tag" style="margin-left:5px">${escapeHtml(f.alias)}</span>` : ''}
+            ${f.alias ? `<span class="pilot-tag">${escapeHtml(f.alias)}</span>` : ''}
           </div>
-          <div style="display:flex;gap:4px">
+          <div style="display:flex;gap:5px">
             <button type="button" class="mini-action-btn btn-edit-fav" data-id="${escapeHtml(f.id)}" title="Editar etiqueta" aria-label="Editar etiqueta de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">✎</button>
             <button type="button" class="mini-action-btn btn-del-fav" data-id="${escapeHtml(f.id)}" title="Eliminar" aria-label="Eliminar parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)} de favoritas">✕</button>
           </div>
@@ -879,13 +935,21 @@ function renderFavorites() {
         <div class="stop-card-name">${escapeHtml(f.nombre)}</div>
         <div class="stop-card-foot">
           <span class="mono-meta" aria-hidden="true">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
-          <button type="button" class="seg-btn seg-btn-xs btn-open-fav" data-id="${escapeHtml(f.id)}" aria-label="Abrir radar de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">Abrir radar →</button>
+          <button type="button" class="seg-btn seg-btn-xs active btn-open-fav" data-id="${escapeHtml(f.id)}" aria-label="Abrir radar de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">Abrir radar →</button>
         </div>
       </div>
     `;
       }
     )
     .join('');
+
+  el.favoritasList.querySelectorAll('.stop-list-card[data-fav-id]').forEach((card) => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.btn-edit-fav, .btn-del-fav, .btn-open-fav')) return;
+      const fav = state.favorites.find((x) => x.id === card.dataset.favId);
+      if (fav) openStopRadar(fav, '000');
+    });
+  });
 
   el.favoritasList.querySelectorAll('.btn-open-fav').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -935,7 +999,7 @@ function closeAliasModal() {
 }
 
 // ============================================================================
-// Tabs & Fluid Interactive Mobile Bottom Sheet
+// Tabs, Desktop Collapsible Island & 3-State Gesture Mobile Sheet
 // ============================================================================
 function getActiveTab() {
   const active = Array.from(el.tabs).find((t) => t.classList.contains('active'));
@@ -954,6 +1018,12 @@ function switchTab(tabName) {
     p.classList.toggle('active', active);
     p.setAttribute('aria-hidden', String(!active));
   });
+  if (isBottomSheetLayout() && state.sheetIndex === 0) {
+    setSheetIndex(1, { silent: true });
+  }
+  if (state.desktopCollapsed) {
+    setDesktopCollapsed(false, { silent: true });
+  }
   if (tabName === 'lineas') {
     loadFlotaResumen(false);
   }
@@ -962,8 +1032,7 @@ function switchTab(tabName) {
 const SHEET_STATES = ['sheet-peek', 'sheet-half', 'sheet-full'];
 
 function getSheetIndex() {
-  const found = SHEET_STATES.findIndex((s) => el.dock.classList.contains(s));
-  return found === -1 ? 1 : found;
+  return typeof state.sheetIndex === 'number' ? state.sheetIndex : 1;
 }
 
 // Matches CSS breakpoints: bottom sheet on <= 860px except wide-landscape side-rail
@@ -975,32 +1044,131 @@ function isBottomSheetLayout() {
 function clearSheetInlineSize() {
   el.dock.style.height = '';
   el.dock.classList.remove('is-dragging');
-  el.appShell?.style.removeProperty('--sheet-h');
+  el.appShell?.style.removeProperty('--sheet-live-h');
 }
 
 function setSheetIndex(idx = 1, { silent = false } = {}) {
   clearSheetInlineSize();
-  const expanded = idx >= 2;
+  const clamped = Math.max(0, Math.min(2, Number(idx) || 0));
+  state.sheetIndex = clamped;
+  const isPeek = clamped === 0;
+  const expanded = clamped >= 2;
   state.dockExpanded = expanded;
+
   SHEET_STATES.forEach((s) => el.dock.classList.remove(s));
-  el.dock.classList.add(expanded ? 'sheet-full' : 'sheet-half');
+  el.dock.classList.add(SHEET_STATES[clamped]);
+  el.appShell?.classList.toggle('dock-peek', isPeek);
   el.appShell?.classList.toggle('dock-expanded', expanded);
+
+  if (el.btnDockPeek) {
+    el.btnDockPeek.classList.toggle('is-active', isPeek);
+    el.btnDockPeek.textContent = isPeek ? 'Subir' : 'Mapa';
+    el.btnDockPeek.setAttribute('aria-label', isPeek ? 'Restaurar panel a vista dividida' : 'Minimizar panel y ver mapa');
+  }
   if (el.btnDockSize) {
     el.btnDockSize.setAttribute('aria-pressed', String(expanded));
     el.btnDockSize.setAttribute('aria-label', expanded ? 'Volver a vista dividida con mapa' : 'Ampliar panel');
   }
   if (el.dockSizeLabel) {
-    el.dockSizeLabel.textContent = expanded ? 'Ver mapa' : 'Ampliar';
+    el.dockSizeLabel.textContent = expanded ? 'Mitad' : 'Ampliar';
   }
   requestAnimationFrame(() => transitMap.invalidateSize());
   if (!silent) haptic('light');
 }
 
+function setDesktopCollapsed(collapsed, { silent = false } = {}) {
+  state.desktopCollapsed = Boolean(collapsed);
+  el.appShell?.classList.toggle('desktop-collapsed', state.desktopCollapsed);
+  el.btnDesktopCollapse?.setAttribute('aria-expanded', String(!state.desktopCollapsed));
+  el.btnDesktopReopen?.classList.toggle('hidden', !state.desktopCollapsed);
+  if (!silent) haptic('light');
+  setTimeout(() => transitMap.invalidateSize(), 290);
+}
+
 function setupMobileSheet() {
   setSheetIndex(1, { silent: true });
-  el.btnDockSize?.addEventListener('click', () => {
-    setSheetIndex(state.dockExpanded ? 1 : 2);
+
+  el.btnDockSize?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setSheetIndex(state.sheetIndex >= 2 ? 1 : 2);
   });
+
+  el.btnDockPeek?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setSheetIndex(state.sheetIndex === 0 ? 1 : 0);
+  });
+
+  el.btnDesktopCollapse?.addEventListener('click', () => setDesktopCollapsed(true));
+  el.btnDesktopReopen?.addEventListener('click', () => setDesktopCollapsed(false));
+
+  // Smooth 60fps pointer/touch drag gesture on the mobile sheet handle
+  const handle = el.dockDragHandle;
+  if (handle) {
+    let dragging = false;
+    let startY = 0;
+    let startH = 0;
+    let lastY = 0;
+    let lastT = 0;
+    let velocityY = 0;
+
+    handle.addEventListener('pointerdown', (e) => {
+      if (!isBottomSheetLayout()) return;
+      if (e.target.closest('button')) return;
+      dragging = true;
+      startY = e.clientY;
+      lastY = e.clientY;
+      lastT = performance.now();
+      velocityY = 0;
+      startH = el.dock.getBoundingClientRect().height;
+      el.dock.classList.add('is-dragging');
+      handle.setPointerCapture?.(e.pointerId);
+    });
+
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const now = performance.now();
+      const dt = Math.max(1, now - lastT);
+      velocityY = (e.clientY - lastY) / dt;
+      lastY = e.clientY;
+      lastT = now;
+
+      const vh = window.innerHeight || 800;
+      const minPx = Math.min(114, Math.round(vh * 0.18));
+      const maxPx = Math.round(vh * 0.88);
+      const nextPx = Math.max(minPx, Math.min(maxPx, startH + (startY - e.clientY)));
+      el.appShell?.style.setProperty('--sheet-live-h', `${Math.round(nextPx)}px`);
+    });
+
+    const finishDrag = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      handle.releasePointerCapture?.(e.pointerId);
+      const vh = window.innerHeight || 800;
+      const curH = el.dock.getBoundingClientRect().height;
+      const ratio = curH / vh;
+
+      let targetIdx = state.sheetIndex;
+      if (Math.abs(e.clientY - startY) < 6) {
+        // Quick tap on the grab bar cycles Half <-> Full (or Peek -> Half)
+        targetIdx = state.sheetIndex === 0 ? 1 : state.sheetIndex === 1 ? 2 : 1;
+      } else if (velocityY < -0.55) {
+        targetIdx = Math.min(2, state.sheetIndex + 1);
+      } else if (velocityY > 0.55) {
+        targetIdx = Math.max(0, state.sheetIndex - 1);
+      } else if (ratio < 0.34) {
+        targetIdx = 0;
+      } else if (ratio > 0.68) {
+        targetIdx = 2;
+      } else {
+        targetIdx = 1;
+      }
+      setSheetIndex(targetIdx);
+    };
+
+    handle.addEventListener('pointerup', finishDrag);
+    handle.addEventListener('pointercancel', finishDrag);
+  }
+
   window.addEventListener('resize', () => {
     clearSheetInlineSize();
     requestAnimationFrame(() => transitMap.invalidateSize());
@@ -1008,7 +1176,7 @@ function setupMobileSheet() {
 }
 
 // ============================================================================
-// Clean Welcome State
+// Intuitive Welcome Hub
 // ============================================================================
 function renderRadarWelcome() {
   el.stopHero.classList.add('hidden');
@@ -1019,11 +1187,13 @@ function renderRadarWelcome() {
   filterStripSig = '';
 
   const topFavs = state.favorites.slice(0, 3);
+  const quickTrunk = state.quickStops.filter((qs) => !state.favorites.some((f) => f.id === qs.id)).slice(0, 4);
+
   const favsHtml =
     topFavs.length > 0
       ? `
       <div class="welcome-favs-block">
-        <span class="micro-heading">Favoritas</span>
+        <span class="micro-heading">Tus paradas favoritas</span>
         <div class="welcome-favs-list">
           ${topFavs
             .map(
@@ -1043,33 +1213,94 @@ function renderRadarWelcome() {
     `
       : '';
 
+  const quickStopsHtml =
+    topFavs.length === 0 && quickTrunk.length > 0
+      ? `
+      <div class="welcome-favs-block">
+        <span class="micro-heading">Paradas troncales rápidas</span>
+        <div class="welcome-favs-list">
+          ${quickTrunk
+            .map(
+              (qs) => `
+            <button type="button" class="welcome-fav-btn" data-welcome-quick="${escapeHtml(qs.id)}">
+              <span class="list-row-main">
+                <span class="list-row-title">${escapeHtml(qs.nombreCorto || qs.nombre || qs.id)}</span>
+                <span class="list-row-sub">${escapeHtml(Array.isArray(qs.lineas) ? qs.lineas.slice(0, 5).join(' · ') : 'Todas las líneas')}</span>
+              </span>
+              <span class="code-badge">${escapeHtml(qs.id)}</span>
+            </button>
+          `
+            )
+            .join('')}
+        </div>
+      </div>
+    `
+      : '';
+
+  const lineCountLabel = state.lineas.length > 0 ? `${state.lineas.length} líneas` : 'Líneas y horarios';
+
   el.arribosList.innerHTML = `
     <div class="radar-welcome">
-      <h2>Elegí una parada para iniciar</h2>
-      <p>Consultá arribos en vivo con coche, chofer, desvío horario, horarios programados 24h y rotaciones de servicio.</p>
+      <div class="welcome-hero-card">
+        <div class="welcome-hero-head">
+          <h2>¿Qué colectivo esperás hoy?</h2>
+          <p>Seguimiento satelital en vivo en Corrientes con coche, chofer, desvío real, horarios 24h y servicios.</p>
+        </div>
 
-      <form id="welcome-stop-form" class="welcome-code-form">
-        <input
-          id="welcome-stop-input"
-          type="text"
-          class="welcome-code-input"
-          placeholder="Ej: CT31498 o CT31942"
-          autocomplete="off"
-          aria-label="Código de parada"
-        />
-        <button type="submit" class="primary-action-btn">Buscar</button>
-      </form>
+        <form id="welcome-stop-form" class="welcome-code-form">
+          <input
+            id="welcome-stop-input"
+            type="text"
+            class="welcome-code-input"
+            placeholder="Código de parada (ej: CT31498)"
+            autocomplete="off"
+            aria-label="Código de parada"
+          />
+          <button type="submit" class="primary-action-btn">Abrir</button>
+        </form>
+      </div>
 
       <div class="welcome-actions">
-        <button id="btn-welcome-lineas" class="secondary-action-btn">Explorar líneas</button>
-        <button id="btn-welcome-cercanas" class="secondary-action-btn">Paradas cercanas</button>
+        <button type="button" id="btn-welcome-cercanas" class="welcome-tile-btn is-primary-tile">
+          <span class="welcome-tile-ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+            </svg>
+          </span>
+          <span class="welcome-tile-title">Cerca mío</span>
+          <span class="welcome-tile-sub">Paradas por GPS o zonas</span>
+        </button>
+
+        <button type="button" id="btn-welcome-lineas" class="welcome-tile-btn">
+          <span class="welcome-tile-ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="4" width="16" height="13" rx="2.5"/>
+              <path d="M4 11h16M8 17v3M16 17v3"/>
+            </svg>
+          </span>
+          <span class="welcome-tile-title">${escapeHtml(lineCountLabel)}</span>
+          <span class="welcome-tile-sub">Recorridos, servicios y flota</span>
+        </button>
       </div>
+
+      <button type="button" id="btn-welcome-free-fleet" class="welcome-free-banner ${state.allFleetMode ? 'is-active' : ''}">
+        <span class="welcome-free-left">
+          <span class="welcome-tile-ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="2"/>
+              <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
+            </svg>
+          </span>
+          <span class="list-row-main">
+            <span class="list-row-title">${state.allFleetMode ? 'Flota en calle activa' : 'Ver todos los colectivos en calle'}</span>
+            <span class="list-row-sub">Modo libre en tiempo real sobre todo el mapa</span>
+          </span>
+        </span>
+        <span class="row-chevron" aria-hidden="true">›</span>
+      </button>
 
       ${favsHtml}
-
-      <div class="welcome-tip">
-        Mové el mapa sobre cualquier avenida y usá la lupa inferior derecha para detectar paradas en esa zona.
-      </div>
+      ${quickStopsHtml}
     </div>
   `;
 
@@ -1082,16 +1313,32 @@ function renderRadarWelcome() {
       showToast('Ingresá un código de parada (ej. CT31498)', 'info');
       return;
     }
-    const known = state.quickStops.find((s) => s.id === raw) || state.favorites.find((f) => f.id === raw);
+    const known =
+      state.quickStops.find((s) => s.id === raw) ||
+      state.favorites.find((f) => f.id === raw) ||
+      state.catalogo?.stopById?.get(raw);
     openStopRadar(known || { id: raw, nombre: `Parada ${raw}` }, '000');
   });
 
   document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => switchTab('lineas'));
   document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => switchTab('cercanas'));
+  document.getElementById('btn-welcome-free-fleet')?.addEventListener('click', () => {
+    toggleAllFleetMode(!state.allFleetMode);
+    if (state.allFleetMode && isBottomSheetLayout()) {
+      setSheetIndex(0, { silent: true });
+    }
+    renderRadarWelcome();
+  });
   el.arribosList.querySelectorAll('[data-welcome-fav]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const fav = state.favorites.find((x) => x.id === btn.dataset.welcomeFav);
       if (fav) openStopRadar(fav, '000');
+    });
+  });
+  el.arribosList.querySelectorAll('[data-welcome-quick]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const qs = state.quickStops.find((x) => x.id === btn.dataset.welcomeQuick);
+      if (qs) openStopRadar(qs, '000');
     });
   });
 }
@@ -2749,8 +2996,8 @@ function renderAllFleetRoster() {
         const driverText = b.choferNombre
           ? `${b.choferNombre}${b.choferLegajo ? ` (${b.choferLegajo})` : ''}`
           : 'Chofer sin informar';
-        const desv = b.desvio || { label: '', cls: '' };
-        const desvHtml = desv.label ? `<span class="desvio-pill ${desv.cls}">${escapeHtml(desv.label)}</span>` : '';
+        const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
+        const desvHtml = desv ? `<span class="desvio-pill desvio-${escapeHtml(desv.status)}">${escapeHtml(desv.label)}</span>` : '';
         return `
           <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
             <div class="fleet-roster-main">
@@ -2801,8 +3048,8 @@ function renderAllFleetRoster() {
     .map((b) => {
       const lineColor = getLineColor(b.descripcionLinea);
       const bandera = b.realBandera || b.descripcionBandera || '';
-      const desv = b.desvio || { label: '', cls: '' };
-      const desvHtml = desv.label ? `<span class="desvio-pill ${desv.cls}">${escapeHtml(desv.label)}</span>` : '';
+      const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
+      const desvHtml = desv ? `<span class="desvio-pill desvio-${escapeHtml(desv.status)}">${escapeHtml(desv.label)}</span>` : '';
       return `
         <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
           <div class="fleet-roster-main">
@@ -4401,7 +4648,8 @@ async function locateFleetUnitOnMap({
       const paradas = Array.isArray(r.paradas) ? r.paradas : [];
       if (paradas.length > 2) {
         const mid = paradas[Math.floor(paradas.length * 0.5)];
-        if (mid?.Identificador) return String(mid.Identificador).trim().toUpperCase();
+        const rawId = mid?.identificador || mid?.Identificador || mid?.id;
+        if (rawId) return String(rawId).trim().toUpperCase();
       }
     }
     return '';
@@ -6452,61 +6700,60 @@ function renderLineasBreadcrumb() {
     return;
   }
 
-  const parts = [`<button type="button" class="crumb-btn" data-back="lineas">← Líneas</button>`];
+  const lineColor = linea ? getLineColor(linea.descripcion) : 'var(--accent)';
+  const isRec = step === 'recorrido';
+  const isSrv = step === 'flota' && state.flotaView.tab === 'servicios';
+  const isFlota = step === 'flota' && state.flotaView.tab !== 'servicios';
+  const isCallesTree = step === 'calles' || step === 'intersecciones' || step === 'paradas';
+
+  const trailParts = [`<button type="button" class="crumb-btn" data-back="lineas">← Líneas</button>`];
   if (linea) {
-    if (step === 'recorrido') {
-      parts.push(
-        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Horarios</span>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="servicios" aria-label="Ver servicios de línea ${escapeHtml(linea.descripcion)}">Servicios</button>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="flota" aria-label="Ver flota de línea ${escapeHtml(linea.descripcion)}">Flota</button>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="calles" aria-label="Ver calles de línea ${escapeHtml(linea.descripcion)}">Calles</button>`
-      );
-    } else if (step === 'flota') {
-      parts.push(
-        `<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Flota</span>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="recorrido" aria-label="Ver paradas y horarios de línea ${escapeHtml(linea.descripcion)}">Horarios</button>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="calles" aria-label="Ver calles y paradas de línea ${escapeHtml(linea.descripcion)}">Calles</button>`
-      );
-    } else if (step === 'calles') {
-      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">Línea ${escapeHtml(linea.descripcion)} · Calles</span>`);
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="recorrido" aria-label="Ver paradas y horarios de línea ${escapeHtml(linea.descripcion)}">Horarios</button>`
-      );
-      parts.push(
-        `<button type="button" class="crumb-btn" data-back="flota" aria-label="Ver flota de coches y choferes de línea ${escapeHtml(linea.descripcion)}">Flota</button>`
-      );
+    trailParts.push(
+      `<span class="line-plate-mini" style="--line-color:${lineColor}" aria-hidden="true">${escapeHtml(linea.descripcion)}</span>`
+    );
+    if (calle && isCallesTree) {
+      const shortCalle = calle.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
+      if (step === 'intersecciones') {
+        trailParts.push(
+          `<button type="button" class="crumb-btn" data-back="calles">Calles</button>`,
+          `<span class="crumb-current">${escapeHtml(shortCalle)}</span>`
+        );
+      } else if (step === 'paradas') {
+        const shortInt = (interseccion?.descripcion || '').replace(/\s*-\s*CORRIENTES$/i, '');
+        trailParts.push(
+          `<button type="button" class="crumb-btn" data-back="intersecciones">${escapeHtml(shortCalle)}</button>`,
+          `<span class="crumb-current">${escapeHtml(shortInt)}</span>`
+        );
+      }
     } else {
-      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><button type="button" class="crumb-btn" data-back="calles">${escapeHtml(linea.descripcion)}</button>`);
+      const sectionLabel = isRec ? 'Horarios y recorrido' : isSrv ? 'Servicios y turnos' : isFlota ? 'Flota y choferes' : 'Calles y paradas';
+      trailParts.push(`<span class="crumb-current">${sectionLabel}</span>`);
     }
-  }
-  if (calle && step !== 'flota' && step !== 'recorrido') {
-    const shortCalle = calle.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
-    if (step === 'intersecciones') {
-      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">${escapeHtml(shortCalle)}</span>`);
-    } else {
-      parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><button type="button" class="crumb-btn" data-back="intersecciones">${escapeHtml(shortCalle)}</button>`);
-    }
-  }
-  if (interseccion && step === 'paradas') {
-    const shortInt = interseccion.descripcion.replace(/\s*-\s*CORRIENTES$/i, '');
-    parts.push(`<span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-current">${escapeHtml(shortInt)}</span>`);
   }
 
-  el.lineasBreadcrumb.innerHTML = parts.join('');
+  const subnavHtml = linea
+    ? `
+      <div class="line-subnav-tabs" role="group" aria-label="Secciones de línea ${escapeHtml(linea.descripcion)}">
+        <button type="button" class="crumb-btn ${isRec ? 'is-active' : ''}" data-back="recorrido" aria-pressed="${isRec}">Horarios</button>
+        <button type="button" class="crumb-btn ${isSrv ? 'is-active' : ''}" data-back="servicios" aria-pressed="${isSrv}">Servicios</button>
+        <button type="button" class="crumb-btn ${isFlota ? 'is-active' : ''}" data-back="flota" aria-pressed="${isFlota}">Flota</button>
+        <button type="button" class="crumb-btn ${isCallesTree ? 'is-active' : ''}" data-back="calles" aria-pressed="${isCallesTree}">Calles</button>
+      </div>
+    `
+    : '';
+
+  el.lineasBreadcrumb.innerHTML = `
+    <div class="breadcrumb-top-row">
+      <div class="breadcrumb-trail">${trailParts.join('')}</div>
+    </div>
+    ${subnavHtml}
+  `;
+
   el.lineasBreadcrumb.querySelectorAll('.crumb-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const target = btn.dataset.back;
       el.lineasFilterInput.value = '';
+      el.btnLineasFilterClear?.classList.add('hidden');
       if (target === 'lineas') {
         state.drill = { step: 'lineas', linea: null, calle: null, interseccion: null, items: state.lineas };
         renderDrilldown();
@@ -6518,7 +6765,7 @@ function renderLineasBreadcrumb() {
       } else if (target === 'calles' && state.drill.linea) {
         openLineCalles(state.drill.linea);
       } else if (target === 'flota' && state.drill.linea) {
-        openLineFlota(state.drill.linea);
+        openLineFlota(state.drill.linea, { initialTab: 'coches' });
       } else if (target === 'intersecciones' && state.drill.linea && state.drill.calle) {
         openCalleIntersecciones(state.drill.calle);
       }
@@ -7060,6 +7307,7 @@ function buildFlotaDayAssignments({
 function renderLineFlotaView() {
   const linea = state.drill.linea;
   if (!linea) return;
+  if (state.drill.step === 'flota') renderLineasBreadcrumb();
   const fv = state.flotaView;
   const color = getLineColor(linea.descripcion);
 
@@ -9188,51 +9436,112 @@ function renderDrilldown() {
   }
 
   if (step === 'lineas') {
-    const filtered = state.lineas.filter((l) => l.descripcion.toLowerCase().includes(query));
-    el.lineasContent.innerHTML = `
-      <div class="lines-grid">
-        ${filtered
-          .map((l) => {
-            const color = getLineColor(l.descripcion);
-            const sum = state.flotaSummaryByLine.get(Number(l.codigo));
-            const peakOrHoy = sum ? sum.peakSimultaneousToday || sum.cochesHoy || 0 : 0;
-            const swapsNote =
-              sum && sum.replacementSwapsToday > 0
-                ? ` (${sum.cochesHoy} internos · ${sum.replacementSwapsToday} reempl.)`
-                : '';
-            const activeNote =
-              sum && sum.activeNow > 0 ? `${sum.activeNow} en línea ahora · ` : '';
-            const countBadge =
-              sum && sum.cochesSemana > 0
-                ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy}/${sum.cochesSemana}` : `${sum.cochesSemana}`} c.</span>`
-                : '';
-            const flotaAria =
-              sum && sum.cochesSemana > 0
-                ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${peakOrHoy} coches simultáneos hoy${
-                    sum.replacementSwapsToday > 0 ? ` (${sum.cochesHoy} internos en total)` : ''
-                  }, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
-                : `Ver flota de coches y choferes de línea ${l.descripcion}`;
-            return `
-              <div class="line-tile" style="--line-color:${color}">
-                <div class="line-tile-head">
-                  <button type="button" class="line-tile-title-btn btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas en orden de recorrido y horarios de línea ${escapeHtml(l.descripcion)}">
-                    <span class="line-tile-swatch" aria-hidden="true"></span>
-                    <span class="line-tile-name">${escapeHtml(l.descripcion)}</span>
-                  </button>
-                  ${countBadge}
-                </div>
-                <div class="line-tile-actions line-tile-actions-4">
-                  <button type="button" class="tile-mini-btn primary btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas ordenadas y horarios de línea ${escapeHtml(l.descripcion)}">Horarios</button>
-                  <button type="button" class="tile-mini-btn btn-line-servicios" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver servicios y turnos de línea ${escapeHtml(l.descripcion)}">Servicios</button>
-                  <button type="button" class="tile-mini-btn btn-line-flota" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="${escapeHtml(flotaAria)}">Flota</button>
-                  <button type="button" class="tile-mini-btn btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver calles y paradas de línea ${escapeHtml(l.descripcion)}">Calles</button>
-                </div>
-              </div>
-            `;
-          })
+    const families = ['ALL', '102', '103', '104', '105', '106', '108', '109', '902-904'];
+    const famLabels = {
+      ALL: `Todas (${state.lineas.length})`,
+      '102': '102',
+      '103': '103',
+      '104': '104',
+      '105': '105',
+      '106': '106',
+      '108': '108',
+      '109': '109',
+      '902-904': '902 · 904'
+    };
+    const matchesFamily = (desc) => {
+      if (query || state.lineFamilyFilter === 'ALL') return true;
+      if (state.lineFamilyFilter === '902-904') {
+        return desc.startsWith('902') || desc.startsWith('904');
+      }
+      return desc.startsWith(state.lineFamilyFilter);
+    };
+
+    const filtered = state.lineas.filter(
+      (l) => l.descripcion.toLowerCase().includes(query) && matchesFamily(l.descripcion.toUpperCase())
+    );
+
+    const familyStripHtml = !query
+      ? `
+      <div class="line-family-strip" role="group" aria-label="Filtrar por familia de línea">
+        ${families
+          .map(
+            (fam) => `
+          <button type="button" class="line-family-chip ${state.lineFamilyFilter === fam ? 'active' : ''}" data-line-family="${fam}" aria-pressed="${state.lineFamilyFilter === fam}">
+            ${escapeHtml(famLabels[fam])}
+          </button>
+        `
+          )
           .join('')}
       </div>
+    `
+      : '';
+
+    el.lineasContent.innerHTML = `
+      ${familyStripHtml}
+      <div class="lines-grid">
+        ${
+          filtered.length === 0
+            ? `<div class="empty-state"><h3>Sin líneas coincidentes</h3><p>Probá con otro filtro o número de línea.</p></div>`
+            : filtered
+                .map((l) => {
+                  const color = getLineColor(l.descripcion);
+                  const sum = state.flotaSummaryByLine.get(Number(l.codigo));
+                  const peakOrHoy = sum ? sum.peakSimultaneousToday || sum.cochesHoy || 0 : 0;
+                  const activeNow = sum?.activeNow || 0;
+                  const swapsNote =
+                    sum && sum.replacementSwapsToday > 0
+                      ? ` (${sum.cochesHoy} internos · ${sum.replacementSwapsToday} reempl.)`
+                      : '';
+                  const activeNote = activeNow > 0 ? `${activeNow} en línea ahora · ` : '';
+                  const livePillHtml =
+                    activeNow > 0
+                      ? `<span class="line-live-pill" aria-hidden="true">● ${activeNow} en línea</span>`
+                      : '';
+                  const countBadge =
+                    sum && sum.cochesSemana > 0
+                      ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} sem.`}</span>`
+                      : '';
+                  const flotaAria =
+                    sum && sum.cochesSemana > 0
+                      ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${peakOrHoy} coches simultáneos hoy${
+                          sum.replacementSwapsToday > 0 ? ` (${sum.cochesHoy} internos en total)` : ''
+                        }, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
+                      : `Ver flota de coches y choferes de línea ${l.descripcion}`;
+                  return `
+                    <div class="line-tile" style="--line-color:${color}">
+                      <div class="line-tile-head">
+                        <button type="button" class="line-tile-title-btn btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas en orden de recorrido y horarios de línea ${escapeHtml(l.descripcion)}">
+                          <span class="line-plate-mini" aria-hidden="true">${escapeHtml(l.descripcion)}</span>
+                          <span class="line-tile-name">Línea ${escapeHtml(l.descripcion)}</span>
+                        </button>
+                        <div class="line-tile-badges">
+                          ${livePillHtml}
+                          ${countBadge}
+                        </div>
+                      </div>
+                      <div class="line-tile-actions line-tile-actions-4">
+                        <button type="button" class="tile-mini-btn primary btn-line-recorrido" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver paradas ordenadas y horarios de línea ${escapeHtml(l.descripcion)}">Horarios</button>
+                        <button type="button" class="tile-mini-btn btn-line-servicios" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver servicios y turnos de línea ${escapeHtml(l.descripcion)}">Servicios</button>
+                        <button type="button" class="tile-mini-btn btn-line-flota" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="${escapeHtml(flotaAria)}">Flota</button>
+                        <button type="button" class="tile-mini-btn btn-line-calles" data-cod="${l.codigo}" data-desc="${escapeHtml(l.descripcion)}" aria-label="Ver calles y paradas de línea ${escapeHtml(l.descripcion)}">Calles</button>
+                      </div>
+                    </div>
+                  `;
+                })
+                .join('')
+        }
+      </div>
     `;
+
+    el.lineasContent.querySelectorAll('[data-line-family]').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const nextFam = chip.dataset.lineFamily || 'ALL';
+        if (state.lineFamilyFilter === nextFam) return;
+        state.lineFamilyFilter = nextFam;
+        haptic('light');
+        renderDrilldown();
+      });
+    });
 
     el.lineasContent.querySelectorAll('.btn-line-recorrido').forEach((btn) => {
       btn.addEventListener('click', () => openLineRecorrido({ codigo: Number(btn.dataset.cod), descripcion: btn.dataset.desc }));
@@ -9328,6 +9637,7 @@ function renderDrilldown() {
 
 async function openLineCalles(linea) {
   el.lineasFilterInput.value = '';
+  el.btnLineasFilterClear?.classList.add('hidden');
   state.drill = { step: 'calles', linea, calle: null, interseccion: null, items: [] };
   renderLineasBreadcrumb();
   el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div>`;
@@ -9343,6 +9653,7 @@ async function openLineCalles(linea) {
 
 async function openCalleIntersecciones(calle) {
   el.lineasFilterInput.value = '';
+  el.btnLineasFilterClear?.classList.add('hidden');
   state.drill = { ...state.drill, step: 'intersecciones', calle, interseccion: null, items: [] };
   renderLineasBreadcrumb();
   el.lineasContent.innerHTML = `<div class="skeleton-card"></div>`;
@@ -9358,6 +9669,7 @@ async function openCalleIntersecciones(calle) {
 
 async function openInterseccionParadas(interseccion) {
   el.lineasFilterInput.value = '';
+  el.btnLineasFilterClear?.classList.add('hidden');
   state.drill = { ...state.drill, step: 'paradas', interseccion, items: [] };
   renderLineasBreadcrumb();
   el.lineasContent.innerHTML = `<div class="skeleton-card"></div>`;
@@ -9421,7 +9733,9 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
           s.lineas ? `, líneas ${s.lineas}` : ''
         }`;
         return `
-          <div class="stop-list-card">
+          <div class="stop-list-card is-card-clickable" data-nearby-id="${escapeHtml(s.identificador)}" data-nearby-name="${escapeHtml(
+            s.descripcion
+          )}" data-nearby-lat="${sLat}" data-nearby-lng="${sLng}">
             <div class="stop-card-top">
               <span class="code-badge">${escapeHtml(s.identificador)}</span>
               <span class="mono-meta">${formatDistance(dist)} · ${formatWalkMin(dist)}</span>
@@ -9430,7 +9744,7 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
             <div class="stop-card-lines">${escapeHtml(s.lineas || '')}</div>
             <div class="stop-card-foot">
               <span class="mono-meta">${escapeHtml(s.callePrincipal || '')}</span>
-              <button type="button" class="seg-btn seg-btn-xs btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
+              <button type="button" class="seg-btn seg-btn-xs active btn-nearby-open" data-id="${escapeHtml(s.identificador)}" data-name="${escapeHtml(
                 s.descripcion
               )}" data-lat="${sLat}" data-lng="${sLng}" aria-label="${escapeHtml(openAria)}">Abrir radar →</button>
             </div>
@@ -9438,6 +9752,21 @@ async function searchNearbyStops(lat, lng, label = 'esta zona') {
         `;
       })
       .join('');
+
+    el.cercanasList.querySelectorAll('.stop-list-card[data-nearby-id]').forEach((card) => {
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('.btn-nearby-open')) return;
+        openStopRadar(
+          {
+            id: card.dataset.nearbyId,
+            nombre: card.dataset.nearbyName,
+            lat: parseFloat(card.dataset.nearbyLat),
+            lng: parseFloat(card.dataset.nearbyLng)
+          },
+          '000'
+        );
+      });
+    });
 
     el.cercanasList.querySelectorAll('.btn-nearby-open').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -10037,12 +10366,41 @@ function bindEvents() {
     if (e.target === el.aliasModal) closeAliasModal();
   });
 
-  el.lineasFilterInput.addEventListener('input', renderDrilldown);
-  el.globalSearch.addEventListener('input', (e) => renderGlobalSearchResults(e.target.value));
+  const syncLineasClearBtn = () => {
+    el.btnLineasFilterClear?.classList.toggle('hidden', !el.lineasFilterInput.value);
+  };
+  const syncGlobalClearBtn = () => {
+    el.btnSearchClear?.classList.toggle('hidden', !el.globalSearch.value);
+  };
+
+  el.lineasFilterInput.addEventListener('input', () => {
+    syncLineasClearBtn();
+    renderDrilldown();
+  });
+  el.btnLineasFilterClear?.addEventListener('click', () => {
+    el.lineasFilterInput.value = '';
+    syncLineasClearBtn();
+    renderDrilldown();
+    el.lineasFilterInput.focus();
+  });
+
+  el.globalSearch.addEventListener('input', (e) => {
+    syncGlobalClearBtn();
+    renderGlobalSearchResults(e.target.value);
+  });
+  el.btnSearchClear?.addEventListener('click', () => {
+    el.globalSearch.value = '';
+    syncGlobalClearBtn();
+    closeSearchDropdown();
+    el.globalSearch.focus();
+  });
   el.globalSearch.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       const first = el.searchDropdown.querySelector('.search-item[data-res-idx="0"]');
-      if (first) first.click();
+      if (first) {
+        first.click();
+        syncGlobalClearBtn();
+      }
     } else if (e.key === 'ArrowDown') {
       const first = el.searchDropdown.querySelector('.search-item[data-res-idx="0"]');
       if (first) {
@@ -10070,6 +10428,15 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
+    const activeTag = document.activeElement?.tagName;
+    const inField = activeTag === 'INPUT' || activeTag === 'TEXTAREA' || document.activeElement?.isContentEditable;
+    if (e.key === '/' && !inField && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      if (state.desktopCollapsed) setDesktopCollapsed(false, { silent: true });
+      el.globalSearch?.focus();
+      return;
+    }
+
     if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
       if (e.key === 'Escape') {
         closeThemeModal();
@@ -10290,6 +10657,7 @@ async function handleNativeBack() {
   const activeTab = getActiveTab();
   if (activeTab === 'lineas' && state.drill.step !== 'lineas') {
     el.lineasFilterInput.value = '';
+    el.btnLineasFilterClear?.classList.add('hidden');
     if (state.drill.step === 'paradas' && state.drill.calle) {
       await openCalleIntersecciones(state.drill.calle);
     } else if (state.drill.step === 'intersecciones' && state.drill.linea) {
@@ -10344,7 +10712,7 @@ async function init() {
   const prefersLight =
     typeof window !== 'undefined' &&
     window.matchMedia?.('(prefers-color-scheme: light)').matches;
-  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || (prefersLight ? '#ffffff' : '#10141c');
+  const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || (prefersLight ? '#f4f7fa' : '#12161a');
   applyTheme(savedTheme);
 
   const launchLink = await initNative({
@@ -10394,15 +10762,10 @@ async function init() {
     }
   }, 10 * 60 * 1000);
 
-  const params = new URLSearchParams(window.location.search);
-  const paramStopId = (params.get('idParada') || '').trim().toUpperCase();
-  const paramCodLinea = params.get('codLinea') || '000';
-
-  if (launchLink) {
-    await handleDeepLink(launchLink);
+  const urlLink = launchLink || parseDeepLink(window.location.href);
+  if (urlLink) {
+    await handleDeepLink(urlLink);
     if (!state.activeStop) renderRadarWelcome();
-  } else if (paramStopId) {
-    await openStopById(paramStopId, paramCodLinea);
   } else {
     renderRadarWelcome();
   }

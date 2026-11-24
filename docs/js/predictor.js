@@ -1932,6 +1932,7 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
     if (score < bestScore) {
       bestScore = score;
       best = {
+        trip: cand.t,
         branch: cand.t.branch,
         isStopBranch: cand.depth === 0,
         legDepth: cand.depth,

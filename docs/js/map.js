@@ -1,6 +1,14 @@
 import { CORRIENTES_CENTER, MAP_TILES, getLineColor, getDirectionColor } from './config.js';
 import { formatDistance } from './api.js';
 
+function escHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 export class TransitMap {
   constructor(containerId, { onBusSelect, onStopPick, onAllFleetBusSelect, onUserDrag } = {}) {
     this.onBusSelect = onBusSelect || (() => {});
@@ -79,25 +87,31 @@ export class TransitMap {
   }
 
   _getPadding() {
+    const shell = document.getElementById('app-shell');
     const header = document.querySelector('.top-bar');
     const dock = document.getElementById('transit-dock');
-    const topPad = header ? Math.max(60, Math.round(header.getBoundingClientRect().bottom + 14)) : 68;
     const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
     const isBottomSheet = window.innerWidth <= 860 && !isLandscapeRail;
 
     if (isBottomSheet) {
-      // On mobile portrait, .map-canvas occupies the fixed top 50% (bottom: 50dvh),
-      // so the dock no longer overlaps the map container.
+      const topPad = header ? Math.max(108, Math.round(header.getBoundingClientRect().bottom + 42)) : 136;
       return {
         paddingTopLeft: [18, topPad],
-        paddingBottomRight: [56, 22]
+        paddingBottomRight: [58, 28]
       };
     }
 
-    const leftPad = dock ? Math.round(dock.getBoundingClientRect().right + 18) : 400;
+    const isCollapsed = Boolean(shell?.classList.contains('desktop-collapsed'));
+    const leftPad = !isCollapsed && dock ? Math.round(dock.getBoundingClientRect().right + 20) : 28;
+    const insp = document.getElementById('bus-inspector');
+    const bottomPad =
+      insp && !insp.classList.contains('hidden')
+        ? Math.min(220, Math.round(insp.offsetHeight + 28))
+        : 44;
+
     return {
-      paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.55)), topPad],
-      paddingBottomRight: [66, 44]
+      paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.56)), 64],
+      paddingBottomRight: [68, bottomPad]
     };
   }
 
@@ -187,7 +201,7 @@ export class TransitMap {
 
     this.stopMarker = L.marker([stop.lat, stop.lng], { icon, zIndexOffset: 700, keyboard: false })
       .addTo(this.stopLayer)
-      .bindTooltip(`<strong>${stop.id}</strong> · ${stop.nombre || ''}`, {
+      .bindTooltip(`<strong>${escHtml(stop.id)}</strong> · ${escHtml(stop.nombre || '')}`, {
         direction: 'top',
         offset: [0, -14]
       });
@@ -235,11 +249,11 @@ export class TransitMap {
 
     const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
     const cocheHtml = bus.identificadorCoche
-      ? `<span class="bus-pill-coche">${bus.identificadorCoche}</span>`
+      ? `<span class="bus-pill-coche">${escHtml(bus.identificadorCoche)}</span>`
       : '';
     const dotHtml =
       bus.desvio && bus.desvio.status !== 'none'
-        ? `<span class="bus-desvio-dot ${bus.desvio.status}"></span>`
+        ? `<span class="bus-desvio-dot ${escHtml(bus.desvio.status)}"></span>`
         : bus.isPredicted || bus.gpsLost
           ? `<span class="bus-desvio-dot pred"></span>`
           : '';
@@ -250,9 +264,9 @@ export class TransitMap {
         <div class="${cls.join(' ')}" style="--bus-color:${color}">
           <div class="bus-pill-marker">
             ${dotHtml}
-            <span class="bus-pill-line">${bus.descripcionLinea}</span>
+            <span class="bus-pill-line">${escHtml(bus.descripcionLinea)}</span>
             ${cocheHtml}
-            <span class="bus-pill-eta">${etaShort}</span>
+            <span class="bus-pill-eta">${escHtml(etaShort)}</span>
           </div>
           <div class="bus-heading-dot"></div>
         </div>
@@ -357,11 +371,11 @@ export class TransitMap {
     const cls = ['bus-marker-wrap', 'is-city-fleet'];
     if (selected) cls.push('is-selected');
     const cocheHtml = bus.identificadorCoche
-      ? `<span class="bus-pill-coche">${bus.identificadorCoche}</span>`
+      ? `<span class="bus-pill-coche">${escHtml(bus.identificadorCoche)}</span>`
       : '';
     const dotHtml =
       bus.desvio && bus.desvio.status !== 'none'
-        ? `<span class="bus-desvio-dot ${bus.desvio.status}"></span>`
+        ? `<span class="bus-desvio-dot ${escHtml(bus.desvio.status)}"></span>`
         : `<span class="bus-desvio-dot ok"></span>`;
     return L.divIcon({
       className: 'bus-leaflet-icon',
@@ -369,7 +383,7 @@ export class TransitMap {
         <div class="${cls.join(' ')}" style="--bus-color:${color}">
           <div class="bus-pill-marker bus-pill-city">
             ${dotHtml}
-            <span class="bus-pill-line">${bus.descripcionLinea}</span>
+            <span class="bus-pill-line">${escHtml(bus.descripcionLinea)}</span>
             ${cocheHtml}
           </div>
           <div class="bus-heading-dot"></div>
@@ -629,7 +643,7 @@ export class TransitMap {
           weight: 3.5,
           opacity: 0.88
         })
-          .bindTooltip(`${lineName} · ${rec.abreviaturaBanderaSMP || 'Recorrido'}`, { sticky: true })
+          .bindTooltip(`${escHtml(lineName)} · ${escHtml(rec.abreviaturaBanderaSMP || 'Recorrido')}`, { sticky: true })
           .addTo(this.routeLayer);
       }
 
@@ -649,7 +663,7 @@ export class TransitMap {
             fillOpacity: 1
           }).addTo(this.routeStopsLayer);
 
-          dot.bindTooltip(`<strong>${p.identificador}</strong> · ${p.descripcion}`, {
+          dot.bindTooltip(`<strong>${escHtml(p.identificador)}</strong> · ${escHtml(p.descripcion)}`, {
             direction: 'top',
             offset: [0, -6]
           });
@@ -694,7 +708,7 @@ export class TransitMap {
         fillOpacity: 0.96
       }).addTo(this.nearbyLayer);
 
-      marker.bindTooltip(`<strong>${s.identificador}</strong> · ${s.descripcion}<br/><small>${s.lineas || ''}</small>`, {
+      marker.bindTooltip(`<strong>${escHtml(s.identificador)}</strong> · ${escHtml(s.descripcion)}<br/><small>${escHtml(s.lineas || '')}</small>`, {
         direction: 'top',
         offset: [0, -8]
       });

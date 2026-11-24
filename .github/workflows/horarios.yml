@@ -53,10 +53,18 @@ jobs:
             exit 0
           fi
           git commit -m "data: horarios programados $(date -u +%F)"
+          pushed_ok=false
           for i in 1 2 3; do
-            git pull --rebase origin main && git push origin HEAD:main && break
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              pushed_ok=true
+              break
+            fi
             sleep 5
           done
+          if [ "$pushed_ok" != "true" ]; then
+            echo "Error: git push falló tras 3 intentos." >&2
+            exit 1
+          fi
           echo "pushed=true" >> "$GITHUB_OUTPUT"
 
       - name: Publicar en GitHub Pages

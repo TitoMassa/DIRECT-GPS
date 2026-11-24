@@ -145,9 +145,12 @@ function setLocalCache(key, value) {
 const IDB_NAME = 'direct_gps_system_mirror';
 const IDB_STORE = 'snapshots';
 
+let mirrorDbPromise = null;
+
 function openMirrorDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
-  return new Promise((resolve) => {
+  if (mirrorDbPromise) return mirrorDbPromise;
+  mirrorDbPromise = new Promise((resolve) => {
     try {
       const req = indexedDB.open(IDB_NAME, 1);
       req.onupgradeneeded = () => {
@@ -155,12 +158,27 @@ function openMirrorDb() {
           req.result.createObjectStore(IDB_STORE);
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          db.close();
+          mirrorDbPromise = null;
+        };
+        db.onclose = () => {
+          mirrorDbPromise = null;
+        };
+        resolve(db);
+      };
+      req.onerror = () => {
+        mirrorDbPromise = null;
+        resolve(null);
+      };
     } catch {
+      mirrorDbPromise = null;
       resolve(null);
     }
   });
+  return mirrorDbPromise;
 }
 
 async function saveIdbValue(key, value) {
@@ -738,24 +756,43 @@ export const api = {
       if (res?.data) {
         // Merge into read-only offline mirror so airplane mode retains latest system assignments & stop arrivals
         readFleetMirror().then((existing) => {
+          const sameDay = existing?.dayKey === res.data.dayKey;
           const mergedTrips = new Map();
           const mergedUnits = new Map();
-          const mergedStops = { ...(existing?.stops || {}) };
-          for (const t of existing?.trips || []) {
-            mergedTrips.set(`${t.codigoLinea}:${t.tripKey}`, t);
+          const rawStops = sameDay ? { ...(existing?.stops || {}) } : {};
+          if (sameDay) {
+            for (const t of existing?.trips || []) {
+              if (!t.dayKey || t.dayKey === res.data.dayKey) {
+                mergedTrips.set(`${t.codigoLinea}:${t.tripKey}`, t);
+              }
+            }
+            for (const u of existing?.units || []) {
+              if (!u.dayKey || u.dayKey === res.data.dayKey) {
+                mergedUnits.set(`${u.codigoLinea}:${u.coche}`, u);
+              }
+            }
           }
           for (const t of res.data.trips || []) {
             mergedTrips.set(`${t.codigoLinea}:${t.tripKey}`, t);
-          }
-          for (const u of existing?.units || []) {
-            mergedUnits.set(`${u.codigoLinea}:${u.coche}`, u);
           }
           for (const u of res.data.units || []) {
             mergedUnits.set(`${u.codigoLinea}:${u.coche}`, u);
           }
           if (res.data.stopSnapshot?.idParada) {
-            mergedStops[res.data.stopSnapshot.idParada] = res.data.stopSnapshot;
+            rawStops[res.data.stopSnapshot.idParada] = {
+              ...res.data.stopSnapshot,
+              _savedAt: Date.now()
+            };
           }
+          const stopEntries = Object.entries(rawStops);
+          const mergedStops =
+            stopEntries.length > 60
+              ? Object.fromEntries(
+                  stopEntries
+                    .sort((a, b) => (Number(b[1]?._savedAt || b[1]?.ts) || 0) - (Number(a[1]?._savedAt || a[1]?.ts) || 0))
+                    .slice(0, 60)
+                )
+              : rawStops;
           saveFleetMirror({
             dayKey: res.data.dayKey,
             trips: [...mergedTrips.values()],
@@ -780,6 +817,12 @@ export const api = {
   reportFleetSeen: async (entries = [], dayKey = '') => {
     if (isBrowserOffline() || !Array.isArray(entries) || entries.length === 0) return;
     const nowMs = Date.now();
+    if (dayKey && reportedTripSigs.size > 0) {
+      const dayPrefix = `${dayKey}:`;
+      for (const k of reportedTripSigs.keys()) {
+        if (!k.startsWith(dayPrefix)) reportedTripSigs.delete(k);
+      }
+    }
     const toSend = [];
 
     for (const e of entries) {
@@ -993,7 +1036,7 @@ export const api = {
 
 // ── Full-Offline IndexedDB Snapshot Helpers (Resumen, Flota 7d, Búsqueda, Modo Libre) ──
 function getArgentinaDayKeyLocal(nowMs = Date.now()) {
-  const d = new Date(nowMs - 3 * 3600 * 1000);
+  const d = new Date(nowMs - 6 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }

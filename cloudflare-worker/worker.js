@@ -520,7 +520,8 @@ async function soapRequest(method, bodyInnerXml) {
       'Content-Type': 'text/xml; charset=utf-8',
       SOAPAction: `"${SOAP_NS}${method}"`
     },
-    body: envelope
+    body: envelope,
+    signal: AbortSignal.timeout(12000)
   });
 
   const xml = await res.text();
@@ -2074,7 +2075,7 @@ export class FleetMemory {
           const cap = capByLine.get(cod) || null;
           byLine.set(cod, {
             codigoLinea: cod,
-            descripcionLinea: desc || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
+            descripcionLinea: resolvePublicLineName(cod, desc) || LINE_NAMES_BY_CODE[cod] || `L${cod}`,
             cochesHoy: 0,
             cochesSemana: 0,
             choferesHoy: 0,
@@ -2955,7 +2956,10 @@ export class FleetMemory {
 
       const matches = [];
       for (const r of carRows) {
-        const hay = normalizeDriverNameKey(`${r.coche} ${r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || ''}`);
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const pubName = resolvePublicLineName(cod, r.descripcion_linea) || LINE_NAMES_BY_CODE[cod] || `L${cod}`;
+        const hay = normalizeDriverNameKey(`${r.coche} ${pubName}`);
         if (!hay.includes(normQ) && !String(r.coche || '').toUpperCase().includes(rawQ.toUpperCase())) continue;
         const u = unitMap.get(`${r.codigo_linea}:${r.coche}`) || null;
         const lat = r.last_lat ?? u?.lat ?? null;
@@ -2963,8 +2967,8 @@ export class FleetMemory {
         const enLineaAhora = r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff;
         matches.push({
           type: 'coche',
-          codigoLinea: r.codigo_linea,
-          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          codigoLinea: cod,
+          descripcionLinea: pubName,
           coche: r.coche,
           choferNombre: r.last_chofer_nombre || '',
           choferLegajo: r.last_chofer_legajo || '',
@@ -2991,6 +2995,9 @@ export class FleetMemory {
       }
 
       for (const r of drvRows) {
+        const cod = Number(r.codigo_linea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        const pubName = resolvePublicLineName(cod, r.descripcion_linea) || LINE_NAMES_BY_CODE[cod] || `L${cod}`;
         const hay = normalizeDriverNameKey(`${r.chofer_nombre} ${r.chofer_legajo || ''}`);
         if (!hay.includes(normQ)) continue;
         const u = r.last_coche ? unitMap.get(`${r.codigo_linea}:${r.last_coche}`) : null;
@@ -3000,8 +3007,8 @@ export class FleetMemory {
         matches.push({
           type: 'chofer',
           driverKey: r.driver_key,
-          codigoLinea: r.codigo_linea,
-          descripcionLinea: r.descripcion_linea || LINE_NAMES_BY_CODE[r.codigo_linea] || `L${r.codigo_linea}`,
+          codigoLinea: cod,
+          descripcionLinea: pubName,
           coche: r.last_coche || '',
           choferNombre: r.chofer_nombre,
           choferLegajo: r.chofer_legajo || '',
@@ -4870,12 +4877,13 @@ export default {
         if (stub) {
           if (targetOffset === 0) {
             try {
+              const serviceDayKey = getArgentinaDayKey();
               const histRes = await stub.fetch(
-                `https://fleet-memory/horarios-live?dayKey=${encodeURIComponent(dateIsoPrefix)}&codLinea=${lineNum}&idParada=${encodeURIComponent(stopId)}`
+                `https://fleet-memory/horarios-live?dayKey=${encodeURIComponent(serviceDayKey)}&codLinea=${lineNum}&idParada=${encodeURIComponent(stopId)}`
               );
               if (histRes.ok) {
                 const histJson = await histRes.json();
-                const storedList = histJson?.days?.[dateIsoPrefix]?.lineas?.[String(lineNum)]?.stops?.[stopId] || [];
+                const storedList = histJson?.days?.[serviceDayKey]?.lineas?.[String(lineNum)]?.stops?.[stopId] || [];
                 for (const raw of storedList) {
                   const [horaPaso, ...bandParts] = String(raw).split('|');
                   const bandera = bandParts.join('|');
@@ -4888,7 +4896,7 @@ export default {
                     codigoLinea: lineNum,
                     identificadorParada: stopId,
                     bandera,
-                    horaPaso: `${dateIsoPrefix} ${horaPaso}`,
+                    horaPaso: `${serviceDayKey} ${horaPaso}`,
                     hora: hhmm,
                     minuteOfDay: parseInt(hh, 10) * 60 + parseInt(mm, 10)
                   });

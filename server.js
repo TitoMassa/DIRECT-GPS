@@ -26,6 +26,8 @@ const BG_SCAN_INTERVAL_MIN = 5;
 const BG_SCAN_BATCH_SIZE = 18;
 const BG_SCAN_CONCURRENCY = 3;
 
+const REMOVED_LINE_CODES = new Set([517, 607, 608, 744, 851, 853, 854]);
+
 const LINE_NAMES_BY_CODE = {
   94: '102A',
   96: '102C',
@@ -47,16 +49,9 @@ const LINE_NAMES_BY_CODE = {
   353: '109B',
   356: '108A',
   357: '108C',
-  433: 'RIACHUELO - ERSA',
-  517: '904A CAMPUS / NAC',
-  607: '904B SARM / NAC',
-  608: '904C BQRAS / NAC',
-  705: 'SANTA ANA-INGENIO',
-  744: 'AEROBUS',
-  851: 'LINEA 110 / PROV',
-  852: 'CHAC CORR /NAC',
-  853: 'CHAC RES / NAC',
-  854: 'PTO. TIROL / PROV',
+  433: '103D',
+  705: '109C',
+  852: '902',
   1037: '904A',
   1038: '904B',
   1039: '904C'
@@ -84,13 +79,9 @@ const FLEET_SCAN_TARGETS = [
   [342, 'CT31244B'], [342, 'CT31922'],
   [353, 'CT31244B'], [353, 'CT31340'],
   [1037, 'CT31648'], [1037, 'CH326'],
-  [517, 'CH115'],
   [1038, 'L9041075'], [1038, 'L9041098'],
-  [607, 'L9041075'], [607, 'CT31212'],
   [1039, 'L9041057'], [1039, 'CT31212'],
-  [608, 'L9041057'], [608, 'CT31212'],
   [852, 'CH490'], [852, 'CH455'], [852, 'CH430'],
-  [854, 'CH1010'], [854, 'CH1007'],
   [433, 'CT31373'], [433, 'RCH010'],
   [705, 'CT31392B'], [705, 'CT31363'],
   [0, 'CT31180'], [0, 'CT31181'], [0, 'CT31498'], [0, 'CT31942'], [0, 'CT31581'], [0, 'CT31350']
@@ -130,7 +121,7 @@ function parseDesvioSeconds(raw = '') {
 }
 
 function parseGpsStampMs(raw = '') {
-  const m = String(raw || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  const m = String(raw || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
   if (!m) return 0;
   return Date.UTC(
     parseInt(m[3], 10),
@@ -675,13 +666,15 @@ async function handleApi(req, res, urlObj) {
       const activeCutoff = nowMs - 38 * 60 * 1000;
       const units = [];
       for (const u of Object.values(fleetStore.units || {})) {
+        const cod = Number(u.codigoLinea);
+        if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
         if ((u.updatedAt || 0) < activeCutoff) continue;
         const lat = Number(u.lat);
         const lng = Number(u.lng);
         if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) continue;
         units.push({
-          codigoLinea: Number(u.codigoLinea),
-          descripcionLinea: u.descripcionLinea || LINE_NAMES_BY_CODE[u.codigoLinea] || `L${u.codigoLinea}`,
+          codigoLinea: cod,
+          descripcionLinea: LINE_NAMES_BY_CODE[cod] || u.descripcionLinea || `L${cod}`,
           coche: u.coche,
           choferNombre: u.choferNombre || '',
           choferLegajo: u.choferLegajo || '',
@@ -700,6 +693,108 @@ async function handleApi(req, res, urlObj) {
       }
       return sendJson(res, 200, {
         data: { dayKey: todayKey, activeWindowMin: 38, units },
+        source: 'fleet-memory-disk',
+        savedAt: nowMs
+      });
+    }
+
+    if (pathname === '/api/flota-buscar' && req.method === 'GET') {
+      const nowMs = Date.now();
+      const todayKey = getArgentinaDayKey(nowMs);
+      const activeCutoff = nowMs - 38 * 60 * 1000;
+      const q = String(searchParams.get('q') || '').trim().toUpperCase();
+      const results = [];
+      if (q.length >= 2) {
+        for (const r of Object.values(fleetStore.cars || {})) {
+          const cod = Number(r.codigoLinea);
+          if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+          const desc = LINE_NAMES_BY_CODE[cod] || r.descripcionLinea || `L${cod}`;
+          if (`${r.coche} ${desc}`.toUpperCase().includes(q)) {
+            results.push({
+              type: 'coche',
+              codigoLinea: cod,
+              descripcionLinea: desc,
+              coche: r.coche,
+              choferNombre: r.lastChoferNombre || '',
+              choferLegajo: r.lastChoferLegajo || '',
+              esAdaptado: Boolean(r.esAdaptado),
+              enLineaAhora: r.lastDayKey === todayKey && (r.lastSeenAt || 0) >= activeCutoff,
+              lastBandera: r.lastBandera || '',
+              lastGps: r.lastGps || '',
+              lastStopId: r.lastStopId || '',
+              lastLat: r.lastLat ?? null,
+              lastLng: r.lastLng ?? null,
+              lastDesvioSec: r.lastDesvioSec || 0,
+              lastDesvioRaw: r.lastDesvioRaw || '',
+              lastSeenAt: r.lastSeenAt || 0,
+              lastDayKey: r.lastDayKey || todayKey
+            });
+          }
+        }
+        for (const d of Object.values(fleetStore.drivers || {})) {
+          const cod = Number(d.codigoLinea);
+          if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+          const desc = LINE_NAMES_BY_CODE[cod] || d.descripcionLinea || `L${cod}`;
+          if (`${d.choferNombre} ${d.choferLegajo || ''}`.toUpperCase().includes(q)) {
+            results.push({
+              type: 'chofer',
+              codigoLinea: cod,
+              descripcionLinea: desc,
+              coche: d.lastCoche || '',
+              choferNombre: d.choferNombre || '',
+              choferLegajo: d.choferLegajo || '',
+              esAdaptado: Boolean(d.lastEsAdaptado),
+              enLineaAhora: d.lastDayKey === todayKey && (d.lastSeenAt || 0) >= activeCutoff,
+              lastBandera: d.lastBandera || '',
+              lastGps: d.lastGps || '',
+              lastStopId: d.lastStopId || '',
+              lastLat: d.lastLat ?? null,
+              lastLng: d.lastLng ?? null,
+              lastDesvioSec: d.lastDesvioSec || 0,
+              lastDesvioRaw: d.lastDesvioRaw || '',
+              lastSeenAt: d.lastSeenAt || 0,
+              lastDayKey: d.lastDayKey || todayKey
+            });
+          }
+        }
+      }
+      return sendJson(res, 200, {
+        data: { dayKey: todayKey, results: results.slice(0, 30) },
+        source: 'fleet-memory-disk',
+        savedAt: nowMs
+      });
+    }
+
+    if (pathname === '/api/horarios-live' && req.method === 'GET') {
+      const nowMs = Date.now();
+      return sendJson(res, 200, {
+        data: { days: {}, meta: { updatedAt: nowMs } },
+        source: 'fleet-memory-disk',
+        savedAt: nowMs
+      });
+    }
+
+    if (pathname === '/api/offline-bundle' && req.method === 'GET') {
+      const nowMs = Date.now();
+      const todayKey = getArgentinaDayKey(nowMs);
+      const activeCutoff = nowMs - 38 * 60 * 1000;
+      const cars = Object.values(fleetStore.cars || {}).filter((c) => !REMOVED_LINE_CODES.has(Number(c.codigoLinea)));
+      const drivers = Object.values(fleetStore.drivers || {}).filter((d) => !REMOVED_LINE_CODES.has(Number(d.codigoLinea)));
+      const units = Object.values(fleetStore.units || {}).filter(
+        (u) => !REMOVED_LINE_CODES.has(Number(u.codigoLinea)) && (u.updatedAt || 0) >= activeCutoff
+      );
+      return sendJson(res, 200, {
+        data: {
+          dayKey: todayKey,
+          retentionDays: ROSTER_RETENTION_DAYS,
+          cars,
+          drivers,
+          units,
+          trips: Object.values(fleetStore.trips || {}).filter((t) => !REMOVED_LINE_CODES.has(Number(t.codigoLinea))),
+          dayObs: [],
+          capacityByLine: {},
+          liveHorarios: { days: {}, meta: { updatedAt: nowMs } }
+        },
         source: 'fleet-memory-disk',
         savedAt: nowMs
       });
