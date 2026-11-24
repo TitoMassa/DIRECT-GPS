@@ -1556,12 +1556,74 @@ input:focus-visible,
 }
 
 .rotation-continuity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   font-family: var(--font-mono);
   font-size: 10.5px;
+  line-height: 1.45;
   color: var(--text-2);
-  padding-top: 6px;
+  padding-top: 7px;
   border-top: 1px dashed var(--border-strong);
   font-variant-numeric: tabular-nums;
+}
+
+.rotation-turnos-line strong {
+  color: var(--text-1);
+}
+
+.rotation-places-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.rot-place-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  line-height: 1.3;
+}
+
+.rot-place-chip strong {
+  color: var(--text-1);
+  font-weight: 700;
+}
+
+.rot-place-chip.is-active-step {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.rot-place-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.rot-place-dot.is-inicio {
+  background: var(--ok);
+}
+
+.rot-place-dot.is-relevo {
+  background: var(--info);
+}
+
+.rot-place-dot.is-corte {
+  background: var(--warn);
+}
+
+.rot-place-dot.is-fin {
+  background: var(--late);
 }
 
 .rotation-laps-chain {
@@ -2411,6 +2473,18 @@ input:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.flota-srv-places {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--text-2);
+  line-height: 1.35;
+}
+
+.flota-srv-places strong {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
 .flota-map-cue {
   color: var(--accent);
   font-weight: 700;
@@ -2475,6 +2549,25 @@ input:focus-visible,
 .srv-turno-meta {
   font-size: 10.5px;
   color: var(--text-3);
+}
+
+.srv-turno-places {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+.srv-turno-places strong {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.srv-place-arrow {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin: 0 3px;
 }
 
 .srv-turno-bottom {
@@ -2651,6 +2744,30 @@ input:focus-visible,
   border-color: var(--accent);
   color: var(--accent);
   font-weight: 700;
+}
+
+.rec-srv-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+.rec-srv-summary-line {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.rec-srv-summary-line strong {
+  color: var(--text-1);
 }
 
 .rec-matrix-toolbar {
@@ -3248,6 +3365,22 @@ input:focus-visible,
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.insp-service-route {
+  display: block;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+.insp-service-route strong {
+  color: var(--text-1);
+  font-weight: 600;
 }
 
 .insp-line-btn {
@@ -4498,6 +4631,31 @@ button.ev-card:hover {
   border-radius: 5px;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+.ev-place-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.ev-place-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-2);
+}
+
+.ev-place-pill strong {
+  color: var(--text-1);
+  font-weight: 700;
 }
 
 .ev-actors {

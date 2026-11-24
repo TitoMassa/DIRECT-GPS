@@ -261,6 +261,7 @@ const el = {
   inspTurnoPill: document.getElementById('insp-turno-pill'),
   inspServicePill: document.getElementById('insp-service-pill'),
   inspAccessBadge: document.getElementById('insp-access-badge'),
+  inspServiceRoute: document.getElementById('insp-service-route'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
   inspEta: document.getElementById('insp-eta'),
@@ -331,6 +332,14 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.5.1',
+    date: '24/11/2026 · 14:40 hs',
+    items: [
+      '<strong>Detalle completo en Horarios 24h para servicios de un solo turno:</strong> al tocar cualquier horario de un servicio con turno único (por ejemplo <strong>Servicio 5 · Turno corrido</strong>), ahora se muestra siempre su franja horaria completa de inicio a fin (<code>T1 HH:MM–HH:MM</code>) y la cantidad total de vueltas igual que en los servicios multiturno.',
+      '<strong>Cabeceras de inicio, relevo, corte y finalización en las 26 líneas:</strong> todas las secciones de servicios, turnos y eventos informan automáticamente <strong>en dónde inicia</strong> cada servicio, <strong>dónde corta o retoma</strong>, <strong>dónde realiza el relevo</strong> y <strong>dónde finaliza</strong> —disponible en <strong>Horarios 24h</strong>, <strong>Líneas → Servicios</strong>, <strong>Eventos globales</strong>, <strong>Flota (Coches y Choferes)</strong>, <strong>Horarios y recorrido</strong>, <strong>Modo libre</strong> e <strong>Inspector de unidad</strong> sin necesidad de cotejar grillas manualmente.'
+    ]
+  },
   {
     version: 'v2.5.0',
     date: '23/11/2026 · 23:55 hs',
@@ -592,6 +601,173 @@ function escapeHtml(str = '') {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function describeTurnoPlaces(t, totalTurnos = 1) {
+  if (!t) return { startVerb: '', startLoc: '', endVerb: '', endLoc: '', textPlain: '', textHtml: '', spoken: '' };
+  const idx = Number(t.turnoIndex) || 1;
+  const count = Math.max(idx, Number(totalTurnos || t.serviceTurnosCount) || 1);
+  const isRelFromPrev = Boolean(t.relevoFromPrev);
+  const isRelToNext = Boolean(t.relevoToNext);
+  const isCortadoEnd = !isRelToNext && (idx < count || Boolean(t.isCortado || t.isCortadoBlock));
+
+  const startVerb = idx > 1 ? (isRelFromPrev ? 'Releva en' : 'Retoma en') : 'Inicia en';
+  const startLoc = (isRelFromPrev ? t.prevRelevoPlace : '') || t.startPlace || '';
+  const endVerb = isRelToNext ? 'Relevo en' : isCortadoEnd ? 'Corta en' : 'Finaliza en';
+  const endLoc = (isRelToNext ? t.relevoPlace : '') || t.endPlace || '';
+
+  if (!startLoc && !endLoc) {
+    return { startVerb, startLoc: '', endVerb, endLoc: '', textPlain: '', textHtml: '', spoken: '' };
+  }
+  if (startLoc && !endLoc) {
+    return {
+      startVerb,
+      startLoc,
+      endVerb: '',
+      endLoc: '',
+      textPlain: `${startVerb} ${startLoc}`,
+      textHtml: `${escapeHtml(startVerb)} <strong>${escapeHtml(startLoc)}</strong>`,
+      spoken: `${startVerb.toLowerCase()} ${startLoc}`
+    };
+  }
+  if (!startLoc && endLoc) {
+    return {
+      startVerb: '',
+      startLoc: '',
+      endVerb,
+      endLoc,
+      textPlain: `${endVerb} ${endLoc}`,
+      textHtml: `${escapeHtml(endVerb)} <strong>${escapeHtml(endLoc)}</strong>`,
+      spoken: `${endVerb.toLowerCase()} ${endLoc}`
+    };
+  }
+
+  const endSpokenJoin = isRelToNext ? `con relevo en ${endLoc}` : `y ${endVerb.toLowerCase()} ${endLoc}`;
+  return {
+    startVerb,
+    startLoc,
+    endVerb,
+    endLoc,
+    textPlain: `${startVerb} ${startLoc} → ${endVerb} ${endLoc}`,
+    textHtml: `${escapeHtml(startVerb)} <strong>${escapeHtml(startLoc)}</strong> <span class="srv-place-arrow" aria-hidden="true">→</span> ${escapeHtml(endVerb)} <strong>${escapeHtml(endLoc)}</strong>`,
+    spoken: `${startVerb.toLowerCase()} ${startLoc} ${endSpokenJoin}`
+  };
+}
+
+function buildServiceTurnosLineHtml(serviceNumber, turnos = [], activeBlockId = '') {
+  if (!Array.isArray(turnos) || turnos.length === 0) return '';
+  const pieces = [];
+  turnos.forEach((tr, idx) => {
+    const span = `${formatSecHHMM(tr.startSec)}–${formatSecHHMM(tr.endSec)}`;
+    const lapsTxt = tr.shiftLaps ? formatShiftLaps(tr.shiftLaps) : '';
+    const detail = [lapsTxt, tr.isCortado ? 'cortado' : null].filter(Boolean).join(', ');
+    const label = `T${tr.turnoIndex} ${span}${detail ? ` (${detail})` : ''}`;
+    const isSel = Boolean(activeBlockId && tr.blockId === activeBlockId) || (turnos.length === 1 && !activeBlockId);
+    pieces.push(isSel ? `<strong>${escapeHtml(label)}</strong>` : escapeHtml(label));
+    if (idx < turnos.length - 1) {
+      const nextT = turnos[idx + 1];
+      const isRel = tr.relevoToNext || (!tr.isCortado && nextT.startSec - tr.endSec <= 45 * 60);
+      pieces.push(isRel ? ' → relevo · ' : ' · ');
+    }
+  });
+  const prefix =
+    turnos.length > 1 ? `Mismo Servicio ${serviceNumber}: ` : `Horario del Servicio ${serviceNumber}: `;
+  return `${escapeHtml(prefix)}${pieces.join('')}`;
+}
+
+function buildServiceMilestonesHtml(turnos = [], activeBlockId = '') {
+  if (!Array.isArray(turnos) || turnos.length === 0) return '';
+  const chips = [];
+  const firstT = turnos[0];
+  const lastT = turnos[turnos.length - 1];
+
+  if (firstT.startPlace) {
+    const activeCls = activeBlockId && firstT.blockId === activeBlockId ? 'is-active-step' : '';
+    chips.push(
+      `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Inicia: <strong>${escapeHtml(
+        firstT.startPlace
+      )}</strong> (${escapeHtml(formatSecHHMM(firstT.startSec))})</span></span>`
+    );
+  }
+
+  for (let i = 0; i < turnos.length - 1; i++) {
+    const cur = turnos[i];
+    const next = turnos[i + 1];
+    const isRel = cur.relevoToNext || (!cur.isCortado && next.startSec - cur.endSec <= 45 * 60);
+    if (isRel) {
+      const relLoc = cur.relevoPlace || next.startPlace || cur.endPlace || '';
+      if (relLoc) {
+        const activeCls =
+          activeBlockId && (cur.blockId === activeBlockId || next.blockId === activeBlockId) ? 'is-active-step' : '';
+        const relTitle = turnos.length > 2 ? `Relevo T${cur.turnoIndex}→T${next.turnoIndex}` : 'Relevo';
+        chips.push(
+          `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-relevo" aria-hidden="true"></span><span>${escapeHtml(
+            relTitle
+          )}: <strong>${escapeHtml(relLoc)}</strong> (${escapeHtml(formatSecHHMM(next.startSec))})</span></span>`
+        );
+      }
+    } else {
+      if (cur.endPlace) {
+        const activeCls = activeBlockId && cur.blockId === activeBlockId ? 'is-active-step' : '';
+        chips.push(
+          `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-corte" aria-hidden="true"></span><span>Corta T${
+            cur.turnoIndex
+          }: <strong>${escapeHtml(cur.endPlace)}</strong> (${escapeHtml(formatSecHHMM(cur.endSec))})</span></span>`
+        );
+      }
+      if (next.startPlace) {
+        const activeCls = activeBlockId && next.blockId === activeBlockId ? 'is-active-step' : '';
+        chips.push(
+          `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Retoma T${
+            next.turnoIndex
+          }: <strong>${escapeHtml(next.startPlace)}</strong> (${escapeHtml(formatSecHHMM(next.startSec))})</span></span>`
+        );
+      }
+    }
+  }
+
+  if (lastT.endPlace) {
+    const activeCls = activeBlockId && lastT.blockId === activeBlockId ? 'is-active-step' : '';
+    const endKindCls = turnos.length === 1 && lastT.isCortado ? 'is-corte' : 'is-fin';
+    const endTitle = turnos.length === 1 && lastT.isCortado ? 'Corta' : 'Finaliza';
+    chips.push(
+      `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot ${endKindCls}" aria-hidden="true"></span><span>${endTitle}: <strong>${escapeHtml(
+        lastT.endPlace
+      )}</strong> (${escapeHtml(formatSecHHMM(lastT.endSec))})</span></span>`
+    );
+  }
+
+  return chips.length ? `<div class="rotation-places-row">${chips.join('')}</div>` : '';
+}
+
+function buildServiceMilestonesSpoken(turnos = []) {
+  if (!Array.isArray(turnos) || turnos.length === 0) return '';
+  const phrases = [];
+  const firstT = turnos[0];
+  const lastT = turnos[turnos.length - 1];
+  if (firstT.startPlace) {
+    phrases.push(`inicia a las ${formatSecHHMM(firstT.startSec)} en ${firstT.startPlace}`);
+  }
+  for (let i = 0; i < turnos.length - 1; i++) {
+    const cur = turnos[i];
+    const next = turnos[i + 1];
+    const isRel = cur.relevoToNext || (!cur.isCortado && next.startSec - cur.endSec <= 45 * 60);
+    if (isRel) {
+      const relLoc = cur.relevoPlace || next.startPlace || cur.endPlace || '';
+      phrases.push(
+        `relevo${relLoc ? ` en ${relLoc}` : ''} a las ${formatSecHHMM(next.startSec)} hacia turno ${next.turnoIndex}`
+      );
+    } else {
+      if (cur.endPlace) phrases.push(`corta turno ${cur.turnoIndex} a las ${formatSecHHMM(cur.endSec)} en ${cur.endPlace}`);
+      if (next.startPlace) phrases.push(`retoma turno ${next.turnoIndex} a las ${formatSecHHMM(next.startSec)} en ${next.startPlace}`);
+    }
+  }
+  if (lastT.endPlace) {
+    phrases.push(
+      `${turnos.length === 1 && lastT.isCortado ? 'corta' : 'finaliza'} a las ${formatSecHHMM(lastT.endSec)} en ${lastT.endPlace}`
+    );
+  }
+  return phrases.join(', ');
 }
 
 function announce(message, { assertive = false } = {}) {
@@ -2280,6 +2456,8 @@ function buildArrivalAriaLabel(bus) {
     const lapPhrase = lapSpoken
       ? `vuelta ${lapSpoken}${shiftLapsSpoken ? ` de ${shiftLapsSpoken} del turno` : ' del turno'}`
       : null;
+    const bi = bus.scheduledTrip?.blockInfo || null;
+    const places = describeTurnoPlaces(bi || bus, bus.serviceTurnosCount || 1);
     const srvDesc = [
       `Servicio ${bus.serviceNumber}`,
       bus.serviceTurnosCount > 1 ? `turno ${bus.turnoIndex || 1}` : null,
@@ -2288,7 +2466,8 @@ function buildArrivalAriaLabel(bus) {
         ? 'horario cortado'
         : bus.isRelevoEnLinea
           ? 'relevo en línea'
-          : null
+          : null,
+      places.spoken || null
     ]
       .filter(Boolean)
       .join(', ');
@@ -2337,14 +2516,23 @@ function buildArrivalTagsHtml(bus) {
     const srvLabel = lapTxt ? `S${bus.serviceNumber}·V${lapTxt}` : `S${bus.serviceNumber}`;
     const turnoTag = bus.serviceTurnosCount > 1 ? ` · Turno ${bus.turnoIndex || 1}/${bus.serviceTurnosCount}` : '';
     const shiftLapsTxt = bus.shiftLaps ? ` (${formatShiftLaps(bus.shiftLaps)})` : '';
+    const bi = bus.scheduledTrip?.blockInfo || null;
+    const spanTxt =
+      bus.turnoStart && bus.turnoEnd
+        ? `${bus.turnoStart}–${bus.turnoEnd}`
+        : bi
+          ? `${formatSecHHMM(bi.startSec)}–${formatSecHHMM(bi.endSec)}`
+          : '';
+    const places = describeTurnoPlaces(bi || bus, bus.serviceTurnosCount || 1);
     const regimeTag = bus.isCortadoBlock
       ? 'Horario cortado'
       : bus.isRelevoEnLinea
         ? 'Relevo en línea'
         : 'Turno corrido';
     const srvTip = [
-      `Servicio ${bus.serviceNumber}${turnoTag}${lapTxt ? ` · Vuelta ${lapTxt} del turno` : ''}${shiftLapsTxt}`,
+      `Servicio ${bus.serviceNumber}${turnoTag}${spanTxt ? ` (${spanTxt})` : ''}${lapTxt ? ` · Vuelta ${lapTxt} del turno` : ''}${shiftLapsTxt}`,
       regimeTag,
+      places.textPlain || null,
       bus.nextLapStopTime ? `Sig. vuelta: ${bus.nextLapStopTime}` : null
     ]
       .filter(Boolean)
@@ -2681,6 +2869,16 @@ function updateInspectorFields(bus) {
     el.inspTurnoPill.classList.add('hidden');
   }
 
+  const inspBi = bus.scheduledTrip?.blockInfo || bus._matchedTrip?.blockInfo || null;
+  const inspPlaces = bus.serviceNumber ? describeTurnoPlaces(inspBi || bus, bus.serviceTurnosCount || 1) : null;
+  const inspSpan =
+    bus.serviceSpan ||
+    (bus.turnoStart && bus.turnoEnd
+      ? `${bus.turnoStart}–${bus.turnoEnd}`
+      : inspBi
+        ? `${formatSecHHMM(inspBi.startSec)}–${formatSecHHMM(inspBi.endSec)}`
+        : '');
+
   if (el.inspServicePill) {
     if (bus.serviceNumber) {
       const lapTxt = bus.lapNumber ? formatLapNumber(bus.lapNumber) : '';
@@ -2695,10 +2893,28 @@ function updateInspectorFields(bus) {
           : bus.serviceTurnosCount > 1
             ? `Turno ${bus.turnoIndex || 1} de ${bus.serviceTurnosCount}`
             : 'Turno corrido';
-      el.inspServicePill.title = `Rotación estimada · ${regimeDesc}${shiftLapsTxt}`;
+      el.inspServicePill.title = [
+        `Rotación estimada · ${regimeDesc}${shiftLapsTxt}`,
+        inspSpan || null,
+        inspPlaces?.textPlain || null
+      ]
+        .filter(Boolean)
+        .join(' · ');
       el.inspServicePill.classList.remove('hidden');
     } else {
       el.inspServicePill.classList.add('hidden');
+    }
+  }
+
+  if (el.inspServiceRoute) {
+    if (bus.serviceNumber && (inspPlaces?.textHtml || inspSpan)) {
+      const tTag = bus.serviceTurnosCount > 1 ? ` · T${bus.turnoIndex || 1}/${bus.serviceTurnosCount}` : '';
+      const headHtml = `<strong>Srv ${bus.serviceNumber}${escapeHtml(tTag)}${inspSpan ? ` (${escapeHtml(inspSpan)})` : ''}</strong>`;
+      el.inspServiceRoute.innerHTML = inspPlaces?.textHtml ? `${headHtml} · ${inspPlaces.textHtml}` : headHtml;
+      el.inspServiceRoute.classList.remove('hidden');
+    } else {
+      el.inspServiceRoute.innerHTML = '';
+      el.inspServiceRoute.classList.add('hidden');
     }
   }
 
@@ -2976,7 +3192,7 @@ function renderAllFleetRoster() {
     });
     const filtered = q
       ? sorted.filter((b) =>
-          `${b.identificadorCoche} ${b.descripcionLinea} ${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.realBandera || b.descripcionBandera || ''}`
+          `${b.identificadorCoche} ${b.descripcionLinea} ${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
             .toLowerCase()
             .includes(q)
         )
@@ -2988,6 +3204,16 @@ function renderAllFleetRoster() {
       }</div>`;
       return;
     }
+
+    const buildRosterSrvHtml = (b) => {
+      if (!b.serviceNumber) return '';
+      const bi = b._matchedTrip?.blockInfo || null;
+      const places = describeTurnoPlaces(bi || b, b.serviceTurnosCount || 1);
+      const tTag = b.serviceTurnosCount > 1 ? ` · T${b.turnoIndex || 1}/${b.serviceTurnosCount}` : '';
+      const span = b.serviceSpan ? ` (${b.serviceSpan})` : '';
+      const head = `Srv ${b.serviceNumber}${tTag}${span}`;
+      return `<div class="fleet-roster-meta">${escapeHtml(head)}${places.textPlain ? ` · ${escapeHtml(places.textPlain)}` : ''}</div>`;
+    };
 
     el.allFleetRosterBody.innerHTML = filtered
       .map((b) => {
@@ -3007,6 +3233,7 @@ function renderAllFleetRoster() {
               </div>
               <div class="fleet-roster-sub">${escapeHtml(driverText)}</div>
               ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
+              ${buildRosterSrvHtml(b)}
             </div>
             <div class="fleet-roster-right">
               ${desvHtml}
@@ -3027,7 +3254,7 @@ function renderAllFleetRoster() {
   });
   const filteredDrivers = q
     ? sortedDrivers.filter((b) =>
-        `${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.identificadorCoche} ${b.descripcionLinea} ${b.realBandera || b.descripcionBandera || ''}`
+        `${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.identificadorCoche} ${b.descripcionLinea} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
           .toLowerCase()
           .includes(q)
       )
@@ -3050,6 +3277,11 @@ function renderAllFleetRoster() {
       const bandera = b.realBandera || b.descripcionBandera || '';
       const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
       const desvHtml = desv ? `<span class="desvio-pill desvio-${escapeHtml(desv.status)}">${escapeHtml(desv.label)}</span>` : '';
+      const bi = b._matchedTrip?.blockInfo || null;
+      const places = b.serviceNumber ? describeTurnoPlaces(bi || b, b.serviceTurnosCount || 1) : null;
+      const srvMetaTxt = b.serviceNumber
+        ? `Srv ${b.serviceNumber}${b.serviceTurnosCount > 1 ? ` · T${b.turnoIndex || 1}/${b.serviceTurnosCount}` : ''}${b.serviceSpan ? ` (${b.serviceSpan})` : ''}${places?.textPlain ? ` · ${places.textPlain}` : ''}`
+        : '';
       return `
         <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
           <div class="fleet-roster-main">
@@ -3059,6 +3291,7 @@ function renderAllFleetRoster() {
             </div>
             <div class="fleet-roster-sub">Coche ${escapeHtml(b.identificadorCoche)}${b.choferLegajo ? ` · Leg. ${escapeHtml(b.choferLegajo)}` : ''}</div>
             ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
+            ${srvMetaTxt ? `<div class="fleet-roster-meta">${escapeHtml(srvMetaTxt)}</div>` : ''}
           </div>
           <div class="fleet-roster-right">
             ${desvHtml}
@@ -3273,6 +3506,12 @@ function applyScheduleMetaToCityBus(bus, meta, model = null) {
   bus.turnoStart = meta.startHHMM;
   bus.turnoEnd = meta.endHHMM;
   bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
+  bus.startPlace = meta.startPlace || meta.blockInfo?.startPlace || '';
+  bus.endPlace = meta.endPlace || meta.blockInfo?.endPlace || '';
+  bus.relevoToNext = Boolean(meta.relevoToNext ?? meta.blockInfo?.relevoToNext);
+  bus.relevoFromPrev = Boolean(meta.relevoFromPrev ?? meta.blockInfo?.relevoFromPrev);
+  bus.relevoPlace = meta.relevoPlace || meta.blockInfo?.relevoPlace || '';
+  bus.prevRelevoPlace = meta.prevRelevoPlace || meta.blockInfo?.prevRelevoPlace || '';
 }
 
 function enrichCityFleetWithSchedules(buses, nowSec, todayTipo) {
@@ -4051,6 +4290,12 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
           shiftLaps: turno.shiftLaps || null,
           isCortado: Boolean(turno.isCortado),
           isRelevoEnLinea: Boolean(turno.isRelevoEnLinea),
+          relevoFromPrev: Boolean(turno.relevoFromPrev),
+          relevoToNext: Boolean(turno.relevoToNext),
+          startPlace: turno.startPlace || '',
+          endPlace: turno.endPlace || '',
+          relevoPlace: turno.relevoPlace || '',
+          prevRelevoPlace: turno.prevRelevoPlace || '',
           startHHMM: formatSecHHMM(turno.startSec),
           endHHMM: formatSecHHMM(turno.endSec)
         }
@@ -4063,6 +4308,20 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
 
       const firstT = turnos[0];
       const firstAssign = blockAssignMap.get(firstT.blockId) || null;
+      const firstNextT = turnos.length > 1 ? turnos[1] : null;
+      const firstIsRel = Boolean(firstNextT && (firstT.relevoToNext || (!firstT.isCortado && firstNextT.startSec - firstT.endSec <= 45 * 60)));
+      const firstEndSummary = firstIsRel
+        ? firstT.relevoPlace || firstT.endPlace
+          ? `relevo en ${firstT.relevoPlace || firstT.endPlace}`
+          : ''
+        : turnos.length > 1 || firstT.isCortado
+          ? firstT.endPlace
+            ? `corta en ${firstT.endPlace}`
+            : ''
+          : firstT.endPlace
+            ? `finaliza en ${firstT.endPlace}`
+            : '';
+
       events.push({
         kind: 'inicio_servicio',
         category: 'inicio',
@@ -4072,9 +4331,14 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
         serviceNumber: srv.serviceNumber,
         turnosCount: turnos.length,
         title: turnos.length > 1 ? 'Inicio de servicio · T1' : 'Inicio de servicio',
+        placeHtml: firstT.startPlace
+          ? `<span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Inicia en <strong>${escapeHtml(firstT.startPlace)}</strong></span>`
+          : '',
+        placeText: firstT.startPlace ? `Inicia en ${firstT.startPlace}` : '',
         metaText: [
           `${formatSecHHMM(firstT.startSec)}–${formatSecHHMM(firstT.endSec)}`,
-          firstT.shiftLaps ? formatShiftLaps(firstT.shiftLaps) : ''
+          firstT.shiftLaps ? formatShiftLaps(firstT.shiftLaps) : '',
+          firstEndSummary
         ]
           .filter(Boolean)
           .join(' · '),
@@ -4092,7 +4356,7 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
         const nextAssign = blockAssignMap.get(nextT.blockId) || null;
         const gapSec = nextT.startSec - curT.endSec;
 
-        if (gapSec <= 45 * 60) {
+        if (curT.relevoToNext || (!curT.isCortado && gapSec <= 45 * 60)) {
           // Continuous shift handoff / relevo
           const preferredAssign =
             nextAssign?.coche && (!isToday || nowSvcSec >= nextT.startSec - 1800 || !curAssign?.coche)
@@ -4102,6 +4366,32 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
                 : nextAssign?.coche
                   ? { assign: nextAssign, turno: nextT }
                   : null;
+          const relLoc = curT.relevoPlace || nextT.startPlace || curT.endPlace || '';
+          const diffEndStart = Boolean(curT.endPlace && nextT.startPlace && curT.endPlace !== nextT.startPlace);
+          const relPlaceHtml = diffEndStart
+            ? `<span class="rot-place-dot is-relevo" aria-hidden="true"></span><span>Llega a <strong>${escapeHtml(curT.endPlace)}</strong> · Releva en <strong>${escapeHtml(nextT.startPlace)}</strong></span>`
+            : relLoc
+              ? `<span class="rot-place-dot is-relevo" aria-hidden="true"></span><span>Relevo en <strong>${escapeHtml(relLoc)}</strong></span>`
+              : '';
+          const relPlaceText = diffEndStart
+            ? `Llega a ${curT.endPlace} · Releva en ${nextT.startPlace}`
+            : relLoc
+              ? `Relevo en ${relLoc}`
+              : '';
+          const afterNextT = i + 2 < turnos.length ? turnos[i + 2] : null;
+          const nextIsRel = Boolean(afterNextT && (nextT.relevoToNext || (!nextT.isCortado && afterNextT.startSec - nextT.endSec <= 45 * 60)));
+          const nextEndSummary = nextIsRel
+            ? nextT.relevoPlace || nextT.endPlace
+              ? `sig. relevo en ${nextT.relevoPlace || nextT.endPlace}`
+              : ''
+            : nextT.turnoIndex < turnos.length || nextT.isCortado
+              ? nextT.endPlace
+                ? `corta en ${nextT.endPlace}`
+                : ''
+              : nextT.endPlace
+                ? `finaliza en ${nextT.endPlace}`
+                : '';
+
           events.push({
             kind: 'relevo',
             category: 'relevo',
@@ -4111,9 +4401,12 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             serviceNumber: srv.serviceNumber,
             turnosCount: turnos.length,
             title: `Relevo · T${curT.turnoIndex} → T${nextT.turnoIndex}`,
+            placeHtml: relPlaceHtml,
+            placeText: relPlaceText,
             metaText: [
               `T${nextT.turnoIndex} ${formatSecHHMM(nextT.startSec)}–${formatSecHHMM(nextT.endSec)}`,
-              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : ''
+              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : '',
+              nextEndSummary
             ]
               .filter(Boolean)
               .join(' · '),
@@ -4125,6 +4418,20 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
           });
         } else {
           // Cortado split: distinct end of turno + later start of turno
+          const afterNextT = i + 2 < turnos.length ? turnos[i + 2] : null;
+          const nextIsRel = Boolean(afterNextT && (nextT.relevoToNext || (!nextT.isCortado && afterNextT.startSec - nextT.endSec <= 45 * 60)));
+          const nextEndSummary = nextIsRel
+            ? nextT.relevoPlace || nextT.endPlace
+              ? `relevo en ${nextT.relevoPlace || nextT.endPlace}`
+              : ''
+            : nextT.turnoIndex < turnos.length || nextT.isCortado
+              ? nextT.endPlace
+                ? `corta en ${nextT.endPlace}`
+                : ''
+              : nextT.endPlace
+                ? `finaliza en ${nextT.endPlace}`
+                : '';
+
           events.push({
             kind: 'fin_turno',
             category: 'fin',
@@ -4134,7 +4441,16 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             serviceNumber: srv.serviceNumber,
             turnosCount: turnos.length,
             title: `Fin de turno T${curT.turnoIndex}`,
-            metaText: `Cortado · receso hasta ${formatSecHHMM(nextT.startSec)}`,
+            placeHtml: curT.endPlace
+              ? `<span class="rot-place-dot is-corte" aria-hidden="true"></span><span>Corta en <strong>${escapeHtml(curT.endPlace)}</strong></span>`
+              : '',
+            placeText: curT.endPlace ? `Corta en ${curT.endPlace}` : '',
+            metaText: [
+              curT.startPlace ? `Inició en ${curT.startPlace}` : 'Cortado',
+              `retoma ${formatSecHHMM(nextT.startSec)}${nextT.startPlace ? ` en ${nextT.startPlace}` : ''}`
+            ]
+              .filter(Boolean)
+              .join(' · '),
             actorLabel: 'Finaliza',
             actor: curAssign,
             outActor: null,
@@ -4150,9 +4466,14 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             serviceNumber: srv.serviceNumber,
             turnosCount: turnos.length,
             title: `Inicio de turno T${nextT.turnoIndex}`,
+            placeHtml: nextT.startPlace
+              ? `<span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Retoma en <strong>${escapeHtml(nextT.startPlace)}</strong></span>`
+              : '',
+            placeText: nextT.startPlace ? `Retoma en ${nextT.startPlace}` : '',
             metaText: [
               `${formatSecHHMM(nextT.startSec)}–${formatSecHHMM(nextT.endSec)}`,
-              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : ''
+              nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : '',
+              nextEndSummary
             ]
               .filter(Boolean)
               .join(' · '),
@@ -4176,7 +4497,16 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
         serviceNumber: srv.serviceNumber,
         turnosCount: turnos.length,
         title: turnos.length > 1 ? `Fin de servicio · T${lastT.turnoIndex}` : 'Fin de servicio',
-        metaText: `Fin de jornada · Srv ${srv.serviceNumber}`,
+        placeHtml: lastT.endPlace
+          ? `<span class="rot-place-dot is-fin" aria-hidden="true"></span><span>Finaliza en <strong>${escapeHtml(lastT.endPlace)}</strong></span>`
+          : '',
+        placeText: lastT.endPlace ? `Finaliza en ${lastT.endPlace}` : '',
+        metaText: [
+          `Fin de jornada · Srv ${srv.serviceNumber}`,
+          firstT.startPlace ? `inició ${formatSecHHMM(firstT.startSec)} en ${firstT.startPlace}` : ''
+        ]
+          .filter(Boolean)
+          .join(' · '),
         actorLabel: 'Finaliza',
         actor: lastAssign,
         outActor: null,
@@ -4280,6 +4610,8 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
       `servicio ${ev.serviceNumber}`,
       `srv ${ev.serviceNumber}`,
       ev.title,
+      ev.placeText || '',
+      ev.metaText || '',
       formatSecHHMM(ev.eventSec),
       ev.actor?.coche || '',
       ev.actor?.choferNombre || '',
@@ -4397,6 +4729,8 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
       busTarget: ev.target
     });
 
+    const placeRowHtml = ev.placeHtml ? `<div class="ev-place-row"><span class="ev-place-pill">${ev.placeHtml}</span></div>` : '';
+
     htmlParts.push(`
       <div class="ev-item ${phaseCls}" role="listitem">
         <div class="ev-time-col" aria-hidden="true">
@@ -4415,6 +4749,7 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
               </div>
               <span class="ev-srv-tag">Srv ${ev.serviceNumber}</span>
             </div>
+            ${placeRowHtml}
             <div class="ev-actors">${actorsHtml}</div>
             <div class="ev-card-foot">
               <span class="ev-meta-txt">${escapeHtml(ev.metaText)}</span>
@@ -4662,8 +4997,15 @@ async function locateFleetUnitOnMap({
     const parsedDesv = raw.desvioRaw || raw.desvioHorario
       ? parseDesvioHorario(raw.desvioRaw || raw.desvioHorario)
       : { status: 'none', label: '', seconds: Number(raw.desvioSec) || 0, raw: '' };
-    const startHHMM = meta?.startHHMM || '';
-    const endHHMM = meta?.endHHMM || '';
+    const resolvedBi =
+      meta?.blockInfo ||
+      (meta?.serviceNumber && model?.blocks
+        ? model.blocks.find(
+            (b) => b.serviceNumber === Number(meta.serviceNumber) && b.turnoIndex === Number(meta.turnoIndex || 1)
+          ) || null
+        : null);
+    const startHHMM = meta?.startHHMM || (resolvedBi ? formatSecHHMM(resolvedBi.startSec) : '');
+    const endHHMM = meta?.endHHMM || (resolvedBi ? formatSecHHMM(resolvedBi.endSec) : '');
     const serviceSpan = startHHMM && endHHMM ? `${startHHMM}–${endHHMM}` : '';
     const bCoche = String(raw.coche || raw.identificadorCoche || coche || '').trim();
     const gpsRaw = raw.ultimaFechaHoraGPS || raw.lastGps || lastGps || '';
@@ -4696,11 +5038,17 @@ async function locateFleetUnitOnMap({
       lastSeenLabel,
       serviceNumber: meta?.serviceNumber || null,
       turnoIndex: meta?.turnoIndex || 1,
-      serviceTurnosCount: meta?.serviceTurnosCount || 1,
+      serviceTurnosCount: meta?.serviceTurnosCount || resolvedBi?.serviceTurnosCount || 1,
       lapNumber: meta?.lapNumber || null,
-      shiftLaps: meta?.shiftLaps || null,
-      isCortadoBlock: Boolean(meta?.isCortado),
-      isRelevoEnLinea: Boolean(meta?.isRelevoEnLinea),
+      shiftLaps: meta?.shiftLaps || resolvedBi?.shiftLaps || null,
+      isCortadoBlock: Boolean(meta?.isCortado ?? resolvedBi?.isCortado),
+      isRelevoEnLinea: Boolean(meta?.isRelevoEnLinea ?? resolvedBi?.isRelevoEnLinea),
+      relevoFromPrev: Boolean(meta?.relevoFromPrev ?? resolvedBi?.relevoFromPrev),
+      relevoToNext: Boolean(meta?.relevoToNext ?? resolvedBi?.relevoToNext),
+      startPlace: meta?.startPlace || resolvedBi?.startPlace || '',
+      endPlace: meta?.endPlace || resolvedBi?.endPlace || '',
+      relevoPlace: meta?.relevoPlace || resolvedBi?.relevoPlace || '',
+      prevRelevoPlace: meta?.prevRelevoPlace || resolvedBi?.prevRelevoPlace || '',
       turnoStart: startHHMM,
       turnoEnd: endHHMM,
       serviceSpan,
@@ -6006,44 +6354,66 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
     })
     .join('');
 
-  // Continuity line showing all turnos of this same service across the full service day
+  // Full service schedule (1-turno AND multi-turno!) + start / relevo / corte / end cabeceras
   let continuityHtml = '';
   let continuitySpoken = '';
-  const allTurnos = Array.isArray(blockInfo.serviceTurnos) ? blockInfo.serviceTurnos : [];
+  const allTurnos =
+    Array.isArray(blockInfo.serviceTurnos) && blockInfo.serviceTurnos.length > 0
+      ? blockInfo.serviceTurnos
+      : [
+          {
+            blockId: blockInfo.blockId,
+            turnoIndex: blockInfo.turnoIndex || 1,
+            startSec: blockInfo.startSec,
+            endSec: blockInfo.endSec,
+            shiftLaps: blockInfo.shiftLaps,
+            isCortado: blockInfo.isCortado,
+            isRelevoEnLinea: blockInfo.isRelevoEnLinea,
+            relevoFromPrev: blockInfo.relevoFromPrev,
+            relevoToNext: blockInfo.relevoToNext,
+            startPlace: blockInfo.startPlace || '',
+            endPlace: blockInfo.endPlace || '',
+            relevoPlace: blockInfo.relevoPlace || '',
+            prevRelevoPlace: blockInfo.prevRelevoPlace || ''
+          }
+        ];
+
+  const turnosLineHtml = buildServiceTurnosLineHtml(blockInfo.serviceNumber, allTurnos, blockInfo.blockId);
+  const milestonesHtml = buildServiceMilestonesHtml(allTurnos, blockInfo.blockId);
+  const milestonesSpoken = buildServiceMilestonesSpoken(allTurnos);
+
+  if (turnosLineHtml || milestonesHtml) {
+    continuityHtml = `
+      <div class="rotation-continuity">
+        ${turnosLineHtml ? `<div class="rotation-turnos-line">${turnosLineHtml}</div>` : ''}
+        ${milestonesHtml}
+      </div>
+    `;
+  }
+
   if (allTurnos.length > 1) {
-    const descPieces = [];
-    allTurnos.forEach((tr, idx) => {
-      const span = `${formatSecHHMM(tr.startSec)}–${formatSecHHMM(tr.endSec)}`;
-      const lapsTxt = tr.shiftLaps ? formatShiftLaps(tr.shiftLaps) : '';
-      const detail = [lapsTxt, tr.isCortado ? 'cortado' : null].filter(Boolean).join(', ');
-      const label = `T${tr.turnoIndex} ${span}${detail ? ` (${detail})` : ''}`;
-      descPieces.push(tr.blockId === blockInfo.blockId ? `<strong>${escapeHtml(label)}</strong>` : escapeHtml(label));
-      if (idx < allTurnos.length - 1) {
-        descPieces.push(tr.relevoToNext ? ' → relevo · ' : ' · ');
-      }
-    });
-    continuityHtml = `<div class="rotation-continuity">Mismo Servicio ${blockInfo.serviceNumber}: ${descPieces.join('')}</div>`;
     const otherTurnos = allTurnos.filter((tr) => tr.blockId !== blockInfo.blockId);
-    continuitySpoken =
-      ' ' +
-      otherTurnos
-        .map((tr) => {
-          const lapsSpoken = tr.shiftLaps ? ` de ${formatShiftLapsSpoken(tr.shiftLaps)}` : '';
-          const relPhrase =
-            tr.turnoIndex === blockInfo.turnoIndex + 1 && blockInfo.relevoToNext
-              ? 'continúa por relevo en línea'
-              : tr.turnoIndex > blockInfo.turnoIndex
-                ? 'retoma'
-                : 'salió antes';
-          return `Mismo Servicio ${blockInfo.serviceNumber} ${relPhrase} en turno ${tr.turnoIndex}${lapsSpoken}, de ${formatSecHHMM(
-            tr.startSec
-          )} a ${formatSecHHMM(tr.endSec)}.`;
-        })
-        .join(' ');
-  } else if (blockInfo.isRelevoEnLinea) {
-    const span = `${formatSecHHMM(blockInfo.startSec)}–${formatSecHHMM(blockInfo.endSec)}`;
-    continuityHtml = `<div class="rotation-continuity">Jornada continua ${escapeHtml(span)} con relevo de chofer en línea (~8 h por turno)</div>`;
-    continuitySpoken = ` Jornada continua de ${formatSecHHMM(blockInfo.startSec)} a ${formatSecHHMM(blockInfo.endSec)} con relevo de chofer en línea.`;
+    const otherSpoken = otherTurnos
+      .map((tr) => {
+        const lapsSpoken = tr.shiftLaps ? ` de ${formatShiftLapsSpoken(tr.shiftLaps)}` : '';
+        const relPhrase =
+          tr.turnoIndex === blockInfo.turnoIndex + 1 && blockInfo.relevoToNext
+            ? 'continúa por relevo en línea'
+            : tr.turnoIndex > blockInfo.turnoIndex
+              ? 'retoma'
+              : 'salió antes';
+        return `Mismo Servicio ${blockInfo.serviceNumber} ${relPhrase} en turno ${tr.turnoIndex}${lapsSpoken}, de ${formatSecHHMM(
+          tr.startSec
+        )} a ${formatSecHHMM(tr.endSec)}.`;
+      })
+      .join(' ');
+    continuitySpoken = ` Turno actual de ${formatSecHHMM(blockInfo.startSec)} a ${formatSecHHMM(blockInfo.endSec)}. ${otherSpoken}${
+      milestonesSpoken ? ` Recorrido del servicio: ${milestonesSpoken}.` : ''
+    }`;
+  } else {
+    continuitySpoken = ` Horario del Servicio ${blockInfo.serviceNumber}: de ${formatSecHHMM(
+      blockInfo.startSec
+    )} a ${formatSecHHMM(blockInfo.endSec)}${milestonesSpoken ? `, ${milestonesSpoken}` : ''}.`;
   }
 
   // Identify live bus currently serving this block TODAY (never across different days!)
@@ -6120,14 +6490,17 @@ function buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext) {
   if (slotMeta?.blockInfo?.serviceNumber) {
     const bi = slotMeta.blockInfo;
     const turnoPart = bi.serviceTurnosCount > 1 ? `, turno ${bi.turnoIndex} de ${bi.serviceTurnosCount}` : '';
+    const spanPart = `, horario ${formatSecHHMM(bi.startSec)} a ${formatSecHHMM(bi.endSec)}`;
     const kindPart = bi.isCortado ? ', horario cortado' : bi.isRelevoEnLinea ? ', relevo en línea' : '';
+    const places = describeTurnoPlaces(bi, bi.serviceTurnosCount || 1);
+    const placePart = places.spoken ? `, ${places.spoken}` : '';
     const tripLap = slotMeta.trip?.lapNumber;
     const lapPart = tripLap
       ? `, vuelta ${formatLapSpoken(tripLap)}${
           bi.shiftLaps ? ` de ${formatShiftLapsSpoken(bi.shiftLaps)} del turno` : ' del turno'
         }`
       : `, vuelta ${slotMeta.lapAtStop} de ${slotMeta.totalLapsAtStop}`;
-    parts.push(`Servicio ${bi.serviceNumber}${turnoPart}${lapPart}${kindPart}`);
+    parts.push(`Servicio ${bi.serviceNumber}${turnoPart}${spanPart}${lapPart}${kindPart}${placePart}`);
   }
   return parts.join(', ');
 }
@@ -7378,6 +7751,12 @@ function renderLineFlotaView() {
       isHalfLap: false,
       isCortado: Boolean(bi.isCortado),
       isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+      relevoFromPrev: Boolean(bi.relevoFromPrev),
+      relevoToNext: Boolean(bi.relevoToNext),
+      startPlace: bi.startPlace || '',
+      endPlace: bi.endPlace || '',
+      relevoPlace: bi.relevoPlace || '',
+      prevRelevoPlace: bi.prevRelevoPlace || '',
       startSec: bi.startSec,
       endSec: bi.endSec,
       startHHMM: formatSecHHMM(bi.startSec),
@@ -7517,7 +7896,9 @@ function renderLineFlotaView() {
           : '';
     const spanPart = srvMeta.startHHMM && srvMeta.endHHMM ? ` · ${srvMeta.startHHMM}–${srvMeta.endHHMM}` : '';
     const prefix = isHistorical && !isLiveNow ? 'Hizo ' : '';
-    return `<div class="flota-service-line"><span class="flota-srv-pill">${escapeHtml(prefix + srvLabel + turnoPart)}</span><span class="flota-srv-meta">${escapeHtml((lapPart + spanPart).replace(/^\s*·\s*/, ''))}</span></div>`;
+    const places = describeTurnoPlaces(srvMeta.blockInfo || srvMeta, srvMeta.serviceTurnosCount || 1);
+    const placesHtml = places.textHtml ? `<span class="flota-srv-places">${places.textHtml}</span>` : '';
+    return `<div class="flota-service-line"><span class="flota-srv-pill">${escapeHtml(prefix + srvLabel + turnoPart)}</span><span class="flota-srv-meta">${escapeHtml((lapPart + spanPart).replace(/^\s*·\s*/, ''))}</span>${placesHtml}</div>`;
   };
 
   const formatServiceSpoken = (srvMeta, isLiveNow) => {
@@ -7528,6 +7909,8 @@ function renderLineFlotaView() {
       parts.push(`vuelta ${formatLapSpoken(srvMeta.lapNumber)}${srvMeta.shiftLaps ? ` de ${formatLapSpoken(srvMeta.shiftLaps)}` : ''}`);
     }
     if (srvMeta.startHHMM && srvMeta.endHHMM) parts.push(`de ${srvMeta.startHHMM} a ${srvMeta.endHHMM}`);
+    const places = describeTurnoPlaces(srvMeta.blockInfo || srvMeta, srvMeta.serviceTurnosCount || 1);
+    if (places.spoken) parts.push(places.spoken);
     return parts.join(', ');
   };
 
@@ -7857,6 +8240,14 @@ function renderLineFlotaView() {
           turnoIndex: bi.turnoIndex,
           serviceTurnosCount: bi.serviceTurnosCount,
           shiftLaps: bi.shiftLaps,
+          isCortado: Boolean(bi.isCortado),
+          isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+          relevoFromPrev: Boolean(bi.relevoFromPrev),
+          relevoToNext: Boolean(bi.relevoToNext),
+          startPlace: bi.startPlace || '',
+          endPlace: bi.endPlace || '',
+          relevoPlace: bi.relevoPlace || '',
+          prevRelevoPlace: bi.prevRelevoPlace || '',
           startHHMM: formatSecHHMM(bi.startSec),
           endHHMM: formatSecHHMM(bi.endSec),
           blockInfo: bi
@@ -7878,6 +8269,14 @@ function renderLineFlotaView() {
           turnoIndex: bi.turnoIndex,
           serviceTurnosCount: bi.serviceTurnosCount,
           shiftLaps: bi.shiftLaps,
+          isCortado: Boolean(bi.isCortado),
+          isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+          relevoFromPrev: Boolean(bi.relevoFromPrev),
+          relevoToNext: Boolean(bi.relevoToNext),
+          startPlace: bi.startPlace || '',
+          endPlace: bi.endPlace || '',
+          relevoPlace: bi.relevoPlace || '',
+          prevRelevoPlace: bi.prevRelevoPlace || '',
           startHHMM: formatSecHHMM(bi.startSec),
           endHHMM: formatSecHHMM(bi.endSec),
           blockInfo: bi
@@ -7891,7 +8290,9 @@ function renderLineFlotaView() {
   const visibleCoches = query
     ? scopeCoches.filter((c) => {
         const m = resolveDayCarMeta(c);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        const srvTxt = m?.serviceNumber
+          ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''} ${m.startPlace || ''} ${m.endPlace || ''} ${m.relevoPlace || ''}`
+          : '';
         const drvsTxt = (c.dayDrivers || []).map((x) => `${x.nombre} ${x.legajo}`).join(' ');
         return `${c.coche} ${c.lastChoferNombre || ''} ${c.lastChoferLegajo || ''} ${drvsTxt} ${c.lastBandera || ''} ${srvTxt}`
           .toLowerCase()
@@ -7901,7 +8302,9 @@ function renderLineFlotaView() {
   const visibleChoferes = query
     ? scopeChoferes.filter((d) => {
         const m = resolveDayDriverMeta(d);
-        const srvTxt = m?.serviceNumber ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''}` : '';
+        const srvTxt = m?.serviceNumber
+          ? `servicio ${m.serviceNumber} ${m.startHHMM || ''} ${m.endHHMM || ''} ${m.startPlace || ''} ${m.endPlace || ''} ${m.relevoPlace || ''}`
+          : '';
         const carsTxt = (d.dayCars || []).join(' ');
         return `${d.choferNombre || ''} ${d.choferLegajo || ''} ${d.lastCoche || ''} ${carsTxt} ${d.lastBandera || ''} ${srvTxt}`
           .toLowerCase()
@@ -7915,7 +8318,7 @@ function renderLineFlotaView() {
         const turnosTxt = (s.turnos || [])
           .map((t) => {
             const a = activeSrvAssignMap.get(t.blockId);
-            return `${formatSecHHMM(t.startSec)} ${formatSecHHMM(t.endSec)} ${a?.coche || ''} ${a?.choferNombre || ''}`;
+            return `${formatSecHHMM(t.startSec)} ${formatSecHHMM(t.endSec)} ${t.startPlace || ''} ${t.endPlace || ''} ${t.relevoPlace || ''} ${a?.coche || ''} ${a?.choferNombre || ''}`;
           })
           .join(' ');
         return `servicio ${s.serviceNumber} ${turnosTxt}`.toLowerCase().includes(query);
@@ -8268,7 +8671,12 @@ function renderLineFlotaView() {
         <ul class="flota-list" role="list" aria-label="Servicios y horarios de línea ${escapeHtml(linea.descripcion)}, ${escapeHtml(dayNavInfo.main)}">
           ${visibleServices
             .map((s) => {
-              const turnosHtml = (s.turnos || [])
+              const sTurnos = Array.isArray(s.turnos) ? s.turnos : [];
+              const fullDaySpan =
+                sTurnos.length > 0
+                  ? `${formatSecHHMM(sTurnos[0].startSec)}–${formatSecHHMM(sTurnos[sTurnos.length - 1].endSec)}`
+                  : '';
+              const turnosHtml = sTurnos
                 .map((t) => {
                   const startHH = formatSecHHMM(t.startSec);
                   const endHH = formatSecHHMM(t.endSec);
@@ -8276,6 +8684,10 @@ function renderLineFlotaView() {
                   const isLiveNow = !isHistoricalSrvDay && Boolean(assign?.enLineaAhora);
                   const regimeTxt = t.isCortado ? 'Cortado' : t.isRelevoEnLinea ? 'Relevo' : 'Corrido';
                   const lapsTxt = t.shiftLaps ? formatShiftLaps(t.shiftLaps) : '';
+                  const tPlaces = describeTurnoPlaces(t, sTurnos.length);
+                  const placesRowHtml = tPlaces.textHtml
+                    ? `<div class="srv-turno-places">${tPlaces.textHtml}</div>`
+                    : '';
                   const lapLiveTxt =
                     isLiveNow && assign?.lapNumber
                       ? `Vta ${formatLapNumber(assign.lapNumber)}${t.shiftLaps ? `/${formatLapNumber(t.shiftLaps)}` : ''}`
@@ -8318,11 +8730,17 @@ function renderLineFlotaView() {
                         serviceMeta: {
                           serviceNumber: s.serviceNumber,
                           turnoIndex: t.turnoIndex,
-                          serviceTurnosCount: s.turnos.length,
+                          serviceTurnosCount: sTurnos.length,
                           lapNumber: assign.lapNumber,
                           shiftLaps: t.shiftLaps,
                           isCortado: t.isCortado,
                           isRelevoEnLinea: t.isRelevoEnLinea,
+                          relevoFromPrev: Boolean(t.relevoFromPrev),
+                          relevoToNext: Boolean(t.relevoToNext),
+                          startPlace: t.startPlace || '',
+                          endPlace: t.endPlace || '',
+                          relevoPlace: t.relevoPlace || '',
+                          prevRelevoPlace: t.prevRelevoPlace || '',
                           startHHMM: startHH,
                           endHHMM: endHH
                         }
@@ -8335,7 +8753,9 @@ function renderLineFlotaView() {
                           isLiveNow ? (lapLiveTxt ? `En línea · ${lapLiveTxt}` : 'En línea') : 'Hoy · Mapa ›'
                         )}</span>
                       `;
-                      const srLbl = `Servicio ${s.serviceNumber}, Turno ${t.turnoIndex} de ${startHH} a ${endHH}, ${lapsTxt}. Coche ${assign.coche}${
+                      const srLbl = `Servicio ${s.serviceNumber}, Turno ${t.turnoIndex} de ${startHH} a ${endHH}, ${lapsTxt}${
+                        tPlaces.spoken ? `, ${tPlaces.spoken}` : ''
+                      }. Coche ${assign.coche}${
                         assign.choferNombre ? `, chofer ${assign.choferNombre}` : ''
                       }${isLiveNow ? ', en línea ahora' : ''}. Tocá para ver en el mapa.`;
                       btnOpen = `<button type="button" class="srv-turno-row is-clickable ${isLiveNow ? 'is-live' : ''}" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srLbl)}">`;
@@ -8349,6 +8769,7 @@ function renderLineFlotaView() {
                         <span class="srv-turno-time">T${t.turnoIndex} · <strong>${escapeHtml(startHH)} – ${escapeHtml(endHH)}</strong></span>
                         <span class="srv-turno-meta">${escapeHtml([lapsTxt, regimeTxt].filter(Boolean).join(' · '))}</span>
                       </div>
+                      ${placesRowHtml}
                       <div class="srv-turno-bottom">
                         ${assignHtml}
                       </div>
@@ -8361,7 +8782,9 @@ function renderLineFlotaView() {
                 <li class="flota-row flota-srv-card" style="--line-color:${color}">
                   <div class="flota-srv-card-head">
                     <span class="flota-coche-title">Servicio ${s.serviceNumber}</span>
-                    <span class="mono-meta">${s.turnos.length} ${s.turnos.length === 1 ? 'turno' : 'turnos'}</span>
+                    <span class="mono-meta">${sTurnos.length} ${sTurnos.length === 1 ? 'turno' : 'turnos'}${
+                      fullDaySpan ? ` · ${escapeHtml(fullDaySpan)}` : ''
+                    }</span>
                   </div>
                   <div class="srv-turnos-stack">
                     ${turnosHtml}
@@ -9133,18 +9556,44 @@ function renderLineRecorridoView() {
     })
     .join('');
 
-  const srvFilterHtml =
-    serviceNums.length > 1
-      ? `
-      <div class="rec-srv-strip" role="group" aria-label="Filtrar vueltas por servicio">
-        <button type="button" class="rec-srv-chip ${rv.serviceFilter === 'ALL' ? 'active' : ''}" data-rec-srv="ALL">Todos (${allBranchTrips.length})</button>
-        ${serviceNums
-          .map(
-            (s) =>
-              `<button type="button" class="rec-srv-chip ${String(rv.serviceFilter) === String(s) ? 'active' : ''}" data-rec-srv="${s}">Srv ${s}</button>`
-          )
-          .join('')}
+  const activeSrvNum =
+    rv.serviceFilter !== 'ALL'
+      ? Number(rv.serviceFilter)
+      : serviceNums.length === 1
+        ? serviceNums[0]
+        : null;
+  const activeSrvObj =
+    activeSrvNum && model?.fleetSummary?.services
+      ? model.fleetSummary.services.find((s) => Number(s.serviceNumber) === activeSrvNum) || null
+      : null;
+  const activeSrvSummaryHtml = activeSrvObj?.turnos?.length
+    ? `
+      <div class="rec-srv-summary" role="status">
+        <div class="rec-srv-summary-line">${buildServiceTurnosLineHtml(activeSrvObj.serviceNumber, activeSrvObj.turnos, '')}</div>
+        ${buildServiceMilestonesHtml(activeSrvObj.turnos, '')}
       </div>
+    `
+    : '';
+
+  const srvFilterHtml =
+    serviceNums.length >= 1
+      ? `
+      ${
+        serviceNums.length > 1
+          ? `
+        <div class="rec-srv-strip" role="group" aria-label="Filtrar vueltas por servicio">
+          <button type="button" class="rec-srv-chip ${rv.serviceFilter === 'ALL' ? 'active' : ''}" data-rec-srv="ALL">Todos (${allBranchTrips.length})</button>
+          ${serviceNums
+            .map(
+              (s) =>
+                `<button type="button" class="rec-srv-chip ${String(rv.serviceFilter) === String(s) ? 'active' : ''}" data-rec-srv="${s}">Srv ${s}</button>`
+            )
+            .join('')}
+        </div>
+      `
+          : ''
+      }
+      ${activeSrvSummaryHtml}
     `
       : '';
 
@@ -9187,8 +9636,17 @@ function renderLineRecorridoView() {
         const depHH = formatSecHHMM(tr.startSec);
         const srvTag = tr.serviceNumber ? `S${tr.serviceNumber}` : `V${cIdx + 1}`;
         const lapTag = tr.lapNumber ? `·V${formatLapNumber(tr.lapNumber)}` : '';
+        const bi = tr.blockInfo || null;
+        const tPlaces = bi ? describeTurnoPlaces(bi, bi.serviceTurnosCount || 1) : null;
+        const colTip = [
+          `Salida ${depHH}${tr.originPlace && tr.destPlace ? ` (${tr.originPlace} → ${tr.destPlace})` : ''}`,
+          `Servicio ${tr.serviceNumber || '—'}${bi && bi.serviceTurnosCount > 1 ? ` · T${bi.turnoIndex}/${bi.serviceTurnosCount}` : ''}${tr.lapNumber ? ` · Vuelta ${formatLapNumber(tr.lapNumber)}` : ''}`,
+          tPlaces?.textPlain || null
+        ]
+          .filter(Boolean)
+          .join(' · ');
         return `
-          <th scope="col" class="rec-th-trip ${isCurrent ? 'is-now-col' : ''}" data-trip-col="${cIdx}" title="Salida ${depHH} · Servicio ${tr.serviceNumber || '—'}${tr.lapNumber ? ` · Vuelta ${formatLapNumber(tr.lapNumber)}` : ''}">
+          <th scope="col" class="rec-th-trip ${isCurrent ? 'is-now-col' : ''}" data-trip-col="${cIdx}" title="${escapeHtml(colTip)}">
             <span class="rec-th-time">${depHH}</span>
             <span class="rec-th-srv">${escapeHtml(srvTag + lapTag)}</span>
           </th>
@@ -9269,7 +9727,8 @@ function renderLineRecorridoView() {
               .map((tr) => ({
                 sec: getTripStopSec(tr, st.id, st.along),
                 srv: tr.serviceNumber,
-                lap: tr.lapNumber
+                lap: tr.lapNumber,
+                bi: tr.blockInfo || null
               }))
               .filter((p) => p.sec !== null);
             const firstUpcoming = isTodayTipo ? passTimes.find((p) => p.sec >= nowSvcSec - 60) || null : null;
@@ -9281,11 +9740,18 @@ function renderLineRecorridoView() {
                 if (p.srv) metaParts.push(`S${p.srv}`);
                 if (p.lap) metaParts.push(`V${formatLapNumber(p.lap)}`);
                 const metaTag = metaParts.length ? `<small>${escapeHtml(metaParts.join(' '))}</small>` : '';
+                const places = p.bi ? describeTurnoPlaces(p.bi, p.bi.serviceTurnosCount || 1) : null;
+                const chipTip = p.srv
+                  ? [
+                      `Servicio ${p.srv}${p.bi && p.bi.serviceTurnosCount > 1 ? ` · T${p.bi.turnoIndex}/${p.bi.serviceTurnosCount}` : ''}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}`,
+                      places?.textPlain || null
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')
+                  : '';
                 return `<span class="rec-time-chip ${isNext ? 'is-next' : ''} ${passed ? 'is-passed' : ''}"${
                   isNext ? ' data-next-chip="1"' : ''
-                } title="${
-                  p.srv ? `Servicio ${p.srv}${p.lap ? ` · Vuelta ${formatLapNumber(p.lap)}` : ''}` : ''
-                }">${formatSecHHMM(p.sec)}${metaTag}</span>`;
+                } title="${escapeHtml(chipTip)}">${formatSecHHMM(p.sec)}${metaTag}</span>`;
               })
               .join('');
 

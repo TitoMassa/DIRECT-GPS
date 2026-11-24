@@ -111,6 +111,177 @@ export function formatDesvioFromSec(sec = 0) {
   return `${sign}${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
 
+const PLACE_ACCENTS = {
+  COLON: 'Colón',
+  RIO: 'Río',
+  PARANA: 'Paraná',
+  PERICHON: 'Perichón',
+  PIRAYUI: 'Pirayuí',
+  YECOHA: 'Yecohá',
+  FERRE: 'Ferré',
+  MAIPU: 'Maipú',
+  IBANEZ: 'Ibáñez',
+  TUCUMAN: 'Tucumán',
+  CORDOBA: 'Córdoba',
+  JOSE: 'José',
+  AGUSTIN: 'Agustín',
+  HIPOLITO: 'Hipólito',
+  MARTIN: 'Martín'
+};
+
+const PLACE_KEEP_UPPER = new Set(['UNNE', 'ERSA', 'S/N']);
+const PLACE_LOWER_WORDS = new Set(['de', 'del', 'la', 'las', 'los', 'el', 'y', 'a', 'x']);
+
+export function cleanTerminalPlace(raw = '') {
+  let s = String(raw || '')
+    .trim()
+    .replace(/\s*-\s*CORRIENTES$/i, '')
+    .replace(/\b(?:IDA|VTA|VUELTA)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^EL\s+/i, '')
+    .replace(/^B[°º]\s*/i, 'Bº ')
+    .replace(/^B\s+(?=\d)/i, 'Bº ')
+    .trim();
+  if (!s) return '';
+
+  const up = s.toUpperCase();
+  if (up === 'SANTA ANA-INGENIO' || up === 'INGENIO-SANTA ANA') return 'Ingenio (Santa Ana)';
+  if (up === 'Bº 40 VIV.-SAN ROQUE') return 'Bº 40 Viv.';
+  if (up === 'Bº MONTAÑA') return 'Bº Dr. Montaña';
+  if (up === 'L BRAVA') return 'Bº Laguna Brava';
+  if (up === '1000 VIV. SANTA CRUZ') return 'Bº 1000 Viv. (Santa Cruz)';
+
+  return s
+    .split(' ')
+    .map((w, idx) => {
+      if (!w) return '';
+      if (w === 'Bº') return 'Bº';
+      const wUp = w.toUpperCase();
+      if (PLACE_ACCENTS[wUp]) return PLACE_ACCENTS[wUp];
+      if (PLACE_KEEP_UPPER.has(wUp)) return wUp;
+      if (wUp === 'CTES' || wUp === 'CTES.') return 'Corrientes';
+      if (wUp === 'RCIA' || wUp === 'RCIA.') return 'Resistencia';
+      if (wUp === 'VIV.' || wUp === 'VIV') return 'Viv.';
+      if (wUp === 'DR.' || wUp === 'DR') return 'Dr.';
+      if (wUp === 'AV.' || wUp === 'AV') return 'Av.';
+      if (wUp === 'GRAL.' || wUp === 'GRAL') return 'Gral.';
+      if (wUp === 'P.') return 'P.';
+      if (wUp === 'T.') return 'T.';
+      const low = w.toLowerCase();
+      if (idx > 0 && PLACE_LOWER_WORDS.has(low)) return low;
+      return low.replace(/(^|[-/])([a-záéíóúñ])/g, (_, sep, ch) => sep + ch.toUpperCase());
+    })
+    .join(' ');
+}
+
+export function parseBranchEndpoints(branchOrBandera) {
+  const branchObj = branchOrBandera && typeof branchOrBandera === 'object' ? branchOrBandera : null;
+  const raw = String(branchObj ? branchObj.bandera || '' : branchOrBandera || '').trim();
+  const ordered = branchObj?.orderedStops || [];
+  const fallbackFirst = ordered[0] ? cleanTerminalPlace(ordered[0].descripcion || ordered[0].id) : '';
+  const fallbackLast = ordered.length ? cleanTerminalPlace(ordered[ordered.length - 1].descripcion || ordered[ordered.length - 1].id) : '';
+
+  if (!raw) {
+    return { from: fallbackFirst, to: fallbackLast };
+  }
+
+  const up = raw.toUpperCase().replace(/\s+/g, ' ').trim();
+  const m904 = up.match(/^(UNNE|PUERTO)\s+(UNNE|PUERTO)\b/);
+  if (m904) {
+    const map904 = (k) => (k === 'UNNE' ? 'UNNE Resistencia' : 'Puerto');
+    return { from: map904(m904[1]), to: map904(m904[2]) };
+  }
+
+  if (up.includes(',')) {
+    const parts = up
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length >= 2) {
+      const first = parts[0].split(/\s*-\s*/)[0];
+      const last = parts[parts.length - 1].split(/\s*-\s*/).pop();
+      const fClean = cleanTerminalPlace(first);
+      let lClean = cleanTerminalPlace(last);
+      if (lClean === 'Terminal' && up.includes('RCIA')) lClean = 'Terminal Resistencia';
+      if (lClean === 'Facultad' && up.includes('RCIA')) lClean = 'Facultad Resistencia';
+      return { from: fClean || fallbackFirst, to: lClean || fallbackLast };
+    }
+  }
+
+  if (/^(FAC|PUERTO\s+CTES)/.test(up) && up.split('-').length >= 3) {
+    const segs = up.split('-').map((x) => x.trim());
+    const normFac = (x) => (x.startsWith('FAC') ? 'Facultad Resistencia' : cleanTerminalPlace(x));
+    return { from: normFac(segs[0]) || fallbackFirst, to: normFac(segs[segs.length - 1]) || fallbackLast };
+  }
+
+  const wordSep = up.match(/^(.+?)\s+(?:HACIA\s+EL|HACIA|AL|A)\s+(.+)$/);
+  if (wordSep) {
+    return {
+      from: cleanTerminalPlace(wordSep[1]) || fallbackFirst,
+      to: cleanTerminalPlace(wordSep[2]) || fallbackLast
+    };
+  }
+
+  if (up.includes(' - ')) {
+    const segs = up
+      .split(' - ')
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (segs.length >= 2) {
+      return {
+        from: cleanTerminalPlace(segs[0]) || fallbackFirst,
+        to: cleanTerminalPlace(segs[segs.length - 1]) || fallbackLast
+      };
+    }
+  }
+
+  if (up.includes('-')) {
+    const segs = up
+      .split('-')
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (segs.length >= 2) {
+      return {
+        from: cleanTerminalPlace(segs[0]) || fallbackFirst,
+        to: cleanTerminalPlace(segs[segs.length - 1]) || fallbackLast
+      };
+    }
+  }
+
+  return {
+    from: fallbackFirst || cleanTerminalPlace(raw),
+    to: fallbackLast || cleanTerminalPlace(raw)
+  };
+}
+
+function resolveTripEndpoints(branch, realPts = []) {
+  const ep = parseBranchEndpoints(branch);
+  const stops = branch?.orderedStops || [];
+  const firstReal = realPts[0] || null;
+  const lastReal = realPts.length ? realPts[realPts.length - 1] : null;
+  const firstStopObj = (firstReal?.stopId && stops.find((s) => s.id === firstReal.stopId)) || stops[0] || null;
+  const lastStopObj = (lastReal?.stopId && stops.find((s) => s.id === lastReal.stopId)) || (stops.length ? stops[stops.length - 1] : null);
+
+  const startsMid =
+    Boolean(firstReal && stops.length && firstReal.along > (stops[0].along || 0) + 400 && firstStopObj?.descripcion);
+  const endsMid =
+    Boolean(
+      lastReal &&
+        stops.length &&
+        lastReal.along < (stops[stops.length - 1].along || 0) - 400 &&
+        lastStopObj?.descripcion
+    );
+
+  return {
+    originPlace: startsMid ? cleanTerminalPlace(firstStopObj.descripcion) : ep.from || cleanTerminalPlace(firstStopObj?.descripcion || ''),
+    destPlace: endsMid ? cleanTerminalPlace(lastStopObj.descripcion) : ep.to || cleanTerminalPlace(lastStopObj?.descripcion || ''),
+    originStopId: firstStopObj?.id || firstReal?.stopId || '',
+    originStopDesc: firstStopObj?.descripcion || '',
+    destStopId: lastStopObj?.id || lastReal?.stopId || '',
+    destStopDesc: lastStopObj?.descripcion || ''
+  };
+}
+
 export const SERVICE_DAY_CUTOFF_SEC = 3 * 3600; // 03:00 AM (0 buses operate between 02:00 and 04:25 AM across Corrientes)
 
 export function toServiceSec(sec) {
@@ -641,6 +812,8 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     }
     usedKeys.add(tripKey);
 
+    const tripEnds = resolveTripEndpoints(branch, pts);
+
     finalized.push({
       tripKey,
       branch,
@@ -648,6 +821,12 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       startSec,
       endSec,
       stopTimeMap,
+      originPlace: tripEnds.originPlace,
+      destPlace: tripEnds.destPlace,
+      originStopId: tripEnds.originStopId,
+      originStopDesc: tripEnds.originStopDesc,
+      destStopId: tripEnds.destStopId,
+      destStopDesc: tripEnds.destStopDesc,
       prevTrip: null,
       nextTrip: null,
       layoverFromPrevSec: null,
@@ -1529,36 +1708,80 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     if (!rawParts.length) continue;
 
     const parts = rawParts.flatMap((p) => splitContinuousShift(p));
+    parts.forEach((p) => {
+      const firstTrip = p.trips[0] || null;
+      const lastTrip = p.trips[p.trips.length - 1] || null;
+      p.startPlace = firstTrip?.originPlace || '';
+      p.endPlace = lastTrip?.destPlace || '';
+      p.startStopId = firstTrip?.originStopId || '';
+      p.startStopDesc = firstTrip?.originStopDesc || '';
+      p.endStopId = lastTrip?.destStopId || '';
+      p.endStopDesc = lastTrip?.destStopDesc || '';
+    });
+
+    // Harmonize short-layover same-terminal handoffs between consecutive non-cortado shifts
+    for (let idx = 0; idx < parts.length - 1; idx++) {
+      const curP = parts[idx];
+      const nextP = parts[idx + 1];
+      const gapSec = nextP.startSec - curP.endSec;
+      if (!curP.isCortado && gapSec >= -120 && gapSec <= 35 * 60 && curP.endPlace && curP.endPlace === nextP.startPlace) {
+        curP.relevoToNext = true;
+        curP.isRelevoEnLinea = true;
+        nextP.relevoFromPrev = true;
+        nextP.isRelevoEnLinea = true;
+      }
+    }
+
     const firstPart = parts[0];
     const hasRelevo = parts.some((p) => p.isRelevoEnLinea);
     if (firstPart.isCortado) cortadosCount++;
     else corridosCount++;
     if (hasRelevo) relevoEnLineaCount++;
 
-    const serviceTurnos = parts.map((p, idx) => ({
-      blockId: `blk:${numCode}:${resolved.tipo}:${s}:t${idx + 1}`,
-      turnoIndex: idx + 1,
-      startSec: p.startSec,
-      endSec: p.endSec,
-      durationSec: p.durSec,
-      isCortado: p.isCortado,
-      isRelevoEnLinea: p.isRelevoEnLinea,
-      relevoFromPrev: Boolean(p.relevoFromPrev),
-      relevoToNext: Boolean(p.relevoToNext),
-      legCount: p.trips.length,
-      shiftLaps: p.trips.length / 2
-    }));
+    const serviceTurnos = parts.map((p, idx) => {
+      const nextP = idx < parts.length - 1 ? parts[idx + 1] : null;
+      const prevP = idx > 0 ? parts[idx - 1] : null;
+      const relevoPlace = p.relevoToNext ? nextP?.startPlace || p.endPlace || '' : '';
+      const prevRelevoPlace = p.relevoFromPrev ? p.startPlace || prevP?.endPlace || '' : '';
+      return {
+        blockId: `blk:${numCode}:${resolved.tipo}:${s}:t${idx + 1}`,
+        turnoIndex: idx + 1,
+        startSec: p.startSec,
+        endSec: p.endSec,
+        durationSec: p.durSec,
+        isCortado: p.isCortado,
+        isRelevoEnLinea: p.isRelevoEnLinea,
+        relevoFromPrev: Boolean(p.relevoFromPrev),
+        relevoToNext: Boolean(p.relevoToNext),
+        legCount: p.trips.length,
+        shiftLaps: p.trips.length / 2,
+        startPlace: p.startPlace,
+        endPlace: p.endPlace,
+        startStopId: p.startStopId,
+        startStopDesc: p.startStopDesc,
+        endStopId: p.endStopId,
+        endStopDesc: p.endStopDesc,
+        relevoPlace,
+        prevRelevoPlace,
+        nextStartSec: nextP ? nextP.startSec : null,
+        nextStartPlace: nextP ? nextP.startPlace : ''
+      };
+    });
 
     fleetServices.push({
       serviceNumber: s,
       isCortadoMorning: firstPart.isCortado,
       isRelevoEnLinea: hasRelevo,
+      startPlace: serviceTurnos[0]?.startPlace || '',
+      endPlace: serviceTurnos[serviceTurnos.length - 1]?.endPlace || '',
+      relevoPlaces: serviceTurnos.filter((t) => t.relevoToNext && t.relevoPlace).map((t) => t.relevoPlace),
       turnos: serviceTurnos
     });
 
     parts.forEach((p, idx) => {
       const turnoIndex = idx + 1;
-      const blockId = serviceTurnos[idx].blockId;
+      const tMeta = serviceTurnos[idx];
+      const blockId = tMeta.blockId;
       const shiftLaps = p.trips.length / 2;
       const info = {
         blockId,
@@ -1577,6 +1800,16 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
         durationSec: p.durSec,
         legCount: p.trips.length,
         shiftLaps,
+        startPlace: tMeta.startPlace,
+        endPlace: tMeta.endPlace,
+        startStopId: tMeta.startStopId,
+        startStopDesc: tMeta.startStopDesc,
+        endStopId: tMeta.endStopId,
+        endStopDesc: tMeta.endStopDesc,
+        relevoPlace: tMeta.relevoPlace,
+        prevRelevoPlace: tMeta.prevRelevoPlace,
+        nextStartSec: tMeta.nextStartSec,
+        nextStartPlace: tMeta.nextStartPlace,
         trips: p.trips
       };
 
@@ -2960,6 +3193,7 @@ export function matchLiveBusesToTrips(
     bus.tripKey = bestItem.trip.tripKey;
     bus.scheduledTrip = bestItem.trip;
     bus.stopProj = bestItem.stopProj;
+    const matchedBi = bestItem.trip.blockInfo || null;
     bus.serviceNumber = bestItem.trip.serviceNumber || null;
     bus.turnoIndex = bestItem.trip.turnoIndex || 1;
     bus.serviceTurnosCount = bestItem.trip.serviceTurnosCount || 1;
@@ -2968,6 +3202,14 @@ export function matchLiveBusesToTrips(
     bus.isHalfLap = Boolean(bestItem.trip.isHalfLap);
     bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
     bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
+    bus.turnoStart = matchedBi ? formatSecHHMM(matchedBi.startSec) : '';
+    bus.turnoEnd = matchedBi ? formatSecHHMM(matchedBi.endSec) : '';
+    bus.startPlace = matchedBi?.startPlace || '';
+    bus.endPlace = matchedBi?.endPlace || '';
+    bus.relevoToNext = Boolean(matchedBi?.relevoToNext);
+    bus.relevoFromPrev = Boolean(matchedBi?.relevoFromPrev);
+    bus.relevoPlace = matchedBi?.relevoPlace || '';
+    bus.prevRelevoPlace = matchedBi?.prevRelevoPlace || '';
     bus.nextLapStopTime = findNextSameBranchPassTime(bestItem.trip, stopId, bestItem.stopProj?.along ?? 0);
 
     // Detect genuine on-the-fly auto-correction (different serviceNumber than previous sticky assignment,
@@ -3909,6 +4151,14 @@ export function predictLineBusesForStop({
       isHalfLap: Boolean(trip.isHalfLap),
       isCortadoBlock: Boolean(trip.isCortadoBlock),
       isRelevoEnLinea: Boolean(trip.isRelevoEnLinea),
+      turnoStart: trip.blockInfo ? formatSecHHMM(trip.blockInfo.startSec) : '',
+      turnoEnd: trip.blockInfo ? formatSecHHMM(trip.blockInfo.endSec) : '',
+      startPlace: trip.blockInfo?.startPlace || '',
+      endPlace: trip.blockInfo?.endPlace || '',
+      relevoToNext: Boolean(trip.blockInfo?.relevoToNext),
+      relevoFromPrev: Boolean(trip.blockInfo?.relevoFromPrev),
+      relevoPlace: trip.blockInfo?.relevoPlace || '',
+      prevRelevoPlace: trip.blockInfo?.prevRelevoPlace || '',
       nextLapStopTime: findNextSameBranchPassTime(trip, stopId, stopProj?.along ?? 0),
       stopProj,
       predAnchor: anchor,
@@ -3983,6 +4233,12 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
       isHalfLap: Boolean(trip.isHalfLap),
       isCortado: Boolean(bi.isCortado),
       isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+      relevoFromPrev: Boolean(bi.relevoFromPrev),
+      relevoToNext: Boolean(bi.relevoToNext),
+      startPlace: bi.startPlace || '',
+      endPlace: bi.endPlace || '',
+      relevoPlace: bi.relevoPlace || '',
+      prevRelevoPlace: bi.prevRelevoPlace || '',
       startSec: bi.startSec,
       endSec: bi.endSec,
       startHHMM: formatSecHHMM(bi.startSec),
@@ -4274,6 +4530,12 @@ export function matchFreeFleetUnitsToModel(model, units = [], nowSec = getArgent
           isHalfLap: Boolean(trip.isHalfLap),
           isCortado: Boolean(bi.isCortado),
           isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
+          relevoFromPrev: Boolean(bi.relevoFromPrev),
+          relevoToNext: Boolean(bi.relevoToNext),
+          startPlace: bi.startPlace || '',
+          endPlace: bi.endPlace || '',
+          relevoPlace: bi.relevoPlace || '',
+          prevRelevoPlace: bi.prevRelevoPlace || '',
           startSec: bi.startSec,
           endSec: bi.endSec,
           startHHMM: formatSecHHMM(bi.startSec),
