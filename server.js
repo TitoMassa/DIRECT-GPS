@@ -163,6 +163,9 @@ function normalizeDriverRecord(choferNombre = '', choferLegajo = '', choferRaw =
       nombre = raw;
     }
   }
+  const resolved = smartmove.resolveDriverDisplayInfo(legajo, nombre, raw);
+  nombre = resolved.nombre;
+  legajo = resolved.legajo;
   const cleanLeg = legajo.replace(/^0+$/, '').trim();
   const normName = normalizeDriverNameKey(nombre);
   const validName = normName && !INVALID_DRIVER_TOKENS.has(normName) && normName.length >= 2;

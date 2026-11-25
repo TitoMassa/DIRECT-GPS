@@ -282,12 +282,96 @@ function unescapeXml(str) {
     .replace(/&amp;/g, '&');
 }
 
+const DRIVER_NAME_OVERRIDES = {
+  '14172': 'BARRIOS CARLOS SEBASTIAN',
+  '12360': 'PUCHETA NELSON HERNAN',
+  '10304': 'DABRIO JUAN',
+  '98535': 'GIMENEZ MARCOS ANTONIO',
+  '98514': 'GIMENEZ ARNALDO JAVIER',
+  '10242': 'GIMENEZ MARIO JOSE',
+  '10880': 'ESCALANTE ADOLFO GUSTAVO',
+  '13347': 'GALVEZ ALAN GASTON',
+  '10413': 'PARRAS EDGARDO JUAN',
+  '12222': 'VILLALBA DAMIAN EMANUEL',
+  '10903': 'ACEVEDO NESTOR DAMIAN',
+  '98534': 'MIRANDA MARCOS CESAR',
+  '98513': 'BENITEZ JOSE LUIS',
+  '10830': 'ARCE ROBERTO CARLOS',
+  '12359': 'PORTO LISANDRO LUCAS',
+  '98540': 'IBARRA MAXIMILIANO ARIEL',
+  '13337': 'VILLAR MATIAS DANIEL',
+  '13177': 'ACEVEDO GUSTAVO ADOLFO',
+  '98512': 'ORTIZ ANIBAL OSCAR',
+  '10853': 'GOMEZ ROBERTO WALDEMAR',
+  '14128': 'LANNUZZI HECTOR MIGUEL',
+  '12109': 'BARRIOS CLAUDIO ANDRES',
+  '10231': 'CANTERO TERENCIO DE JESUS',
+  '19060': 'TRIPIER JUAN LUIS',
+  '10164': 'MACIEL JUAN MANUEL',
+  '10128': 'ESTIGARRIBIA RAMON TOMAS',
+  '10246': 'MAIDANA JORGE OSVALDO',
+  '10340': 'MARINILLI JULIO CESAR',
+  '14034': 'PINTOS DANIEL ALEJANDRO',
+  '10463': 'DUARTE ANTONIO REGINO',
+  '10043': 'SOSA CHRISTIAN HUGO',
+  '19020': 'CANTEROS JUAN RAMON'
+};
+
+function resolveDriverDisplayInfo(choferLegajo = '', choferNombre = '', choferRaw = '') {
+  let leg = String(choferLegajo || '').trim();
+  const nom = String(choferNombre || '').trim();
+  const raw = String(choferRaw || '').trim();
+
+  if (!leg && raw) {
+    const rm = raw.match(/\(\s*([^)]+)\s*\)\s*$/);
+    if (rm) leg = rm[1].trim();
+  }
+
+  const lookupOverride = (candidate) => {
+    const clean = String(candidate || '').trim();
+    if (!clean) return null;
+    if (DRIVER_NAME_OVERRIDES[clean]) return { leg: clean, nombre: DRIVER_NAME_OVERRIDES[clean] };
+    const noZero = clean.replace(/^0+/, '');
+    if (noZero && DRIVER_NAME_OVERRIDES[noZero]) return { leg: noZero, nombre: DRIVER_NAME_OVERRIDES[noZero] };
+    return null;
+  };
+
+  const byLeg = lookupOverride(leg);
+  if (byLeg) return { nombre: byLeg.nombre, legajo: leg || byLeg.leg };
+
+  if (nom) {
+    const m = nom.match(/^(?:Legajo\s+)?0*(\d+)$/i) || nom.match(/\(\s*0*(\d+)\s*\)\s*$/);
+    if (m) {
+      const byNameId = lookupOverride(m[1]);
+      if (byNameId) return { nombre: byNameId.nombre, legajo: leg || byNameId.leg };
+    }
+  }
+
+  if (raw && !nom) {
+    const m = raw.match(/^(?:Legajo\s+)?0*(\d+)$/i) || raw.match(/\(\s*0*(\d+)\s*\)\s*$/);
+    if (m) {
+      const byRawId = lookupOverride(m[1]);
+      if (byRawId) return { nombre: byRawId.nombre, legajo: leg || byRawId.leg };
+    }
+  }
+
+  return { nombre: nom, legajo: leg };
+}
+
+function resolveDriverDisplayName(choferLegajo = '', choferNombre = '', choferRaw = '') {
+  return resolveDriverDisplayInfo(choferLegajo, choferNombre, choferRaw).nombre;
+}
+
 function parseChofer(raw = '') {
   const clean = String(raw || '').trim();
   if (!clean) return { choferNombre: '', choferLegajo: '', choferRaw: '' };
   const m = clean.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
-  if (m) return { choferNombre: m[1].trim(), choferLegajo: m[2].trim(), choferRaw: clean };
-  return { choferNombre: clean, choferLegajo: '', choferRaw: clean };
+  if (m) {
+    const resolved = resolveDriverDisplayInfo(m[2].trim(), m[1].trim(), clean);
+    return { choferNombre: resolved.nombre, choferLegajo: resolved.legajo, choferRaw: clean };
+  }
+  const resolved = resolveDriverDisplayInfo('', clean, clean);
+  return { choferNombre: resolved.nombre, choferLegajo: resolved.legajo, choferRaw: clean };
 }
 
 const INVALID_DRIVER_TOKENS = new Set([
@@ -326,6 +410,9 @@ function normalizeDriverRecord(choferNombre = '', choferLegajo = '', choferRaw =
     nombre = parsed.choferNombre;
     legajo = parsed.choferLegajo;
   }
+  const resolved = resolveDriverDisplayInfo(legajo, nombre, raw);
+  nombre = resolved.nombre;
+  legajo = resolved.legajo;
   const cleanLeg = legajo.replace(/^0+$/, '').trim();
   const normName = normalizeDriverNameKey(nombre);
   const validName = normName && !INVALID_DRIVER_TOKENS.has(normName) && normName.length >= 2;
@@ -2328,7 +2415,7 @@ export class FleetMemory {
             esAdaptado: Boolean(r.es_adaptado),
             vistoHoy: r.last_day_key === todayKey,
             enLineaAhora: r.last_day_key === todayKey && Number(r.last_seen_at) >= activeCutoff,
-            lastChoferNombre: r.last_chofer_nombre || '',
+            lastChoferNombre: resolveDriverDisplayName(r.last_chofer_legajo, r.last_chofer_nombre),
             lastChoferLegajo: r.last_chofer_legajo || '',
             lastBandera: r.last_bandera || '',
             lastGps: r.last_gps || '',
@@ -2374,7 +2461,7 @@ export class FleetMemory {
           const desvioRaw = r.last_desvio_raw || (isSameCarFresh ? u?.desvio_raw : '') || '';
           return {
             driverKey: r.driver_key,
-            choferNombre: r.chofer_nombre,
+            choferNombre: resolveDriverDisplayName(r.chofer_legajo, r.chofer_nombre),
             choferLegajo: r.chofer_legajo || '',
             lastCoche: r.last_coche || '',
             lastEsAdaptado: Boolean(r.last_es_adaptado),
@@ -2411,7 +2498,7 @@ export class FleetMemory {
         tripKey: t.trip_key,
         turnoHora: t.turno_hora,
         coche: t.coche,
-        choferNombre: t.chofer_nombre || '',
+        choferNombre: resolveDriverDisplayName(t.chofer_legajo, t.chofer_nombre),
         choferLegajo: t.chofer_legajo || '',
         esAdaptado: Boolean(t.es_adaptado),
         desvioSec: t.desvio_sec || 0,
@@ -2428,7 +2515,7 @@ export class FleetMemory {
         dayKey: o.day_key,
         coche: o.coche,
         driverKey: o.driver_key,
-        choferNombre: o.chofer_nombre || '',
+        choferNombre: resolveDriverDisplayName(o.chofer_legajo, o.chofer_nombre),
         choferLegajo: o.chofer_legajo || '',
         esAdaptado: Boolean(o.es_adaptado),
         lastBandera: o.last_bandera || '',
@@ -2516,7 +2603,7 @@ export class FleetMemory {
           codigoLinea: Number(r.codigo_linea),
           descripcionLinea: resolvePublicLineName(r.codigo_linea, r.descripcion_linea),
           coche: r.coche,
-          choferNombre: r.last_chofer_nombre || '',
+          choferNombre: resolveDriverDisplayName(r.last_chofer_legajo, r.last_chofer_nombre),
           choferLegajo: r.last_chofer_legajo || '',
           esAdaptado: Boolean(r.es_adaptado),
           bandera: (useUnitGps ? u?.bandera : r.last_bandera) || r.last_bandera || u?.bandera || '',
@@ -2679,7 +2766,7 @@ export class FleetMemory {
           esAdaptado: Boolean(r.es_adaptado),
           vistoHoy: r.last_day_key === todayKey,
           enLineaAhora,
-          lastChoferNombre: r.last_chofer_nombre || '',
+          lastChoferNombre: resolveDriverDisplayName(r.last_chofer_legajo, r.last_chofer_nombre),
           lastChoferLegajo: r.last_chofer_legajo || '',
           lastBandera: r.last_bandera || '',
           lastGps: r.last_gps || '',
@@ -2719,7 +2806,7 @@ export class FleetMemory {
               codigoLinea: cod,
               descripcionLinea: bucket.descripcionLinea,
               coche: r.coche,
-              choferNombre: r.last_chofer_nombre || '',
+              choferNombre: resolveDriverDisplayName(r.last_chofer_legajo, r.last_chofer_nombre),
               choferLegajo: r.last_chofer_legajo || '',
               esAdaptado: Boolean(r.es_adaptado),
               bandera: (useUnitGps ? u?.bandera : r.last_bandera) || r.last_bandera || u?.bandera || '',
@@ -2767,7 +2854,7 @@ export class FleetMemory {
 
         bucket.choferes.push({
           driverKey: r.driver_key,
-          choferNombre: r.chofer_nombre,
+          choferNombre: resolveDriverDisplayName(r.chofer_legajo, r.chofer_nombre),
           choferLegajo: r.chofer_legajo || '',
           lastCoche: r.last_coche || '',
           lastEsAdaptado: Boolean(r.last_es_adaptado),
@@ -2804,7 +2891,7 @@ export class FleetMemory {
           tripKey: t.trip_key,
           turnoHora: t.turno_hora,
           coche: t.coche,
-          choferNombre: t.chofer_nombre || '',
+          choferNombre: resolveDriverDisplayName(t.chofer_legajo, t.chofer_nombre),
           choferLegajo: t.chofer_legajo || '',
           esAdaptado: Boolean(t.es_adaptado),
           desvioSec: t.desvio_sec || 0,
@@ -2827,7 +2914,7 @@ export class FleetMemory {
           dayKey: o.day_key,
           coche: o.coche,
           driverKey: o.driver_key,
-          choferNombre: o.chofer_nombre || '',
+          choferNombre: resolveDriverDisplayName(o.chofer_legajo, o.chofer_nombre),
           choferLegajo: o.chofer_legajo || '',
           esAdaptado: Boolean(o.es_adaptado),
           lastBandera: o.last_bandera || '',
@@ -3033,7 +3120,7 @@ export class FleetMemory {
           codigoLinea: cod,
           descripcionLinea: pubName,
           coche: r.coche,
-          choferNombre: r.last_chofer_nombre || '',
+          choferNombre: resolveDriverDisplayName(r.last_chofer_legajo, r.last_chofer_nombre),
           choferLegajo: r.last_chofer_legajo || '',
           esAdaptado: Boolean(r.es_adaptado),
           vistoHoy: r.last_day_key === todayKey,
@@ -3061,7 +3148,8 @@ export class FleetMemory {
         const cod = Number(r.codigo_linea);
         if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
         const pubName = resolvePublicLineName(cod, r.descripcion_linea) || LINE_NAMES_BY_CODE[cod] || `L${cod}`;
-        const hay = normalizeDriverNameKey(`${r.chofer_nombre} ${r.chofer_legajo || ''}`);
+        const displayChoferNombre = resolveDriverDisplayName(r.chofer_legajo, r.chofer_nombre);
+        const hay = normalizeDriverNameKey(`${displayChoferNombre} ${r.chofer_legajo || ''}`);
         if (!hay.includes(normQ)) continue;
         const u = r.last_coche ? unitMap.get(`${r.codigo_linea}:${r.last_coche}`) : null;
         const lat = r.last_lat ?? u?.lat ?? null;
@@ -3073,7 +3161,7 @@ export class FleetMemory {
           codigoLinea: cod,
           descripcionLinea: pubName,
           coche: r.last_coche || '',
-          choferNombre: r.chofer_nombre,
+          choferNombre: displayChoferNombre,
           choferLegajo: r.chofer_legajo || '',
           esAdaptado: Boolean(r.last_es_adaptado),
           vistoHoy: r.last_day_key === todayKey,
@@ -3404,7 +3492,7 @@ export class FleetMemory {
           tripKey: r.trip_key,
           turnoHora: r.turno_hora,
           coche: r.coche,
-          choferNombre: r.chofer_nombre,
+          choferNombre: resolveDriverDisplayName(r.chofer_legajo, r.chofer_nombre, r.chofer_raw),
           choferLegajo: r.chofer_legajo,
           choferRaw: r.chofer_raw,
           esAdaptado: Boolean(r.es_adaptado),
@@ -3421,7 +3509,7 @@ export class FleetMemory {
           coche: r.coche,
           dayKey: r.day_key,
           tripKey: r.trip_key,
-          choferNombre: r.chofer_nombre,
+          choferNombre: resolveDriverDisplayName(r.chofer_legajo, r.chofer_nombre, r.chofer_raw),
           choferLegajo: r.chofer_legajo,
           choferRaw: r.chofer_raw,
           esAdaptado: Boolean(r.es_adaptado),

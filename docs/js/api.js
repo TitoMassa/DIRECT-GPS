@@ -1,4 +1,9 @@
-import { DEFAULT_API_BASE, REMOVED_LINE_CODES, normalizePublicLineName } from './config.js';
+import {
+  DEFAULT_API_BASE,
+  REMOVED_LINE_CODES,
+  normalizePublicLineName,
+  resolveDriverDisplayInfo
+} from './config.js';
 import {
   staticBootstrap,
   staticCalles,
@@ -8,8 +13,40 @@ import {
   staticRecorridos
 } from './static-data.js';
 
+function sanitizeDriverFields(item) {
+  if (!item || typeof item !== 'object') return item;
+  if (
+    item.choferNombre !== undefined ||
+    item.choferLegajo !== undefined ||
+    item.identificadorChofer !== undefined
+  ) {
+    const resolved = resolveDriverDisplayInfo(
+      item.choferLegajo,
+      item.choferNombre,
+      item.identificadorChofer || item.choferRaw || ''
+    );
+    if (item.choferNombre !== undefined || resolved.nombre) {
+      item.choferNombre = resolved.nombre;
+    }
+    if (resolved.legajo && !item.choferLegajo) {
+      item.choferLegajo = resolved.legajo;
+    }
+  }
+  if (item.lastChoferNombre !== undefined || item.lastChoferLegajo !== undefined) {
+    const resolved = resolveDriverDisplayInfo(item.lastChoferLegajo, item.lastChoferNombre);
+    if (item.lastChoferNombre !== undefined || resolved.nombre) {
+      item.lastChoferNombre = resolved.nombre;
+    }
+    if (resolved.legajo && !item.lastChoferLegajo) {
+      item.lastChoferLegajo = resolved.legajo;
+    }
+  }
+  return item;
+}
+
 function sanitizeLineItem(item) {
   if (!item || typeof item !== 'object') return item;
+  sanitizeDriverFields(item);
   const cod = Number(item.codigoLinea ?? item.codigo);
   if (!cod) return item;
   if (item.descripcionLinea !== undefined) {
@@ -31,6 +68,12 @@ function sanitizeLineArray(arr) {
     .map(sanitizeLineItem);
 }
 
+function sanitizeDriverArray(arr) {
+  if (!Array.isArray(arr)) return arr;
+  for (const item of arr) sanitizeDriverFields(item);
+  return arr;
+}
+
 function sanitizeApiPayload(json) {
   if (!json || typeof json !== 'object') return json;
   const targets = [json, json.data].filter((o) => o && typeof o === 'object');
@@ -47,8 +90,30 @@ function sanitizeApiPayload(json) {
     if (Array.isArray(obj.arribos)) obj.arribos = sanitizeLineArray(obj.arribos);
     if (Array.isArray(obj.corridorFleet)) obj.corridorFleet = sanitizeLineArray(obj.corridorFleet);
     if (Array.isArray(obj.units)) obj.units = sanitizeLineArray(obj.units);
+    if (Array.isArray(obj.activeUnits)) obj.activeUnits = sanitizeLineArray(obj.activeUnits);
     if (Array.isArray(obj.trips)) obj.trips = sanitizeLineArray(obj.trips);
+    if (Array.isArray(obj.todayTrips)) obj.todayTrips = sanitizeDriverArray(obj.todayTrips);
+    if (Array.isArray(obj.dayTrips)) obj.dayTrips = sanitizeDriverArray(obj.dayTrips);
+    if (Array.isArray(obj.dayObs)) obj.dayObs = sanitizeDriverArray(obj.dayObs);
+    if (Array.isArray(obj.coches)) obj.coches = sanitizeDriverArray(obj.coches);
+    if (Array.isArray(obj.choferes)) obj.choferes = sanitizeDriverArray(obj.choferes);
     if (Array.isArray(obj.results)) obj.results = sanitizeLineArray(obj.results);
+    if (obj.stopSnapshot && Array.isArray(obj.stopSnapshot.arribos)) {
+      obj.stopSnapshot.arribos = sanitizeLineArray(obj.stopSnapshot.arribos);
+    }
+    if (obj.lines && typeof obj.lines === 'object' && !Array.isArray(obj.lines)) {
+      for (const lineObj of Object.values(obj.lines)) {
+        if (!lineObj || typeof lineObj !== 'object') continue;
+        if (Array.isArray(lineObj.coches)) sanitizeDriverArray(lineObj.coches);
+        if (Array.isArray(lineObj.choferes)) sanitizeDriverArray(lineObj.choferes);
+        if (lineObj.dayTripsByDay && typeof lineObj.dayTripsByDay === 'object') {
+          for (const arr of Object.values(lineObj.dayTripsByDay)) sanitizeDriverArray(arr);
+        }
+        if (lineObj.dayObsByDay && typeof lineObj.dayObsByDay === 'object') {
+          for (const arr of Object.values(lineObj.dayObsByDay)) sanitizeDriverArray(arr);
+        }
+      }
+    }
     if (obj.codigoLinea && obj.descripcionLinea !== undefined) {
       obj.descripcionLinea = normalizePublicLineName(obj.codigoLinea, obj.descripcionLinea);
     }
@@ -808,10 +873,10 @@ export const api = {
     }
     const mirrored = await readFleetMirror();
     if (!mirrored) return { dayKey: '', stopSnapshot: null, trips: [], units: [] };
-    return {
+    return sanitizeApiPayload({
       ...mirrored,
       stopSnapshot: cleanStop && mirrored.stops ? mirrored.stops[cleanStop] || null : null
-    };
+    });
   },
 
   reportFleetSeen: async (entries = [], dayKey = '') => {
@@ -881,6 +946,7 @@ export const api = {
       idbSnap = await readIdbValue('offline_bundle');
       const idbTs = Number(idbSnap?.savedAt) || 0;
       if (!force && idbSnap?.data && (isBrowserOffline() || now - idbTs < maxAgeMs)) {
+        sanitizeApiPayload(idbSnap.data);
         lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
         return {
           data: idbSnap.data,
@@ -917,6 +983,7 @@ export const api = {
     if (!idbSnap) idbSnap = await readIdbValue('offline_bundle');
     if (idbSnap?.data) {
       const idbTs = Number(idbSnap.savedAt) || 0;
+      sanitizeApiPayload(idbSnap.data);
       lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
       return { data: idbSnap.data, savedAt: idbTs, isOfflineCache: true };
     }
@@ -1249,7 +1316,7 @@ async function searchOfflineFlotaBundle(rawQ = '') {
   }
   const bundleSnap = await readIdbValue('offline_bundle');
   if (!bundleSnap?.data?.lines) return null;
-  const b = bundleSnap.data;
+  const b = sanitizeApiPayload(bundleSnap.data);
   const todayKey = b.dayKey || getArgentinaDayKeyLocal(bundleSnap.savedAt);
   const matches = [];
 
@@ -1678,15 +1745,22 @@ export function matchBusesWithHorarios(buses = [], horarios = []) {
 
 export function parseChoferInfo(raw = '', existingNombre = '', existingLegajo = '') {
   if (existingNombre || existingLegajo) {
-    return { nombre: existingNombre, legajo: existingLegajo, raw: raw || `${existingNombre} (${existingLegajo})` };
+    const resolved = resolveDriverDisplayInfo(existingLegajo, existingNombre, raw);
+    return {
+      nombre: resolved.nombre,
+      legajo: resolved.legajo,
+      raw: raw || (resolved.legajo ? `${resolved.nombre} (${resolved.legajo})` : resolved.nombre)
+    };
   }
   const clean = String(raw || '').trim();
   if (!clean) return { nombre: '', legajo: '', raw: '' };
   const m = clean.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
   if (m) {
-    return { nombre: m[1].trim(), legajo: m[2].trim(), raw: clean };
+    const resolved = resolveDriverDisplayInfo(m[2].trim(), m[1].trim(), clean);
+    return { nombre: resolved.nombre, legajo: resolved.legajo, raw: clean };
   }
-  return { nombre: clean, legajo: '', raw: clean };
+  const resolved = resolveDriverDisplayInfo('', clean, clean);
+  return { nombre: resolved.nombre, legajo: resolved.legajo, raw: clean };
 }
 
 export function formatGpsTimeOnly(rawStamp = '') {

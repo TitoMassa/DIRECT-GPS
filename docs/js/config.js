@@ -25,6 +25,87 @@ export function normalizePublicLineName(codLinea, fallback = '') {
   return String(fallback || '').trim();
 }
 
+// Nombres visibles definitivos de choferes por legajo
+export const DRIVER_NAME_OVERRIDES = {
+  '14172': 'BARRIOS CARLOS SEBASTIAN',
+  '12360': 'PUCHETA NELSON HERNAN',
+  '10304': 'DABRIO JUAN',
+  '98535': 'GIMENEZ MARCOS ANTONIO',
+  '98514': 'GIMENEZ ARNALDO JAVIER',
+  '10242': 'GIMENEZ MARIO JOSE',
+  '10880': 'ESCALANTE ADOLFO GUSTAVO',
+  '13347': 'GALVEZ ALAN GASTON',
+  '10413': 'PARRAS EDGARDO JUAN',
+  '12222': 'VILLALBA DAMIAN EMANUEL',
+  '10903': 'ACEVEDO NESTOR DAMIAN',
+  '98534': 'MIRANDA MARCOS CESAR',
+  '98513': 'BENITEZ JOSE LUIS',
+  '10830': 'ARCE ROBERTO CARLOS',
+  '12359': 'PORTO LISANDRO LUCAS',
+  '98540': 'IBARRA MAXIMILIANO ARIEL',
+  '13337': 'VILLAR MATIAS DANIEL',
+  '13177': 'ACEVEDO GUSTAVO ADOLFO',
+  '98512': 'ORTIZ ANIBAL OSCAR',
+  '10853': 'GOMEZ ROBERTO WALDEMAR',
+  '14128': 'LANNUZZI HECTOR MIGUEL',
+  '12109': 'BARRIOS CLAUDIO ANDRES',
+  '10231': 'CANTERO TERENCIO DE JESUS',
+  '19060': 'TRIPIER JUAN LUIS',
+  '10164': 'MACIEL JUAN MANUEL',
+  '10128': 'ESTIGARRIBIA RAMON TOMAS',
+  '10246': 'MAIDANA JORGE OSVALDO',
+  '10340': 'MARINILLI JULIO CESAR',
+  '14034': 'PINTOS DANIEL ALEJANDRO',
+  '10463': 'DUARTE ANTONIO REGINO',
+  '10043': 'SOSA CHRISTIAN HUGO',
+  '19020': 'CANTEROS JUAN RAMON'
+};
+
+export function resolveDriverDisplayInfo(choferLegajo = '', choferNombre = '', choferRaw = '') {
+  let leg = String(choferLegajo || '').trim();
+  const nom = String(choferNombre || '').trim();
+  const raw = String(choferRaw || '').trim();
+
+  if (!leg && raw) {
+    const rm = raw.match(/\(\s*([^)]+)\s*\)\s*$/);
+    if (rm) leg = rm[1].trim();
+  }
+
+  const lookupOverride = (candidate) => {
+    const clean = String(candidate || '').trim();
+    if (!clean) return null;
+    if (DRIVER_NAME_OVERRIDES[clean]) return { leg: clean, nombre: DRIVER_NAME_OVERRIDES[clean] };
+    const noZero = clean.replace(/^0+/, '');
+    if (noZero && DRIVER_NAME_OVERRIDES[noZero]) return { leg: noZero, nombre: DRIVER_NAME_OVERRIDES[noZero] };
+    return null;
+  };
+
+  const byLeg = lookupOverride(leg);
+  if (byLeg) return { nombre: byLeg.nombre, legajo: leg || byLeg.leg };
+
+  if (nom) {
+    const m = nom.match(/^(?:Legajo\s+)?0*(\d+)$/i) || nom.match(/\(\s*0*(\d+)\s*\)\s*$/);
+    if (m) {
+      const byNameId = lookupOverride(m[1]);
+      if (byNameId) return { nombre: byNameId.nombre, legajo: leg || byNameId.leg };
+    }
+  }
+
+  if (raw && !nom) {
+    const m = raw.match(/^(?:Legajo\s+)?0*(\d+)$/i) || raw.match(/\(\s*0*(\d+)\s*\)\s*$/);
+    if (m) {
+      const byRawId = lookupOverride(m[1]);
+      if (byRawId) return { nombre: byRawId.nombre, legajo: leg || byRawId.leg };
+    }
+  }
+
+  return { nombre: nom, legajo: leg };
+}
+
+export function resolveDriverDisplayName(choferLegajo = '', choferNombre = '', choferRaw = '') {
+  return resolveDriverDisplayInfo(choferLegajo, choferNombre, choferRaw).nombre;
+}
+
 // Distinct, high-contrast civic transit palette by Corrientes line family
 const FAMILY_COLORS = {
   '102': '#0284c7', // Corrientes River Blue
