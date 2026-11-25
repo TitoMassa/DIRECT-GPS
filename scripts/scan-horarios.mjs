@@ -358,6 +358,86 @@ async function getFeriados(years) {
   return set;
 }
 
+function hasNearSec(list = [], targetSec, tolSec = 90) {
+  for (const it of list) {
+    const s = horaToSec(it.hora);
+    if (s >= 0 && Math.abs(s - targetSec) <= tolSec) return true;
+  }
+  return false;
+}
+
+/**
+ * Protects canonical 'habil' and 'sabado' archives from being overwritten by provincial/municipal/university
+ * holidays (e.g. UNNE asuetos on 904A/904B), local strikes, or reduced-service weekdays not listed in national feriados.
+ */
+function detectReducedScheduleAnomaly(tipo, storedMap, stagedMergedByStop, freshRawByStop) {
+  if (tipo !== 'habil' && tipo !== 'sabado') return { anomalous: false, reason: '' };
+
+  let prevTotal = 0;
+  let mergedTotal = 0;
+  let sabTotal = 0;
+  let domTotal = 0;
+  let freshCount = 0;
+  let weekendMatches = 0;
+  let habilMatches = 0;
+
+  for (const [stopId, mergedList] of stagedMergedByStop.entries()) {
+    const prevObj = storedMap.get(stopId) || {};
+    const prevTipoList = prevObj[tipo] || [];
+    const sabList = prevObj.sabado || [];
+    const domList = prevObj.domingo || [];
+
+    prevTotal += prevTipoList.length;
+    mergedTotal += mergedList.length;
+    sabTotal += sabList.length;
+    domTotal += domList.length;
+
+    if (tipo === 'habil') {
+      const freshItems = freshRawByStop.get(stopId) || [];
+      for (const it of freshItems) {
+        const sec = horaToSec(it.hora);
+        if (sec < 0) continue;
+        freshCount++;
+        if (hasNearSec(sabList, sec, 90) || hasNearSec(domList, sec, 90)) weekendMatches++;
+        if (hasNearSec(prevTipoList, sec, 90)) habilMatches++;
+      }
+    }
+  }
+
+  if (tipo === 'habil' && prevTotal >= 60) {
+    if (mergedTotal < prevTotal * 0.85) {
+      return {
+        anomalous: true,
+        reason: `caída de frecuencia (${mergedTotal} vs ${prevTotal} pasos habituales en día hábil)`
+      };
+    }
+    const wkndTotal = Math.max(sabTotal, domTotal);
+    if (
+      wkndTotal > 0 &&
+      prevTotal > wkndTotal * 1.12 &&
+      freshCount >= 20 &&
+      weekendMatches / freshCount >= 0.78 &&
+      weekendMatches > habilMatches * 1.15
+    ) {
+      return {
+        anomalous: true,
+        reason: `coincide con diagrama de fin de semana (${Math.round((weekendMatches / freshCount) * 100)}%)`
+      };
+    }
+  }
+
+  if (tipo === 'sabado' && prevTotal >= 60 && domTotal > 0 && prevTotal > domTotal * 1.15) {
+    if (mergedTotal < prevTotal * 0.82) {
+      return {
+        anomalous: true,
+        reason: `caída de frecuencia de sábado (${mergedTotal} vs ${prevTotal} pasos habituales)`
+      };
+    }
+  }
+
+  return { anomalous: false, reason: '' };
+}
+
 async function main() {
   const t0 = Date.now();
   const nowArtMs = Date.now() - 3 * 3600 * 1000;
@@ -375,20 +455,23 @@ async function main() {
     };
   });
   const feriados = await getFeriados([...new Set(candidates.map((c) => c.iso.slice(0, 4)))]);
-  const targets = [];
+  const targetsByTipo = new Map();
   for (const c of candidates) {
     if (feriados.has(c.iso)) {
-      console.log(`· ${c.iso} es feriado: se omite (su grilla no representa un ${c.tipo} normal).`);
+      console.log(`· ${c.iso} es feriado nacional: se omite (su grilla no representa un ${c.tipo} normal).`);
       continue;
     }
-    if (targets.some((t) => t.tipo === c.tipo)) continue;
-    targets.push(c);
+    if (!targetsByTipo.has(c.tipo)) targetsByTipo.set(c.tipo, []);
+    targetsByTipo.get(c.tipo).push(c);
   }
-  if (!targets.length) {
+  if (!targetsByTipo.size) {
     console.log('Nada para escanear.');
     return;
   }
-  console.log(`Escaneando: ${targets.map((t) => `${t.tipo} (${t.iso})`).join(', ')} · concurrencia ${CONCURRENCY}`);
+  const planDesc = [...targetsByTipo.entries()]
+    .map(([tipo, list]) => `${tipo} (${list.map((x) => x.iso).join(' / ')})`)
+    .join(', ');
+  console.log(`Escaneando: ${planDesc} · concurrencia ${CONCURRENCY}`);
 
   await mkdir(OUT_DIR, { recursive: true });
   const indexFile = path.join(OUT_DIR, 'index.json');
@@ -413,41 +496,77 @@ async function main() {
     const lineFile = path.join(OUT_DIR, `${linea.codigo}.json`);
     const stored = decodeLineFile(await readJson(lineFile, null));
 
-    const jobs = [];
-    for (const stopId of stops) for (const t of targets) jobs.push({ stopId, t });
     const stat = { updated: 0, kept: 0, failed: 0, empty: 0 };
-    const okTipos = new Set();
+    const committedIsoByTipo = new Map();
 
-    await pool(
-      jobs,
-      async ({ stopId, t }) => {
-        const r = await scanStopDay(stopId, linea.codigo, t.iso, validStartArtMs, validEndArtMs);
-        const prev = stored.get(stopId) || {};
-        if (!r.ok) {
-          stat.failed++;
-          return;
+    for (const [tipo, candList] of targetsByTipo.entries()) {
+      for (let ci = 0; ci < candList.length; ci++) {
+        const t = candList[ci];
+        const stagedMerged = new Map();
+        const freshRaw = new Map();
+        const subStat = { updated: 0, kept: 0, failed: 0, empty: 0 };
+        let anyOk = false;
+
+        await pool(
+          stops,
+          async (stopId) => {
+            const r = await scanStopDay(stopId, linea.codigo, t.iso, validStartArtMs, validEndArtMs);
+            const prev = stored.get(stopId) || {};
+            if (!r.ok) {
+              subStat.failed++;
+              return;
+            }
+            anyOk = true;
+            if (!r.items.length) {
+              subStat.empty++;
+              return;
+            }
+            freshRaw.set(stopId, r.items);
+            const before = JSON.stringify(prev[t.tipo] || []);
+            const merged = mergeScheduleItems(prev[t.tipo], r);
+            stagedMerged.set(stopId, merged);
+            if (before === JSON.stringify(merged)) subStat.kept++;
+            else subStat.updated++;
+          },
+          CONCURRENCY
+        );
+
+        if (!anyOk || subStat.failed >= stops.length) {
+          stat.failed += subStat.failed;
+          continue;
         }
-        okTipos.add(t.tipo);
-        if (!r.items.length) {
-          stat.empty++;
-          return;
+
+        const anomaly =
+          stagedMerged.size > 0
+            ? detectReducedScheduleAnomaly(tipo, stored, stagedMerged, freshRaw)
+            : { anomalous: false, reason: '' };
+
+        if (anomaly.anomalous) {
+          const nextHint = ci + 1 < candList.length ? ` → probando ${candList[ci + 1].iso}` : ' → se conserva archivo previo';
+          console.log(`  ⚠ ${linea.descripcion} (${t.iso} · ${tipo}): omitido por ${anomaly.reason}${nextHint}`);
+          continue;
         }
-        const before = JSON.stringify(prev[t.tipo] || []);
-        const merged = mergeScheduleItems(prev[t.tipo], r);
-        prev[t.tipo] = merged;
-        stored.set(stopId, prev);
-        if (before === JSON.stringify(merged)) stat.kept++;
-        else stat.updated++;
-      },
-      CONCURRENCY
-    );
+
+        for (const [stopId, merged] of stagedMerged.entries()) {
+          const prev = stored.get(stopId) || {};
+          prev[tipo] = merged;
+          stored.set(stopId, prev);
+        }
+        stat.updated += subStat.updated;
+        stat.kept += subStat.kept;
+        stat.empty += subStat.empty;
+        stat.failed += subStat.failed;
+        committedIsoByTipo.set(tipo, t.iso);
+        break;
+      }
+    }
 
     await writeFile(lineFile, encodeLineFile(linea, stored));
     const meta = (index.lineas[String(linea.codigo)] ||= { tipos: {} });
     meta.descripcion = linea.descripcion;
     meta.paradas = [...stored.values()].filter((v) => Object.keys(v).length).length;
     meta.tipos ||= {};
-    for (const t of targets) if (okTipos.has(t.tipo) && stat.failed < jobs.length) meta.tipos[t.tipo] = t.iso;
+    for (const [tipo, iso] of committedIsoByTipo.entries()) meta.tipos[tipo] = iso;
     for (const k of Object.keys(totals)) totals[k] += stat[k];
     console.log(
       `✓ ${linea.descripcion.padEnd(18)} paradas ${String(stops.length).padStart(3)} · nuevos/cambiados ${stat.updated} · sin cambios ${stat.kept} · sin horarios ${stat.empty} · fallidos ${stat.failed}`
@@ -467,7 +586,11 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+export { decodeLineFile, detectReducedScheduleAnomaly };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

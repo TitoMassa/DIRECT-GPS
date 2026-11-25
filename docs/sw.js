@@ -1,5 +1,5 @@
-const CACHE_NAME = 'direct-gps-v83';
-const DATA_CACHE = 'direct-gps-data-v4';
+const CACHE_NAME = 'direct-gps-v85';
+const DATA_CACHE = 'direct-gps-data-v5';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
 
@@ -33,7 +33,10 @@ function canonicalTileKey(url) {
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_ASSETS)).catch(() => {})
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(SHELL_ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
+      .catch(() => {})
   );
   self.skipWaiting();
 });
@@ -91,7 +94,12 @@ self.addEventListener('fetch', (event) => {
   }
 
   // 2) Static route/schedule archives (docs/data/**): stale-while-revalidate for instant offline & online
-  if (url.origin === self.location.origin && url.pathname.includes('/data/')) {
+  //    (horarios/index.json uses network-first below so updatedAt version checks are immediate)
+  if (
+    url.origin === self.location.origin &&
+    url.pathname.includes('/data/') &&
+    !url.pathname.endsWith('/horarios/index.json')
+  ) {
     event.respondWith(
       caches.open(DATA_CACHE).then(async (cache) => {
         const cached = await cache.match(req);
@@ -106,7 +114,9 @@ self.addEventListener('fetch', (event) => {
           return cached;
         }
         const net = await netPromise;
-        return net || new Response('{"error":"offline"}', { status: 503, headers: { 'Content-Type': 'application/json' } });
+        if (net) return net;
+        const anyCached = await cache.match(req, { ignoreSearch: true });
+        return anyCached || new Response('{"error":"offline"}', { status: 503, headers: { 'Content-Type': 'application/json' } });
       })
     );
     return;

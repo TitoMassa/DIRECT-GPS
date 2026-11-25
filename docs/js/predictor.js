@@ -34,12 +34,57 @@ function getBranchKey(b) {
   return `${b?.index ?? 0}:${b?.git || normalizeBandera(b?.bandera || '')}`;
 }
 
-export function normalizeBandera(str = '') {
+function normalizeBanderaLegacy(str = '') {
   return String(str || '')
     .toUpperCase()
     .replace(/[º°]/g, 'O')
     .replace(/[^A-Z0-9]+/g, ' ')
     .trim();
+}
+
+export function normalizeBandera(str = '') {
+  return String(str || '')
+    .toUpperCase()
+    .replace(/[º°]/g, 'O')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+}
+
+class TripKeyMap extends Map {
+  constructor() {
+    super();
+    this._aliases = new Map();
+  }
+
+  registerAlias(aliasKey, trip) {
+    if (aliasKey && !super.has(aliasKey)) {
+      this._aliases.set(aliasKey, trip);
+    }
+  }
+
+  has(key) {
+    if (super.has(key)) return true;
+    if (this._aliases.has(key)) return true;
+    const idx = typeof key === 'string' ? key.lastIndexOf('@') : -1;
+    if (idx > 0) {
+      const normKey = `${normalizeBandera(key.slice(0, idx))}${key.slice(idx)}`;
+      if (super.has(normKey)) return true;
+    }
+    return false;
+  }
+
+  get(key) {
+    if (super.has(key)) return super.get(key);
+    if (this._aliases.has(key)) return this._aliases.get(key);
+    const idx = typeof key === 'string' ? key.lastIndexOf('@') : -1;
+    if (idx > 0) {
+      const normKey = `${normalizeBandera(key.slice(0, idx))}${key.slice(idx)}`;
+      if (super.has(normKey)) return super.get(normKey);
+    }
+    return undefined;
+  }
 }
 
 export function parseTimeToSec(hhmmss = '') {
@@ -692,6 +737,7 @@ export function resolveLiveHorariosForDay(archiveFile, liveLineData, fallbackTip
 function reconstructBranchTrips(branch, horariosFile, tipoDia) {
   const banderas = Array.isArray(horariosFile?.banderas) ? horariosFile.banderas : [];
   const normBranchBandera = normalizeBandera(branch.bandera);
+  const normBranchBanderaLegacy = normalizeBanderaLegacy(branch.bandera);
   const paradasMap = horariosFile?.paradas || {};
 
   const matchingBanderaIdx = new Set();
@@ -760,12 +806,12 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       if (bestTrip) {
         const last = bestTrip.tr.points[bestTrip.tr.points.length - 1];
         const safeSec = Math.max(last.sec + 1, bestTrip.sec);
-        bestTrip.tr.points.push({ sIdx, stopId: st.stopId, along: st.along, sec: safeSec });
+        bestTrip.tr.points.push({ sIdx, stopId: st.stopId, along: st.along, sec: safeSec, rawSec: bestTrip.sec });
         usedTrips.add(bestTrip.tr);
       } else {
         trips.push({
           branch,
-          points: [{ sIdx, stopId: st.stopId, along: st.along, sec: rawSec }]
+          points: [{ sIdx, stopId: st.stopId, along: st.along, sec: rawSec, rawSec }]
         });
       }
     }
@@ -802,25 +848,37 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     const startSec = fullPts[0].sec;
     const endSec = fullPts[fullPts.length - 1].sec;
     const stopTimeMap = new Map();
+    const rawStopTimeMap = new Map();
     for (const p of pts) {
-      if (p.stopId) stopTimeMap.set(p.stopId, p.sec);
+      if (p.stopId) {
+        stopTimeMap.set(p.stopId, p.sec);
+        rawStopTimeMap.set(p.stopId, p.rawSec ?? p.sec);
+      }
     }
 
-    let tripKey = `${normBranchBandera}@${formatSecHHMM(startSec)}`;
+    let suffix = `@${formatSecHHMM(startSec)}`;
+    let tripKey = `${normBranchBandera}${suffix}`;
     if (usedKeys.has(tripKey)) {
-      tripKey = `${normBranchBandera}@${formatSecHHMM(startSec)}:${Math.round(startSec % 60)}`;
+      suffix = `@${formatSecHHMM(startSec)}:${Math.round(startSec % 60)}`;
+      tripKey = `${normBranchBandera}${suffix}`;
     }
     usedKeys.add(tripKey);
+    const legacyTripKey =
+      normBranchBanderaLegacy && normBranchBanderaLegacy !== normBranchBandera
+        ? `${normBranchBanderaLegacy}${suffix}`
+        : '';
 
     const tripEnds = resolveTripEndpoints(branch, pts);
 
     finalized.push({
       tripKey,
+      legacyTripKey,
       branch,
       points: fullPts,
       startSec,
       endSec,
       stopTimeMap,
+      rawStopTimeMap,
       originPlace: tripEnds.originPlace,
       destPlace: tripEnds.destPlace,
       originStopId: tripEnds.originStopId,
@@ -1140,9 +1198,10 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
     .sort((a, c) => a.startSec - c.startSec);
 
-  const tripByKey = new Map();
+  const tripByKey = new TripKeyMap();
   for (const trip of allTrips) {
     tripByKey.set(trip.tripKey, trip);
+    if (trip.legacyTripKey) tripByKey.registerAlias(trip.legacyTripKey, trip);
   }
 
   const sameTerminalPair = (inBr, outBr) =>
@@ -1290,6 +1349,59 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       bestSwap.depNext.layoverFromPrevSec = bestSwap.layB;
       bestSwap.depNext.linkConfidence = 'rebalanced';
     }
+
+    // Pass C: Midday shift-completion handoff (e.g. 108A 14:02/14:11 -> 14:14):
+    // When an early-morning block A has just completed an exact ~8h single shift (k === typicalLegs)
+    // and took a partial afternoon tail, while a mid-morning block B (starting 09:30–13:00) ended
+    // mid-shift (< typicalLegs - 1) at the same terminal CLOSER to A[k]'s departure, hand A[k..] to B
+    // so A ends cleanly at 1 full shift, B completes its shift, and cyclic 1..N service order is preserved.
+    for (let iter = 0; iter < 4; iter++) {
+      const chains = extractChains();
+      let bestMidSwap = null;
+      for (const B of chains) {
+        const sB = B[0].startSec;
+        const arrB = B[B.length - 1];
+        const durB = arrB.endSec - sB;
+        if (sB < 9.5 * 3600 || sB >= 13.0 * 3600) continue;
+        if (arrB.endSec < 13.0 * 3600 || arrB.endSec > 16.5 * 3600) continue;
+        if (B.length > typicalLegs - 2 || durB >= 5.2 * 3600) continue;
+
+        for (const A of chains) {
+          if (A === B) continue;
+          const sA = A[0].startSec;
+          if (sA >= 8.5 * 3600) continue;
+          if (A.length < typicalLegs + 2 || A.length > 2 * typicalLegs - 2) continue;
+
+          const k = typicalLegs;
+          if (k >= A.length) continue;
+          const arrA = A[k - 1];
+          const depNext = A[k];
+          const headDurA = arrA.endSec - sA;
+          if (headDurA < 6.5 * 3600 || headDurA > 8.30 * 3600) continue;
+          if (!sameTerminalPair(arrB.branch, depNext.branch)) continue;
+
+          const layB = depNext.startSec - arrB.endSec;
+          const layA = depNext.startSec - arrA.endSec;
+          if (layB < -120 || layB > 18 * 60) continue;
+          if (layB >= layA) continue; // B must have arrived closer to depNext than A
+
+          const tailLegs = A.length - k;
+          const newLegsB = B.length + tailLegs;
+          if (newLegsB < typicalLegs || newLegsB > typicalLegs + 4) continue;
+
+          const gain = (layA - layB) + (typicalLegs - B.length) * 600;
+          if (!bestMidSwap || gain > bestMidSwap.gain) {
+            bestMidSwap = { arrA, arrB, depNext, layB, gain };
+          }
+        }
+      }
+      if (!bestMidSwap) break;
+      bestMidSwap.arrA.nextTrip = null;
+      bestMidSwap.arrB.nextTrip = bestMidSwap.depNext;
+      bestMidSwap.depNext.prevTrip = bestMidSwap.arrB;
+      bestMidSwap.depNext.layoverFromPrevSec = bestMidSwap.layB;
+      bestMidSwap.depNext.linkConfidence = 'rebalanced';
+    }
   }
 
   const rawBlocks = [];
@@ -1313,6 +1425,22 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
   const primaryBranch = firstTrip?.branch || branches[0] || null;
   const primaryTrips = primaryBranch ? branchTrips.get(getBranchKey(primaryBranch)) || [] : [];
 
+  // For multi-branch lines feeding a shared destination hub (e.g. 105C Perichón + Bº 250 Viviendas -> Puerto),
+  // use the combined hub-bound outbound corridor to determine canonical 1..N service order so minor sub-branches
+  // never invert or scramble service numbers!
+  const sharedHubTerm =
+    primaryBranch && !shuttleIsolated.has(primaryBranch)
+      ? terminals.find((term) => term.inBranches.length > 1 && term.inBranches.includes(primaryBranch))
+      : null;
+  const primaryOrderBranchSet = sharedHubTerm
+    ? new Set(sharedHubTerm.inBranches)
+    : new Set(primaryBranch ? [primaryBranch] : []);
+  const primaryOrderTrips = sharedHubTerm
+    ? sharedHubTerm.inBranches
+        .flatMap((b) => branchTrips.get(getBranchKey(b)) || [])
+        .sort((a, b) => a.startSec - b.startSec)
+    : primaryTrips;
+
   const cyclicDist = (a, b, n) => (((b - a) % n) + n) % n;
   const isStrictlyBetweenCyc = (prevS, cand, nextS, n) => {
     if (prevS === nextS) return cand !== prevS;
@@ -1321,12 +1449,16 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     return dPC > 0 && dPC < dPN;
   };
 
-  const isWeekend = resolved.tipo !== 'habil';
+  // Domain rule: Interprovincial 904 lines NEVER run horarios cortados on any day of the week;
+  // Urban lines (102–109) ONLY run horarios cortados on weekdays (Lun–Vie / 'habil'), NEVER on sábados, domingos or feriados.
+  const allowsCortado = !isInterprovincial && resolved.tipo === 'habil';
   const blockMeta = rawBlocks.map((trips, idx) => {
     const startSec = trips[0]?.startSec ?? 0;
     const endSec = trips[trips.length - 1]?.endSec ?? 0;
     const durSec = Math.max(0, endSec - startSec);
-    const primTrips = primaryBranch ? trips.filter((t) => t.branch === primaryBranch) : [];
+    const primTrips = primaryOrderBranchSet.size
+      ? trips.filter((t) => primaryOrderBranchSet.has(t.branch))
+      : [];
     const branchSet = new Set(trips.map((t) => t.branch));
     return {
       idx,
@@ -1334,7 +1466,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       startSec,
       endSec,
       durSec,
-      isCortado: !isInterprovincial && !isWeekend && durSec < 5.5 * 3600,
+      isCortado: allowsCortado && durSec < 5.5 * 3600,
       isRelevoEnLinea: durSec >= 11 * 3600,
       primTrips,
       branchSet,
@@ -1382,7 +1514,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
   for (const bm of blockMeta) {
     for (const t of bm.trips) tripToBm.set(t, bm);
   }
-  const firstPrimTrip = primaryTrips[0] || null;
+  const firstPrimTrip = primaryOrderTrips[0] || null;
   const firstBm = firstPrimTrip ? tripToBm.get(firstPrimTrip) : null;
   const firstLap2 = firstBm && firstBm.primTrips.length >= 2 ? firstBm.primTrips[1] : null;
   const peakSet = new Set(peakSnapshot);
@@ -1390,9 +1522,9 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
   const morningOrdered = [];
   const usedMorning = new Set();
   if (firstLap2) {
-    const lap2Idx = primaryTrips.indexOf(firstLap2);
-    for (let k = lap2Idx; k < primaryTrips.length; k++) {
-      const bm = tripToBm.get(primaryTrips[k]);
+    const lap2Idx = primaryOrderTrips.indexOf(firstLap2);
+    for (let k = lap2Idx; k < primaryOrderTrips.length; k++) {
+      const bm = tripToBm.get(primaryOrderTrips[k]);
       if (!bm || usedMorning.has(bm)) break;
       if (!peakSet.has(bm) && bm.endSec <= peakTime - 180) continue;
       usedMorning.add(bm);
@@ -1408,10 +1540,10 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       const refTrip = mp.primTrips.reduce((best, t) =>
         Math.abs(t.startSec - peakTime) < Math.abs(best.startSec - peakTime) ? t : best
       );
-      const rIdx = primaryTrips.indexOf(refTrip);
+      const rIdx = primaryOrderTrips.indexOf(refTrip);
       let prevKnown = null;
       for (let k = rIdx - 1; k >= 0; k--) {
-        const b = tripToBm.get(primaryTrips[k]);
+        const b = tripToBm.get(primaryOrderTrips[k]);
         if (b && usedMorning.has(b)) {
           prevKnown = b;
           break;
@@ -1467,7 +1599,8 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
     let arcFracSum = 0;
 
     for (const t of bm.trips) {
-      const list = branchTrips.get(getBranchKey(t.branch)) || [];
+      const inPrimCorridor = sharedHubTerm && primaryOrderBranchSet.has(t.branch);
+      const list = inPrimCorridor ? primaryOrderTrips : branchTrips.get(getBranchKey(t.branch)) || [];
       const pos = list.indexOf(t);
       if (pos < 0) continue;
 
@@ -1497,7 +1630,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       }
 
       if (prevS !== null && nextS !== null) {
-        const w = t.branch === primaryBranch ? 2 : 1;
+        const w = primaryOrderBranchSet.has(t.branch) ? 2 : 1;
         observations += w;
         if (isStrictlyBetweenCyc(prevS, s, nextS, totalServices)) {
           matches += w;
@@ -1686,7 +1819,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       endSec: curTrips[curTrips.length - 1].endSec,
       durSec: tailDur,
       // A trailing night relief right after a relevo en línea is a continuation shift, NOT a morning cortado
-      isCortado: cameFromRelevo ? false : !isInterprovincial && !isWeekend && tailDur < 5.5 * 3600,
+      isCortado: cameFromRelevo ? false : allowsCortado && tailDur < 5.5 * 3600,
       isRelevoEnLinea: cameFromRelevo,
       relevoFromPrev: cameFromRelevo,
       relevoToNext: false,
@@ -1729,6 +1862,7 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
         curP.isRelevoEnLinea = true;
         nextP.relevoFromPrev = true;
         nextP.isRelevoEnLinea = true;
+        nextP.isCortado = false; // A continuous relevo continuation is NEVER a horario cortado
       }
     }
 
@@ -1743,14 +1877,16 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
       const prevP = idx > 0 ? parts[idx - 1] : null;
       const relevoPlace = p.relevoToNext ? nextP?.startPlace || p.endPlace || '' : '';
       const prevRelevoPlace = p.relevoFromPrev ? p.startPlace || prevP?.endPlace || '' : '';
+      const resumesFromCortado = Boolean(prevP && !p.relevoFromPrev && prevP.isCortado);
       return {
         blockId: `blk:${numCode}:${resolved.tipo}:${s}:t${idx + 1}`,
         turnoIndex: idx + 1,
         startSec: p.startSec,
         endSec: p.endSec,
         durationSec: p.durSec,
-        isCortado: p.isCortado,
-        isRelevoEnLinea: p.isRelevoEnLinea,
+        isCortado: Boolean(p.isCortado),
+        resumesFromCortado,
+        isRelevoEnLinea: Boolean(p.isRelevoEnLinea),
         relevoFromPrev: Boolean(p.relevoFromPrev),
         relevoToNext: Boolean(p.relevoToNext),
         legCount: p.trips.length,
@@ -1790,8 +1926,9 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
         serviceTurnosCount: parts.length,
         serviceTurnos,
         isPeakService: Boolean(p.isPeak),
-        isCortado: p.isCortado,
-        isRelevoEnLinea: p.isRelevoEnLinea,
+        isCortado: Boolean(p.isCortado),
+        resumesFromCortado: Boolean(tMeta.resumesFromCortado),
+        isRelevoEnLinea: Boolean(p.isRelevoEnLinea),
         relevoFromPrev: Boolean(p.relevoFromPrev),
         relevoToNext: Boolean(p.relevoToNext),
         isInterprovincial,
@@ -1867,22 +2004,25 @@ export function buildLineScheduleModel(codLinea, branches = [], horariosFile = n
  * (Servicio/Bloque, vuelta number, variable lap durations, and whether the rotation is cortado or continuo).
  */
 export function buildStopTimetableBlocks(model, stopId, stopCoords) {
-  const slotMetaByHora = new Map(); // 'HH:MM' -> { trip, blockInfo, lapAtStop, totalLapsAtStop, stopSlots }
+  const slotMetaByHora = new Map(); // 'HH:MM' or 'HH:MM|NORM_BANDERA' -> { trip, blockInfo, lapAtStop, totalLapsAtStop, stopSlots }
   const blockSlotsById = new Map(); // blockId -> Array<{ hora, sec, trip, lapAtStop }>
   if (!model || !stopCoords) return { slotMetaByHora, blockSlotsById };
 
+  const cleanId = String(stopId || '').trim().toUpperCase();
   const stopBranches = pickStopBranches(model.branches, stopId, stopCoords);
   if (!stopBranches.length) return { slotMetaByHora, blockSlotsById };
 
   for (const sb of stopBranches) {
     const sp = projectOnPolyline(sb.pts, sb.cum, stopCoords.lat, stopCoords.lng);
+    const normSbBandera = normalizeBandera(sb.bandera || '');
     for (const tr of model.getTripsForBranch(sb)) {
       const stSec = getTripStopSec(tr, stopId, sp?.along ?? 0);
       if (stSec === null) continue;
-      const hora = formatSecHHMM(stSec);
+      const rawSec = cleanId && tr.rawStopTimeMap?.has(cleanId) ? tr.rawStopTimeMap.get(cleanId) : stSec;
+      const hora = formatSecHHMM(Math.floor(rawSec));
       const bId = tr.blockId || tr.tripKey;
       if (!blockSlotsById.has(bId)) blockSlotsById.set(bId, []);
-      blockSlotsById.get(bId).push({ hora, sec: stSec, trip: tr });
+      blockSlotsById.get(bId).push({ hora, sec: stSec, rawSec, trip: tr, normBandera: normSbBandera });
     }
   }
 
@@ -1892,17 +2032,24 @@ export function buildStopTimetableBlocks(model, stopId, stopCoords) {
     slots.forEach((s, idx) => {
       s.lapAtStop = idx + 1;
       s.deltaPrevMin = idx > 0 ? Math.round((s.sec - slots[idx - 1].sec) / 60) : null;
+      const meta = {
+        hora: s.hora,
+        sec: s.sec,
+        trip: s.trip,
+        blockId: bId,
+        blockInfo: info,
+        lapAtStop: idx + 1,
+        totalLapsAtStop: slots.length,
+        stopSlots: slots
+      };
+      if (s.normBandera) {
+        const bandKey = `${s.hora}|${s.normBandera}`;
+        if (!slotMetaByHora.has(bandKey)) {
+          slotMetaByHora.set(bandKey, meta);
+        }
+      }
       if (!slotMetaByHora.has(s.hora)) {
-        slotMetaByHora.set(s.hora, {
-          hora: s.hora,
-          sec: s.sec,
-          trip: s.trip,
-          blockId: bId,
-          blockInfo: info,
-          lapAtStop: idx + 1,
-          totalLapsAtStop: slots.length,
-          stopSlots: slots
-        });
+        slotMetaByHora.set(s.hora, meta);
       }
     });
   }
@@ -2197,14 +2344,22 @@ export function buildGpsAnchorForTrip(trip, lat, lng, clockSec, fallbackDesvioSe
  *    neither early nor late!
  *  - When a bus is mid-route or late, it starts right from its last GPS position and gradually recovers delay.
  */
+function branchTurnaroundGap(fromBranch, toBranch) {
+  const a = fromBranch?.pts?.[fromBranch.pts.length - 1];
+  const b = toBranch?.pts?.[0];
+  if (!a || !b) return 0;
+  return distanceMeters(a[0], a[1], b[0], b[1]) || 0;
+}
+
 export function evaluateTripState(
   trip,
   stopId,
   stopProj,
   nowSec,
   desvioSec = 0,
-  { maxAheadSec = 240 * 60, anchor = null } = {}
+  options = {}
 ) {
+  const { maxAheadSec = 240 * 60, anchor = null } = options || {};
   if (!trip || !stopProj) return null;
   const targetStopSec = getTripStopSec(trip, stopId, stopProj.along);
   if (targetStopSec === null) return null;
@@ -2231,11 +2386,12 @@ export function evaluateTripState(
     const termAlong = Number.isFinite(anchor.along) ? anchor.along : 0;
     const inOpp = termBranch !== stopBranch;
     const oppRem = inOpp ? Math.max(0, termBranch.totalLen - termAlong) : 0;
+    const gapOppToStop = inOpp ? branchTurnaroundGap(termBranch, stopBranch) : 0;
 
     if (effNow < trip.startSec) {
       const sample = sampleBranchAtAlong(termBranch, termAlong) || sampleBranchAtAlong(stopBranch, 0);
       if (!sample) return null;
-      const remainingMeters = inOpp ? oppRem + stopProj.along : Math.max(0, stopProj.along - termAlong);
+      const remainingMeters = inOpp ? oppRem + gapOppToStop + stopProj.along : Math.max(0, stopProj.along - termAlong);
       return {
         activeBranch: termBranch,
         activeAlong: termAlong,
@@ -2260,8 +2416,8 @@ export function evaluateTripState(
     const ev = evalPointsAtSec(trip.points, Math.min(effNow, targetStopSec));
     const u = stopProj.along > 1 ? Math.max(0, Math.min(1, ev.along / stopProj.along)) : 1;
 
-    if (inOpp && oppRem > 1) {
-      const totalDist = oppRem + stopProj.along;
+    if (inOpp && oppRem + gapOppToStop > 1) {
+      const totalDist = oppRem + gapOppToStop + stopProj.along;
       const travelled = u * totalDist;
       const scale = totalDist / Math.max(1, stopProj.along);
       if (travelled < oppRem) {
@@ -2289,7 +2445,34 @@ export function evaluateTripState(
           targetStopSec
         };
       }
-      const along = Math.min(stopProj.along, Math.max(0, travelled - oppRem));
+      if (gapOppToStop > 0.5 && travelled < oppRem + gapOppToStop) {
+        const endA = termBranch.pts[termBranch.pts.length - 1];
+        const startB = stopBranch.pts[0];
+        const frac = Math.max(0, Math.min(1, (travelled - oppRem) / gapOppToStop));
+        const lat = endA[0] + (startB[0] - endA[0]) * frac;
+        const lng = endA[1] + (startB[1] - endA[1]) * frac;
+        const remainingMeters = Math.max(0, totalDist - travelled);
+        const spd = Math.min(25.0, ev.speedMps * scale);
+        return {
+          activeBranch: termBranch,
+          activeAlong: termBranch.totalLen,
+          viaBranch: null,
+          legDepth: 1,
+          lat,
+          lng,
+          remainingMeters,
+          etaSec: Math.max(0, etaSec),
+          speedMps: spd,
+          isAtTerminal: false,
+          inOppositeLeg: true,
+          inNextCycle: false,
+          realBandera: termBranch.bandera,
+          realBanderaColor: termBranch.color,
+          effectiveOffsetSec: 0,
+          targetStopSec
+        };
+      }
+      const along = Math.min(stopProj.along, Math.max(0, travelled - oppRem - gapOppToStop));
       const sample = sampleBranchAtAlong(stopBranch, along);
       if (!sample) return null;
       const remainingMeters = Math.max(0, stopProj.along - along);
@@ -2425,6 +2608,8 @@ export function evaluateTripState(
 
   // 2) Chained return/feeder leg (`trip.prevTrip`, `legDepth = 1`) and turnaround layovers
   if (prev) {
+    const gapPrevToStop = branchTurnaroundGap(prev.branch, stopBranch);
+
     // 2a) Resting at `trip` origin cabecera between `prev.endSec` (at `tEffPrev`) and `trip.startSec` (at `tEffTrip`)
     if (tEffPrev >= prev.endSec) {
       const sample = sampleBranchAtAlong(stopBranch, 0);
@@ -2457,9 +2642,10 @@ export function evaluateTripState(
       if (!sample) return null;
       const inPP = termBranch !== prev.branch;
       const ppRem = inPP ? Math.max(0, termBranch.totalLen - termAlong) : 0;
+      const gapPPToPrev = inPP ? branchTurnaroundGap(termBranch, prev.branch) : 0;
       const remainingMeters = inPP
-        ? ppRem + prev.branch.totalLen + stopProj.along
-        : Math.max(0, prev.branch.totalLen - termAlong) + stopProj.along;
+        ? ppRem + gapPPToPrev + prev.branch.totalLen + gapPrevToStop + stopProj.along
+        : Math.max(0, prev.branch.totalLen - termAlong) + gapPrevToStop + stopProj.along;
       return {
         activeBranch: termBranch,
         activeAlong: termAlong,
@@ -2486,7 +2672,7 @@ export function evaluateTripState(
       const sample = sampleBranchAtAlong(prev.branch, ev.along);
       if (!sample) return null;
       const oppRem = Math.max(0, prev.branch.totalLen - ev.along);
-      const remainingMeters = oppRem + stopProj.along;
+      const remainingMeters = oppRem + gapPrevToStop + stopProj.along;
       const spd = oppRem <= 3 ? 0 : Math.min(25.0, ev.speedMps * speedFactorPrev);
       return {
         activeBranch: prev.branch,
@@ -2510,6 +2696,8 @@ export function evaluateTripState(
 
     // 2c) Previous lap (`trip.prevTrip.prevTrip`, `legDepth = 2` -> `full_cycle`)!
     if (pp) {
+      const gapPPToPrev = branchTurnaroundGap(pp.branch, prev.branch);
+
       // Resting at `prevTrip` origin cabecera between `pp.endSec` (at `tEffPP`) and `prev.startSec` (at `tEffPrev`)
       if (tEffPP >= pp.endSec) {
         const sample = sampleBranchAtAlong(prev.branch, 0);
@@ -2521,7 +2709,7 @@ export function evaluateTripState(
           legDepth: 1,
           lat: sample.lat,
           lng: sample.lng,
-          remainingMeters: prev.branch.totalLen + stopProj.along,
+          remainingMeters: prev.branch.totalLen + gapPrevToStop + stopProj.along,
           etaSec: Math.max(0, etaSec),
           speedMps: 0,
           isAtTerminal: true,
@@ -2540,7 +2728,7 @@ export function evaluateTripState(
         const sample = sampleBranchAtAlong(pp.branch, ev.along);
         if (!sample) return null;
         const ppRem = Math.max(0, pp.branch.totalLen - ev.along);
-        const remainingMeters = ppRem + prev.branch.totalLen + stopProj.along;
+        const remainingMeters = ppRem + gapPPToPrev + prev.branch.totalLen + gapPrevToStop + stopProj.along;
         const spd = ppRem <= 3 ? 0 : Math.min(25.0, ev.speedMps * speedFactorPP);
         return {
           activeBranch: pp.branch,
@@ -2893,15 +3081,16 @@ function scoreCorridorPeerAgainstService(
 
   const ultimaGps = String(unit.ultimaFechaHoraGPS || unit.ultimaGps || unit.lastGps || '').trim();
   let parsedDesvio = null;
-  if (typeof unit.desvioSec === 'number') {
+  const rawDesvioStr = String(unit.desvioHorario || unit.desvioRaw || unit.lastDesvioRaw || '').trim();
+  if (typeof unit.desvioSec === 'number' && unit.desvioSec !== 0) {
     parsedDesvio = { seconds: unit.desvioSec, status: 'ok' };
-  } else if (unit.desvioHorario) {
-    parsedDesvio = parseDesvioHorario(unit.desvioHorario);
-  } else if (unit.lastDesvioRaw) {
-    parsedDesvio = parseDesvioHorario(unit.lastDesvioRaw);
-    if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof unit.lastDesvioSec === 'number') {
-      parsedDesvio = { seconds: unit.lastDesvioSec, status: 'ok' };
+  } else if (rawDesvioStr) {
+    parsedDesvio = parseDesvioHorario(rawDesvioStr);
+    if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof (unit.desvioSec ?? unit.lastDesvioSec) === 'number') {
+      parsedDesvio = { seconds: Number(unit.desvioSec ?? unit.lastDesvioSec) || 0, status: 'ok' };
     }
+  } else if (typeof unit.desvioSec === 'number') {
+    parsedDesvio = { seconds: unit.desvioSec, status: 'ok' };
   } else if (typeof unit.lastDesvioSec === 'number' && unit.lastDesvioSec !== 0) {
     parsedDesvio = { seconds: unit.lastDesvioSec, status: 'ok' };
   }
@@ -3201,9 +3390,11 @@ export function matchLiveBusesToTrips(
     bus.shiftLaps = bestItem.trip.shiftLaps || null;
     bus.isHalfLap = Boolean(bestItem.trip.isHalfLap);
     bus.isCortadoBlock = Boolean(bestItem.trip.isCortadoBlock);
+    bus.resumesFromCortado = Boolean(matchedBi?.resumesFromCortado);
     bus.isRelevoEnLinea = Boolean(bestItem.trip.isRelevoEnLinea);
     bus.turnoStart = matchedBi ? formatSecHHMM(matchedBi.startSec) : '';
     bus.turnoEnd = matchedBi ? formatSecHHMM(matchedBi.endSec) : '';
+    bus.turnoEndSec = matchedBi ? matchedBi.endSec : null;
     bus.startPlace = matchedBi?.startPlace || '';
     bus.endPlace = matchedBi?.endPlace || '';
     bus.relevoToNext = Boolean(matchedBi?.relevoToNext);
@@ -3552,6 +3743,9 @@ function computeExtraMetersAcrossBlock(block, srcIdx, targetIdx, stopCoords, sto
     } else {
       extra += srcTrip.branch.totalLen * 0.5;
     }
+  }
+  for (let i = srcIdx; i < targetIdx; i++) {
+    extra += branchTurnaroundGap(block[i]?.branch, block[i + 1]?.branch);
   }
   for (let i = srcIdx + 1; i < targetIdx; i++) {
     extra += block[i]?.branch?.totalLen || 0;
@@ -4150,9 +4344,11 @@ export function predictLineBusesForStop({
       shiftLaps: trip.shiftLaps || null,
       isHalfLap: Boolean(trip.isHalfLap),
       isCortadoBlock: Boolean(trip.isCortadoBlock),
+      resumesFromCortado: Boolean(trip.blockInfo?.resumesFromCortado),
       isRelevoEnLinea: Boolean(trip.isRelevoEnLinea),
       turnoStart: trip.blockInfo ? formatSecHHMM(trip.blockInfo.startSec) : '',
       turnoEnd: trip.blockInfo ? formatSecHHMM(trip.blockInfo.endSec) : '',
+      turnoEndSec: trip.blockInfo ? trip.blockInfo.endSec : null,
       startPlace: trip.blockInfo?.startPlace || '',
       endPlace: trip.blockInfo?.endPlace || '',
       relevoToNext: Boolean(trip.blockInfo?.relevoToNext),
@@ -4232,6 +4428,7 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
       shiftLaps: bi.shiftLaps || trip.shiftLaps || null,
       isHalfLap: Boolean(trip.isHalfLap),
       isCortado: Boolean(bi.isCortado),
+      resumesFromCortado: Boolean(bi.resumesFromCortado),
       isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
       relevoFromPrev: Boolean(bi.relevoFromPrev),
       relevoToNext: Boolean(bi.relevoToNext),
@@ -4273,15 +4470,16 @@ export function resolveUnitScheduleMeta(model, unit, nowSec = getArgentinaSecOfD
   // 2) Spatial-temporal matching against all trips in model (authoritative whenever GPS coords exist!)
   if (model && Array.isArray(model.branches) && model.branches.length > 0 && (hasCoords || hasOwnTime)) {
     let parsedDesvio = null;
-    if (typeof unit.desvioSec === 'number') {
+    const rawDesvioStr = String(unit.desvioHorario || unit.desvioRaw || unit.lastDesvioRaw || '').trim();
+    if (typeof unit.desvioSec === 'number' && unit.desvioSec !== 0) {
       parsedDesvio = { seconds: unit.desvioSec };
-    } else if (unit.desvioHorario) {
-      parsedDesvio = parseDesvioHorario(unit.desvioHorario);
-    } else if (unit.lastDesvioRaw) {
-      parsedDesvio = parseDesvioHorario(unit.lastDesvioRaw);
-      if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof unit.lastDesvioSec === 'number') {
-        parsedDesvio = { seconds: unit.lastDesvioSec };
+    } else if (rawDesvioStr) {
+      parsedDesvio = parseDesvioHorario(rawDesvioStr);
+      if ((!parsedDesvio || parsedDesvio.status === 'none') && typeof (unit.desvioSec ?? unit.lastDesvioSec) === 'number') {
+        parsedDesvio = { seconds: Number(unit.desvioSec ?? unit.lastDesvioSec) || 0 };
       }
+    } else if (typeof unit.desvioSec === 'number') {
+      parsedDesvio = { seconds: unit.desvioSec };
     } else if (typeof unit.lastDesvioSec === 'number' && unit.lastDesvioSec !== 0) {
       parsedDesvio = { seconds: unit.lastDesvioSec };
     }
@@ -4529,6 +4727,7 @@ export function matchFreeFleetUnitsToModel(model, units = [], nowSec = getArgent
           shiftLaps: bi.shiftLaps || trip.shiftLaps || null,
           isHalfLap: Boolean(trip.isHalfLap),
           isCortado: Boolean(bi.isCortado),
+          resumesFromCortado: Boolean(bi.resumesFromCortado),
           isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
           relevoFromPrev: Boolean(bi.relevoFromPrev),
           relevoToNext: Boolean(bi.relevoToNext),
@@ -4649,24 +4848,97 @@ export function evaluateFreeBusSchedulePos(
   seedTrip,
   model,
   nowSec = getArgentinaSecOfDay(),
-  { desvioSec = 0, lastGpsSec = null, allowShiftContinuation = true } = {}
+  options = {}
 ) {
   if (!seedTrip || !seedTrip.branch?.pts?.length) return null;
 
+  const opts =
+    typeof options === 'number'
+      ? { desvioSec: options }
+      : options && typeof options === 'object'
+        ? options
+        : {};
+  const {
+    desvioSec = 0,
+    lastGpsSec = null,
+    anchorLat = null,
+    anchorLng = null,
+    allowShiftContinuation = true
+  } = opts;
+
   const effNow = toServiceSec(nowSec);
   const safeDesvio = Math.abs(desvioSec || 0) <= 38 * 60 ? (desvioSec || 0) : 0;
+
+  // Spatial-temporal anchor along seedTrip at lastGpsSec: eliminates any jump when transitioning
+  // from live GPS to schedule continuation at the 180s mark!
+  let initialOffsetSec = safeDesvio;
+  if (
+    typeof anchorLat === 'number' &&
+    typeof anchorLng === 'number' &&
+    !Number.isNaN(anchorLat) &&
+    !Number.isNaN(anchorLng) &&
+    Number.isFinite(lastGpsSec)
+  ) {
+    const effLastGps = toServiceSec(lastGpsSec);
+    const proj = projectOnPolyline(seedTrip.branch.pts, seedTrip.branch.cum, anchorLat, anchorLng);
+    if (proj && proj.perp <= 180) {
+      const atOriginCabecera = isAtBranchStartTerminal(
+        seedTrip.branch,
+        proj.along,
+        anchorLat,
+        anchorLng,
+        seedTrip.prevTrip?.branch
+      );
+      const schedAtAnchor = getTripSecAtAlong(seedTrip, proj.along);
+      if (schedAtAnchor !== null) {
+        let spatialOffset = schedAtAnchor - effLastGps;
+        if (spatialOffset > 43200) spatialOffset -= 86400;
+        if (spatialOffset < -43200) spatialOffset += 86400;
+        if (
+          atOriginCabecera &&
+          (effLastGps <= Math.max(seedTrip.startSec, schedAtAnchor) + 20 || spatialOffset > 0)
+        ) {
+          initialOffsetSec = 0;
+        } else if (Math.abs(spatialOffset) <= 45 * 60) {
+          initialOffsetSec = spatialOffset;
+        }
+      }
+    }
+  }
+
   const elapsedSec =
     Number.isFinite(lastGpsSec) ? Math.max(0, effNow - toServiceSec(lastGpsSec)) : 0;
-  const baseOffset = computeGradualOffsetSec(safeDesvio, elapsedSec);
+  const baseOffset = computeGradualOffsetSec(initialOffsetSec, elapsedSec);
 
-  // Collect ordered trips of this service (or this shift block if continuation disabled)
+  // Collect ordered trips of this shift block, chaining ONLY across continuous relevo en línea blocks
+  // (<= 45 min layover / relevoToNext) and NEVER across horario cortado garage breaks!
   let srvTrips = [];
   if (model && Array.isArray(model.blocks) && seedTrip.serviceNumber) {
-    for (const blk of model.blocks) {
+    const svcBlocks = model.blocks
+      .filter((blk) =>
+        allowShiftContinuation
+          ? blk.serviceNumber === seedTrip.serviceNumber
+          : blk.blockId === seedTrip.blockId
+      )
+      .sort((a, b) => a.startSec - b.startSec);
+
+    if (svcBlocks.length > 0) {
+      let startBlkIdx = svcBlocks.findIndex(
+        (blk) => blk.blockId === seedTrip.blockId || blk.trips?.some((t) => t.tripKey === seedTrip.tripKey)
+      );
+      if (startBlkIdx < 0) startBlkIdx = 0;
+      srvTrips.push(...(svcBlocks[startBlkIdx].trips || []));
+
       if (allowShiftContinuation) {
-        if (blk.serviceNumber === seedTrip.serviceNumber) srvTrips.push(...blk.trips);
-      } else if (blk.blockId === seedTrip.blockId) {
-        srvTrips.push(...blk.trips);
+        for (let b = startBlkIdx + 1; b < svcBlocks.length; b++) {
+          const prevBlk = svcBlocks[b - 1];
+          const nextBlk = svcBlocks[b];
+          const gapSec = nextBlk.startSec - prevBlk.endSec;
+          // Stop at horario cortado breaks (> 45 min gap where vehicle pulls into garage)
+          if (!prevBlk.relevoToNext && gapSec > 45 * 60) break;
+          if (gapSec > 55 * 60) break;
+          srvTrips.push(...(nextBlk.trips || []));
+        }
       }
     }
   }

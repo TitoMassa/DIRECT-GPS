@@ -847,7 +847,7 @@ const CAPACITY_HISTORY_RETENTION_MS = 28 * 86400 * 1000; // 4 weeks of day-type 
 
 function parseDesvioSeconds(raw = '') {
   const clean = String(raw || '').replace(/\s+/g, '');
-  const m = clean.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  const m = clean.match(/^([+-])(\d{1,4}):(\d{2})$/);
   if (!m) return 0;
   return (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
 }

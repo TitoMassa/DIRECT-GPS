@@ -329,10 +329,8 @@ export function buildTrajectoryFromBranchAlong(
     const pathPts = [...seg1Pts, ...seg2Pts, ...seg3Pts];
     const cum = buildCumDist(pathPts);
     const totalMeters = cum[cum.length - 1] || 0;
-    const len1 = buildCumDist(seg1Pts).slice(-1)[0] || 0;
-    const len2 = buildCumDist(seg2Pts).slice(-1)[0] || 0;
-    const oppStartMeters = len1;
-    const turnaroundAtMeters = len1 + len2;
+    const oppStartMeters = cum[seg1Pts.length] ?? (cum[Math.max(0, seg1Pts.length - 1)] || 0);
+    const turnaroundAtMeters = cum[seg1Pts.length + seg2Pts.length] ?? oppStartMeters;
 
     const actBandera = activeBranch.bandera || stopBandera;
     const actColor = activeBranch.color || stopColor;
@@ -406,7 +404,7 @@ export function buildTrajectoryFromBranchAlong(
   const pathPts = [...oppRemainder, ...stopApproach];
   const cum = buildCumDist(pathPts);
   const totalMeters = cum[cum.length - 1] || 0;
-  const turnaroundAtMeters = buildCumDist(oppRemainder).slice(-1)[0] || 0;
+  const turnaroundAtMeters = cum[oppRemainder.length] ?? (cum[Math.max(0, oppRemainder.length - 1)] || 0);
   const oppBandera = activeBranch.bandera || 'Sentido opuesto';
   const oppColor = activeBranch.color;
 
@@ -442,6 +440,7 @@ export function buildTrajectoryFromBranchAlong(
 function normalizeBanderaLite(str = '') {
   return String(str || '')
     .toUpperCase()
+    .replace(/[º°]/g, 'O')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^A-Z0-9]+/g, ' ')
@@ -978,8 +977,8 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const pathPts = [...stopRemainder, ...retFull, ...stopApproach];
     const cum = buildCumDist(pathPts);
     const totalMeters = cum[cum.length - 1] || 0;
-    const oppStartMeters = buildCumDist(stopRemainder).slice(-1)[0] || 0;
-    const turnaroundAtMeters = buildCumDist([...stopRemainder, ...retFull]).slice(-1)[0] || 0;
+    const oppStartMeters = cum[stopRemainder.length] ?? (cum[Math.max(0, stopRemainder.length - 1)] || 0);
+    const turnaroundAtMeters = cum[stopRemainder.length + retFull.length] ?? oppStartMeters;
 
     const stopAlongs = [
       ...mapStopsInRange(stopBranch, busOnStop.along, stopBranch.totalLen, 0),
@@ -1039,7 +1038,7 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const oppColor = oppositeBranch.color;
     const cum = buildCumDist(pathPts);
     const totalMeters = cum[cum.length - 1] || 0;
-    const turnaroundAtMeters = buildCumDist(oppRemainder).slice(-1)[0] || 0;
+    const turnaroundAtMeters = cum[oppRemainder.length] ?? (cum[Math.max(0, oppRemainder.length - 1)] || 0);
 
     const stopAlongs = [
       ...mapStopsInRange(oppositeBranch, busOnOpp.along, oppositeBranch.totalLen, 0),

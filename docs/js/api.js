@@ -416,8 +416,9 @@ function loadArchiveLine(codLinea) {
         if (cachedOta?.file) return cachedOta.file;
       }
 
-      // 2) Bundled local static archive
-      const url = new URL(`../data/horarios/${key}.json`, import.meta.url);
+      // 2) Bundled local static archive (cache-busted by index updatedAt so updates apply on first load)
+      const verSuffix = localHorariosUpdatedAt ? `?v=${encodeURIComponent(localHorariosUpdatedAt)}` : '';
+      const url = new URL(`../data/horarios/${key}.json${verSuffix}`, import.meta.url);
       const file = await fetch(url, { cache: 'no-cache' })
         .then((res) => (res.ok ? res.json() : null))
         .catch(() => null);
@@ -1658,9 +1659,9 @@ export function parseDesvioHorario(raw = '') {
     return { raw: clean, status: 'ok', label: '00:00', shortLabel: '00:00', sign: '=', minutes: 0, seconds: 0 };
   }
 
-  const m = normalized.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  const m = normalized.match(/^([+-])(\d{1,4}):(\d{2})$/);
   if (!m) {
-    return { raw: clean, status: 'ok', label: normalized, shortLabel: normalized, sign: '', minutes: 0, seconds: 0 };
+    return { raw: clean, status: 'none', label: normalized, shortLabel: normalized, sign: '', minutes: 0, seconds: 0 };
   }
 
   const sign = m[1];

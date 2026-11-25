@@ -115,7 +115,7 @@ function getArgentinaDayKey(nowMs = Date.now()) {
 
 function parseDesvioSeconds(raw = '') {
   const clean = String(raw || '').replace(/\s+/g, '');
-  const m = clean.match(/^([+-])(\d{1,2}):(\d{2})$/);
+  const m = clean.match(/^([+-])(\d{1,4}):(\d{2})$/);
   if (!m) return 0;
   return (m[1] === '+' ? 1 : -1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
 }
@@ -244,6 +244,11 @@ function upsertLocalRosterUnit(u, nowMs = Date.now(), explicitDayKey = '') {
   const bandera = String(u.bandera || u.descripcionBandera || '').trim();
   const stopId = String(u.stopId || '').trim().toUpperCase();
   const esAdaptado = Boolean(u.esAdaptado);
+  const uLat = Number(u.lat ?? u.latitud);
+  const uLng = Number(u.lng ?? u.longitud);
+  const validCoords = Number.isFinite(uLat) && Number.isFinite(uLng) && (uLat !== 0 || uLng !== 0);
+  const desvioRaw = String(u.desvioRaw || u.desvioHorario || '').trim();
+  const desvioSec = Number.isFinite(Number(u.desvioSec)) ? Number(u.desvioSec) : parseDesvioSeconds(desvioRaw);
   const driver = normalizeDriverRecord(
     u.choferNombre || '',
     u.choferLegajo || '',
@@ -266,6 +271,10 @@ function upsertLocalRosterUnit(u, nowMs = Date.now(), explicitDayKey = '') {
     lastBandera: (isNewerCar && bandera) || prevCar?.lastBandera || '',
     lastGps: (isNewerCar && ultimaGps) || prevCar?.lastGps || '',
     lastStopId: (isNewerCar && stopId) || prevCar?.lastStopId || '',
+    lastLat: isNewerCar && validCoords ? uLat : prevCar?.lastLat ?? null,
+    lastLng: isNewerCar && validCoords ? uLng : prevCar?.lastLng ?? null,
+    lastDesvioSec: isNewerCar ? desvioSec : prevCar?.lastDesvioSec || 0,
+    lastDesvioRaw: (isNewerCar && desvioRaw) || prevCar?.lastDesvioRaw || '',
     firstSeenAt: prevCar ? Math.min(prevCar.firstSeenAt, obsMs) : obsMs,
     lastSeenAt: prevCar ? Math.max(prevCar.lastSeenAt, obsMs) : obsMs,
     lastDayKey: isNewerCar ? effectiveDayKey : prevCar.lastDayKey,
@@ -292,6 +301,10 @@ function upsertLocalRosterUnit(u, nowMs = Date.now(), explicitDayKey = '') {
       lastBandera: (isNewerDrv && bandera) || prevDrv?.lastBandera || '',
       lastGps: (isNewerDrv && ultimaGps) || prevDrv?.lastGps || '',
       lastStopId: (isNewerDrv && stopId) || prevDrv?.lastStopId || '',
+      lastLat: isNewerDrv && validCoords ? uLat : prevDrv?.lastLat ?? null,
+      lastLng: isNewerDrv && validCoords ? uLng : prevDrv?.lastLng ?? null,
+      lastDesvioSec: isNewerDrv ? desvioSec : prevDrv?.lastDesvioSec || 0,
+      lastDesvioRaw: (isNewerDrv && desvioRaw) || prevDrv?.lastDesvioRaw || '',
       firstSeenAt: prevDrv ? Math.min(prevDrv.firstSeenAt, obsMs) : obsMs,
       lastSeenAt: prevDrv ? Math.max(prevDrv.lastSeenAt, obsMs) : obsMs,
       lastDayKey: isNewerDrv ? effectiveDayKey : prevDrv.lastDayKey,
@@ -671,6 +684,7 @@ async function handleApi(req, res, urlObj) {
       for (const u of Object.values(fleetStore.units || {})) {
         const cod = Number(u.codigoLinea);
         if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
+        if (u.dayKey && u.dayKey !== todayKey) continue;
         if ((u.updatedAt || 0) < activeCutoff) continue;
         const lat = Number(u.lat);
         const lng = Number(u.lng);
@@ -708,7 +722,7 @@ async function handleApi(req, res, urlObj) {
       const q = String(searchParams.get('q') || '').trim().toUpperCase();
       const results = [];
       if (q.length >= 2) {
-        for (const r of Object.values(fleetStore.cars || {})) {
+        for (const r of Object.values(fleetStore.rosterCars || {})) {
           const cod = Number(r.codigoLinea);
           if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
           const desc = LINE_NAMES_BY_CODE[cod] || r.descripcionLinea || `L${cod}`;
@@ -734,7 +748,7 @@ async function handleApi(req, res, urlObj) {
             });
           }
         }
-        for (const d of Object.values(fleetStore.drivers || {})) {
+        for (const d of Object.values(fleetStore.rosterDrivers || {})) {
           const cod = Number(d.codigoLinea);
           if (!cod || REMOVED_LINE_CODES.has(cod)) continue;
           const desc = LINE_NAMES_BY_CODE[cod] || d.descripcionLinea || `L${cod}`;
@@ -781,10 +795,13 @@ async function handleApi(req, res, urlObj) {
       const nowMs = Date.now();
       const todayKey = getArgentinaDayKey(nowMs);
       const activeCutoff = nowMs - 38 * 60 * 1000;
-      const cars = Object.values(fleetStore.cars || {}).filter((c) => !REMOVED_LINE_CODES.has(Number(c.codigoLinea)));
-      const drivers = Object.values(fleetStore.drivers || {}).filter((d) => !REMOVED_LINE_CODES.has(Number(d.codigoLinea)));
+      const cars = Object.values(fleetStore.rosterCars || {}).filter((c) => !REMOVED_LINE_CODES.has(Number(c.codigoLinea)));
+      const drivers = Object.values(fleetStore.rosterDrivers || {}).filter((d) => !REMOVED_LINE_CODES.has(Number(d.codigoLinea)));
       const units = Object.values(fleetStore.units || {}).filter(
-        (u) => !REMOVED_LINE_CODES.has(Number(u.codigoLinea)) && (u.updatedAt || 0) >= activeCutoff
+        (u) =>
+          !REMOVED_LINE_CODES.has(Number(u.codigoLinea)) &&
+          (!u.dayKey || u.dayKey === todayKey) &&
+          (u.updatedAt || 0) >= activeCutoff
       );
       return sendJson(res, 200, {
         data: {

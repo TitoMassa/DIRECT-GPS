@@ -46,7 +46,8 @@ import {
   matchFreeFleetUnitsToModel,
   resolveLiveHorariosForDay,
   sanitizeLiveDesvio,
-  evaluateFreeBusSchedulePos
+  evaluateFreeBusSchedulePos,
+  normalizeBandera
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -175,6 +176,9 @@ const state = {
     branchIdx: 0,
     viewMode: 'grilla', // 'grilla' | 'paradas'
     serviceFilter: 'ALL',
+    fullscreen: false,
+    hasGridRows: false,
+    liveNote: '',
     expandedStopId: null,
     model: null,
     branches: [],
@@ -332,6 +336,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.5.3',
+    date: '25/11/2026 · 16:10 hs',
+    items: [
+      '<strong>Horarios Lun–Vie restaurados y blindados ante asuetos locales:</strong> se restauró la grilla completa de día hábil en <strong>904A</strong> (10 vueltas, 2 servicios) y <strong>904B</strong> (48 vueltas) y se incorporó detección automática de diagramas reducidos/asuetos universitarios o provinciales en el escáner para que nunca pisen los horarios habituales de lunes a viernes.',
+      '<strong>Grilla de horarios mucho más amplia y modo Pantalla completa:</strong> al entrar a <strong>Horarios</strong> de una línea el panel se expande automáticamente, la tabla aprovecha todo el alto disponible sin doble scroll, las columnas son más ágiles para ver más horarios a la vez y se sumó el botón <strong>Pantalla completa</strong> para desplegar la grilla al 100 % de la pantalla.',
+      '<strong>Horarios cortados y orden de servicios corregidos en las 26 líneas:</strong> las líneas interprovinciales <strong>904A/B/C</strong> nunca muestran horarios cortados ni etiquetas de corte ningún día de la semana, y las líneas urbanas solo aplican cortados de lunes a viernes (nunca en sábados, domingos ni feriados). También se perfeccionó el orden numérico cíclico <code>1, 2, 3…</code> (corrigiendo desfasajes en <strong>105C</strong>, <strong>108A</strong> y relevos de <strong>103C</strong>).',
+      '<strong>Mayor precisión en simulación EN VIVO, banderas y desvíos:</strong> conectores exactos en giros de cabecera en las 26 líneas, anclaje espacial sin saltos al pasar a horario tras 3 min sin GPS, fin automático al concluir horarios cortados, soporte de desvíos de 3 dígitos y distinción por bandera en paradas compartidas.'
+    ]
+  },
   {
     version: 'v2.5.2',
     date: '24/11/2026 · 15:45 hs',
@@ -616,9 +630,14 @@ function describeTurnoPlaces(t, totalTurnos = 1) {
   const count = Math.max(idx, Number(totalTurnos || t.serviceTurnosCount) || 1);
   const isRelFromPrev = Boolean(t.relevoFromPrev);
   const isRelToNext = Boolean(t.relevoToNext);
-  const isCortadoEnd = !isRelToNext && (idx < count || Boolean(t.isCortado || t.isCortadoBlock));
+  const endSecVal = typeof t.endSec === 'number' ? t.endSec : typeof t.turnoEndSec === 'number' ? t.turnoEndSec : null;
+  const isGenuineCortado = Boolean(t.isCortado || t.isCortadoBlock);
+  // Only genuine urban Lun–Vie horarios cortados say "Corta en" (never 904, weekends, holidays, or full ~8h shifts,
+  // and never a final evening shift terminating for the night).
+  const isCortadoEnd = !isRelToNext && isGenuineCortado && (idx < count || endSecVal === null || endSecVal < 17 * 3600);
+  const isRetomaStart = idx > 1 && !isRelFromPrev && Boolean(t.resumesFromCortado);
 
-  const startVerb = idx > 1 ? (isRelFromPrev ? 'Releva en' : 'Retoma en') : 'Inicia en';
+  const startVerb = idx > 1 ? (isRelFromPrev ? 'Releva en' : isRetomaStart ? 'Retoma en' : 'Inicia en') : 'Inicia en';
   const startLoc = (isRelFromPrev ? t.prevRelevoPlace : '') || t.startPlace || '';
   const endVerb = isRelToNext ? 'Relevo en' : isCortadoEnd ? 'Corta en' : 'Finaliza en';
   const endLoc = (isRelToNext ? t.relevoPlace : '') || t.endPlace || '';
@@ -713,7 +732,7 @@ function buildServiceMilestonesHtml(turnos = [], activeBlockId = '') {
           )}: <strong>${escapeHtml(relLoc)}</strong> (${escapeHtml(formatSecHHMM(next.startSec))})</span></span>`
         );
       }
-    } else {
+    } else if (cur.isCortado) {
       if (cur.endPlace) {
         const activeCls = activeBlockId && cur.blockId === activeBlockId ? 'is-active-step' : '';
         chips.push(
@@ -730,13 +749,31 @@ function buildServiceMilestonesHtml(turnos = [], activeBlockId = '') {
           }: <strong>${escapeHtml(next.startPlace)}</strong> (${escapeHtml(formatSecHHMM(next.startSec))})</span></span>`
         );
       }
+    } else {
+      if (cur.endPlace) {
+        const activeCls = activeBlockId && cur.blockId === activeBlockId ? 'is-active-step' : '';
+        chips.push(
+          `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-fin" aria-hidden="true"></span><span>Fin T${
+            cur.turnoIndex
+          }: <strong>${escapeHtml(cur.endPlace)}</strong> (${escapeHtml(formatSecHHMM(cur.endSec))})</span></span>`
+        );
+      }
+      if (next.startPlace) {
+        const activeCls = activeBlockId && next.blockId === activeBlockId ? 'is-active-step' : '';
+        chips.push(
+          `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Inicia T${
+            next.turnoIndex
+          }: <strong>${escapeHtml(next.startPlace)}</strong> (${escapeHtml(formatSecHHMM(next.startSec))})</span></span>`
+        );
+      }
     }
   }
 
   if (lastT.endPlace) {
     const activeCls = activeBlockId && lastT.blockId === activeBlockId ? 'is-active-step' : '';
-    const endKindCls = turnos.length === 1 && lastT.isCortado ? 'is-corte' : 'is-fin';
-    const endTitle = turnos.length === 1 && lastT.isCortado ? 'Corta' : 'Finaliza';
+    const isLastCortado = turnos.length === 1 && lastT.isCortado && (typeof lastT.endSec !== 'number' || lastT.endSec < 17 * 3600);
+    const endKindCls = isLastCortado ? 'is-corte' : 'is-fin';
+    const endTitle = isLastCortado ? 'Corta' : 'Finaliza';
     chips.push(
       `<span class="rot-place-chip ${activeCls}"><span class="rot-place-dot ${endKindCls}" aria-hidden="true"></span><span>${endTitle}: <strong>${escapeHtml(
         lastT.endPlace
@@ -764,14 +801,18 @@ function buildServiceMilestonesSpoken(turnos = []) {
       phrases.push(
         `relevo${relLoc ? ` en ${relLoc}` : ''} a las ${formatSecHHMM(next.startSec)} hacia turno ${next.turnoIndex}`
       );
-    } else {
+    } else if (cur.isCortado) {
       if (cur.endPlace) phrases.push(`corta turno ${cur.turnoIndex} a las ${formatSecHHMM(cur.endSec)} en ${cur.endPlace}`);
       if (next.startPlace) phrases.push(`retoma turno ${next.turnoIndex} a las ${formatSecHHMM(next.startSec)} en ${next.startPlace}`);
+    } else {
+      if (cur.endPlace) phrases.push(`finaliza turno ${cur.turnoIndex} a las ${formatSecHHMM(cur.endSec)} en ${cur.endPlace}`);
+      if (next.startPlace) phrases.push(`inicia turno ${next.turnoIndex} a las ${formatSecHHMM(next.startSec)} en ${next.startPlace}`);
     }
   }
   if (lastT.endPlace) {
+    const isLastCortado = turnos.length === 1 && lastT.isCortado && (typeof lastT.endSec !== 'number' || lastT.endSec < 17 * 3600);
     phrases.push(
-      `${turnos.length === 1 && lastT.isCortado ? 'corta' : 'finaliza'} a las ${formatSecHHMM(lastT.endSec)} en ${lastT.endPlace}`
+      `${isLastCortado ? 'corta' : 'finaliza'} a las ${formatSecHHMM(lastT.endSec)} en ${lastT.endPlace}`
     );
   }
   return phrases.join(', ');
@@ -1201,6 +1242,10 @@ function switchTab(tabName) {
     p.classList.toggle('active', active);
     p.setAttribute('aria-hidden', String(!active));
   });
+  if (tabName !== 'lineas' && state.recorridoView.fullscreen) {
+    state.recorridoView.fullscreen = false;
+  }
+  syncGrillaLayoutState();
   if (isBottomSheetLayout() && state.sheetIndex === 0) {
     setSheetIndex(1, { silent: true });
   }
@@ -3581,8 +3626,9 @@ function pickCityBusBranch(bus, branches, rec, gpsMs) {
 
   // Layer 5: Server-persisted confirmedDir (only if schedule didn't resolve and server hint is fresh)
   if (confirmedDir && confirmedDir.fromServer && confirmedDir.bandera) {
+    const targetBand = normalizeBandera(confirmedDir.bandera);
     const matched = branches.find(
-      (b) => b.bandera && b.bandera.toUpperCase() === confirmedDir.bandera.toUpperCase()
+      (b) => b.bandera && normalizeBandera(b.bandera) === targetBand
     );
     if (matched) {
       const cp = projectOnPolyline(matched.pts, matched.cum, lat, lng);
@@ -3618,9 +3664,11 @@ function applyScheduleMetaToCityBus(bus, meta, model = null) {
   bus.lapNumber = meta.lapNumber;
   bus.shiftLaps = meta.shiftLaps;
   bus.isCortadoBlock = meta.isCortado;
+  bus.resumesFromCortado = Boolean(meta.resumesFromCortado ?? meta.blockInfo?.resumesFromCortado);
   bus.isRelevoEnLinea = meta.isRelevoEnLinea;
   bus.turnoStart = meta.startHHMM;
   bus.turnoEnd = meta.endHHMM;
+  bus.turnoEndSec = typeof meta.endSec === 'number' ? meta.endSec : meta.blockInfo?.endSec ?? null;
   bus.serviceSpan = meta.startHHMM && meta.endHHMM ? `${meta.startHHMM}–${meta.endHHMM}` : '';
   bus.startPlace = meta.startPlace || meta.blockInfo?.startPlace || '';
   bus.endPlace = meta.endPlace || meta.blockInfo?.endPlace || '';
@@ -3766,9 +3814,15 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
 
       if (seedTrip && !isHistoricalFinished) {
         const lastGpsSec = parseGpsStampSecOfDay(bus.ultimaFechaHoraGPS);
-        const schedPos = evaluateFreeBusSchedulePos(seedTrip, model, nowSec, {
+        const originSeedTrip =
+          prevSim && prevSim.mode === 'schedule' && prevSim.lastGpsMs === gpsMs && prevSim.seedTrip
+            ? prevSim.seedTrip
+            : seedTrip;
+        const schedPos = evaluateFreeBusSchedulePos(originSeedTrip, model, nowSec, {
           desvioSec: bus.desvio?.seconds || 0,
           lastGpsSec,
+          anchorLat: rawLat,
+          anchorLng: rawLng,
           allowShiftContinuation: isActiveUnit
         });
         if (schedPos && schedPos.branch && !schedPos.finished) {
@@ -3780,18 +3834,20 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
 
           const curAlong =
             prevSim &&
-            prevSim.mode === 'schedule' &&
             prevSim.branch === schedPos.branch &&
-            Math.abs(schedPos.along - prevSim.along) <= 220
+            Math.abs(schedPos.along - prevSim.along) <= 260
               ? prevSim.along
               : schedPos.along;
 
           cityFleetSim.set(bus.key, {
             mode: 'schedule',
-            seedTrip: schedPos.trip || seedTrip,
+            seedTrip: originSeedTrip,
+            activeTrip: schedPos.trip || originSeedTrip,
             model,
             desvioSec: bus.desvio?.seconds || 0,
             lastGpsSec,
+            anchorLat: rawLat,
+            anchorLng: rawLng,
             allowShiftContinuation: isActiveUnit,
             branch: schedPos.branch,
             along: curAlong,
@@ -3952,6 +4008,8 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
       const pos = evaluateFreeBusSchedulePos(sim.seedTrip, sim.model, nowSec, {
         desvioSec: sim.desvioSec || 0,
         lastGpsSec: sim.lastGpsSec ?? null,
+        anchorLat: sim.anchorLat ?? null,
+        anchorLng: sim.anchorLng ?? null,
         allowShiftContinuation: Boolean(sim.allowShiftContinuation)
       });
       if (!pos || !pos.branch || pos.finished) {
@@ -3963,7 +4021,7 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
       if (pos.branch !== sim.branch) {
         sim.branch = pos.branch;
         sim.along = pos.along;
-        sim.seedTrip = pos.trip || sim.seedTrip;
+        sim.activeTrip = pos.trip || sim.activeTrip || sim.seedTrip;
         if (pos.branch.bandera) {
           bus.realBandera = pos.branch.bandera;
           bus.realBanderaColor = pos.branch.color || getLineColor(bus.descripcionLinea);
@@ -3971,7 +4029,7 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
         if (pos.trip?.lapNumber) bus.lapNumber = pos.trip.lapNumber;
         if (pos.trip?.turnoIndex) bus.turnoIndex = pos.trip.turnoIndex;
       } else {
-        sim.seedTrip = pos.trip || sim.seedTrip;
+        sim.activeTrip = pos.trip || sim.activeTrip || sim.seedTrip;
         if (pos.trip?.lapNumber) bus.lapNumber = pos.trip.lapNumber;
         if (pos.trip?.turnoIndex) bus.turnoIndex = pos.trip.turnoIndex;
         if (pos.isAtTerminal && pos.speedMps <= 0.05) {
@@ -4405,6 +4463,7 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
           lapNumber: assign.lapNumber || null,
           shiftLaps: turno.shiftLaps || null,
           isCortado: Boolean(turno.isCortado),
+          resumesFromCortado: Boolean(turno.resumesFromCortado),
           isRelevoEnLinea: Boolean(turno.isRelevoEnLinea),
           relevoFromPrev: Boolean(turno.relevoFromPrev),
           relevoToNext: Boolean(turno.relevoToNext),
@@ -4412,6 +4471,7 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
           endPlace: turno.endPlace || '',
           relevoPlace: turno.relevoPlace || '',
           prevRelevoPlace: turno.prevRelevoPlace || '',
+          endSec: turno.endSec,
           startHHMM: formatSecHHMM(turno.startSec),
           endHHMM: formatSecHHMM(turno.endSec)
         }
@@ -4426,11 +4486,12 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
       const firstAssign = blockAssignMap.get(firstT.blockId) || null;
       const firstNextT = turnos.length > 1 ? turnos[1] : null;
       const firstIsRel = Boolean(firstNextT && (firstT.relevoToNext || (!firstT.isCortado && firstNextT.startSec - firstT.endSec <= 45 * 60)));
+      const firstIsCortadoEnd = Boolean(!firstIsRel && firstT.isCortado && (turnos.length > 1 || firstT.endSec < 17 * 3600));
       const firstEndSummary = firstIsRel
         ? firstT.relevoPlace || firstT.endPlace
           ? `relevo en ${firstT.relevoPlace || firstT.endPlace}`
           : ''
-        : turnos.length > 1 || firstT.isCortado
+        : firstIsCortadoEnd
           ? firstT.endPlace
             ? `corta en ${firstT.endPlace}`
             : ''
@@ -4496,11 +4557,12 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
               : '';
           const afterNextT = i + 2 < turnos.length ? turnos[i + 2] : null;
           const nextIsRel = Boolean(afterNextT && (nextT.relevoToNext || (!nextT.isCortado && afterNextT.startSec - nextT.endSec <= 45 * 60)));
+          const nextIsCortadoEnd = Boolean(!nextIsRel && nextT.isCortado && (nextT.turnoIndex < turnos.length || nextT.endSec < 17 * 3600));
           const nextEndSummary = nextIsRel
             ? nextT.relevoPlace || nextT.endPlace
               ? `sig. relevo en ${nextT.relevoPlace || nextT.endPlace}`
               : ''
-            : nextT.turnoIndex < turnos.length || nextT.isCortado
+            : nextIsCortadoEnd
               ? nextT.endPlace
                 ? `corta en ${nextT.endPlace}`
                 : ''
@@ -4533,14 +4595,17 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             target: preferredAssign ? packTarget(preferredAssign.assign, preferredAssign.turno, srv) : null
           });
         } else {
-          // Cortado split: distinct end of turno + later start of turno
+          // Non-relevo transition: genuine urban Lun–Vie horario cortado ("Corta / Retoma") vs.
+          // two full shifts separated by a rest gap on 904, weekends, holidays, or corridos ("Finaliza / Inicia")
+          const isCurCortado = Boolean(curT.isCortado);
           const afterNextT = i + 2 < turnos.length ? turnos[i + 2] : null;
           const nextIsRel = Boolean(afterNextT && (nextT.relevoToNext || (!nextT.isCortado && afterNextT.startSec - nextT.endSec <= 45 * 60)));
+          const nextIsCortadoEnd = Boolean(!nextIsRel && nextT.isCortado && (nextT.turnoIndex < turnos.length || nextT.endSec < 17 * 3600));
           const nextEndSummary = nextIsRel
             ? nextT.relevoPlace || nextT.endPlace
               ? `relevo en ${nextT.relevoPlace || nextT.endPlace}`
               : ''
-            : nextT.turnoIndex < turnos.length || nextT.isCortado
+            : nextIsCortadoEnd
               ? nextT.endPlace
                 ? `corta en ${nextT.endPlace}`
                 : ''
@@ -4556,14 +4621,18 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             lineName,
             serviceNumber: srv.serviceNumber,
             turnosCount: turnos.length,
-            title: `Fin de turno T${curT.turnoIndex}`,
+            title: isCurCortado ? `Corte de turno T${curT.turnoIndex}` : `Fin de turno T${curT.turnoIndex}`,
             placeHtml: curT.endPlace
-              ? `<span class="rot-place-dot is-corte" aria-hidden="true"></span><span>Corta en <strong>${escapeHtml(curT.endPlace)}</strong></span>`
+              ? `<span class="rot-place-dot ${isCurCortado ? 'is-corte' : 'is-fin'}" aria-hidden="true"></span><span>${
+                  isCurCortado ? 'Corta' : 'Finaliza'
+                } en <strong>${escapeHtml(curT.endPlace)}</strong></span>`
               : '',
-            placeText: curT.endPlace ? `Corta en ${curT.endPlace}` : '',
+            placeText: curT.endPlace ? `${isCurCortado ? 'Corta' : 'Finaliza'} en ${curT.endPlace}` : '',
             metaText: [
-              curT.startPlace ? `Inició en ${curT.startPlace}` : 'Cortado',
-              `retoma ${formatSecHHMM(nextT.startSec)}${nextT.startPlace ? ` en ${nextT.startPlace}` : ''}`
+              curT.startPlace ? `Inició en ${curT.startPlace}` : isCurCortado ? 'Cortado' : 'Turno corrido',
+              `${isCurCortado ? 'retoma' : `T${nextT.turnoIndex} inicia`} ${formatSecHHMM(nextT.startSec)}${
+                nextT.startPlace ? ` en ${nextT.startPlace}` : ''
+              }`
             ]
               .filter(Boolean)
               .join(' · '),
@@ -4583,9 +4652,11 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
             turnosCount: turnos.length,
             title: `Inicio de turno T${nextT.turnoIndex}`,
             placeHtml: nextT.startPlace
-              ? `<span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>Retoma en <strong>${escapeHtml(nextT.startPlace)}</strong></span>`
+              ? `<span class="rot-place-dot is-inicio" aria-hidden="true"></span><span>${
+                  isCurCortado ? 'Retoma' : 'Inicia'
+                } en <strong>${escapeHtml(nextT.startPlace)}</strong></span>`
               : '',
-            placeText: nextT.startPlace ? `Retoma en ${nextT.startPlace}` : '',
+            placeText: nextT.startPlace ? `${isCurCortado ? 'Retoma' : 'Inicia'} en ${nextT.startPlace}` : '',
             metaText: [
               `${formatSecHHMM(nextT.startSec)}–${formatSecHHMM(nextT.endSec)}`,
               nextT.shiftLaps ? formatShiftLaps(nextT.shiftLaps) : '',
@@ -5072,7 +5143,7 @@ async function locateFleetUnitOnMap({
 
   haptic('light');
   // Lower the mobile bottom sheet so the map, route polylines, stops, and bus pin are clearly visible!
-  if (window.innerWidth < 768) {
+  if (isBottomSheetLayout()) {
     setSheetIndex(0, { silent: true });
   }
 
@@ -5158,6 +5229,7 @@ async function locateFleetUnitOnMap({
       lapNumber: meta?.lapNumber || null,
       shiftLaps: meta?.shiftLaps || resolvedBi?.shiftLaps || null,
       isCortadoBlock: Boolean(meta?.isCortado ?? resolvedBi?.isCortado),
+      resumesFromCortado: Boolean(meta?.resumesFromCortado ?? resolvedBi?.resumesFromCortado),
       isRelevoEnLinea: Boolean(meta?.isRelevoEnLinea ?? resolvedBi?.isRelevoEnLinea),
       relevoFromPrev: Boolean(meta?.relevoFromPrev ?? resolvedBi?.relevoFromPrev),
       relevoToNext: Boolean(meta?.relevoToNext ?? resolvedBi?.relevoToNext),
@@ -5167,6 +5239,7 @@ async function locateFleetUnitOnMap({
       prevRelevoPlace: meta?.prevRelevoPlace || resolvedBi?.prevRelevoPlace || '',
       turnoStart: startHHMM,
       turnoEnd: endHHMM,
+      turnoEndSec: typeof meta?.endSec === 'number' ? meta.endSec : resolvedBi?.endSec ?? null,
       serviceSpan,
       enLineaAhora: Boolean(isLiveNow),
       isFreeTracked: true,
@@ -6361,8 +6434,24 @@ function formatMinuteOfDayHHMM(minOfDay) {
   return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 }
 
-function lookupSlotBlockMeta(slotMetaByHora, hora, minuteOfDay) {
+function lookupSlotBlockMeta(slotMetaByHora, hora, minuteOfDay, bandera = '') {
   if (!slotMetaByHora || slotMetaByHora.size === 0) return null;
+  const normB = bandera ? normalizeBandera(bandera) : '';
+  if (normB) {
+    const exactBandKey = `${hora}|${normB}`;
+    if (slotMetaByHora.has(exactBandKey)) return slotMetaByHora.get(exactBandKey);
+    for (const [k, v] of slotMetaByHora.entries()) {
+      if (!k.startsWith(`${hora}|`)) continue;
+      const kb = k.slice(hora.length + 1);
+      if (kb && (kb.includes(normB) || normB.includes(kb))) return v;
+    }
+    if (typeof minuteOfDay === 'number') {
+      const prev = formatMinuteOfDayHHMM(minuteOfDay - 1);
+      const next = formatMinuteOfDayHHMM(minuteOfDay + 1);
+      if (slotMetaByHora.has(`${prev}|${normB}`)) return slotMetaByHora.get(`${prev}|${normB}`);
+      if (slotMetaByHora.has(`${next}|${normB}`)) return slotMetaByHora.get(`${next}|${normB}`);
+    }
+  }
   if (slotMetaByHora.has(hora)) return slotMetaByHora.get(hora);
   if (typeof minuteOfDay === 'number') {
     const prev = formatMinuteOfDayHHMM(minuteOfDay - 1);
@@ -6484,6 +6573,7 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
             endSec: blockInfo.endSec,
             shiftLaps: blockInfo.shiftLaps,
             isCortado: blockInfo.isCortado,
+            resumesFromCortado: Boolean(blockInfo.resumesFromCortado),
             isRelevoEnLinea: blockInfo.isRelevoEnLinea,
             relevoFromPrev: blockInfo.relevoFromPrev,
             relevoToNext: blockInfo.relevoToNext,
@@ -6516,7 +6606,9 @@ function renderRotationBannerContent(ctx, liveInfo, { speakSelection = false } =
           tr.turnoIndex === blockInfo.turnoIndex + 1 && blockInfo.relevoToNext
             ? 'continúa por relevo en línea'
             : tr.turnoIndex > blockInfo.turnoIndex
-              ? 'retoma'
+              ? blockInfo.isCortado
+                ? 'retoma'
+                : 'continúa'
               : 'salió antes';
         return `Mismo Servicio ${blockInfo.serviceNumber} ${relPhrase} en turno ${tr.turnoIndex}${lapsSpoken}, de ${formatSecHHMM(
           tr.startSec
@@ -6666,7 +6758,7 @@ function refreshHorariosLiveTags() {
     pill.classList.toggle('is-next', isNext);
     pill.classList.toggle('is-past', !matchedBus && isTodayScheme && hora !== nextHora && svcMin < nowSvcMin);
 
-    const slotMeta = lookupSlotBlockMeta(ctx.blockData?.slotMetaByHora, hora, minOfDay);
+    const slotMeta = lookupSlotBlockMeta(ctx.blockData?.slotMetaByHora, hora, minOfDay, pill.dataset.bandera || '');
     pill.setAttribute('aria-label', buildHoraPillAriaLabel(hora, slotMeta, matchedBus, isNext));
 
     const sub = pill.querySelector('[data-hora-sub]');
@@ -6878,7 +6970,7 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia, 
                 ${g.items
                   .map((h) => {
                     const matchedBus = slotToBus.get(h.hora);
-                    const slotMeta = lookupSlotBlockMeta(blockData?.slotMetaByHora, h.hora, h.minuteOfDay);
+                    const slotMeta = lookupSlotBlockMeta(blockData?.slotMetaByHora, h.hora, h.minuteOfDay, h.bandera || '');
                     const bId = slotMeta?.blockId || '';
                     const srvNum = slotMeta?.blockInfo?.serviceNumber || '';
                     const svcMin = toServiceMinuteOfDay(h.minuteOfDay);
@@ -6899,7 +6991,7 @@ async function loadAndRenderHorarios(codLinea, tipoDia = state.horariosTipoDia, 
                         : `<span class="hora-srv-tag" data-hora-sub aria-hidden="true"></span>`;
 
                     const ariaLabel = buildHoraPillAriaLabel(h.hora, slotMeta, matchedBus, isNext);
-                    return `<button type="button" class="hora-pill ${cls}" data-hora="${escapeHtml(h.hora)}" data-min="${h.minuteOfDay}" data-block-id="${escapeHtml(bId)}" data-srv="${srvNum}" aria-pressed="false" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}"><span aria-hidden="true">${escapeHtml(
+                    return `<button type="button" class="hora-pill ${cls}" data-hora="${escapeHtml(h.hora)}" data-min="${h.minuteOfDay}" data-bandera="${escapeHtml(h.bandera || '')}" data-block-id="${escapeHtml(bId)}" data-srv="${srvNum}" aria-pressed="false" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(ariaLabel)}"><span aria-hidden="true">${escapeHtml(
                       h.hora
                     )}</span>${subHtml}</button>`;
                   })
@@ -7182,6 +7274,10 @@ function syncLineasFilterPlaceholder() {
 
 function renderLineasBreadcrumb() {
   const { step, linea, calle, interseccion } = state.drill;
+  if (step !== 'recorrido' && state.recorridoView.fullscreen) {
+    state.recorridoView.fullscreen = false;
+  }
+  syncGrillaLayoutState();
   syncLineasFilterPlaceholder();
 
   if (step === 'lineas') {
@@ -7866,6 +7962,7 @@ function renderLineFlotaView() {
       shiftLaps: bi.shiftLaps || assign.shiftLaps || null,
       isHalfLap: false,
       isCortado: Boolean(bi.isCortado),
+      resumesFromCortado: Boolean(bi.resumesFromCortado),
       isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
       relevoFromPrev: Boolean(bi.relevoFromPrev),
       relevoToNext: Boolean(bi.relevoToNext),
@@ -8357,6 +8454,7 @@ function renderLineFlotaView() {
           serviceTurnosCount: bi.serviceTurnosCount,
           shiftLaps: bi.shiftLaps,
           isCortado: Boolean(bi.isCortado),
+          resumesFromCortado: Boolean(bi.resumesFromCortado),
           isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
           relevoFromPrev: Boolean(bi.relevoFromPrev),
           relevoToNext: Boolean(bi.relevoToNext),
@@ -8364,6 +8462,7 @@ function renderLineFlotaView() {
           endPlace: bi.endPlace || '',
           relevoPlace: bi.relevoPlace || '',
           prevRelevoPlace: bi.prevRelevoPlace || '',
+          endSec: bi.endSec,
           startHHMM: formatSecHHMM(bi.startSec),
           endHHMM: formatSecHHMM(bi.endSec),
           blockInfo: bi
@@ -8386,6 +8485,7 @@ function renderLineFlotaView() {
           serviceTurnosCount: bi.serviceTurnosCount,
           shiftLaps: bi.shiftLaps,
           isCortado: Boolean(bi.isCortado),
+          resumesFromCortado: Boolean(bi.resumesFromCortado),
           isRelevoEnLinea: Boolean(bi.isRelevoEnLinea),
           relevoFromPrev: Boolean(bi.relevoFromPrev),
           relevoToNext: Boolean(bi.relevoToNext),
@@ -8393,6 +8493,7 @@ function renderLineFlotaView() {
           endPlace: bi.endPlace || '',
           relevoPlace: bi.relevoPlace || '',
           prevRelevoPlace: bi.prevRelevoPlace || '',
+          endSec: bi.endSec,
           startHHMM: formatSecHHMM(bi.startSec),
           endHHMM: formatSecHHMM(bi.endSec),
           blockInfo: bi
@@ -8850,6 +8951,7 @@ function renderLineFlotaView() {
                           lapNumber: assign.lapNumber,
                           shiftLaps: t.shiftLaps,
                           isCortado: t.isCortado,
+                          resumesFromCortado: Boolean(t.resumesFromCortado),
                           isRelevoEnLinea: t.isRelevoEnLinea,
                           relevoFromPrev: Boolean(t.relevoFromPrev),
                           relevoToNext: Boolean(t.relevoToNext),
@@ -8857,6 +8959,7 @@ function renderLineFlotaView() {
                           endPlace: t.endPlace || '',
                           relevoPlace: t.relevoPlace || '',
                           prevRelevoPlace: t.prevRelevoPlace || '',
+                          endSec: t.endSec,
                           startHHMM: startHH,
                           endHHMM: endHH
                         }
@@ -9478,6 +9581,22 @@ async function refreshActiveLineFlotaSilent() {
 // ============================================================================
 // Ordered Stops & Glanceable Full Timetable Matrix per Line (Líneas -> Horarios)
 // ============================================================================
+function syncGrillaLayoutState() {
+  const isRecStep = getActiveTab() === 'lineas' && state.drill.step === 'recorrido';
+  const rv = state.recorridoView;
+  const isGrillaActive = Boolean(
+    isRecStep &&
+      !rv.loading &&
+      !rv.error &&
+      rv.viewMode === 'grilla' &&
+      rv.hasGridRows
+  );
+  const isFull = Boolean(isGrillaActive && rv.fullscreen);
+  el.lineasContent?.classList.toggle('is-grilla-mode', isGrillaActive);
+  document.getElementById('panel-lineas')?.classList.toggle('is-recorrido-step', isRecStep);
+  el.appShell?.classList.toggle('grilla-fullscreen', isFull);
+}
+
 async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {}) {
   el.lineasFilterInput.value = '';
   const sameLine = state.drill.step === 'recorrido' && state.drill.linea?.codigo === linea.codigo;
@@ -9488,6 +9607,9 @@ async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {
     branchIdx: sameLine ? state.recorridoView.branchIdx : 0,
     viewMode: sameLine ? state.recorridoView.viewMode : 'grilla',
     serviceFilter: sameLine ? state.recorridoView.serviceFilter : 'ALL',
+    fullscreen: sameLine ? Boolean(state.recorridoView.fullscreen) : false,
+    hasGridRows: false,
+    liveNote: '',
     expandedStopId: null,
     model: null,
     branches: [],
@@ -9495,6 +9617,9 @@ async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {
     loading: true,
     error: null
   };
+  if (isBottomSheetLayout() && state.sheetIndex < 2) {
+    setSheetIndex(2, { silent: true });
+  }
   renderLineasBreadcrumb();
   renderLineRecorridoView();
 
@@ -9519,21 +9644,26 @@ async function openLineRecorrido(linea, { tipoDia = null, drawOnMap = true } = {
       state.routesVisible = true;
     }
 
-    let effHorFile = horFile;
+    // Keep `horFile` strictly as the canonical archive so Lun–Vie / Sábado / Domingo tabs ALWAYS show
+    // their true diagram; only pre-select the holiday tab on initial open if live SOAP matched Sábado/Domingo.
     let effTipo = targetTipo;
+    let liveNote = '';
     if (!tipoDia && !sameLine && horFile) {
       const resolved = resolveEffectiveLineHorarios(num, getArgentinaDayKey());
-      effHorFile = resolved.horariosFile || horFile;
-      effTipo = resolved.tipoDia || targetTipo;
-      if (effTipo === 'habil' || effTipo === 'sabado' || effTipo === 'domingo') {
+      if (resolved.isLiveOverride && (resolved.matchedTipo === 'sabado' || resolved.matchedTipo === 'domingo')) {
+        effTipo = resolved.matchedTipo;
         state.recorridoView.tipoDia = effTipo;
+        if (resolved.labelOverride) {
+          liveNote = `Hoy circula con frecuencia de ${resolved.labelOverride}`;
+        }
       }
     }
 
-    const model = branches.length && effHorFile ? buildLineScheduleModel(num, branches, effHorFile, effTipo) : null;
+    const model = branches.length && horFile ? buildLineScheduleModel(num, branches, horFile, effTipo) : null;
     state.recorridoView.branches = branches;
-    state.recorridoView.horFile = effHorFile;
+    state.recorridoView.horFile = horFile;
     state.recorridoView.model = model;
+    state.recorridoView.liveNote = liveNote;
     if (state.recorridoView.branchIdx >= branches.length) state.recorridoView.branchIdx = 0;
     state.recorridoView.loading = false;
     state.recorridoView.error = null;
@@ -9558,10 +9688,14 @@ function renderLineRecorridoView() {
   const color = getLineColor(linea.descripcion);
 
   if (rv.loading) {
+    rv.hasGridRows = false;
+    syncGrillaLayoutState();
     el.lineasContent.innerHTML = `<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>`;
     return;
   }
   if (rv.error) {
+    rv.hasGridRows = false;
+    syncGrillaLayoutState();
     el.lineasContent.innerHTML = `
       <div class="empty-state">
         <h3>Error al cargar horarios</h3>
@@ -9575,6 +9709,8 @@ function renderLineRecorridoView() {
 
   const branches = rv.branches || [];
   if (!branches.length) {
+    rv.hasGridRows = false;
+    syncGrillaLayoutState();
     el.lineasContent.innerHTML = `
       <div class="empty-state">
         <h3>Sin recorrido archivado</h3>
@@ -9664,7 +9800,7 @@ function renderLineRecorridoView() {
     .map((b, i) => {
       const shortName = String(b.bandera || `Ramal ${i + 1}`).trim();
       return `
-        <button type="button" class="rec-branch-pill ${i === rv.branchIdx ? 'active' : ''}" data-rec-branch="${i}" style="--branch-color:${b.color || color}" aria-pressed="${i === rv.branchIdx}">
+        <button type="button" class="rec-branch-pill ${i === rv.branchIdx ? 'active' : ''}" data-rec-branch="${i}" style="--branch-color:${b.color || color}" aria-pressed="${i === rv.branchIdx}" title="${escapeHtml(shortName)}">
           <span class="dir-dot" style="background:${b.color || color}" aria-hidden="true"></span>
           <span>${escapeHtml(shortName)}</span>
         </button>
@@ -9672,12 +9808,9 @@ function renderLineRecorridoView() {
     })
     .join('');
 
-  const activeSrvNum =
-    rv.serviceFilter !== 'ALL'
-      ? Number(rv.serviceFilter)
-      : serviceNums.length === 1
-        ? serviceNums[0]
-        : null;
+  // Only show detailed rotation milestone card when the user explicitly filters by a specific Service chip
+  // (keeps maximum screen height dedicated to the timetable grid by default!)
+  const activeSrvNum = rv.serviceFilter !== 'ALL' ? Number(rv.serviceFilter) : null;
   const activeSrvObj =
     activeSrvNum && model?.fleetSummary?.services
       ? model.fleetSummary.services.find((s) => Number(s.serviceNumber) === activeSrvNum) || null
@@ -9692,11 +9825,8 @@ function renderLineRecorridoView() {
     : '';
 
   const srvFilterHtml =
-    serviceNums.length >= 1
+    serviceNums.length > 1
       ? `
-      ${
-        serviceNums.length > 1
-          ? `
         <div class="rec-srv-strip" role="group" aria-label="Filtrar vueltas por servicio">
           <button type="button" class="rec-srv-chip ${rv.serviceFilter === 'ALL' ? 'active' : ''}" data-rec-srv="ALL">Todos (${allBranchTrips.length})</button>
           ${serviceNums
@@ -9706,12 +9836,16 @@ function renderLineRecorridoView() {
             )
             .join('')}
         </div>
+        ${activeSrvSummaryHtml}
       `
-          : ''
-      }
-      ${activeSrvSummaryHtml}
-    `
       : '';
+
+  const hasGridRows = Boolean(isExactTipo && allBranchTrips.length > 0 && rv.viewMode === 'grilla');
+  rv.hasGridRows = hasGridRows;
+  if (!hasGridRows && rv.fullscreen) {
+    rv.fullscreen = false;
+  }
+  syncGrillaLayoutState();
 
   let bodyHtml = '';
   if (!isExactTipo || allBranchTrips.length === 0) {
@@ -9801,20 +9935,32 @@ function renderLineRecorridoView() {
       })
       .join('');
 
+    const fullIconSvg = rv.fullscreen
+      ? `<svg viewBox="0 0 20 20" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3v4H3M13 3v4h4M7 17v-4H3M13 17v-4h4"/></svg>`
+      : `<svg viewBox="0 0 20 20" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V3h4M17 7V3h-4M3 13v4h4M17 13v4h-4"/></svg>`;
+
     bodyHtml = `
       <div class="rec-matrix-toolbar">
-        <span class="mono-meta">${visibleStops.length} paradas en orden · ${filteredTrips.length} vueltas</span>
-        ${
-          isTodayTipo && currentTripIdx >= 0
-            ? `<button type="button" id="btn-rec-scroll-now" class="seg-btn seg-btn-xs active">Ir a ahora</button>`
-            : ''
-        }
+        <span class="mono-meta">${visibleStops.length} paradas · ${filteredTrips.length} vueltas${
+          serviceNums.length >= 1 ? ` · ${serviceNums.length} ${serviceNums.length === 1 ? 'srv' : 'srvs'}` : ''
+        }</span>
+        <div class="rec-toolbar-actions">
+          ${
+            isTodayTipo && currentTripIdx >= 0
+              ? `<button type="button" id="btn-rec-scroll-now" class="seg-btn seg-btn-xs active">Ir a ahora</button>`
+              : ''
+          }
+          <button type="button" id="btn-rec-fullscreen" class="seg-btn seg-btn-xs ${rv.fullscreen ? 'active' : ''}" aria-pressed="${Boolean(rv.fullscreen)}" aria-label="${rv.fullscreen ? 'Salir de pantalla completa' : 'Ver grilla en pantalla completa'}" title="${rv.fullscreen ? 'Volver al panel normal' : 'Expandir grilla a toda la pantalla'}">
+            ${fullIconSvg}
+            <span>${rv.fullscreen ? 'Reducir' : 'Pantalla completa'}</span>
+          </button>
+        </div>
       </div>
       <div id="rec-matrix-scroll" class="rec-matrix-wrap" role="region" aria-label="Grilla completa de horarios por parada en orden de recorrido">
         <table class="rec-matrix-table">
           <thead>
             <tr>
-              <th scope="col" class="rec-th-stop">Parada (orden recorrido)</th>
+              <th scope="col" class="rec-th-stop" title="Paradas en orden de recorrido">Parada</th>
               ${headerCells}
             </tr>
           </thead>
@@ -9896,6 +10042,10 @@ function renderLineRecorridoView() {
     `;
   }
 
+  const liveNoteHtml = rv.liveNote
+    ? `<div class="rec-live-note">${escapeHtml(rv.liveNote)}</div>`
+    : '';
+
   el.lineasContent.innerHTML = `
     <div class="rec-view">
       <div class="rec-controls-card">
@@ -9912,6 +10062,7 @@ function renderLineRecorridoView() {
           ${branchTabsHtml}
         </div>
         ${srvFilterHtml}
+        ${liveNoteHtml}
       </div>
       ${bodyHtml}
     </div>
@@ -9946,6 +10097,7 @@ function renderLineRecorridoView() {
       const nextMode = btn.dataset.recMode;
       if (state.recorridoView.viewMode === nextMode) return;
       state.recorridoView.viewMode = nextMode;
+      if (nextMode !== 'grilla') state.recorridoView.fullscreen = false;
       haptic('light');
       renderLineRecorridoView();
     });
@@ -9974,6 +10126,8 @@ function renderLineRecorridoView() {
 
   el.lineasContent.querySelectorAll('[data-open-stop]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      state.recorridoView.fullscreen = false;
+      syncGrillaLayoutState();
       const stop = {
         id: btn.dataset.openStop,
         nombre: btn.dataset.stopName || btn.dataset.openStop,
@@ -9988,7 +10142,7 @@ function renderLineRecorridoView() {
     const wrap = document.getElementById('rec-matrix-scroll');
     const nowTh = wrap?.querySelector('.rec-th-trip.is-now-col');
     if (wrap && nowTh) {
-      const stopColW = wrap.querySelector('.rec-th-stop')?.offsetWidth || 150;
+      const stopColW = wrap.querySelector('.rec-th-stop')?.offsetWidth || 135;
       const targetLeft = Math.max(0, nowTh.offsetLeft - stopColW - 8);
       wrap.scrollTo({ left: targetLeft, behavior: smooth ? 'smooth' : 'auto' });
     }
@@ -9996,6 +10150,20 @@ function renderLineRecorridoView() {
   document.getElementById('btn-rec-scroll-now')?.addEventListener('click', () => {
     haptic('light');
     scrollNowCol(true);
+  });
+  document.getElementById('btn-rec-fullscreen')?.addEventListener('click', () => {
+    const wrap = document.getElementById('rec-matrix-scroll');
+    const prevTop = wrap?.scrollTop || 0;
+    const prevLeft = wrap?.scrollLeft || 0;
+    state.recorridoView.fullscreen = !state.recorridoView.fullscreen;
+    haptic('light');
+    renderLineRecorridoView();
+    const nextWrap = document.getElementById('rec-matrix-scroll');
+    if (nextWrap) {
+      nextWrap.scrollTop = prevTop;
+      nextWrap.scrollLeft = prevLeft;
+    }
+    requestAnimationFrame(() => transitMap.invalidateSize());
   });
   if (rv.viewMode === 'grilla' && isTodayTipo && currentTripIdx >= 0) {
     requestAnimationFrame(() => scrollNowCol(false));
@@ -10779,7 +10947,15 @@ function bindEvents() {
             lapNumber: bus.lapNumber,
             shiftLaps: bus.shiftLaps,
             isCortado: bus.isCortadoBlock,
+            resumesFromCortado: Boolean(bus.resumesFromCortado),
             isRelevoEnLinea: bus.isRelevoEnLinea,
+            relevoFromPrev: Boolean(bus.relevoFromPrev),
+            relevoToNext: Boolean(bus.relevoToNext),
+            startPlace: bus.startPlace || '',
+            endPlace: bus.endPlace || '',
+            relevoPlace: bus.relevoPlace || '',
+            prevRelevoPlace: bus.prevRelevoPlace || '',
+            endSec: typeof bus.turnoEndSec === 'number' ? bus.turnoEndSec : null,
             startHHMM: bus.turnoStart,
             endHHMM: bus.turnoEnd
           }
@@ -11062,6 +11238,18 @@ function bindEvents() {
       }
     } else if (e.key === 'Escape' && state.inspectorOpen) {
       closeBusInspector();
+    } else if (e.key === 'Escape' && state.recorridoView.fullscreen) {
+      const wrap = document.getElementById('rec-matrix-scroll');
+      const prevTop = wrap?.scrollTop || 0;
+      const prevLeft = wrap?.scrollLeft || 0;
+      state.recorridoView.fullscreen = false;
+      renderLineRecorridoView();
+      const nextWrap = document.getElementById('rec-matrix-scroll');
+      if (nextWrap) {
+        nextWrap.scrollTop = prevTop;
+        nextWrap.scrollLeft = prevLeft;
+      }
+      requestAnimationFrame(() => transitMap.invalidateSize());
     }
   });
   document.addEventListener('click', (e) => {
@@ -11264,6 +11452,20 @@ async function handleNativeBack() {
   }
   if (state.horariosOpen) {
     await toggleHorariosView();
+    return true;
+  }
+  if (state.recorridoView.fullscreen) {
+    const wrap = document.getElementById('rec-matrix-scroll');
+    const prevTop = wrap?.scrollTop || 0;
+    const prevLeft = wrap?.scrollLeft || 0;
+    state.recorridoView.fullscreen = false;
+    renderLineRecorridoView();
+    const nextWrap = document.getElementById('rec-matrix-scroll');
+    if (nextWrap) {
+      nextWrap.scrollTop = prevTop;
+      nextWrap.scrollLeft = prevLeft;
+    }
+    requestAnimationFrame(() => transitMap.invalidateSize());
     return true;
   }
   if (isBottomSheetLayout() && getSheetIndex() === 2) {
