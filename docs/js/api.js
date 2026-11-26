@@ -1281,7 +1281,7 @@ async function readOfflineFlotaLinea(codLinea, dayKey = '') {
         dayKey: bundleToday,
         selectedDayKey,
         isHistoricalDay: selectedDayKey !== bundleToday,
-        retentionDays: b.retentionDays || 7,
+        retentionDays: b.retentionDays || 3,
         daysWithData: Array.isArray(lineObj?.daysWithData) ? lineObj.daysWithData : [bundleToday],
         meta: b.meta || {},
         capacity: lineObj?.capacity || null,

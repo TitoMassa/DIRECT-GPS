@@ -66,8 +66,8 @@ const CORRIENTES_HUBS = [
   { name: 'Hospital Escuela', lat: -27.47582, lng: -58.83461 }
 ];
 
-// Central Fleet & Driver Roster configuration (rolling 7-day retention + daily 03:00 ART view)
-const ROSTER_RETENTION_DAYS = 7;
+// Central Fleet & Driver Roster configuration (rolling 3-day retention + daily 03:00 ART view)
+const ROSTER_RETENTION_DAYS = 3;
 const ROSTER_RETENTION_MS = ROSTER_RETENTION_DAYS * 86400 * 1000;
 const CRON_SCAN_INTERVAL_MIN = 5;
 const CRON_BATCH_SIZE = 18; // <= 18 SOAP + 2 DO = 20 subrequests/tick (Cloudflare Free limit: 50)
@@ -843,7 +843,7 @@ function getArgentinaServiceTipo(nowMs = Date.now()) {
 }
 
 const SIMULTANEOUS_ACTIVE_WINDOW_MS = 38 * 60 * 1000; // 38 min covers full 20-min Cron cycle + cabecera layover
-const CAPACITY_HISTORY_RETENTION_MS = 28 * 86400 * 1000; // 4 weeks of day-type capacity learning
+const CAPACITY_HISTORY_RETENTION_MS = 14 * 86400 * 1000; // 2 weeks of day-type capacity learning
 
 function parseDesvioSeconds(raw = '') {
   const clean = String(raw || '').replace(/\s+/g, '');
@@ -868,6 +868,10 @@ export class FleetMemory {
     this._capacityWriteCache = new Map();
     this._stopSnapWriteCache = new Map();
     this._horariosWindowCache = new Map();
+    this._metaCache = new Map();
+    this._lastLiveMetaTs = 0;
+    this._lastLiveCapTs = 0;
+    this._lastHorariosMetaTs = 0;
   }
 
   _shouldWrite(cacheMap, key, sig, nowMs, minIntervalMs, maxEntries = 2500) {
@@ -1177,6 +1181,17 @@ export class FleetMemory {
       // Non-fatal purge guard
     }
 
+    // One-time immediate prune when migrating from 7-day to 3-day retention so stale rows are freed right away
+    try {
+      const retVer = Number(this._getMeta('retention_prune_v', 0)) || 0;
+      if (retVer < 3) {
+        this._pruneOld(Date.now());
+        this._setMeta('retention_prune_v', 3);
+      }
+    } catch {
+      // Non-fatal migration guard
+    }
+
     this._ready = true;
   }
 
@@ -1254,33 +1269,70 @@ export class FleetMemory {
   }
 
   _getMeta(key, fallback = null) {
-    const rows = this.sql.exec('SELECT value FROM roster_meta WHERE key = ?', key).toArray();
-    if (!rows.length) return fallback;
-    try {
-      return JSON.parse(rows[0].value);
-    } catch {
-      return rows[0].value;
+    if (this._metaCache.has(key)) {
+      const cached = this._metaCache.get(key);
+      return cached === undefined ? fallback : cached;
     }
+    const rows = this.sql.exec('SELECT value FROM roster_meta WHERE key = ?', key).toArray();
+    if (!rows.length) {
+      this._metaCache.set(key, undefined);
+      return fallback;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(rows[0].value);
+    } catch {
+      parsed = rows[0].value;
+    }
+    this._metaCache.set(key, parsed);
+    return parsed;
   }
 
   _setMeta(key, value) {
+    const serialized = JSON.stringify(value);
+    if (this._metaCache.has(key) && JSON.stringify(this._metaCache.get(key)) === serialized) {
+      return;
+    }
+    this._metaCache.set(key, value);
     this.sql.exec(
       `INSERT INTO roster_meta (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE roster_meta.value != excluded.value`,
       key,
-      JSON.stringify(value)
+      serialized
     );
   }
 
+  _getCronMeta() {
+    const bundled = this._getMeta('cron_meta', null);
+    if (bundled && typeof bundled === 'object') return bundled;
+    return {
+      scanCursor: Number(this._getMeta('scan_cursor', 0)) || 0,
+      lastCronAt: Number(this._getMeta('last_cron_at', 0)) || 0,
+      lastLiveAt: Number(this._getMeta('last_live_at', 0)) || 0,
+      lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || 0,
+      totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0,
+      lastBatchUnits: Number(this._getMeta('last_batch_units', 0)) || 0,
+      lastPruneDay: String(this._getMeta('last_prune_day', '') || '')
+    };
+  }
+
+  _saveCronMeta(patch) {
+    const cur = this._getCronMeta();
+    const next = { ...cur, ...patch };
+    this._setMeta('cron_meta', next);
+    return next;
+  }
+
   _getRosterMetaSummary() {
-    const lastCronAt = Number(this._getMeta('last_cron_at', 0)) || null;
-    const lastLiveAt = Number(this._getMeta('last_live_at', 0)) || lastCronAt || null;
+    const cm = this._getCronMeta();
+    const lastCronAt = Number(cm.lastCronAt) || null;
+    const lastLiveAt = Math.max(Number(cm.lastLiveAt) || 0, Number(this._lastLiveMetaTs) || 0, lastCronAt || 0) || null;
     return {
       lastCronAt,
       lastLiveAt,
-      lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || null,
-      totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0,
-      lastBatchUnits: Number(this._getMeta('last_batch_units', 0)) || 0,
+      lastCycleAt: Number(cm.lastCycleAt) || null,
+      totalSweeps: Number(cm.totalSweeps) || 0,
+      lastBatchUnits: Number(cm.lastBatchUnits) || 0,
       scanIntervalMin: CRON_SCAN_INTERVAL_MIN,
       fullCycleMin: CRON_FULL_CYCLE_MIN,
       retentionDays: ROSTER_RETENTION_DAYS
@@ -1324,9 +1376,10 @@ export class FleetMemory {
     const dLegajo = driver ? driver.legajo : '';
     const dRaw = driver ? driver.raw : '';
 
+    // 15-min passive refresh (well inside 38-min active window), immediate write on any driver/bandera/service/turno change
     const rosterKey = `${effectiveDayKey}:${cod}:${coche}`;
-    const rosterSig = `${driver?.driverKey || ''}|${dNombre}|${dLegajo}|${bandera}|${tripKey}|${serviceNum}|${turnoIdx}|${lapNum}|${esAdaptado}`;
-    if (!this._shouldWrite(this._rosterWriteCache, rosterKey, rosterSig, nowMs, 4 * 60 * 1000)) {
+    const rosterSig = `${driver?.driverKey || ''}|${dNombre}|${dLegajo}|${bandera}|${tripKey}|${serviceNum}|${turnoIdx}|${esAdaptado}`;
+    if (!this._shouldWrite(this._rosterWriteCache, rosterKey, rosterSig, nowMs, 15 * 60 * 1000)) {
       return;
     }
 
@@ -1411,7 +1464,14 @@ export class FleetMemory {
         first_seen_at = MIN(fleet_cars.first_seen_at, excluded.first_seen_at),
         last_day_key = CASE WHEN excluded.last_seen_at >= fleet_cars.last_seen_at THEN excluded.last_day_key ELSE fleet_cars.last_day_key END,
         last_seen_at = MAX(fleet_cars.last_seen_at, excluded.last_seen_at),
-        seen_count = fleet_cars.seen_count + 1`,
+        seen_count = fleet_cars.seen_count + 1
+      WHERE excluded.last_day_key != fleet_cars.last_day_key
+         OR excluded.last_seen_at - fleet_cars.last_seen_at >= 900000
+         OR (excluded.last_chofer_nombre != '' AND excluded.last_chofer_nombre != fleet_cars.last_chofer_nombre)
+         OR (excluded.last_chofer_legajo != '' AND excluded.last_chofer_legajo != fleet_cars.last_chofer_legajo)
+         OR (excluded.last_bandera != '' AND excluded.last_bandera != fleet_cars.last_bandera)
+         OR (excluded.last_trip_key != '' AND excluded.last_trip_key != fleet_cars.last_trip_key)
+         OR (excluded.last_service_num > 0 AND excluded.last_service_num != fleet_cars.last_service_num)`,
       cod,
       coche,
       descLinea,
@@ -1493,7 +1553,13 @@ export class FleetMemory {
           first_seen_at = MIN(fleet_drivers.first_seen_at, excluded.first_seen_at),
           last_day_key = CASE WHEN excluded.last_seen_at >= fleet_drivers.last_seen_at THEN excluded.last_day_key ELSE fleet_drivers.last_day_key END,
           last_seen_at = MAX(fleet_drivers.last_seen_at, excluded.last_seen_at),
-          seen_count = fleet_drivers.seen_count + 1`,
+          seen_count = fleet_drivers.seen_count + 1
+        WHERE excluded.last_day_key != fleet_drivers.last_day_key
+           OR excluded.last_seen_at - fleet_drivers.last_seen_at >= 900000
+           OR excluded.last_coche != fleet_drivers.last_coche
+           OR (excluded.last_bandera != '' AND excluded.last_bandera != fleet_drivers.last_bandera)
+           OR (excluded.last_trip_key != '' AND excluded.last_trip_key != fleet_drivers.last_trip_key)
+           OR (excluded.last_service_num > 0 AND excluded.last_service_num != fleet_drivers.last_service_num)`,
         cod,
         driver.driverKey,
         descLinea,
@@ -1523,7 +1589,7 @@ export class FleetMemory {
       );
     }
 
-    // Preserve daily per-(coche, driver) shift history for the 7-day Servicios timeline
+    // Preserve daily per-(coche, driver) shift history for the 3-day Servicios timeline
     const obsDriverKey = String(driver?.driverKey || '_car');
     try {
       this.sql.exec(
@@ -1551,7 +1617,11 @@ export class FleetMemory {
           last_turno_idx = CASE WHEN excluded.last_service_num > 0 THEN excluded.last_turno_idx ELSE fleet_daily_obs.last_turno_idx END,
           first_seen_at = MIN(fleet_daily_obs.first_seen_at, excluded.first_seen_at),
           last_seen_at = MAX(fleet_daily_obs.last_seen_at, excluded.last_seen_at),
-          seen_count = fleet_daily_obs.seen_count + 1`,
+          seen_count = fleet_daily_obs.seen_count + 1
+        WHERE excluded.last_seen_at - fleet_daily_obs.last_seen_at >= 900000
+           OR (excluded.last_bandera != '' AND excluded.last_bandera != fleet_daily_obs.last_bandera)
+           OR (excluded.last_trip_key != '' AND excluded.last_trip_key != fleet_daily_obs.last_trip_key)
+           OR (excluded.last_service_num > 0 AND excluded.last_service_num != fleet_daily_obs.last_service_num)`,
         effectiveDayKey,
         cod,
         coche,
@@ -1632,7 +1702,7 @@ export class FleetMemory {
 
       const capKey = `${todayKey}:${cod}`;
       const capSig = `${activeNow}|${totalUnique}|${tipoDia}`;
-      if (!this._shouldWrite(this._capacityWriteCache, capKey, capSig, nowMs, 10 * 60 * 1000, 500)) {
+      if (!this._shouldWrite(this._capacityWriteCache, capKey, capSig, nowMs, 20 * 60 * 1000, 500)) {
         continue;
       }
 
@@ -1648,7 +1718,10 @@ export class FleetMemory {
           active_now = excluded.active_now,
           total_unique_cars = MAX(fleet_capacity_daily.total_unique_cars, excluded.total_unique_cars),
           samples_count = fleet_capacity_daily.samples_count + 1,
-          updated_at = excluded.updated_at`,
+          updated_at = excluded.updated_at
+        WHERE excluded.peak_simultaneous > fleet_capacity_daily.peak_simultaneous
+           OR excluded.total_unique_cars > fleet_capacity_daily.total_unique_cars
+           OR excluded.updated_at - fleet_capacity_daily.updated_at >= 1200000`,
         todayKey,
         cod,
         tipoDia,
@@ -2003,18 +2076,17 @@ export class FleetMemory {
   }
 
   _pruneOld(nowMs) {
-    const historyCutoff = nowMs - (ROSTER_RETENTION_DAYS + 1) * 86400 * 1000;
     const rosterCutoff = nowMs - ROSTER_RETENTION_MS;
-    const cutoffDayKey = shiftCalendarDayIso(getArgentinaDayKey(nowMs), -(ROSTER_RETENTION_DAYS + 1));
-    this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', historyCutoff);
-    this.sql.exec('DELETE FROM fleet_daily_obs WHERE last_seen_at < ?', historyCutoff);
-    this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
-    this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', nowMs - 14 * 86400 * 1000);
+    const cutoffDayKey = shiftCalendarDayIso(getArgentinaDayKey(nowMs), -ROSTER_RETENTION_DAYS);
+    this.sql.exec('DELETE FROM trip_assignments WHERE updated_at < ?', rosterCutoff);
+    this.sql.exec('DELETE FROM fleet_daily_obs WHERE last_seen_at < ?', rosterCutoff);
+    this.sql.exec('DELETE FROM unit_last_seen WHERE updated_at < ?', rosterCutoff);
+    this.sql.exec('DELETE FROM stop_last_arribos WHERE updated_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_cars WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_drivers WHERE last_seen_at < ?', rosterCutoff);
     this.sql.exec('DELETE FROM fleet_capacity_daily WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
-    this.sql.exec('DELETE FROM learned_shift_transitions WHERE updated_at < ?', nowMs - CAPACITY_HISTORY_RETENTION_MS);
-    // Keep 7+ days of history + today + future (+1/+2) live SOAP schedules; never delete today's passed times!
+    this.sql.exec('DELETE FROM learned_shift_transitions');
+    // Keep 3 days of history + today + future (+1/+2) live SOAP schedules; never delete today's passed times!
     this.sql.exec('DELETE FROM live_horarios_daily WHERE day_key < ?', cutoffDayKey);
     this.sql.exec('DELETE FROM live_horarios_windows WHERE day_key < ?', cutoffDayKey);
   }
@@ -2026,12 +2098,13 @@ export class FleetMemory {
     const todayKey = getArgentinaDayKey(nowMs);
 
     if (request.method === 'GET' && url.pathname === '/cron-state') {
+      const cm = this._getCronMeta();
       return Response.json({
-        scanCursor: Number(this._getMeta('scan_cursor', 0)) || 0,
-        lastCronAt: Number(this._getMeta('last_cron_at', 0)) || 0,
-        lastCycleAt: Number(this._getMeta('last_cycle_at', 0)) || 0,
-        lastPruneDay: String(this._getMeta('last_prune_day', '') || ''),
-        totalSweeps: Number(this._getMeta('total_sweeps', 0)) || 0
+        scanCursor: Number(cm.scanCursor) || 0,
+        lastCronAt: Number(cm.lastCronAt) || 0,
+        lastCycleAt: Number(cm.lastCycleAt) || 0,
+        lastPruneDay: String(cm.lastPruneDay || ''),
+        totalSweeps: Number(cm.totalSweeps) || 0
       });
     }
 
@@ -2061,6 +2134,7 @@ export class FleetMemory {
       const windows = Array.isArray(body.windows) ? body.windows : [];
       const ts = Number(body.scannedAt) || nowMs;
       let inserted = 0;
+      let windowsUpdated = 0;
 
       // Strictly additive non-destructive INSERT OR IGNORE: passed SOAP times are NEVER removed,
       // and already-recorded rows incur 0 rows_written on Cloudflare Durable Objects SQLite!
@@ -2073,7 +2147,7 @@ export class FleetMemory {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dk) || !cod || REMOVED_LINE_CODES.has(cod) || !stopId || !/^\d{2}:\d{2}:\d{2}$/.test(horaPaso)) {
           continue;
         }
-        this.sql.exec(
+        const cur = this.sql.exec(
           `INSERT OR IGNORE INTO live_horarios_daily (
             day_key, codigo_linea, stop_id, hora_paso, bandera, first_seen_at, last_seen_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -2085,7 +2159,7 @@ export class FleetMemory {
           ts,
           ts
         );
-        inserted++;
+        if ((cur?.rowsWritten || 0) > 0) inserted++;
       }
 
       for (const w of windows) {
@@ -2099,7 +2173,7 @@ export class FleetMemory {
         const itemsCnt = Math.max(0, Number(w.itemsCount) || 0);
         const winKey = `${dk}:${cod}:${stopId}:${wh}`;
         const prevWin = this._horariosWindowCache.get(winKey);
-        if (prevWin && prevWin.itemsCnt >= itemsCnt && nowMs - prevWin.ts < 2 * 3600 * 1000) {
+        if (prevWin && prevWin.itemsCnt >= itemsCnt && nowMs - prevWin.ts < 4 * 3600 * 1000) {
           continue;
         }
         if (this._horariosWindowCache.size >= 4000 && !this._horariosWindowCache.has(winKey)) {
@@ -2107,13 +2181,15 @@ export class FleetMemory {
         }
         this._horariosWindowCache.set(winKey, { itemsCnt, ts: nowMs });
 
-        this.sql.exec(
+        const cur = this.sql.exec(
           `INSERT INTO live_horarios_windows (
             day_key, codigo_linea, stop_id, window_hour, items_count, scanned_at
           ) VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(day_key, codigo_linea, stop_id, window_hour) DO UPDATE SET
             items_count = MAX(live_horarios_windows.items_count, excluded.items_count),
-            scanned_at = excluded.scanned_at`,
+            scanned_at = excluded.scanned_at
+          WHERE excluded.items_count > live_horarios_windows.items_count
+             OR excluded.scanned_at - live_horarios_windows.scanned_at >= 14400000`,
           dk,
           cod,
           stopId,
@@ -2121,18 +2197,20 @@ export class FleetMemory {
           itemsCnt,
           ts
         );
+        if ((cur?.rowsWritten || 0) > 0) windowsUpdated++;
       }
 
       if (Number.isInteger(body.nextLiveCursor)) {
         this._setMeta('horarios_live_cursor', body.nextLiveCursor);
       }
-      if (!body.passiveOnly) {
+      if (!body.passiveOnly && (inserted > 0 || windowsUpdated > 0 || nowMs - this._lastHorariosMetaTs >= 30 * 60 * 1000)) {
+        this._lastHorariosMetaTs = nowMs;
         this._setMeta('last_horarios_scan_at', ts);
         const prevScans = Number(this._getMeta('total_horarios_scans', 0)) || 0;
         this._setMeta('total_horarios_scans', prevScans + 1);
       }
 
-      return Response.json({ ok: true, inserted, windowsUpdated: windows.length, scannedAt: ts });
+      return Response.json({ ok: true, inserted, windowsUpdated, scannedAt: ts });
     }
 
     if (request.method === 'GET' && url.pathname === '/horarios-live') {
@@ -2172,7 +2250,7 @@ export class FleetMemory {
           const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
           const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
           const ultimaGps = String(u.ultimaGps || '').trim();
-          if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 120000, 0)) {
+          if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 240000, 180000)) {
             const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
             this.sql.exec(
               `INSERT INTO unit_last_seen (
@@ -2193,7 +2271,11 @@ export class FleetMemory {
                 lng = COALESCE(excluded.lng, unit_last_seen.lng),
                 stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
                 gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-                updated_at = excluded.updated_at`,
+                updated_at = excluded.updated_at
+              WHERE excluded.day_key != unit_last_seen.day_key
+                 OR excluded.updated_at - unit_last_seen.updated_at >= 180000
+                 OR (excluded.chofer_nombre != '' AND excluded.chofer_nombre != unit_last_seen.chofer_nombre)
+                 OR (excluded.bandera != '' AND excluded.bandera != unit_last_seen.bandera)`,
               cod,
               coche,
               todayKey,
@@ -2217,26 +2299,29 @@ export class FleetMemory {
           count++;
         }
 
-        // Measure and update live simultaneous capacity across all lines on cycle completion (or touched lines per tick)
-        this._updateLiveCapacity(nowMs, todayKey, body.cycleCompleted ? null : Array.from(touchedLines));
-
-        if (Number.isInteger(body.nextCursor)) {
-          this._setMeta('scan_cursor', body.nextCursor);
-        }
-        this._setMeta('last_cron_at', nowMs);
-        this._setMeta('last_live_at', nowMs);
-        this._setMeta('last_batch_units', count);
+        // Measure and update live simultaneous capacity across all lines on cycle completion
         if (body.cycleCompleted) {
-          this._setMeta('last_cycle_at', nowMs);
-          const prevSweeps = Number(this._getMeta('total_sweeps', 0)) || 0;
-          this._setMeta('total_sweeps', prevSweeps + 1);
+          this._updateLiveCapacity(nowMs, todayKey, null);
         }
+
+        const cm = this._getCronMeta();
+        const patch = {
+          lastCronAt: nowMs,
+          lastLiveAt: nowMs,
+          lastBatchUnits: count
+        };
+        if (Number.isInteger(body.nextCursor)) patch.scanCursor = body.nextCursor;
+        if (body.cycleCompleted) {
+          patch.lastCycleAt = nowMs;
+          patch.totalSweeps = (Number(cm.totalSweeps) || 0) + 1;
+        }
+        this._saveCronMeta(patch);
       }
 
-      const lastPruneDay = String(this._getMeta('last_prune_day', '') || '');
-      if (body.pruneOnly || lastPruneDay !== todayKey) {
+      const cmAfter = this._getCronMeta();
+      if (body.pruneOnly || String(cmAfter.lastPruneDay || '') !== todayKey) {
         this._pruneOld(nowMs);
-        this._setMeta('last_prune_day', todayKey);
+        this._saveCronMeta({ lastPruneDay: todayKey });
       }
 
       return Response.json({
@@ -2368,8 +2453,9 @@ export class FleetMemory {
         .exec(
           `SELECT coche, day_key, trip_key, desvio_sec, desvio_raw, lat, lng, gps_trail, dir_bandera, updated_at
            FROM unit_last_seen
-           WHERE codigo_linea = ?`,
-          codLinea
+           WHERE codigo_linea = ? AND updated_at >= ?`,
+          codLinea,
+          minTs
         )
         .toArray();
       const unitByCoche = new Map();
@@ -3062,6 +3148,7 @@ export class FleetMemory {
       const units = Array.isArray(body.units) ? body.units : [];
       const touchedLines = new Set();
       let count = 0;
+      let unitsWritten = 0;
       for (const u of units) {
         const cod = Number(u.codigoLinea);
         const coche = String(u.coche || u.identificadorCoche || '').trim();
@@ -3069,53 +3156,65 @@ export class FleetMemory {
         const lat = Number.isFinite(Number(u.lat)) ? Number(u.lat) : null;
         const lng = Number.isFinite(Number(u.lng)) ? Number(u.lng) : null;
         const ultimaGps = String(u.ultimaGps || '').trim();
-        const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
-        this.sql.exec(
-          `INSERT INTO unit_last_seen (
-            codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
-            es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
-          ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(codigo_linea, coche) DO UPDATE SET
-            day_key = excluded.day_key,
-            chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
-            chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
-            chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
-            es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
-            desvio_sec = excluded.desvio_sec,
-            desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
-            bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
-            ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
-            lat = COALESCE(excluded.lat, unit_last_seen.lat),
-            lng = COALESCE(excluded.lng, unit_last_seen.lng),
-            stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
-            gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-            updated_at = excluded.updated_at`,
-          cod,
-          coche,
-          todayKey,
-          String(u.choferNombre || '').trim(),
-          String(u.choferLegajo || '').trim(),
-          String(u.choferRaw || '').trim(),
-          u.esAdaptado ? 1 : 0,
-          Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
-          String(u.desvioRaw || '').trim(),
-          String(u.bandera || '').trim(),
-          ultimaGps,
-          lat,
-          lng,
-          String(u.stopId || '').trim().toUpperCase(),
-          mergedTrail,
-          nowMs
-        );
+        if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 300000, 180000)) {
+          const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
+          this.sql.exec(
+            `INSERT INTO unit_last_seen (
+              codigo_linea, coche, day_key, trip_key, chofer_nombre, chofer_legajo, chofer_raw,
+              es_adaptado, desvio_sec, desvio_raw, bandera, ultima_gps, lat, lng, stop_id, gps_trail, updated_at
+            ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(codigo_linea, coche) DO UPDATE SET
+              day_key = excluded.day_key,
+              chofer_nombre = CASE WHEN excluded.chofer_nombre != '' THEN excluded.chofer_nombre ELSE unit_last_seen.chofer_nombre END,
+              chofer_legajo = CASE WHEN excluded.chofer_legajo != '' THEN excluded.chofer_legajo ELSE unit_last_seen.chofer_legajo END,
+              chofer_raw = CASE WHEN excluded.chofer_raw != '' THEN excluded.chofer_raw ELSE unit_last_seen.chofer_raw END,
+              es_adaptado = MAX(unit_last_seen.es_adaptado, excluded.es_adaptado),
+              desvio_sec = excluded.desvio_sec,
+              desvio_raw = CASE WHEN excluded.desvio_raw != '' THEN excluded.desvio_raw ELSE unit_last_seen.desvio_raw END,
+              bandera = CASE WHEN excluded.bandera != '' THEN excluded.bandera ELSE unit_last_seen.bandera END,
+              ultima_gps = CASE WHEN excluded.ultima_gps != '' THEN excluded.ultima_gps ELSE unit_last_seen.ultima_gps END,
+              lat = COALESCE(excluded.lat, unit_last_seen.lat),
+              lng = COALESCE(excluded.lng, unit_last_seen.lng),
+              stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
+              gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
+              updated_at = excluded.updated_at
+            WHERE unit_last_seen.day_key != excluded.day_key
+               OR (excluded.chofer_nombre != '' AND unit_last_seen.chofer_nombre != excluded.chofer_nombre)
+               OR (excluded.chofer_legajo != '' AND unit_last_seen.chofer_legajo != excluded.chofer_legajo)
+               OR (excluded.bandera != '' AND unit_last_seen.bandera != excluded.bandera)
+               OR (excluded.updated_at - unit_last_seen.updated_at) >= 180000`,
+            cod,
+            coche,
+            todayKey,
+            String(u.choferNombre || '').trim(),
+            String(u.choferLegajo || '').trim(),
+            String(u.choferRaw || '').trim(),
+            u.esAdaptado ? 1 : 0,
+            Number.isFinite(u.desvioSec) ? Math.round(u.desvioSec) : 0,
+            String(u.desvioRaw || '').trim(),
+            String(u.bandera || '').trim(),
+            ultimaGps,
+            lat,
+            lng,
+            String(u.stopId || '').trim().toUpperCase(),
+            mergedTrail,
+            nowMs
+          );
+          unitsWritten++;
+        }
         this._upsertRosterUnit(u, nowMs);
         touchedLines.add(cod);
         count++;
       }
-      if (touchedLines.size > 0) {
+      if (touchedLines.size > 0 && nowMs - this._lastLiveCapTs >= 15 * 60 * 1000) {
+        this._lastLiveCapTs = nowMs;
         this._updateLiveCapacity(nowMs, todayKey, Array.from(touchedLines));
       }
-      this._setMeta('last_live_at', nowMs);
-      return Response.json({ ok: true, count, lastLiveAt: nowMs });
+      if (nowMs - this._lastLiveMetaTs >= 5 * 60 * 1000) {
+        this._lastLiveMetaTs = nowMs;
+        this._saveCronMeta({ lastLiveAt: nowMs });
+      }
+      return Response.json({ ok: true, count, unitsWritten, lastLiveAt: nowMs });
     }
 
     if (request.method === 'GET' && url.pathname === '/flota-buscar') {
@@ -3159,7 +3258,10 @@ export class FleetMemory {
         .toArray();
 
       const unitRows = this.sql
-        .exec('SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw FROM unit_last_seen')
+        .exec(
+          'SELECT codigo_linea, coche, day_key, trip_key, lat, lng, desvio_sec, desvio_raw FROM unit_last_seen WHERE updated_at >= ?',
+          minTs
+        )
         .toArray();
       const unitMap = new Map();
       for (const u of unitRows) unitMap.set(`${u.codigo_linea}:${u.coche}`, u);
@@ -3261,7 +3363,6 @@ export class FleetMemory {
       const body = await request.json().catch(() => ({}));
       const units = Array.isArray(body.units) ? body.units : [];
       let count = 0;
-      const touchedLines = new Set();
       for (const u of units) {
         const cod = Number(u.codigoLinea);
         const coche = String(u.coche || '').trim();
@@ -3269,7 +3370,7 @@ export class FleetMemory {
         const lat = Number.isFinite(u.lat) ? u.lat : null;
         const lng = Number.isFinite(u.lng) ? u.lng : null;
         const ultimaGps = String(u.ultimaGps || '').trim();
-        if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 120000, 35000)) {
+        if (this._shouldWriteUnit(cod, coche, u, todayKey, nowMs, 300000, 180000)) {
           const mergedTrail = this._mergeUnitTrail(cod, coche, u.gpsTrail, lat, lng, ultimaGps, nowMs);
           this.sql.exec(
             `INSERT INTO unit_last_seen (
@@ -3291,7 +3392,13 @@ export class FleetMemory {
               lng = COALESCE(excluded.lng, unit_last_seen.lng),
               stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
               gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
-              updated_at = excluded.updated_at`,
+              updated_at = excluded.updated_at
+            WHERE unit_last_seen.day_key != excluded.day_key
+               OR (excluded.trip_key != '' AND unit_last_seen.trip_key != excluded.trip_key)
+               OR (excluded.chofer_nombre != '' AND unit_last_seen.chofer_nombre != excluded.chofer_nombre)
+               OR (excluded.chofer_legajo != '' AND unit_last_seen.chofer_legajo != excluded.chofer_legajo)
+               OR (excluded.bandera != '' AND unit_last_seen.bandera != excluded.bandera)
+               OR (excluded.updated_at - unit_last_seen.updated_at) >= 180000`,
             cod,
             coche,
             todayKey,
@@ -3312,16 +3419,12 @@ export class FleetMemory {
           );
         }
         this._upsertRosterUnit(u, nowMs, todayKey);
-        touchedLines.add(cod);
         count++;
-      }
-      if (touchedLines.size > 0) {
-        this._updateLiveCapacity(nowMs, todayKey, Array.from(touchedLines));
       }
       if (body.stopSnapshot && body.stopSnapshot.idParada) {
         const sid = String(body.stopSnapshot.idParada).trim().toUpperCase();
         const prevSnapTs = this._stopSnapWriteCache.get(sid) || 0;
-        if (nowMs - prevSnapTs >= 60000) {
+        if (nowMs - prevSnapTs >= 300000) {
           if (this._stopSnapWriteCache.size >= 1000 && !this._stopSnapWriteCache.has(sid)) {
             this._stopSnapWriteCache.clear();
           }
@@ -3331,7 +3434,8 @@ export class FleetMemory {
              VALUES (?, ?, ?)
              ON CONFLICT(stop_id) DO UPDATE SET
                payload_json = excluded.payload_json,
-               updated_at = excluded.updated_at`,
+               updated_at = excluded.updated_at
+             WHERE (excluded.updated_at - stop_last_arribos.updated_at) >= 300000`,
             sid,
             JSON.stringify(body.stopSnapshot),
             nowMs
@@ -3346,7 +3450,6 @@ export class FleetMemory {
       const entries = Array.isArray(body.entries) ? body.entries : [];
       const dayKey = String(body.dayKey || todayKey).slice(0, 10);
       let count = 0;
-      const touchedLines = new Set();
 
       for (const e of entries) {
         const cod = Number(e.codigoLinea ?? body.codigoLinea);
@@ -3375,7 +3478,7 @@ export class FleetMemory {
 
         const tripCacheKey = `${dayKey}:${cod}:${tripKey}`;
         const tripSig = `${coche}|${String(e.choferNombre || '').trim()}|${String(e.choferLegajo || '').trim()}|${String(e.turnoHora || '').trim()}`;
-        if (this._shouldWrite(this._tripWriteCache, tripCacheKey, tripSig, nowMs, 5 * 60 * 1000)) {
+        if (this._shouldWrite(this._tripWriteCache, tripCacheKey, tripSig, nowMs, 15 * 60 * 1000)) {
           this.sql.exec(
             `INSERT INTO trip_assignments (
               day_key, codigo_linea, trip_key, turno_hora, coche, chofer_nombre, chofer_legajo,
@@ -3394,7 +3497,11 @@ export class FleetMemory {
               lat = COALESCE(excluded.lat, trip_assignments.lat),
               lng = COALESCE(excluded.lng, trip_assignments.lng),
               stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE trip_assignments.stop_id END,
-              updated_at = excluded.updated_at`,
+              updated_at = excluded.updated_at
+            WHERE trip_assignments.coche != excluded.coche
+               OR (excluded.chofer_nombre != '' AND trip_assignments.chofer_nombre != excluded.chofer_nombre)
+               OR (excluded.chofer_legajo != '' AND trip_assignments.chofer_legajo != excluded.chofer_legajo)
+               OR (excluded.updated_at - trip_assignments.updated_at) >= 900000`,
             dayKey,
             cod,
             tripKey,
@@ -3414,7 +3521,7 @@ export class FleetMemory {
           );
         }
 
-        if (this._shouldWriteUnit(cod, coche, { ...e, tripKey, dirBandera }, dayKey, nowMs, 120000, 35000)) {
+        if (this._shouldWriteUnit(cod, coche, { ...e, tripKey, dirBandera }, dayKey, nowMs, 300000, 180000)) {
           const mergedTrail = this._mergeUnitTrail(cod, coche, e.gpsTrail, lat, lng, ultimaGps, nowMs);
           this.sql.exec(
             `INSERT INTO unit_last_seen (
@@ -3437,7 +3544,14 @@ export class FleetMemory {
               stop_id = CASE WHEN excluded.stop_id != '' THEN excluded.stop_id ELSE unit_last_seen.stop_id END,
               gps_trail = CASE WHEN excluded.gps_trail != '' THEN excluded.gps_trail ELSE unit_last_seen.gps_trail END,
               dir_bandera = CASE WHEN excluded.dir_bandera != '' THEN excluded.dir_bandera ELSE unit_last_seen.dir_bandera END,
-              updated_at = excluded.updated_at`,
+              updated_at = excluded.updated_at
+            WHERE unit_last_seen.day_key != excluded.day_key
+               OR unit_last_seen.trip_key != excluded.trip_key
+               OR (excluded.chofer_nombre != '' AND unit_last_seen.chofer_nombre != excluded.chofer_nombre)
+               OR (excluded.chofer_legajo != '' AND unit_last_seen.chofer_legajo != excluded.chofer_legajo)
+               OR (excluded.bandera != '' AND unit_last_seen.bandera != excluded.bandera)
+               OR (excluded.dir_bandera != '' AND unit_last_seen.dir_bandera != excluded.dir_bandera)
+               OR (excluded.updated_at - unit_last_seen.updated_at) >= 180000`,
             cod,
             coche,
             dayKey,
@@ -3459,13 +3573,9 @@ export class FleetMemory {
           );
         }
         this._upsertRosterUnit({ ...e, codigoLinea: cod, coche }, nowMs, dayKey);
-        touchedLines.add(cod);
         count++;
       }
 
-      if (touchedLines.size > 0) {
-        this._updateLiveCapacity(nowMs, dayKey, Array.from(touchedLines));
-      }
       return Response.json({ ok: true, count, dayKey });
     }
 
@@ -3882,7 +3992,7 @@ export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn
   };
 }
 
-const LIVE_HORARIOS_TTL_MS = 55000;
+const LIVE_HORARIOS_TTL_MS = 180000;
 const liveHorariosCache = new Map(); // cacheKey -> { ts, data }
 
 /**
@@ -3903,6 +4013,9 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
   const art = new Date(artMs);
   const artMinOfDay = art.getUTCHours() * 60 + art.getUTCMinutes();
   const isNightQuiet = artMinOfDay >= 90 && artMinOfDay < 270;
+  if (isNightQuiet && art.getUTCMinutes() % 15 >= 5) {
+    return { skipped: true, reason: 'night-quiet-throttle', isNightQuiet: true, soapCalls: 0, entriesFound: 0 };
+  }
   const soapBudget = isNightQuiet ? HORARIOS_NIGHT_SOAP_BUDGET : HORARIOS_DAY_SOAP_BUDGET;
 
   let liveCursor = 0;
@@ -4028,9 +4141,9 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
               if (isPrimary) buckets.unscannedTomorrowPrimary.push(item);
               else buckets.unscannedTomorrowSecondary.push(item);
             }
-          } else if (isTodayCal && nowMs - scannedAt >= 55 * 60 * 1000) {
+          } else if (isTodayCal && nowMs - scannedAt >= 240 * 60 * 1000) {
             buckets.staleToday.push(item);
-          } else if (!isTodayCal && fullEndCovered && nowMs - scannedAt >= 180 * 60 * 1000) {
+          } else if (!isTodayCal && fullEndCovered && nowMs - scannedAt >= 480 * 60 * 1000) {
             buckets.staleTomorrow.push(item);
           }
         }
@@ -4088,21 +4201,26 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
   }
 
   const entries = Array.from(entryMap.values());
-  try {
-    await stub.fetch('https://fleet-memory/horarios-ingest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        entries,
-        windows: recordedWindows,
-        nextLiveCursor,
-        scannedAt: nowMs
-      })
-    });
-    liveHorariosCache.clear();
-    offlineBundleCache = { ts: 0, data: null };
-  } catch {
-    // Non-fatal
+  if (entries.length > 0 || recordedWindows.length > 0) {
+    try {
+      const ingRes = await stub.fetch('https://fleet-memory/horarios-ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entries,
+          windows: recordedWindows,
+          nextLiveCursor,
+          scannedAt: nowMs
+        })
+      });
+      const ing = ingRes.ok ? await ingRes.json().catch(() => null) : null;
+      if ((ing?.inserted || 0) > 0 || (ing?.windowsUpdated || 0) > 0) {
+        liveHorariosCache.clear();
+        offlineBundleCache = { ts: 0, data: null };
+      }
+    } catch {
+      // Non-fatal
+    }
   }
 
   return {
@@ -4130,9 +4248,15 @@ const LIVE_CITY_SWEEP_TTL_MS = 8500;
 let liveCitySweepCache = { ts: 0, units: [] };
 let liveCitySweepInFlight = null;
 
-const OFFLINE_BUNDLE_TTL_MS = 45000;
+const OFFLINE_BUNDLE_TTL_MS = 180000;
 let offlineBundleCache = { ts: 0, data: null };
 let offlineBundleInFlight = null;
+
+const FLOTA_RESUMEN_TTL_MS = 20000;
+let flotaResumenCache = { ts: 0, data: null };
+
+const FLOTA_ACTIVA_DO_TTL_MS = 15000;
+let flotaActivaDoCache = { ts: 0, data: null };
 
 export async function runLiveCityHubSweep(env, ctx, nowMs = Date.now(), fetchStopFn = fetchOneStop) {
   if (nowMs - liveCitySweepCache.ts < LIVE_CITY_SWEEP_TTL_MS && liveCitySweepCache.units.length > 0) {
@@ -4326,7 +4450,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.4',
+          version: '2.5',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {
@@ -4398,18 +4522,25 @@ export default {
       if (pathname === '/api/flota-resumen' && request.method === 'GET') {
         const nowMs = Date.now();
         const wantLive = searchParams.get('live') === '1';
+        if (!wantLive && flotaResumenCache.data && nowMs - flotaResumenCache.ts < FLOTA_RESUMEN_TTL_MS) {
+          return jsonResponse({ data: flotaResumenCache.data, source: 'fleet-memory-edge', savedAt: flotaResumenCache.ts });
+        }
         if (wantLive) {
           await Promise.race([
             runLiveCityHubSweep(env, ctx, nowMs).catch(() => []),
             new Promise((r) => setTimeout(r, 1800))
           ]);
         }
+        if (flotaResumenCache.data && Date.now() - flotaResumenCache.ts < FLOTA_RESUMEN_TTL_MS) {
+          return jsonResponse({ data: flotaResumenCache.data, source: 'fleet-memory-edge', savedAt: flotaResumenCache.ts });
+        }
         const stub = getFleetStub(env);
         if (stub) {
           try {
             const doRes = await stub.fetch('https://fleet-memory/flota-resumen');
             const data = await doRes.json();
-            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
+            flotaResumenCache = { ts: Date.now(), data };
+            return jsonResponse({ data, source: 'fleet-memory-do', savedAt: flotaResumenCache.ts });
           } catch {
             // Fall through to in-memory fallback
           }
@@ -4474,11 +4605,13 @@ export default {
         const isTodayQuery = !dayKeyParam || dayKeyParam === todayKey;
         const wantLive = searchParams.get('live') !== '0' && isTodayQuery;
 
+        let liveLineUnits = [];
         if (wantLive) {
-          await Promise.race([
+          const swept = await Promise.race([
             runLiveLineSweep(env, codLinea, nowMs).catch(() => []),
-            new Promise((r) => setTimeout(r, 2800))
+            new Promise((r) => setTimeout(() => r([]), 2800))
           ]);
+          if (Array.isArray(swept)) liveLineUnits = swept.filter((u) => Number(u.codigoLinea) === codLinea);
         }
 
         const stub = getFleetStub(env);
@@ -4489,6 +4622,32 @@ export default {
             }`;
             const doRes = await stub.fetch(`https://fleet-memory/flota?${qs}`);
             const data = await doRes.json();
+            // Overlay fresh 8.5s live SOAP positions in RAM so throttled SQLite writes never lag live UI
+            if (isTodayQuery && liveLineUnits.length > 0 && Array.isArray(data?.coches)) {
+              const liveByCoche = new Map();
+              for (const lu of liveLineUnits) liveByCoche.set(String(lu.coche), lu);
+              for (const c of data.coches) {
+                const lu = liveByCoche.get(String(c.coche));
+                if (!lu) continue;
+                const luObsMs = parseGpsStampMs(lu.ultimaGps) || nowMs;
+                if (luObsMs >= (c.lastSeenAt || 0)) {
+                  if (Number.isFinite(lu.lat) && Number.isFinite(lu.lng)) {
+                    c.lastLat = lu.lat;
+                    c.lastLng = lu.lng;
+                  }
+                  if (lu.ultimaGps) c.lastGps = lu.ultimaGps;
+                  if (lu.bandera) c.lastBandera = lu.bandera;
+                  if (lu.stopId) c.lastStopId = lu.stopId;
+                  if (lu.desvioRaw) {
+                    c.lastDesvioRaw = lu.desvioRaw;
+                    c.lastDesvioSec = Number(lu.desvioSec) || 0;
+                  }
+                  c.lastSeenAt = luObsMs;
+                  c.vistoHoy = true;
+                  c.enLineaAhora = true;
+                }
+              }
+            }
             return jsonResponse({ data, source: 'fleet-memory-do', savedAt: Date.now() });
           } catch {
             // Fall through to in-memory fallback
@@ -4568,15 +4727,22 @@ export default {
         const todayKey = getArgentinaDayKey(nowMs);
         const wantLive = searchParams.get('live') !== '0';
         const stub = getFleetStub(env);
+        const hasFreshDoCache = Boolean(flotaActivaDoCache.data && nowMs - flotaActivaDoCache.ts < FLOTA_ACTIVA_DO_TTL_MS);
 
         const [liveUnits, doData] = await Promise.all([
           wantLive ? runLiveCityHubSweep(env, ctx, nowMs).catch(() => []) : Promise.resolve([]),
-          stub
-            ? stub
-                .fetch('https://fleet-memory/flota-activa')
-                .then((r) => (r.ok ? r.json() : null))
-                .catch(() => null)
-            : Promise.resolve(null)
+          hasFreshDoCache
+            ? Promise.resolve(flotaActivaDoCache.data)
+            : stub
+              ? stub
+                  .fetch('https://fleet-memory/flota-activa')
+                  .then((r) => (r.ok ? r.json() : null))
+                  .then((d) => {
+                    if (d) flotaActivaDoCache = { ts: Date.now(), data: d };
+                    return d;
+                  })
+                  .catch(() => null)
+              : Promise.resolve(null)
         ]);
 
         const mergedByKey = new Map();

@@ -337,6 +337,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.5.4',
+    date: '25/11/2026 · 21:10 hs',
+    items: [
+      '<strong>Historial optimizado a 3 días (antes 7 días):</strong> coches, choferes, servicios, observaciones diarias y eventos pasados ahora se conservan durante los últimos <strong>3 días</strong> (manteniendo los próximos <strong>7 días</strong> programados sin cambios). Esto reduce en más de un 55 % el peso de la base de datos, el paquete offline y las lecturas diarias del servidor.',
+      '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron, escaneo nocturno más espaciado y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~80 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
+    ]
+  },
+  {
     version: 'v2.5.3',
     date: '25/11/2026 · 16:10 hs',
     items: [
@@ -4307,7 +4315,7 @@ function toggleAllFleetMode(forceState = null) {
 // ============================================================================
 // Global Vertical Chronological Events Timeline (-7d History / Today / +7d)
 // ============================================================================
-const EVENTS_MAX_PAST_DAYS = 7;
+const EVENTS_MAX_PAST_DAYS = 3;
 const EVENTS_MAX_FUTURE_DAYS = 7;
 const eventsLineModelCache = new Map(); // `${codLinea}:${tipoDia}` -> LineScheduleModel | null
 
@@ -4833,7 +4841,7 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
           ? `Sin conexión · Caché local${clock ? ` (${clock})` : ''} · Tocá un evento para ver el chip`
           : `Actualización automática cada ${REFRESH_INTERVAL_SEC} s · Tocá un evento para ir al chip`;
     } else if (built.isPastDay) {
-      el.eventsModalSub.textContent = 'Registro histórico (últimos 7 días) · Tocá un coche registrado para verlo en mapa';
+      el.eventsModalSub.textContent = 'Registro histórico (últimos 3 días) · Tocá un coche registrado para verlo en mapa';
     } else {
       el.eventsModalSub.textContent = 'Eventos programados (próximos 7 días) · Coches y choferes se asignan al iniciar';
     }
@@ -7913,9 +7921,9 @@ function renderLineFlotaView() {
     return;
   }
 
-  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayObs: [], dayKey: getArgentinaDayKey(), retentionDays: 7, meta: {} };
+  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayObs: [], dayKey: getArgentinaDayKey(), retentionDays: 3, meta: {} };
   const todayKey = data.dayKey || getArgentinaDayKey();
-  const retentionDays = data.retentionDays || 7;
+  const retentionDays = data.retentionDays || 3;
   const meta = data.meta || {};
   const model = fv.model || null;
   const nowSec = getArgentinaSecOfDay();
@@ -8655,7 +8663,7 @@ function renderLineFlotaView() {
                 ? `Los coches de ${escapeHtml(dayNavInfo.main)} se registran automáticamente al iniciar el servicio. Mirá el diagrama completo en Servicios.`
                 : isHistoricalSrvDay
                   ? `No quedaron registros de coches guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                  : 'El sistema escanea automáticamente todas las líneas y guarda el registro diario por 7 días.'
+                  : `El sistema escanea automáticamente todas las líneas y guarda el registro diario por ${retentionDays} días.`
           }</p>
         </div>
       `;
@@ -8782,7 +8790,7 @@ function renderLineFlotaView() {
                 ? `Los choferes de ${escapeHtml(dayNavInfo.main)} se asignan automáticamente al iniciar cada turno. Mirá los horarios en Servicios.`
                 : isHistoricalSrvDay
                   ? `No quedaron registros de choferes guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                  : 'El sistema guarda automáticamente la actividad diaria de cada chofer durante 7 días.'
+                  : `El sistema guarda automáticamente la actividad diaria de cada chofer durante ${retentionDays} días.`
           }</p>
         </div>
       `;
@@ -9336,7 +9344,7 @@ async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null
 async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
   const fv = state.flotaView;
   if (!linea || state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
-  const retentionDays = fv.data?.retentionDays || 7;
+  const retentionDays = fv.data?.retentionDays || 3;
   const maxOffset = Math.max(0, retentionDays - 1);
   const minOffset = -EVENTS_MAX_FUTURE_DAYS;
   const clamped = Math.max(minOffset, Math.min(maxOffset, Number(dayOffset) || 0));
@@ -9469,7 +9477,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     ]);
     const data = res?.data;
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
-    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 7, meta: {} };
+    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 3, meta: {} };
     state.flotaView.schedSummary = schedSummary;
     state.flotaView.model = schedSummary?._model || null;
     state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
@@ -10249,13 +10257,13 @@ function renderDrilldown() {
                       : '';
                   const countBadge =
                     sum && sum.cochesSemana > 0
-                      ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} sem.`}</span>`
+                      ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 3 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} (3d)`}</span>`
                       : '';
                   const flotaAria =
                     sum && sum.cochesSemana > 0
                       ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${peakOrHoy} coches simultáneos hoy${
                           sum.replacementSwapsToday > 0 ? ` (${sum.cochesHoy} internos en total)` : ''
-                        }, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
+                        }, ${sum.cochesSemana} en los últimos 3 días y ${sum.choferesSemana} choferes`
                       : `Ver flota de coches y choferes de línea ${l.descripcion}`;
                   return `
                     <div class="line-tile" style="--line-color:${color}">
