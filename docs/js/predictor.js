@@ -3193,6 +3193,144 @@ function scoreCorridorPeerAgainstService(
 }
 
 /**
+ * Cross-checks a live GPS bus against the line's schedule/service/shift diagram (`model`) to detect
+ * whether the bus is finishing service (or cutting for a Cortado break) at the terminal and will NOT
+ * start another passenger trip through `stopId`:
+ *
+ *  1) `final_outbound_already_passed`: bus already passed `stopId` (`leg === 'full_cycle'`) on its
+ *     FINAL trip of that direction — its returning leg ends with `nextTrip === null` (Fin de servicio / Corte),
+ *     so it will NEVER depart `stopId` again in this shift.
+ *  2) `returning_to_end_service`: bus is on the opposite return branch (`leg === 'previous_leg'`)
+ *     tightly locked to a terminal-ending return trip (`nextTrip === null`, e.g. 904B S2 V4 22:01 -> 22:49),
+ *     meaning it arrives at the terminal ONLY to finish service and will NOT load passengers on `stopBranch`.
+ *
+ * Note: Returns `null` for stops ON the returning trip itself (`leg === 'direct'`), so passengers
+ * riding the final return leg back to the terminal still see the bus normally.
+ */
+export function detectEndingServiceBusForStop(
+  model,
+  stopId,
+  stopCoords,
+  bus,
+  nowSec = getArgentinaSecOfDay(),
+  { matchedTrip = null, stickyRec = null, evidenceRec = null } = {}
+) {
+  if (!model || !bus || bus.isNextLap || !bus.trajectory) return null;
+
+  const stopBranches = pickStopBranches(model.branches, stopId, stopCoords, bus.descripcionBandera || '');
+  if (stopBranches.length === 0) return null;
+  const stopBranchSet = new Set(stopBranches);
+
+  const hasFutureStopBranchTrip = (trip) => {
+    let cur = trip?.nextTrip || null;
+    let hops = 0;
+    while (cur && hops < 4) {
+      if (stopBranchSet.has(cur.branch)) return true;
+      cur = cur.nextTrip || null;
+      hops++;
+    }
+    return false;
+  };
+
+  // Case 1: Bus ALREADY PASSED `stopId` (`full_cycle`) on its last `stopBranch` trip of the shift
+  if (bus.trajectory.leg === 'full_cycle' && (bus.routeMeters ?? 0) >= 2000 && matchedTrip) {
+    if (stopBranchSet.has(matchedTrip.branch) && !hasFutureStopBranchTrip(matchedTrip)) {
+      return {
+        isEndingService: true,
+        reason: 'final_outbound_already_passed',
+        activeTrip: matchedTrip,
+        endingTrip: matchedTrip.nextTrip || matchedTrip
+      };
+    }
+  }
+
+  // Case 2: Bus is physically on the opposite branch returning to the terminal ONLY to end service / cut
+  if (
+    (bus.trajectory.leg === 'previous_leg' || bus.isOppositeLeg) &&
+    typeof bus.lat === 'number' &&
+    typeof bus.lng === 'number'
+  ) {
+    const effNow = toServiceSec(nowSec);
+    const gpsClockRaw = parseGpsStampSecOfDay(bus.ultimaFechaHoraGPS || '');
+    const effClock =
+      gpsClockRaw !== null && Math.abs(toServiceSec(gpsClockRaw) - effNow) <= 10 * 60
+        ? toServiceSec(gpsClockRaw)
+        : effNow;
+    const hasDesvio = Boolean(bus.desvio && bus.desvio.status && bus.desvio.status !== 'none');
+    const rawDesvioSec = hasDesvio ? bus.desvio.seconds || 0 : 0;
+    const safeDesvioSec = Math.abs(rawDesvioSec) <= 38 * 60 ? rawDesvioSec : 0;
+
+    const projCache = new Map();
+    const getProj = (branch) => {
+      if (!projCache.has(branch)) {
+        projCache.set(branch, projectOnPolyline(branch.pts, branch.cum, bus.lat, bus.lng));
+      }
+      return projCache.get(branch);
+    };
+
+    const evalOppTrips = (clockSec) => {
+      let bestEnding = { err: Infinity, tr: null };
+      let bestContinuing = { err: Infinity, tr: null };
+
+      for (const br of model.branches) {
+        if (stopBranchSet.has(br)) continue;
+        const proj = getProj(br);
+        if (!proj || proj.perp > 160) continue;
+
+        for (const tr of model.getTripsForBranch(br)) {
+          if (clockSec < tr.startSec - 12 * 60 || clockSec > tr.endSec + 25 * 60) continue;
+          const schedAtBus = getTripSecAtAlong(tr, proj.along);
+          if (schedAtBus === null) continue;
+          let d = Math.abs(schedAtBus - clockSec);
+          if (d > 43200) d = Math.abs(d - 86400);
+          const score = d + Math.min(120, proj.perp * 0.8);
+
+          if (!hasFutureStopBranchTrip(tr)) {
+            if (score < bestEnding.err) bestEnding = { err: score, tr };
+          } else {
+            if (score < bestContinuing.err) bestContinuing = { err: score, tr };
+          }
+        }
+      }
+      return { bestEnding, bestContinuing };
+    };
+
+    let res = evalOppTrips(effClock + safeDesvioSec);
+    // Also evaluate raw clock if desvio was missing or unusually large (>38 min clamped)
+    if (!hasDesvio || Math.abs(rawDesvioSec) > 38 * 60) {
+      const rawRes = evalOppTrips(effClock);
+      if (rawRes.bestEnding.err < res.bestEnding.err) res = rawRes;
+    }
+
+    const { bestEnding, bestContinuing } = res;
+    if (bestEnding.tr) {
+      const knownSrv =
+        stickyRec?.serviceNumber ||
+        (evidenceRec && evidenceRec.count >= 2 && evidenceRec.avgErrSec <= 240 ? evidenceRec.serviceNumber : null);
+      const matchesKnownService = Boolean(
+        knownSrv &&
+          bestEnding.tr.serviceNumber === knownSrv &&
+          bestEnding.err <= 8 * 60 &&
+          bestEnding.err <= bestContinuing.err + 120
+      );
+      const clearlyBestEnding =
+        bestEnding.err <= 4.5 * 60 && bestContinuing.err - bestEnding.err >= 4 * 60;
+
+      if (matchesKnownService || clearlyBestEnding) {
+        return {
+          isEndingService: true,
+          reason: 'returning_to_end_service',
+          activeTrip: bestEnding.tr,
+          endingTrip: bestEnding.tr
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Globally matches ALL live GPS buses of one line (stop arrivals + Corridor Radar peers) to their
  * canonical scheduled `serviceNumber` & `trip` simultaneously using exact minimum-cost bipartite
  * assignment (Hungarian algorithm).

@@ -34,6 +34,7 @@ import {
   buildGpsAnchorForTrip,
   parseGpsStampSecOfDay,
   detectAlreadyPassedTrips,
+  detectEndingServiceBusForStop,
   predictLineBusesForStop,
   getArgentinaSecOfDay,
   getArgentinaDayKey,
@@ -342,7 +343,7 @@ const CHANGELOG_ENTRIES = [
     items: [
       '<strong>Historial optimizado a 3 días (antes 7 días):</strong> coches, choferes, servicios, observaciones diarias y eventos pasados ahora se conservan durante los últimos <strong>3 días</strong> (manteniendo los próximos <strong>7 días</strong> programados sin cambios). Esto reduce en más de un 55 % el peso de la base de datos, el paquete offline y las lecturas diarias del servidor.',
       '<strong>Escáner de horarios en 2 ventanas diarias (03:00 y 15:00 hs):</strong> en lugar de correr las 24 h cada 5 minutos, ahora realiza la barrida completa del nuevo día laboral entre las <strong>03:00 y 04:30 hs</strong> (capturando el 100 % de las 53 paradas ancla antes del primer coche) y un repaso aditivo extra entre las <strong>15:00 y 16:00 hs</strong> sin borrar nada de lo registrado a la madrugada, permaneciendo inactivo (0 consultas al Durable Object) las restantes 21,5 horas del día.',
-      '<strong>Corrección de arribos fantasma <code>+Flota</code> en coches que ya salieron:</strong> el radar de corredor y la app ahora descartan automáticamente cualquier coche que ya pasó la parada y se está alejando en sentido contrario (como un <strong>904B</strong> recién salido del Puerto rumbo a Resistencia), evitando que aparezca como próximo arribo con minutos irreales.',
+      '<strong>Corrección de arribos fantasma <code>+Flota</code> y coches que finalizan servicio:</strong> el radar de corredor y la app ahora cruzan la posición real con el diagrama de horarios, servicios y turnos para descartar automáticamente tanto coches que ya salieron y se alejan en sentido contrario como coches en su <strong>última vuelta de regreso a cabecera</strong> (fin de servicio o corte, sin próxima salida programada), evitando mostrarlos como próximo arribo donde ya no cargarán pasajeros.',
       '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~85 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
     ]
   },
@@ -5569,13 +5570,62 @@ function reconcileWithSchedulePrediction(
     const lineCorridorBuses = (state.corridorFleet || []).filter((u) => Number(u.codigoLinea) === Number(cod));
 
     if (model && stopCoords) {
-      const matches = matchLiveBusesToTrips(model, stopId, stopCoords, buses, nowSec, {
+      // Pre-filter returning buses whose active opposite-branch trip ends service / cuts at the terminal
+      // (`nextTrip === null`) so they NEVER appear as boarding arrivals at outbound stops or steal another service's slot!
+      const busesForMatching = [];
+      for (const b of buses) {
+        if (!b.isNextLap && (b.isOppositeLeg || b.trajectory?.leg === 'previous_leg')) {
+          const cKey = b.identificadorCoche ? `${cod}:${b.identificadorCoche}` : null;
+          const endCheck = detectEndingServiceBusForStop(model, stopId, stopCoords, b, nowSec, {
+            stickyRec: cKey ? state.stickyLiveTripByCoche.get(cKey) || null : null,
+            evidenceRec: cKey ? state.serviceEvidenceByCoche.get(cKey) || null : null
+          });
+          if (endCheck?.isEndingService) {
+            b._dropPassedGhost = true;
+            if (b.identificadorCoche) matchedCoches.delete(b.identificadorCoche);
+            // Still persist its live returning trip to FleetMemory so Flota & Modo libre keep tracking it!
+            const endTr = endCheck.endingTrip;
+            if (b.identificadorCoche && endTr) {
+              const endBi = endTr.blockInfo || (endTr.blockId ? model.blockInfoById?.get(endTr.blockId) : null);
+              seenReports.push({
+                codigoLinea: cod,
+                descripcionLinea: b.descripcionLinea || '',
+                tripKey: endTr.tripKey,
+                turnoHora: formatSecHHMM(endTr.startSec),
+                coche: b.identificadorCoche,
+                choferNombre: b.choferNombre || '',
+                choferLegajo: b.choferLegajo || '',
+                choferRaw: b.choferRaw || '',
+                esAdaptado: Boolean(b.esAdaptado),
+                desvioSec: b.desvio?.seconds || 0,
+                desvioRaw: b.desvio?.raw || '',
+                ultimaGps: b.ultimaFechaHoraGPS || '',
+                lat: b.lat,
+                lng: b.lng,
+                stopId,
+                bandera: endTr.branch?.bandera || b.realBandera || '',
+                dirBandera: endTr.branch?.bandera || '',
+                serviceNumber: endTr.serviceNumber || 0,
+                turnoIndex: endTr.turnoIndex || 1,
+                turnoStart: endBi ? formatSecHHMM(endBi.startSec) : '',
+                turnoEnd: endBi ? formatSecHHMM(endBi.endSec) : '',
+                lapNumber: endTr.lapNumber || 0,
+                shiftLaps: endTr.shiftLaps || 0
+              });
+            }
+            continue;
+          }
+        }
+        busesForMatching.push(b);
+      }
+
+      const matches = matchLiveBusesToTrips(model, stopId, stopCoords, busesForMatching, nowSec, {
         stickyTripByCoche: state.stickyLiveTripByCoche,
         corridorBuses: lineCorridorBuses,
         gpsHistoryByUnit: state.lastRealGpsByUnit,
         serviceEvidenceByCoche: state.serviceEvidenceByCoche
       });
-      for (const b of buses) {
+      for (const b of busesForMatching) {
         const m = matches.get(b.key);
         if (!m) {
           if (!b.isNextLap && b.trajectory && b.routeMeters > 0) {
@@ -5757,13 +5807,18 @@ function reconcileWithSchedulePrediction(
                 ? m.targetStopSec - (b.desvio?.seconds || 0) - effNowSvc
                 : null;
 
+            const endingAfterPass = isFullCycle
+              ? detectEndingServiceBusForStop(model, stopId, stopCoords, b, nowSec, { matchedTrip: m.trip })
+              : null;
+
             if (
-              isFullCycle &&
-              b.routeMeters >= 3000 &&
-              (b.esExtendido ||
-                (!b.trajectory.isAtTerminal &&
-                  impliedSpeedMps > 14.5 &&
-                  (schedRemSec !== null ? schedRemSec < -90 : (b.eta?.minutes ?? 99) <= 20)))
+              endingAfterPass?.isEndingService ||
+              (isFullCycle &&
+                b.routeMeters >= 3000 &&
+                (b.esExtendido ||
+                  (!b.trajectory.isAtTerminal &&
+                    impliedSpeedMps > 14.5 &&
+                    (schedRemSec !== null ? schedRemSec < -90 : (b.eta?.minutes ?? 99) <= 20))))
             ) {
               b._dropPassedGhost = true;
               completedSet.add(`${cod}:${m.tripKey}`);
