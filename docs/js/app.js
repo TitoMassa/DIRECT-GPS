@@ -342,6 +342,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.5.6',
+    date: '26/11/2026 · 17:00 hs',
+    items: [
+      '<strong>Etiqueta GPS fiel en coches proyectados con señal reciente:</strong> los arribos lejanos reconstruidos por memoria de flota con GPS activo en los últimos <strong>3 minutos</strong> ahora muestran <strong>En línea · GPS HH:MM</strong> (en el inspector) y <strong>Est. · GPS HH:MM</strong> (en la tarjeta), reservando <strong>Sin GPS · últ. HH:MM</strong> únicamente cuando de verdad pasaron ≥ 3 minutos sin reporte satelital.'
+    ]
+  },
+  {
     version: 'v2.5.5',
     date: '26/11/2026 · 16:05 hs',
     items: [
@@ -2601,6 +2608,71 @@ async function handleLineFilterClick(e) {
   await fetchArribos(true, { announceSummary: true });
 }
 
+const FRESH_FLEET_GPS_MAX_AGE_SEC = 180;
+
+function getBusGpsClockHHMM(bus) {
+  const fromTimeOnly = String(bus?.gpsTimeOnly || '')
+    .replace(/^últ\.?\s*/i, '')
+    .trim();
+  if (fromTimeOnly) return fromTimeOnly.slice(0, 5);
+  const fromRaw = formatGpsTimeOnly(bus?.ultimaFechaHoraGPS || '');
+  return fromRaw ? fromRaw.slice(0, 5) : '';
+}
+
+function hasFreshFleetGps(bus, nowMs = Date.now()) {
+  if (!bus || bus.gpsLost) return false;
+  const gpsMs = parseGpsTimestampMs(bus.ultimaFechaHoraGPS || '');
+  if (!gpsMs) return false;
+  const ageSec = (nowMs - gpsMs) / 1000;
+  return ageSec >= -120 && ageSec < FRESH_FLEET_GPS_MAX_AGE_SEC;
+}
+
+function describeArrivalGpsStatus(bus, nowMs = Date.now()) {
+  const isPredictedCard = Boolean(bus?.isPredicted && !bus?.nextLapSourceLive);
+  const isLost = Boolean(bus?.gpsLost);
+  const clock = getBusGpsClockHHMM(bus);
+
+  if (isLost) {
+    return {
+      mode: 'no-gps',
+      cardText: clock ? `Sin GPS · últ. ${clock}` : 'Sin GPS',
+      inspText: clock ? `Sin GPS · últ. ${clock}` : 'Sin GPS',
+      title: 'Sin reporte GPS reciente (≥ 3 min) · estimado por horario',
+      warn: true
+    };
+  }
+  if (isPredictedCard) {
+    if (hasFreshFleetGps(bus, nowMs) && clock) {
+      return {
+        mode: 'fresh-fleet',
+        cardText: `Est. · GPS ${clock}`,
+        inspText: `En línea · GPS ${clock}`,
+        title: 'GPS activo en otra zona · llegada estimada por horario',
+        warn: false
+      };
+    }
+    return {
+      mode: 'no-gps',
+      cardText: clock ? `Sin GPS · últ. ${clock}` : 'Est. horario',
+      inspText: clock ? `Sin GPS · últ. ${clock}` : 'Est. horario',
+      title: clock
+        ? 'Sin reporte GPS reciente (≥ 3 min) · estimado por horario'
+        : 'Posición estimada por horarios programados',
+      warn: true
+    };
+  }
+  const rawTime = String(bus?.gpsTimeOnly || '')
+    .replace(/^últ\.?\s*/i, '')
+    .trim() || clock;
+  return {
+    mode: 'live',
+    cardText: rawTime,
+    inspText: rawTime ? `GPS ${rawTime}` : '',
+    title: rawTime ? 'Último reporte GPS' : '',
+    warn: false
+  };
+}
+
 function buildArrivalAriaLabel(bus) {
   const parts = [];
   const currentBandera = bus.realBandera || bus.descripcionBandera;
@@ -2676,8 +2748,10 @@ function buildArrivalAriaLabel(bus) {
     parts.push(`Chofer ${bus.choferNombre}.`);
   }
 
-  const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
-  if (isOfflineStyled) {
+  const gpsStatus = describeArrivalGpsStatus(bus);
+  if (gpsStatus.mode === 'fresh-fleet') {
+    parts.push('En línea en otra zona, llegada estimada por horario.');
+  } else if (gpsStatus.mode === 'no-gps') {
     parts.push('Estimado por horario programado, sin señal GPS.');
   }
 
@@ -2873,21 +2947,12 @@ function patchArrivalRow(row, bus) {
       : '';
   if (r.distVal.textContent !== distTxt) r.distVal.textContent = distTxt;
 
-  const gpsSig = `${isOfflineStyled ? 1 : 0}|${bus.gpsTimeOnly || ''}`;
+  const gpsStatus = describeArrivalGpsStatus(bus);
+  const gpsSig = `${gpsStatus.mode}|${gpsStatus.warn ? 1 : 0}|${gpsStatus.cardText}`;
   if (r.lastGpsSig !== gpsSig) {
-    if (isOfflineStyled) {
-      r.gpsVal.className = 'arrival-gps-val pred-meta';
-      r.gpsVal.title = 'Posición estimada por horarios programados';
-      r.gpsVal.textContent = bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario';
-    } else if (bus.gpsTimeOnly) {
-      r.gpsVal.className = 'arrival-gps-val';
-      r.gpsVal.title = 'Último reporte GPS';
-      r.gpsVal.textContent = bus.gpsTimeOnly;
-    } else {
-      r.gpsVal.className = 'arrival-gps-val';
-      r.gpsVal.title = '';
-      r.gpsVal.textContent = '';
-    }
+    r.gpsVal.className = gpsStatus.warn ? 'arrival-gps-val pred-meta' : 'arrival-gps-val';
+    r.gpsVal.title = gpsStatus.title;
+    r.gpsVal.textContent = gpsStatus.cardText;
     r.lastGpsSig = gpsSig;
   }
 
@@ -3166,19 +3231,22 @@ function updateInspectorFields(bus) {
   }
 
   const gpsParts = [];
-  const isOfflineStyled = (bus.isPredicted && !bus.nextLapSourceLive) || Boolean(bus.gpsLost);
   const isFollowing = Boolean(state.followSelectedBus && state.selectedBusKey === bus.key);
   if (isFollowing) gpsParts.push('Siguiendo');
   if (bus.isFreeTracked) {
-    if (bus.enLineaAhora && !isFollowing) gpsParts.push('En vivo');
-    else if (!bus.enLineaAhora) gpsParts.push('Última ubicación');
-    if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
-    else if (bus.lastSeenLabel) gpsParts.push(bus.lastSeenLabel);
-  } else if (isOfflineStyled) {
-    gpsParts.push(bus.gpsTimeOnly ? `Sin GPS · ${bus.gpsTimeOnly}` : 'Est. horario');
+    if (bus.gpsLost) {
+      const clock = getBusGpsClockHHMM(bus);
+      gpsParts.push(clock ? `Sin GPS · últ. ${clock}` : 'Sin GPS');
+    } else {
+      if (bus.enLineaAhora && !isFollowing) gpsParts.push('En vivo');
+      else if (!bus.enLineaAhora) gpsParts.push('Última ubicación');
+      if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
+      else if (bus.lastSeenLabel) gpsParts.push(bus.lastSeenLabel);
+    }
   } else {
-    if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
-    if (bus.esExtendido) gpsParts.push('+Flota');
+    const gpsStatus = describeArrivalGpsStatus(bus);
+    if (gpsStatus.inspText) gpsParts.push(gpsStatus.inspText);
+    if (gpsStatus.mode === 'live' && bus.esExtendido) gpsParts.push('+Flota');
   }
   el.inspGps.textContent = gpsParts.join(' · ') || '—';
 
