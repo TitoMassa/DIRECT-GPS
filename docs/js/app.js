@@ -48,7 +48,11 @@ import {
   resolveLiveHorariosForDay,
   sanitizeLiveDesvio,
   evaluateFreeBusSchedulePos,
-  normalizeBandera
+  normalizeBandera,
+  getTripLocalSpeedMps,
+  getPaceAdjustedTripSpeedMps,
+  projectAlongTripBySeconds,
+  measureTripPaceFactor
 } from './predictor.js';
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
@@ -337,6 +341,15 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.5.5',
+    date: '26/11/2026 · 16:05 hs',
+    items: [
+      '<strong>Simulación EN VIVO compensada por antigüedad real del GPS (adiós al retraso de 2–3 cuadras):</strong> ahora el simulador proyecta automáticamente cada colectivo desde la hora exacta de su último paquete GPS (<code>ultimaFechaHoraGPS</code>) hasta el segundo actual tanto al abrir una parada como al llegar cada nuevo reporte satelital, comparando siempre <em>posición actual estimada vs. posición actual real</em> para evitar los frenados falsos que dejaban las unidades 2 o 3 cuadras atrás.',
+      '<strong>Adaptación nativa a GPS que reportan cada 1 a 2 minutos:</strong> se amplió el aprendizaje de cadencia satelital a <strong>15–135 s</strong> (antes topeado en 55 s y detenido en falso a los 48–65 s de silencio), eliminando el freno prematuro y el tope de avance corto en <strong>Radar de paradas</strong>, <strong>Modo libre</strong> y <strong>Seguimiento individual</strong>, con transición invisible al horario programado a los 3 minutos sin saltos.',
+      '<strong>Velocidad inteligente por tramo y corredor (centro vs. avenidas vs. puente):</strong> el movimiento EN VIVO ahora combina el ritmo real medido de cada colectivo (<code>gpsTrail</code>) con el perfil de velocidad tramo a tramo del diagrama oficial de esa hora, acelerando naturalmente al salir del centro hacia avenidas rápidas (como Av. Pedro Ferré o Independencia) o el puente, sin doble penalización en paradas y con cierre neto real del retraso cuando una unidad avanza más rápido.'
+    ]
+  },
   {
     version: 'v2.5.4',
     date: '25/11/2026 · 21:20 hs',
@@ -2340,6 +2353,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       lat: draftBus.lat,
       lng: draftBus.lng,
       prevGpsFix,
+      gpsTrail: Array.isArray(gpsHist?.trail) ? gpsHist.trail.slice() : null,
       confirmedDirectionBandera: trajectory?.confirmedDirectionBandera || confirmedDir?.bandera || '',
       directionSource: trajectory?.directionSource || (confirmedDir ? 'persisted' : 'eta'),
       distanceMeters: straightDist,
@@ -3846,7 +3860,7 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
           const curAlong =
             prevSim &&
             prevSim.branch === schedPos.branch &&
-            Math.abs(schedPos.along - prevSim.along) <= 260
+            Math.abs(schedPos.along - prevSim.along) <= 450
               ? prevSim.along
               : schedPos.along;
 
@@ -3927,48 +3941,119 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
       bus.realBanderaColor = branch.color || getLineColor(bus.descripcionLinea);
     }
 
+    const matchedTrip = bus._matchedTrip && bus._matchedTrip.branch === branch ? bus._matchedTrip : null;
+    const localSchedV = matchedTrip ? getTripLocalSpeedMps(matchedTrip, gpsAlong) : null;
     const nearTerminal = gpsAlong <= 120 || (branch.totalLen || 0) - gpsAlong <= 120;
     const isFreshNewFix = Boolean(gpsMs && prevSim?.lastGpsMs && gpsMs > prevSim.lastGpsMs);
+    const isSameGpsFix = Boolean(
+      prevSim && prevSim.mode === 'gps' && prevSim.branch === branch && !isFreshNewFix && gpsMs && prevSim.lastGpsMs === gpsMs
+    );
 
-    // Learn real cruising speed from penultimate -> latest real GPS fix (blended smoothly with previous speed)
-    let speedMps = prevSim && prevSim.speedMps > 1.0 ? prevSim.speedMps : 5.4;
-    let isStopped = gpsAgeSec > 150 || nearTerminal || (!dirConfirmed && ambiguous);
+    // Learn real reporting cadence (15–135 s) from multi-point gpsTrail + fresh fix deltas
+    let cadenceSec = prevSim?.cadenceSec || null;
+    if (isFreshNewFix && gpsMs && prevSim?.lastGpsMs) {
+      const dtFix = (gpsMs - prevSim.lastGpsMs) / 1000;
+      if (dtFix >= 5 && dtFix <= 165) {
+        const samp = Math.max(15, Math.min(135, dtFix));
+        cadenceSec = cadenceSec !== null ? (samp > cadenceSec ? 0.65 * samp + 0.35 * cadenceSec : 0.45 * samp + 0.55 * cadenceSec) : samp;
+      }
+    }
+    if (cadenceSec === null && Array.isArray(rec?.gpsHist?.trail) && rec.gpsHist.trail.length >= 2) {
+      const dts = [];
+      const tr = rec.gpsHist.trail;
+      for (let tIdx = 1; tIdx < tr.length; tIdx++) {
+        const msA = tr[tIdx - 1]?.gpsMs;
+        const msB = tr[tIdx]?.gpsMs;
+        if (typeof msA === 'number' && typeof msB === 'number') {
+          const dt = (msB - msA) / 1000;
+          if (dt >= 5 && dt <= 165) dts.push(dt);
+        }
+      }
+      if (dts.length > 0) {
+        const sorted = dts.slice(-4).sort((a, b) => a - b);
+        cadenceSec = Math.max(15, Math.min(135, sorted[Math.floor(sorted.length / 2)]));
+      }
+    }
+    const effCadenceSec = Math.max(15, Math.min(135, cadenceSec || 75));
+
+    // Learn real cruising speed & corridor pace factor from penultimate -> latest real GPS fix
+    let paceFactor = Number.isFinite(prevSim?.paceFactor) ? prevSim.paceFactor : 1.0;
+    let speedMps =
+      prevSim && prevSim.mode === 'gps' && prevSim.speedMps > 1.0
+        ? prevSim.speedMps
+        : localSchedV ?? 4.8;
+    let isStopped = nearTerminal || (!dirConfirmed && ambiguous) || (gpsAgeSec >= 175 && !matchedTrip);
+    let hasConfirmedMove = Boolean(prevSim?.hasConfirmedMove);
     const prevFix = rec?.prevGpsFix;
     if (!isStopped && prevFix && gpsMs && prevFix.gpsMs) {
       const dtPrev = (gpsMs - prevFix.gpsMs) / 1000;
-      if (dtPrev >= 4 && dtPrev <= 180) {
+      if (dtPrev >= 4 && dtPrev <= 195) {
         const moved = distanceMeters(prevFix.lat, prevFix.lng, rawLat, rawLng) ?? 0;
         if (moved < 14 && dtPrev >= 12) {
           isStopped = true;
           speedMps = 0;
-        } else if (moved >= 14 && moved < Math.max(2200, dtPrev * 30)) {
-          const measured = Math.max(2.0, Math.min(19.0, (moved * 1.02) / dtPrev));
+        } else if (moved >= 14 && moved < Math.max(2400, dtPrev * 30)) {
+          const measured = Math.max(1.5, Math.min(22.0, (moved * 1.03) / dtPrev));
+          hasConfirmedMove = true;
           speedMps =
             prevSim && !prevSim.isStopped && prevSim.speedMps > 1.0 && isFreshNewFix
               ? measured * 0.65 + prevSim.speedMps * 0.35
               : measured;
+          if (matchedTrip && (!isSameGpsFix || !prevSim)) {
+            const pPrev = projectOnPolyline(branch.pts, branch.cum, prevFix.lat, prevFix.lng);
+            if (pPrev && pPrev.perp <= 165 && gpsAlong - pPrev.along >= 18) {
+              const instPace = measureTripPaceFactor(matchedTrip, pPrev.along, gpsAlong, dtPrev);
+              if (instPace !== null) {
+                paceFactor = prevSim && isFreshNewFix
+                  ? Math.max(0.55, Math.min(1.55, 0.65 * instPace + 0.35 * paceFactor))
+                  : instPace;
+              }
+            }
+          }
         }
       }
     }
 
-    // Realistic GPS-lag lead (capped at 20s) + bounded dead-reckoning ceiling so stale pings never drift blocks away
-    const initialLead = !isStopped && gpsAgeSec <= 40 ? Math.min(20, gpsAgeSec) * speedMps * 0.8 : 0;
-    const targetAlong = Math.min(Math.max(0, branch.totalLen - 12), gpsAlong + initialLead);
-    const maxLeadMeters = Math.min(280, Math.max(85, speedMps * 36));
-    const maxAlong = isStopped
-      ? gpsAlong
-      : Math.min(Math.max(0, branch.totalLen - 12), gpsAlong + maxLeadMeters);
+    // Time-compensated position at NOW: project from P(ultimaFechaHoraGPS) over gpsAgeSec using corridor speed profile!
+    const branchEnd = Math.max(0, (branch.totalLen || 0) - 12);
+    const maxCompSec = Math.max(120, Math.min(165, effCadenceSec * 1.25));
+    let ageAdvance = 0;
+    if (!isStopped && gpsAgeSec > 0.5 && gpsAgeSec < 178) {
+      const effAgeSec = Math.min(gpsAgeSec, maxCompSec) * (hasConfirmedMove ? 1.0 : 0.88);
+      if (matchedTrip) {
+        const projNow = projectAlongTripBySeconds(matchedTrip, gpsAlong, effAgeSec, paceFactor, branchEnd);
+        if (projNow && Number.isFinite(projNow.deltaMeters)) {
+          ageAdvance = projNow.deltaMeters;
+          if (projNow.localSpeedMps > 1.2) speedMps = projNow.localSpeedMps;
+        } else {
+          ageAdvance = effAgeSec * speedMps;
+        }
+      } else {
+        ageAdvance = effAgeSec * speedMps;
+      }
+    }
+
+    const targetAlong = Math.min(branchEnd, gpsAlong + ageAdvance);
+    const refSpeed = Math.max(speedMps, localSchedV || 0, 4.5);
+    const maxLeadMeters = Math.min(2400, Math.max(220, refSpeed * Math.max(effCadenceSec * 1.45, 135)));
+    const maxAlong = isStopped ? gpsAlong : Math.min(branchEnd, gpsAlong + maxLeadMeters);
 
     let curAlong = targetAlong;
+    let nextExpectedAlong = Math.min(maxAlong, targetAlong);
     if (prevSim && prevSim.branch === branch) {
       if (isStopped) {
         // Gently settle onto real GPS if bus genuinely stopped (small step avoids abrupt pop)
-        curAlong = Math.abs(gpsAlong - prevSim.along) <= 35 ? gpsAlong : prevSim.along;
-      } else {
+        curAlong = Math.abs(gpsAlong - prevSim.along) <= 45 ? gpsAlong : prevSim.along;
+        nextExpectedAlong = curAlong;
+      } else if (isSameGpsFix && prevSim.wasSimulating) {
+        // Same GPS fix across 10s polls: keep smooth 60fps marker position untouched & advance target monotonically!
+        curAlong = prevSim.along;
+        nextExpectedAlong = Math.min(maxAlong, Math.max(prevSim.expectedAlong ?? prevSim.along, targetAlong));
+      } else if (prevSim.wasSimulating) {
+        // Fresh GPS fix (NOW vs NOW): zero backward jump; let continuous motion close any real lag or bleed true overshoot!
         const diff = targetAlong - prevSim.along;
-        if (diff >= -180 && diff <= 380) {
-          // Zero-backjump continuity: never jump backwards; let continuous cruise speed smoothly close small gaps
-          curAlong = diff < 0 ? prevSim.along : prevSim.along + diff * 0.35;
+        if (diff >= -320 && diff <= 750) {
+          curAlong = prevSim.along;
         }
       }
     }
@@ -3977,9 +4062,14 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
     cityFleetSim.set(bus.key, {
       mode: 'gps',
       branch,
+      matchedTrip,
+      paceFactor,
+      cadenceSec: effCadenceSec,
+      hasConfirmedMove,
+      wasSimulating: Boolean(state.simulateMode),
       along: curAlong,
       gpsAlong,
-      expectedAlong: Math.min(maxAlong, targetAlong),
+      expectedAlong: Math.min(maxAlong, nextExpectedAlong),
       maxAlong,
       speedMps: isStopped ? 0 : speedMps,
       lastGpsMs: gpsMs,
@@ -4074,26 +4164,34 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
       continue;
     }
 
-    if (sim.isStopped || sim.speedMps <= 0.1) continue;
+    if (sim.isStopped) continue;
 
-    // Advance expectedAlong continuously at learned GPS speed so there is zero 7-second rubber-banding
-    sim.expectedAlong = Math.min(sim.maxAlong, (sim.expectedAlong ?? sim.along) + sim.speedMps * dtSec);
+    const localSchedSpeed = sim.matchedTrip
+      ? getPaceAdjustedTripSpeedMps(sim.matchedTrip, sim.along, sim.paceFactor || 1.0)
+      : null;
+    const baseSpeed = localSchedSpeed ?? sim.speedMps;
+    if (baseSpeed <= 0.1) continue;
+    sim.speedMps = baseSpeed;
+
+    // Advance expectedAlong continuously at corridor-adapted pace so 60–120 s AVL gaps track physical street progress
+    sim.expectedAlong = Math.min(sim.maxAlong, (sim.expectedAlong ?? sim.along) + baseSpeed * dtSec);
 
     const gap = sim.expectedAlong - sim.along;
-    let effSpeed = sim.speedMps;
-    if (gap < -15) {
-      // Gently bleed excess overshoot so real GPS catches up without stopping
-      effSpeed *= Math.max(0.35, 1 + gap / 160);
-    } else if (gap > 15) {
-      // Smoothly catch up when behind real GPS
-      effSpeed *= Math.min(1.4, 1 + gap / 120);
+    let effSpeed = baseSpeed;
+    if (gap < -12) {
+      // Gently bleed genuine overshoot so real GPS catches up without backjumping
+      effSpeed *= Math.max(0.30, 1 + gap / 180);
+    } else if (gap > 12) {
+      // Smoothly close real lag when bus moved ahead of prior estimate
+      effSpeed *= Math.min(1.65, 1 + gap / 90);
     }
 
-    // Soft coast-down over the final 35m before maxAlong ceiling so stale pings decelerate smoothly instead of slamming
+    // Soft coast-down near maxAlong ceiling (preserving motion until 180 s schedule handoff when matched)
     const remToMax = sim.maxAlong - sim.along;
     if (remToMax <= 0.05) continue;
-    if (remToMax < 35) {
-      effSpeed *= Math.max(0.12, remToMax / 35);
+    if (remToMax < 45) {
+      const floorRatio = sim.matchedTrip ? 0.45 : 0.12;
+      effSpeed *= Math.max(floorRatio, remToMax / 45);
     }
 
     const nextAlong = Math.min(sim.maxAlong, sim.along + effSpeed * dtSec);

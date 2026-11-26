@@ -2129,6 +2129,184 @@ function evalPointsAtSec(points, tEff) {
   };
 }
 
+function resolveSegmentSpeedMps(points, segIdx) {
+  const n = points.length - 1;
+  if (n <= 0) return null;
+  const idx = Math.max(0, Math.min(n - 1, segIdx));
+  const check = (k) => {
+    const a = points[k];
+    const b = points[k + 1];
+    const ds = (b?.along ?? 0) - (a?.along ?? 0);
+    const dt = (b?.sec ?? 0) - (a?.sec ?? 0);
+    if (ds >= 10 && dt >= 1) {
+      return Math.max(1.8, Math.min(22.0, ds / dt));
+    }
+    return null;
+  };
+  const direct = check(idx);
+  if (direct !== null) return direct;
+  for (let off = 1; off <= 4; off++) {
+    if (idx + off < n) {
+      const r = check(idx + off);
+      if (r !== null) return r;
+    }
+    if (idx - off >= 0) {
+      const l = check(idx - off);
+      if (l !== null) return l;
+    }
+  }
+  return null;
+}
+
+function findPointSegmentByAlong(points, along) {
+  const n = points.length;
+  if (n < 2) return 0;
+  if (along <= points[0].along) return 0;
+  if (along >= points[n - 1].along) return n - 2;
+  let lo = 0;
+  let hi = n - 2;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (points[mid + 1].along < along) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Returns the scheduled commercial segment speed (m/s) along `trip` at `along` meters.
+ * Captures both spatial corridor speed (downtown vs avenue vs bridge) and time-of-day traffic.
+ */
+export function getTripLocalSpeedMps(trip, along) {
+  const pts = trip?.points;
+  if (!pts || pts.length < 2 || !Number.isFinite(along)) return null;
+  const idx = findPointSegmentByAlong(pts, along);
+  return resolveSegmentSpeedMps(pts, idx);
+}
+
+/**
+ * Scales the local scheduled segment speed by the vehicle's observed real-time `paceFactor`,
+ * applying a conservative cap on high-speed highway/bridge corridors so downtown variance
+ * never predicts unrealistic highway speeds.
+ */
+export function getPaceAdjustedTripSpeedMps(trip, along, paceFactor = 1.0) {
+  const localV = getTripLocalSpeedMps(trip, along);
+  if (localV === null) return null;
+  const p = Number.isFinite(paceFactor) ? paceFactor : 1.0;
+  const segPace = localV >= 9.5 ? Math.max(0.72, Math.min(1.28, p)) : Math.max(0.55, Math.min(1.55, p));
+  return Math.max(1.6, Math.min(22.0, localV * segPace));
+}
+
+/**
+ * Integrates forward along `trip` from `startAlong` over `deltaSec` real seconds using the exact
+ * same piecewise pace-adjusted velocity field as `getPaceAdjustedTripSpeedMps`, ensuring 0 drift
+ * between GPS-age compensation and continuous 60fps simulation.
+ */
+export function projectAlongTripBySeconds(trip, startAlong, deltaSec, paceFactor = 1.0, maxAlong = Infinity) {
+  const pts = trip?.points;
+  if (!pts || pts.length < 2 || !Number.isFinite(startAlong) || !Number.isFinite(deltaSec) || deltaSec <= 0) {
+    return null;
+  }
+  const lastAlong = pts[pts.length - 1].along;
+  const capAlong = Math.min(Number.isFinite(maxAlong) ? maxAlong : lastAlong, lastAlong);
+  if (startAlong >= capAlong) {
+    const vEnd = getPaceAdjustedTripSpeedMps(trip, capAlong, paceFactor) || 0;
+    return { along: capAlong, deltaMeters: 0, localSpeedMps: vEnd };
+  }
+
+  let cur = Math.max(0, startAlong);
+  let remT = deltaSec;
+  let lastSpeed = getPaceAdjustedTripSpeedMps(trip, cur, paceFactor) || 4.5;
+  let guard = 0;
+
+  while (remT > 0.01 && cur < capAlong - 0.01 && guard++ < pts.length + 4) {
+    let segIdx;
+    let segEnd;
+    if (cur < pts[0].along - 0.01) {
+      segIdx = 0;
+      segEnd = Math.min(capAlong, pts[0].along);
+    } else {
+      segIdx = findPointSegmentByAlong(pts, cur + 0.001);
+      segEnd = Math.min(capAlong, pts[segIdx + 1].along);
+    }
+
+    const baseV = resolveSegmentSpeedMps(pts, segIdx);
+    if (baseV === null) break;
+    const p = Number.isFinite(paceFactor) ? paceFactor : 1.0;
+    const segPace = baseV >= 9.5 ? Math.max(0.72, Math.min(1.28, p)) : Math.max(0.55, Math.min(1.55, p));
+    const v = Math.max(1.6, Math.min(22.0, baseV * segPace));
+    lastSpeed = v;
+
+    const segDist = Math.max(0, segEnd - cur);
+    if (segDist <= 0.01) {
+      cur = Math.min(capAlong, cur + 0.05);
+      continue;
+    }
+
+    const tNeed = segDist / v;
+    if (remT >= tNeed) {
+      cur = segEnd;
+      remT -= tNeed;
+    } else {
+      cur = Math.min(capAlong, cur + v * remT);
+      remT = 0;
+    }
+  }
+
+  return {
+    along: cur,
+    deltaMeters: Math.max(0, cur - startAlong),
+    localSpeedMps: lastSpeed
+  };
+}
+
+/**
+ * Measures the vehicle's real-time pace ratio (`scheduledTime / actualTime`) across two consecutive
+ * GPS projections `(prevAlong -> curAlong)` separated by `dtSec` real seconds.
+ * Values > 1.0 mean the bus is moving faster than timetable; < 1.0 means slower traffic.
+ */
+export function measureTripPaceFactor(trip, prevAlong, curAlong, dtSec) {
+  const pts = trip?.points;
+  if (
+    !pts ||
+    pts.length < 2 ||
+    !Number.isFinite(prevAlong) ||
+    !Number.isFinite(curAlong) ||
+    !Number.isFinite(dtSec)
+  ) {
+    return null;
+  }
+  if (curAlong - prevAlong < 18 || dtSec < 6 || dtSec > 240) return null;
+
+  const start = Math.max(pts[0].along, prevAlong);
+  const end = Math.min(pts[pts.length - 1].along, curAlong);
+  if (end - start < 15) return null;
+
+  let cur = start;
+  let schedDt = 0;
+  let guard = 0;
+  while (cur < end - 0.01 && guard++ < pts.length + 2) {
+    const segIdx = findPointSegmentByAlong(pts, cur + 0.001);
+    const segEnd = Math.min(end, pts[segIdx + 1].along);
+    const segV = resolveSegmentSpeedMps(pts, segIdx);
+    const segDist = Math.max(0, segEnd - cur);
+    if (segV === null || segDist <= 0.01) {
+      cur = Math.min(end, cur + 0.05);
+      continue;
+    }
+    schedDt += segDist / segV;
+    cur = segEnd;
+  }
+
+  if (schedDt < 5) return null;
+  // Scale schedDt proportionally if prevAlong/curAlong slightly extended past first/last timed stop
+  const coveredFrac = (end - start) / Math.max(1, curAlong - prevAlong);
+  const effDt = dtSec * coveredFrac;
+  if (effDt < 5) return null;
+  return Math.max(0.55, Math.min(1.55, schedDt / effDt));
+}
+
+
 function isAtBranchStartTerminal(branch, projAlong, lat, lng, incomingBranch = null) {
   if (!branch?.pts?.length) return false;
   const firstStopAlong = branch.orderedStops?.[0]?.along ?? 0;
