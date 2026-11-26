@@ -3245,8 +3245,13 @@ export function detectEndingServiceBusForStop(
   }
 
   // Case 2: Bus is physically on the opposite branch returning to the terminal ONLY to end service / cut
+  // (also covers first-poll shared-corridor `full_cycle` projections when trail/lane has not locked `stopBranch`)
+  const lockedToStopBranch =
+    (bus.trajectory.directionSource === 'trail' || bus.trajectory.directionSource === 'lane') &&
+    bus.trajectory.confirmedBranch &&
+    stopBranchSet.has(bus.trajectory.confirmedBranch);
   if (
-    (bus.trajectory.leg === 'previous_leg' || bus.isOppositeLeg) &&
+    (bus.trajectory.leg === 'previous_leg' || bus.isOppositeLeg || (bus.trajectory.leg === 'full_cycle' && !lockedToStopBranch)) &&
     typeof bus.lat === 'number' &&
     typeof bus.lng === 'number'
   ) {
@@ -3314,7 +3319,7 @@ export function detectEndingServiceBusForStop(
           bestEnding.err <= bestContinuing.err + 120
       );
       const clearlyBestEnding =
-        bestEnding.err <= 4.5 * 60 && bestContinuing.err - bestEnding.err >= 4 * 60;
+        bestEnding.err <= 3.5 * 60 && bestContinuing.err - bestEnding.err >= 2.5 * 60;
 
       if (matchesKnownService || clearlyBestEnding) {
         return {

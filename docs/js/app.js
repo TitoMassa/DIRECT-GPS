@@ -5574,7 +5574,7 @@ function reconcileWithSchedulePrediction(
       // (`nextTrip === null`) so they NEVER appear as boarding arrivals at outbound stops or steal another service's slot!
       const busesForMatching = [];
       for (const b of buses) {
-        if (!b.isNextLap && (b.isOppositeLeg || b.trajectory?.leg === 'previous_leg')) {
+        if (!b.isNextLap && b.trajectory && b.trajectory.leg !== 'direct') {
           const cKey = b.identificadorCoche ? `${cod}:${b.identificadorCoche}` : null;
           const endCheck = detectEndingServiceBusForStop(model, stopId, stopCoords, b, nowSec, {
             stickyRec: cKey ? state.stickyLiveTripByCoche.get(cKey) || null : null,

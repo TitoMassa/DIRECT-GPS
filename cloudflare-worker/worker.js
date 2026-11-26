@@ -5428,7 +5428,7 @@ export default {
                   byCid.set(cid, { arribo: a, pMin });
                 }
               }
-              return { stopId: pr.stopId, items: Array.from(byCid.entries()) };
+              return { stopId: pr.stopId, zone: pr.zone, items: Array.from(byCid.entries()) };
             });
 
           for (let pass = 0; pass < 4; pass++) {
@@ -5456,7 +5456,10 @@ export default {
                     arribo: {
                       ...a,
                       tiempoRestanteArribo: `${estMin} min. est.`,
-                      descripcionBandera: sortedBase[0]?.descripcionBandera || a.descripcionBandera,
+                      descripcionBandera:
+                        pr.zone === 'opposite'
+                          ? a.descripcionBandera || sortedBase[0]?.descripcionBandera
+                          : sortedBase[0]?.descripcionBandera || a.descripcionBandera,
                       latitudParada: String(basePayload.stopCoords?.lat ?? ''),
                       longitudParada: String(basePayload.stopCoords?.lng ?? ''),
                       esExtendido: true,
