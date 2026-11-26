@@ -338,10 +338,11 @@ const el = {
 const CHANGELOG_ENTRIES = [
   {
     version: 'v2.5.4',
-    date: '25/11/2026 · 21:10 hs',
+    date: '25/11/2026 · 21:20 hs',
     items: [
       '<strong>Historial optimizado a 3 días (antes 7 días):</strong> coches, choferes, servicios, observaciones diarias y eventos pasados ahora se conservan durante los últimos <strong>3 días</strong> (manteniendo los próximos <strong>7 días</strong> programados sin cambios). Esto reduce en más de un 55 % el peso de la base de datos, el paquete offline y las lecturas diarias del servidor.',
-      '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron, escaneo nocturno más espaciado y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~80 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
+      '<strong>Escáner de horarios en 2 ventanas diarias (03:00 y 15:00 hs):</strong> en lugar de correr las 24 h cada 5 minutos, ahora realiza la barrida completa del nuevo día laboral entre las <strong>03:00 y 04:30 hs</strong> (capturando el 100 % de las 53 paradas ancla antes del primer coche) y un repaso aditivo extra entre las <strong>15:00 y 16:00 hs</strong> sin borrar nada de lo registrado a la madrugada, permaneciendo inactivo (0 consultas al Durable Object) las restantes 21,5 horas del día.',
+      '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~85 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
     ]
   },
   {

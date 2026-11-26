@@ -3992,16 +3992,16 @@ export async function runScheduledFleetScan(env, nowMs = Date.now(), fetchStopFn
   };
 }
 
-const LIVE_HORARIOS_TTL_MS = 180000;
+const LIVE_HORARIOS_TTL_MS = 600000;
 const liveHorariosCache = new Map(); // cacheKey -> { ts, data }
 
 /**
- * Continuous automatic SOAP timetable scanner (runs on every 5-min Cloudflare Cron tick).
- * - Priority 1 (every 10 min): scans ALL 25 scheduled lines' primary anchor stop for [now+2m, now+2h01m].
- * - Priority 2 (background catch-up): fills ALL 53 branch anchor stops across all future 2h windows
- *   for today & tomorrow (round-robin by peak daytime windows first, then full-day sweep).
- * - Strictly additive: NEVER deletes passed times that SOAP stops returning!
- * - Stays safely under Cloudflare Workers Free 50-subrequest limit (<= 44 daytime, <= 43 night).
+ * Scheduled 2-window automatic SOAP timetable scanner (runs on 5-min Cloudflare Cron ticks ONLY inside 2 windows):
+ * - Window 1 (03:00–04:30 ART): full-day sweep of today's new service day (04:00–02:59) across all 53 anchor stops
+ *   (18 ticks × 40 SOAP calls = 720 >= 636 blocks, while fleet scan sleeps 01:30–04:30).
+ * - Window 2 (15:00–16:00 ART): additive afternoon/evening refresh (12 ticks × 22 = 264 SOAP calls) for remaining
+ *   blocks of today (15:00–02:59), catching intraday changes while NEVER deleting times captured at 03:00 AM.
+ * - Outside those 2 windows (21.5h/day): exits immediately BEFORE touching the Durable Object (0 reads, 0 writes).
  */
 export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWindowFn = fetchHorariosWindowSoap) {
   const stub = getFleetStub(env);
@@ -4012,163 +4012,129 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
   const artMs = nowMs - 3 * 3600 * 1000;
   const art = new Date(artMs);
   const artMinOfDay = art.getUTCHours() * 60 + art.getUTCMinutes();
-  const isNightQuiet = artMinOfDay >= 90 && artMinOfDay < 270;
-  if (isNightQuiet && art.getUTCMinutes() % 15 >= 5) {
-    return { skipped: true, reason: 'night-quiet-throttle', isNightQuiet: true, soapCalls: 0, entriesFound: 0 };
+  const isMorningWindow = artMinOfDay >= 180 && artMinOfDay < 270; // 03:00–04:29 ART
+  const isAfternoonWindow = artMinOfDay >= 900 && artMinOfDay < 960; // 15:00–15:59 ART
+  if (!isMorningWindow && !isAfternoonWindow) {
+    return {
+      skipped: true,
+      reason: 'outside-scan-windows',
+      window: null,
+      soapCalls: 0,
+      entriesFound: 0
+    };
   }
-  const soapBudget = isNightQuiet ? HORARIOS_NIGHT_SOAP_BUDGET : HORARIOS_DAY_SOAP_BUDGET;
+  const scanWindow = isMorningWindow ? 'morning-03' : 'afternoon-15';
+  const soapBudget = isMorningWindow ? HORARIOS_NIGHT_SOAP_BUDGET : HORARIOS_DAY_SOAP_BUDGET;
 
-  let liveCursor = 0;
   const scannedMap = new Map();
   try {
     const stRes = await stub.fetch('https://fleet-memory/horarios-scan-state');
     if (stRes.ok) {
       const st = await stRes.json();
-      if (Number.isInteger(st?.liveCursor)) liveCursor = st.liveCursor;
       for (const row of st?.scannedWindows || []) {
         if (!Array.isArray(row) || row.length < 5) continue;
         scannedMap.set(`${row[0]}|${row[1]}|${row[2]}|${row[3]}`, Number(row[4]) || 0);
       }
     }
   } catch {
-    // Non-fatal: proceed with cursor 0
+    // Non-fatal: proceed with empty map
   }
 
   const safeStartArtMs = artMs + 2 * 60 * 1000;
   const safeHorizonArtMs = artMs + 47.5 * 3600 * 1000;
+  const serviceToday = getArgentinaDayKey(nowMs);
   const calToday = getArgentinaCalendarDayIso(nowMs);
   const calTomorrow = shiftCalendarDayIso(calToday, 1);
 
-  const jobs = [];
-  const jobKeys = new Set();
+  const buckets = {
+    unscannedPrimary: [],
+    unscannedSecondary: [],
+    stalePrimary: [],
+    staleSecondary: []
+  };
 
-  // Priority 1: Live 10-minute rolling sweep across ALL 25 scheduled lines (13 on tick 0, 12 on tick 1)
-  const half = Math.ceil(HORARIOS_PRIMARY_STOPS.length / 2);
-  const normCursor = liveCursor % 2 === 1 ? 1 : 0;
-  const nextLiveCursor = normCursor === 0 ? 1 : 0;
-  const p1Slice =
-    normCursor === 0
-      ? HORARIOS_PRIMARY_STOPS.slice(0, half)
-      : HORARIOS_PRIMARY_STOPS.slice(half);
+  const orderedAnchors = [
+    ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] === 1),
+    ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] !== 1)
+  ];
 
-  let p1StartMs = safeStartArtMs;
-  const p1StartDate = new Date(p1StartMs);
-  const p1DayEndMs = Date.UTC(
-    p1StartDate.getUTCFullYear(),
-    p1StartDate.getUTCMonth(),
-    p1StartDate.getUTCDate(),
-    23,
-    59,
-    59
-  );
-  let p1EndMs = Math.min(p1DayEndMs, p1StartMs + 119 * 60 * 1000);
-  if (p1EndMs - p1StartMs < 3 * 60 * 1000) {
-    p1StartMs = p1DayEndMs + 1000;
-    p1EndMs = p1StartMs + 119 * 60 * 1000;
-  }
-  const p1DesdeIso = formatArtIsoDateTime(p1StartMs);
-  const p1HastaIso = formatArtIsoDateTime(p1EndMs);
+  // Scan ONLY blocks belonging to today's service day (04:00–23:59 of calToday + 00:00–02:59 of calTomorrow)
+  for (const calDate of [calToday, calTomorrow]) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(calDate);
+    if (!m) continue;
+    const baseDayMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0);
 
-  for (const [cod, stopId] of p1Slice) {
-    const jk = `${cod}|${stopId}|${p1DesdeIso}|${p1HastaIso}`;
-    if (jobKeys.has(jk)) continue;
-    jobKeys.add(jk);
-    jobs.push({
-      cod,
-      stopId,
-      desdeIso: p1DesdeIso,
-      hastaIso: p1HastaIso,
-      recordWindow: null
-    });
-  }
+    for (const h of HORARIOS_WINDOW_ORDER) {
+      const windowDayKey = h < 3 ? shiftCalendarDayIso(calDate, -1) : calDate;
+      if (windowDayKey !== serviceToday) continue;
 
-  // Priority 2: Full-day lookahead + return branches across all 53 anchor stops (today + tomorrow)
-  const remaining = Math.max(0, soapBudget - jobs.length);
-  if (remaining > 0) {
-    const buckets = {
-      unscannedTodayPrimary: [],
-      unscannedTodaySecondary: [],
-      unscannedTomorrowPrimary: [],
-      unscannedTomorrowSecondary: [],
-      staleToday: [],
-      staleTomorrow: []
-    };
+      const winStartMs = baseDayMs + h * 3600 * 1000;
+      const winEndMs = baseDayMs + (h + 1) * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000;
+      if (winEndMs <= safeStartArtMs + 120 * 1000) continue; // Already passed
+      if (winStartMs >= safeHorizonArtMs - 120 * 1000) continue; // Beyond SmartMovePro 48h horizon
 
-    const orderedAnchors = [
-      ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] === 1),
-      ...HORARIOS_ANCHOR_STOPS.filter((a) => a[2] !== 1)
-    ];
+      const desdeMs = Math.max(winStartMs, safeStartArtMs);
+      const hastaMs = Math.min(winEndMs, safeHorizonArtMs, desdeMs + 119 * 60 * 1000);
+      if (hastaMs - desdeMs < 120 * 1000) continue;
 
-    for (const calDate of [calToday, calTomorrow]) {
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(calDate);
-      if (!m) continue;
-      const baseDayMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0);
-      const isTodayCal = calDate === calToday;
+      // Mark the 2-hour block covered when it reaches the end of the block (additive SQLite INSERT OR IGNORE preserves earlier times)
+      const fullEndCovered = hastaMs >= winEndMs - 120 * 1000;
+      const desdeIso = formatArtIsoDateTime(desdeMs);
+      const hastaIso = formatArtIsoDateTime(hastaMs);
 
-      for (const h of HORARIOS_WINDOW_ORDER) {
-        const winStartMs = baseDayMs + h * 3600 * 1000;
-        const winEndMs = baseDayMs + (h + 1) * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000;
-        if (winEndMs <= safeStartArtMs + 120 * 1000) continue; // Already passed
-        if (winStartMs >= safeHorizonArtMs - 120 * 1000) continue; // Beyond SmartMovePro 48h horizon
+      for (const [cod, stopId, isPrimary] of orderedAnchors) {
+        const wKey = `${windowDayKey}|${cod}|${stopId}|${h}`;
+        const scannedAt = scannedMap.get(wKey) || 0;
+        const item = {
+          cod,
+          stopId,
+          desdeIso,
+          hastaIso,
+          scannedAt,
+          recordWindow: fullEndCovered ? { dayKey: windowDayKey, codigoLinea: cod, stopId, windowHour: h } : null
+        };
 
-        const desdeMs = Math.max(winStartMs, safeStartArtMs);
-        const hastaMs = Math.min(winEndMs, safeHorizonArtMs, desdeMs + 119 * 60 * 1000);
-        if (hastaMs - desdeMs < 120 * 1000) continue;
-
-        // Only mark the 2-hour window fully covered if it reaches the end of the 2-hour block
-        const fullEndCovered = hastaMs >= winEndMs - 120 * 1000;
-        const windowDayKey = h < 3 ? shiftCalendarDayIso(calDate, -1) : calDate;
-        const desdeIso = formatArtIsoDateTime(desdeMs);
-        const hastaIso = formatArtIsoDateTime(hastaMs);
-
-        for (const [cod, stopId, isPrimary] of orderedAnchors) {
-          const wKey = `${windowDayKey}|${cod}|${stopId}|${h}`;
-          const scannedAt = scannedMap.get(wKey) || 0;
-          const item = {
-            cod,
-            stopId,
-            desdeIso,
-            hastaIso,
-            scannedAt,
-            recordWindow: fullEndCovered ? { dayKey: windowDayKey, codigoLinea: cod, stopId, windowHour: h } : null
-          };
-
-          if (!scannedAt) {
-            if (isTodayCal) {
-              if (isPrimary) buckets.unscannedTodayPrimary.push(item);
-              else buckets.unscannedTodaySecondary.push(item);
-            } else if (fullEndCovered) {
-              if (isPrimary) buckets.unscannedTomorrowPrimary.push(item);
-              else buckets.unscannedTomorrowSecondary.push(item);
-            }
-          } else if (isTodayCal && nowMs - scannedAt >= 240 * 60 * 1000) {
-            buckets.staleToday.push(item);
-          } else if (!isTodayCal && fullEndCovered && nowMs - scannedAt >= 480 * 60 * 1000) {
-            buckets.staleTomorrow.push(item);
-          }
+        if (!scannedAt) {
+          if (isPrimary) buckets.unscannedPrimary.push(item);
+          else buckets.unscannedSecondary.push(item);
+        } else if (isAfternoonWindow && nowMs - scannedAt >= 6 * 3600 * 1000) {
+          // Afternoon extra pass: re-scan blocks captured in the 03:00 AM sweep (6h+ old) once, additively
+          if (isPrimary) buckets.stalePrimary.push(item);
+          else buckets.staleSecondary.push(item);
         }
       }
     }
+  }
 
-    buckets.staleToday.sort((a, b) => a.scannedAt - b.scannedAt);
-    buckets.staleTomorrow.sort((a, b) => a.scannedAt - b.scannedAt);
+  buckets.stalePrimary.sort((a, b) => a.scannedAt - b.scannedAt);
+  buckets.staleSecondary.sort((a, b) => a.scannedAt - b.scannedAt);
 
-    const queue = [
-      ...buckets.unscannedTodayPrimary,
-      ...buckets.unscannedTodaySecondary,
-      ...buckets.unscannedTomorrowPrimary,
-      ...buckets.unscannedTomorrowSecondary,
-      ...buckets.staleToday,
-      ...buckets.staleTomorrow
-    ];
+  const queue = [
+    ...buckets.unscannedPrimary,
+    ...buckets.unscannedSecondary,
+    ...buckets.stalePrimary,
+    ...buckets.staleSecondary
+  ];
 
-    for (const q of queue) {
-      if (jobs.length >= soapBudget) break;
-      const jk = `${q.cod}|${q.stopId}|${q.desdeIso}|${q.hastaIso}`;
-      if (jobKeys.has(jk)) continue;
-      jobKeys.add(jk);
-      jobs.push(q);
-    }
+  const jobs = [];
+  const jobKeys = new Set();
+  for (const q of queue) {
+    if (jobs.length >= soapBudget) break;
+    const jk = `${q.cod}|${q.stopId}|${q.desdeIso}|${q.hastaIso}`;
+    if (jobKeys.has(jk)) continue;
+    jobKeys.add(jk);
+    jobs.push(q);
+  }
+
+  if (jobs.length === 0) {
+    return {
+      skipped: false,
+      window: scanWindow,
+      soapCalls: 0,
+      succeeded: 0,
+      entriesFound: 0,
+      windowsRecorded: 0
+    };
   }
 
   const entryMap = new Map();
@@ -4209,7 +4175,6 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
         body: JSON.stringify({
           entries,
           windows: recordedWindows,
-          nextLiveCursor,
           scannedAt: nowMs
         })
       });
@@ -4225,12 +4190,11 @@ export async function runScheduledHorariosScan(env, nowMs = Date.now(), fetchWin
 
   return {
     skipped: false,
-    isNightQuiet,
+    window: scanWindow,
     soapCalls: jobs.length,
     succeeded,
     entriesFound: entries.length,
-    windowsRecorded: recordedWindows.length,
-    nextLiveCursor
+    windowsRecorded: recordedWindows.length
   };
 }
 
@@ -4450,7 +4414,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.5',
+          version: '2.5.1',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {
@@ -4460,7 +4424,7 @@ export default {
             targets: FLEET_SCAN_TARGETS.length
           },
           autoHorariosScan: {
-            intervalMin: HORARIOS_LIVE_INTERVAL_MIN,
+            scheduleWindows: ['03:00-04:30 ART', '15:00-16:00 ART'],
             primaryLines: HORARIOS_PRIMARY_STOPS.length,
             anchorStops: HORARIOS_ANCHOR_STOPS.length,
             nonDestructive: true
