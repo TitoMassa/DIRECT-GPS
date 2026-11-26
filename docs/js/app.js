@@ -342,6 +342,7 @@ const CHANGELOG_ENTRIES = [
     items: [
       '<strong>Historial optimizado a 3 días (antes 7 días):</strong> coches, choferes, servicios, observaciones diarias y eventos pasados ahora se conservan durante los últimos <strong>3 días</strong> (manteniendo los próximos <strong>7 días</strong> programados sin cambios). Esto reduce en más de un 55 % el peso de la base de datos, el paquete offline y las lecturas diarias del servidor.',
       '<strong>Escáner de horarios en 2 ventanas diarias (03:00 y 15:00 hs):</strong> en lugar de correr las 24 h cada 5 minutos, ahora realiza la barrida completa del nuevo día laboral entre las <strong>03:00 y 04:30 hs</strong> (capturando el 100 % de las 53 paradas ancla antes del primer coche) y un repaso aditivo extra entre las <strong>15:00 y 16:00 hs</strong> sin borrar nada de lo registrado a la madrugada, permaneciendo inactivo (0 consultas al Durable Object) las restantes 21,5 horas del día.',
+      '<strong>Corrección de arribos fantasma <code>+Flota</code> en coches que ya salieron:</strong> el radar de corredor y la app ahora descartan automáticamente cualquier coche que ya pasó la parada y se está alejando en sentido contrario (como un <strong>904B</strong> recién salido del Puerto rumbo a Resistencia), evitando que aparezca como próximo arribo con minutos irreales.',
       '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~85 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
     ]
   },
@@ -5577,10 +5578,21 @@ function reconcileWithSchedulePrediction(
       for (const b of buses) {
         const m = matches.get(b.key);
         if (!m) {
-          if (!b.isNextLap && b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
+          if (!b.isNextLap && b.trajectory && b.routeMeters > 0) {
+            const isFullCycle = b.trajectory.leg === 'full_cycle';
             const impliedSpeedMps =
               b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
-            if (impliedSpeedMps > 13.5) {
+            // Drop +Flota or stale just-departed ghosts already moving AWAY on full_cycle
+            if (
+              isFullCycle &&
+              b.routeMeters >= 3000 &&
+              (b.esExtendido || (!b.trajectory.isAtTerminal && impliedSpeedMps > 14.5 && (b.eta?.minutes ?? 99) <= 20))
+            ) {
+              b._dropPassedGhost = true;
+              if (b.identificadorCoche) matchedCoches.delete(b.identificadorCoche);
+              continue;
+            }
+            if ((b.isOppositeLeg || isFullCycle) && impliedSpeedMps > 13.5) {
               const estSec = Math.max(Math.round(b.routeMeters / 10.5), Math.round(b.routeMeters / 5.8));
               const estMin = Math.max(1, Math.round(estSec / 60));
               b.eta = parseEtaMinutes(`${estMin} min`);
@@ -5732,10 +5744,11 @@ function reconcileWithSchedulePrediction(
             }
           }
 
-          // If this bus is physically on the opposite leg (detected by lane, GPS trail, OR schedule lock)
-          // and SmartMovePro gave a bogus short ETA (e.g. 12 min for 21 km = 105 km/h!), recompute an accurate
-          // ETA from the matched schedule pass time & sanitized desvio!
-          if (b.isOppositeLeg && b.trajectory && b.routeMeters > 0) {
+          // If this bus is physically on the opposite leg OR already passed stopId (`full_cycle`),
+          // drop false +Flota / stale just-departed ghosts and recompute any physically impossible ETA
+          // (e.g. 16 min for 39.83 km = 149 km/h!).
+          const isFullCycle = b.trajectory?.leg === 'full_cycle';
+          if ((b.isOppositeLeg || isFullCycle) && b.trajectory && b.routeMeters > 0) {
             const effNowSvc = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
             const impliedSpeedMps =
               b.eta?.valid && b.eta.minutes > 0 ? b.routeMeters / (b.eta.minutes * 60) : 99;
@@ -5743,27 +5756,42 @@ function reconcileWithSchedulePrediction(
               typeof m.targetStopSec === 'number'
                 ? m.targetStopSec - (b.desvio?.seconds || 0) - effNowSvc
                 : null;
-            const validSchedRem = schedRemSec !== null && schedRemSec >= 120 && schedRemSec <= 4 * 3600;
-            const etaMismatchSec =
-              validSchedRem && b.eta?.valid ? Math.abs(schedRemSec - b.eta.minutes * 60) : 0;
 
-            if (impliedSpeedMps > 13.5 || etaMismatchSec >= 20 * 60) {
-              const minPhysSec = Math.round(b.routeMeters / 10.5);
-              const estSec = validSchedRem
-                ? Math.max(minPhysSec, Math.round(schedRemSec))
-                : Math.max(minPhysSec, Math.round(b.routeMeters / 5.8));
-              const estMin = Math.max(1, Math.round(estSec / 60));
-              b.eta = parseEtaMinutes(`${estMin} min`);
-              b.etaSecondsRemaining = estSec;
-              b.tiempoRaw = `${estMin} min`;
-              b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
-              b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
+            if (
+              isFullCycle &&
+              b.routeMeters >= 3000 &&
+              (b.esExtendido ||
+                (!b.trajectory.isAtTerminal &&
+                  impliedSpeedMps > 14.5 &&
+                  (schedRemSec !== null ? schedRemSec < -90 : (b.eta?.minutes ?? 99) <= 20)))
+            ) {
+              b._dropPassedGhost = true;
+              completedSet.add(`${cod}:${m.tripKey}`);
+              liveBusByTrip.delete(m.tripKey);
+              if (b.identificadorCoche) matchedCoches.delete(b.identificadorCoche);
+            } else {
+              const validSchedRem = schedRemSec !== null && schedRemSec >= 120 && schedRemSec <= 4 * 3600;
+              const etaMismatchSec =
+                validSchedRem && b.eta?.valid ? Math.abs(schedRemSec - b.eta.minutes * 60) : 0;
+
+              if (impliedSpeedMps > 13.5 || etaMismatchSec >= 20 * 60) {
+                const minPhysSec = Math.round(b.routeMeters / 10.5);
+                const estSec = validSchedRem
+                  ? Math.max(minPhysSec, Math.round(schedRemSec))
+                  : Math.max(minPhysSec, Math.round(b.routeMeters / 5.8));
+                const estMin = Math.max(1, Math.round(estSec / 60));
+                b.eta = parseEtaMinutes(`${estMin} min`);
+                b.etaSecondsRemaining = estSec;
+                b.tiempoRaw = `${estMin} min`;
+                b.proximityPct = computeProximityPercent(estMin, b.routeMeters);
+                b.trajectory.speedMps = Math.max(3.5, Math.min(12.5, b.routeMeters / Math.max(60, estSec)));
+              }
             }
           }
         }
 
         // Seamless GPS recovery handoff: transfer simulator state from prior predicted marker!
-        if (!b.isNextLap) {
+        if (!b.isNextLap && !b._dropPassedGhost) {
           const predKey = `pred:${cod}:${m.tripKey}`;
           if (busSimulator.transferState(predKey, b.key)) {
             if (state.selectedBusKey === predKey) state.selectedBusKey = b.key;
@@ -5883,9 +5911,11 @@ function reconcileWithSchedulePrediction(
     return list;
   };
 
+  const visibleLiveBuses = liveBuses.filter((b) => !b._dropPassedGhost);
+
   // ULT. GPS (blue mode): show ONLY static last GPS positions without schedule-synthesized units
   if (!state.simulateMode) {
-    return syncNextLapCardsToPrimary(liveBuses).sort(
+    return syncNextLapCardsToPrimary(visibleLiveBuses).sort(
       (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
     );
   }
@@ -5978,6 +6008,7 @@ function reconcileWithSchedulePrediction(
       // this predicted slot (e.g., running >16 min late), bind the live bus instead of spawning a ghost!
       const nearbyUnmatchedLive = lineLive.find(
         (lb) =>
+          !lb._dropPassedGhost &&
           !lb.tripKey &&
           typeof lb.lat === 'number' &&
           typeof lb.lng === 'number' &&
@@ -6036,7 +6067,7 @@ function reconcileWithSchedulePrediction(
     }
   }
 
-  return syncNextLapCardsToPrimary([...liveBuses, ...predictedAll]).sort(
+  return syncNextLapCardsToPrimary([...visibleLiveBuses, ...predictedAll]).sort(
     (a, b) => (a.etaSecondsRemaining ?? 99999) - (b.etaSecondsRemaining ?? 99999)
   );
 }

@@ -5401,6 +5401,19 @@ export default {
             }
           }
 
+          // Build earliest downstream ETA per coche to reject already-passed buses heading AWAY past stopId
+          const downstreamMinByCid = new Map();
+          for (const pr of probeResults) {
+            if (pr.zone !== 'downstream') continue;
+            for (const a of pr.arribos) {
+              const cid = a.identificadorCoche || `${a.latitud},${a.longitud}`;
+              const dMin = parseMin(a.tiempoRestanteArribo);
+              if (dMin === null) continue;
+              const prev = downstreamMinByCid.get(cid);
+              if (prev === undefined || dMin < prev) downstreamMinByCid.set(cid, dMin);
+            }
+          }
+
           // Use ONLY upstream + opposite probes for `esExtendido` approaching-fleet discovery
           // (downstream probes are strictly for early-passed ghost suppression & corridorFleet X-ray!)
           const approachingProbes = probeResults
@@ -5435,6 +5448,10 @@ export default {
               for (const [cid, { arribo: a, pMin }] of pr.items) {
                 if (!fleet.has(cid) && pMin !== null) {
                   const estMin = Math.max(1, Math.round(pMin + travelDelta));
+                  // Never inject a bus that reaches a downstream stop (strictly AFTER stopId) earlier
+                  // than stopId or this probe — that proves it already passed stopId and is going away!
+                  const downMin = downstreamMinByCid.get(cid);
+                  if (downMin !== undefined && (downMin <= pMin + 2 || downMin < estMin - 2)) continue;
                   fleet.set(cid, {
                     arribo: {
                       ...a,
