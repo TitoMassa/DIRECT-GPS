@@ -1,6 +1,6 @@
 import { distanceMeters, parseDesvioHorario } from './api.js';
 import { projectOnPolyline } from './trajectory.js';
-import { formatSecHHMM, getArgentinaSecOfDay } from './predictor.js';
+import { formatSecHHMM, getArgentinaSecOfDay, parseGpsStampSecOfDay } from './predictor.js';
 
 const INTERPROVINCIAL_CODES = new Set([852, 1037, 1038, 1039]); // 902, 904A, 904B, 904C
 
@@ -252,22 +252,211 @@ export function classifyBusEndingBadge(bus, model = null) {
 }
 
 /**
- * Calcula velocidad estimada (km/h), estado físico y estela reciente del colectivo seleccionado.
+ * Evalúa con coherencia entre horario programado de fin de servicio/turno, desvío real,
+ * última marca GPS, distancia a la punta de línea y hora actual si un coche o chofer
+ * YA FINALIZÓ su servicio/turno (evitando que figure "En línea" o siga simulando movimiento).
  */
-export function computeBusPhysicalTelemetry(bus, gpsHist = null, simState = null) {
-  const trail = [];
-  if (Array.isArray(gpsHist?.trail)) {
-    for (const pt of gpsHist.trail.slice(-8)) {
-      if (Number.isFinite(pt?.lat) && Number.isFinite(pt?.lng)) {
-        trail.push([pt.lat, pt.lng]);
+export function evaluateServiceCompletionStatus(
+  unit,
+  model = null,
+  nowSec = getArgentinaSecOfDay(),
+  { entityType = 'coche', srvMeta = null, blockInfo = null, nowMs = Date.now() } = {}
+) {
+  const NOT_FINISHED = { finished: false, snapToTerminal: false };
+  if (!unit) return NOT_FINISHED;
+
+  // 1) Resolve blockInfo (service/turno block)
+  let bi =
+    blockInfo ||
+    srvMeta?.blockInfo ||
+    srvMeta?.trip?.blockInfo ||
+    unit._matchedTrip?.blockInfo ||
+    unit.scheduledTrip?.blockInfo ||
+    null;
+
+  if (!bi && model?.blocks?.length) {
+    const bid = srvMeta?.blockId || unit._matchedTrip?.blockId || unit.scheduledTrip?.blockId || '';
+    if (bid && model.blockInfoById?.has(bid)) {
+      bi = model.blockInfoById.get(bid);
+    } else {
+      const sNum = Number(srvMeta?.serviceNumber ?? unit.serviceNumber);
+      const tIdx = Number(srvMeta?.turnoIndex ?? unit.turnoIndex ?? 1);
+      if (sNum > 0) {
+        bi =
+          model.blocks.find((b) => b.serviceNumber === sNum && b.turnoIndex === tIdx) ||
+          model.blocks.find((b) => b.serviceNumber === sNum) ||
+          null;
       }
     }
   }
-  if (Number.isFinite(bus?.lat) && Number.isFinite(bus?.lng)) {
-    const last = trail[trail.length - 1];
-    if (!last || (distanceMeters(last[0], last[1], bus.lat, bus.lng) || 0) > 4) {
-      trail.push([bus.lat, bus.lng]);
+
+  const schedEndSec =
+    typeof bi?.endSec === 'number'
+      ? bi.endSec
+      : typeof srvMeta?.endSec === 'number'
+        ? srvMeta.endSec
+        : typeof unit.turnoEndSec === 'number'
+          ? unit.turnoEndSec
+          : null;
+
+  if (schedEndSec === null || !Number.isFinite(schedEndSec)) return NOT_FINISHED;
+
+  const isRelevoToNext = Boolean(bi?.relevoToNext ?? srvMeta?.relevoToNext ?? unit.relevoToNext);
+  // On a relevo-en-linea block, the CAR continues with the relieving driver, whereas the DRIVER finishes their turno!
+  if (entityType === 'coche' && isRelevoToNext) {
+    return NOT_FINISHED;
+  }
+
+  const isCortadoBreak = Boolean(
+    !isRelevoToNext &&
+      bi &&
+      model?.blocks?.some((b) => b.serviceNumber === bi.serviceNumber && b.startSec > bi.endSec + 30 * 60)
+  );
+
+  // 2) Resolve final trip of the block and exact terminal (punta de línea) coordinates
+  const lastTrip =
+    (Array.isArray(bi?.trips) && bi.trips.length > 0 ? bi.trips[bi.trips.length - 1] : null) ||
+    srvMeta?.trip ||
+    unit._matchedTrip ||
+    unit.scheduledTrip ||
+    null;
+  const endBranch = lastTrip?.branch || null;
+  let terminalLat = null;
+  let terminalLng = null;
+  let lastStopName = '';
+  if (endBranch) {
+    const stops = Array.isArray(endBranch.orderedStops) ? endBranch.orderedStops : [];
+    const lastStop = stops.length > 0 ? stops[stops.length - 1] : null;
+    if (lastStop && Number.isFinite(Number(lastStop.lat)) && Number.isFinite(Number(lastStop.lng))) {
+      terminalLat = Number(lastStop.lat);
+      terminalLng = Number(lastStop.lng);
+      lastStopName = lastStop.nombre || lastStop.descripcion || '';
+    } else if (Array.isArray(endBranch.pts) && endBranch.pts.length > 0) {
+      const pt = endBranch.pts[endBranch.pts.length - 1];
+      terminalLat = pt[0];
+      terminalLng = pt[1];
     }
+  }
+  const endPlace = bi?.endPlace || srvMeta?.endPlace || unit.endPlace || lastStopName || '';
+
+  // 3) Compute delay-adjusted real expected finish time & GPS age
+  const effNow = nowSec < 3 * 3600 ? nowSec + 86400 : nowSec;
+  let rawDesvioSec = null;
+  if (typeof unit.desvio?.seconds === 'number' && unit.desvio?.status !== 'none') {
+    rawDesvioSec = unit.desvio.seconds;
+  } else if (typeof unit.desvioSec === 'number') {
+    rawDesvioSec = unit.desvioSec;
+  } else if (typeof unit.lastDesvioSec === 'number') {
+    rawDesvioSec = unit.lastDesvioSec;
+  } else if (unit.desvioRaw || unit.lastDesvioRaw) {
+    const p = parseDesvioHorario(unit.desvioRaw || unit.lastDesvioRaw);
+    if (p && p.status !== 'none' && typeof p.seconds === 'number') rawDesvioSec = p.seconds;
+  }
+  const clampedDesvio =
+    rawDesvioSec !== null && Number.isFinite(rawDesvioSec) && Math.abs(rawDesvioSec) <= 95 * 60
+      ? Math.max(-75 * 60, Math.min(4 * 60, rawDesvioSec))
+      : 0;
+  // Negative desvio = late (atrasado), so expectedEndSec shifts LATER by |desvio|
+  const expectedEndSec = schedEndSec - clampedDesvio;
+
+  const rawGpsStr = unit.ultimaFechaHoraGPS || unit.lastGps || '';
+  const parsedGpsSec = parseGpsStampSecOfDay(rawGpsStr);
+  const lastGpsSec = parsedGpsSec !== null ? (parsedGpsSec < 3 * 3600 ? parsedGpsSec + 86400 : parsedGpsSec) : null;
+  let gpsAgeSec = null;
+  if (lastGpsSec !== null) {
+    gpsAgeSec = Math.max(0, effNow - lastGpsSec);
+  } else if (typeof unit.lastSeenAt === 'number' && unit.lastSeenAt > 0) {
+    gpsAgeSec = Math.max(0, (nowMs - unit.lastSeenAt) / 1000);
+  }
+
+  // 4) Measure distance from last real GPS to the end terminal (punta de línea)
+  const lat = Number(unit.rawLat ?? unit.lat ?? unit.lastLat);
+  const lng = Number(unit.rawLng ?? unit.lng ?? unit.lastLng);
+  let distToEndM = null;
+  let remAlongM = null;
+  if (Number.isFinite(lat) && Number.isFinite(lng) && Number.isFinite(terminalLat) && Number.isFinite(terminalLng)) {
+    distToEndM = distanceMeters(lat, lng, terminalLat, terminalLng);
+    if (endBranch && Array.isArray(endBranch.pts) && endBranch.pts.length >= 2) {
+      const proj = projectOnPolyline(endBranch.pts, endBranch.cum, lat, lng);
+      if (proj && proj.perp <= 380) {
+        remAlongM = Math.max(0, (endBranch.totalLen || 0) - proj.along);
+      }
+    }
+  }
+  const remDistM = remAlongM !== null ? remAlongM : distToEndM;
+  const estRemTravelSec = remDistM !== null ? Math.round(remDistM / 4.4) : 0;
+  const etaTerminalFromLastGps = lastGpsSec !== null ? lastGpsSec + estRemTravelSec : expectedEndSec;
+
+  // Guard: If GPS is actively reporting RIGHT NOW (< 75 s old) AND bus is still > 850 m away from terminal,
+  // it is genuinely still circulating (e.g. heavily delayed or assigned an extra stretch).
+  if (gpsAgeSec !== null && gpsAgeSec <= 75 && distToEndM !== null && distToEndM > 850 && effNow < expectedEndSec + 10 * 60) {
+    return NOT_FINISHED;
+  }
+
+  // Condition A: Bus already reached/approached the end terminal right around or after end-of-shift
+  const atTerminalAroundEnd =
+    ((distToEndM !== null && distToEndM <= 500) || (remAlongM !== null && remAlongM <= 550)) &&
+    effNow >= Math.min(schedEndSec, expectedEndSec) - 3 * 60 &&
+    (effNow >= expectedEndSec || gpsAgeSec === null || gpsAgeSec >= 75);
+
+  // Condition B: Past delay-adjusted end time, GPS has stopped updating, and enough time passed to reach terminal
+  const pastExpectedAndReachable =
+    effNow >= expectedEndSec + 75 &&
+    (gpsAgeSec === null || gpsAgeSec >= 75) &&
+    (remDistM === null || effNow >= etaTerminalFromLastGps + 45);
+
+  // Condition C: Well past expected end (>= 20 min) with stale GPS (>= 3 min)
+  const wellPastExpectedEnd =
+    effNow >= expectedEndSec + 20 * 60 && (gpsAgeSec === null || gpsAgeSec >= 180);
+
+  if (!atTerminalAroundEnd && !pastExpectedAndReachable && !wellPastExpectedEnd) {
+    return NOT_FINISHED;
+  }
+
+  const reason = isRelevoToNext ? 'turno_ended' : isCortadoBreak ? 'cortado_ended' : 'service_ended';
+  const label = isRelevoToNext
+    ? 'Turno finalizado'
+    : isCortadoBreak
+      ? 'En corte'
+      : 'Servicio finalizado';
+
+  const snapToTerminal = Boolean(
+    Number.isFinite(terminalLat) &&
+      Number.isFinite(terminalLng) &&
+      (remDistM === null || remDistM <= 4500)
+  );
+
+  return {
+    finished: true,
+    reason,
+    label,
+    endPlace,
+    scheduledEndHHMM: formatSecHHMM(schedEndSec),
+    expectedEndHHMM: formatSecHHMM(expectedEndSec),
+    snapToTerminal,
+    terminalLat,
+    terminalLng
+  };
+}
+
+/**
+ * Calcula velocidad estimada (km/h) y estado físico del colectivo seleccionado.
+ */
+export function computeBusPhysicalTelemetry(bus, gpsHist = null, simState = null) {
+  if (bus?.serviceFinished) {
+    const placeSuffix = bus.finishedPlace ? ` · ${bus.finishedPlace}` : '';
+    return {
+      speedKmh: null,
+      stateKind: 'finished',
+      stateLabel: `${bus.finishedLabel || 'Servicio finalizado'}${placeSuffix}`
+    };
+  }
+  if (bus?.isFreeTracked && bus?.enLineaAhora === false) {
+    return {
+      speedKmh: null,
+      stateKind: 'offline',
+      stateLabel: 'Fuera de línea · Última ubicación'
+    };
   }
 
   let speedMps = null;
@@ -302,7 +491,7 @@ export function computeBusPhysicalTelemetry(bus, gpsHist = null, simState = null
     stateLabel = `Tránsito lento · ${speedKmh} km/h`;
   }
 
-  return { speedKmh, stateKind, stateLabel, trail };
+  return { speedKmh, stateKind, stateLabel };
 }
 
 /**
@@ -310,7 +499,8 @@ export function computeBusPhysicalTelemetry(bus, gpsHist = null, simState = null
  * ajustando los horarios programados por el desvío real en vivo.
  */
 export function buildBusUpcomingStops(bus, model, branches = [], nowSec = getArgentinaSecOfDay()) {
-  if (!bus || !Number.isFinite(bus.lat) || !Number.isFinite(bus.lng)) return [];
+  if (!bus || bus.serviceFinished || (bus.isFreeTracked && bus.enLineaAhora === false)) return [];
+  if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng)) return [];
   const trip = bus._matchedTrip || bus.scheduledTrip || null;
 
   let activeBranch = trip?.branch || null;
@@ -611,33 +801,4 @@ export function formatServiceShareText(lineName, tipoLabel, serviceSummary, bloc
     }
   }
   return lines.join('\n');
-}
-
-/**
- * Genera un documento HTML limpio y listo para imprimir o guardar como PDF desde la Grilla de horarios.
- */
-export function buildPrintableScheduleHtml(title, subtitle, tableHtml) {
-  return `<!DOCTYPE html>
-<html lang="es-AR">
-<head>
-  <meta charset="UTF-8" />
-  <title>${title}</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; color: #111827; margin: 18px; }
-    h1 { font-size: 18px; margin: 0 0 4px; }
-    p { font-size: 12px; color: #4b5563; margin: 0 0 14px; }
-    table { width: 100%; border-collapse: collapse; font-size: 11px; }
-    th, td { border: 1px solid #d1d5db; padding: 4px 6px; text-align: center; }
-    th { background: #f3f4f6; font-weight: 700; }
-    td:first-child, th:first-child { text-align: left; font-weight: 600; }
-    @media print { body { margin: 8px; } }
-  </style>
-</head>
-<body>
-  <h1>${title}</h1>
-  <p>${subtitle} · Generado con DIRECT GPS Corrientes</p>
-  ${tableHtml}
-  <script>window.addEventListener('load', () => { setTimeout(() => window.print(), 250); });</script>
-</body>
-</html>`;
 }

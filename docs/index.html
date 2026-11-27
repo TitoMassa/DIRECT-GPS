@@ -384,7 +384,7 @@
       </div>
     </section>
 
-    <!-- Floating Top Map Action Pills (¿Cómo llego? + Global Events + Citywide Fleet Mode + Desktop Expand) -->
+    <!-- Floating Top Map Action Pills (Global Events + Citywide Fleet Mode + Desktop Expand) -->
     <div class="map-hud-top" role="group" aria-label="Herramientas en vivo sobre el mapa">
       <button
         type="button"
@@ -399,22 +399,6 @@
           <polyline points="12.5 9.5 15 12 12.5 14.5"/>
         </svg>
         <span>Panel</span>
-      </button>
-
-      <button
-        type="button"
-        id="btn-open-planner"
-        class="map-hud-pill"
-        aria-haspopup="dialog"
-        aria-controls="trip-planner-modal"
-        title="¿Cómo llego? Planificador de viajes origen a destino"
-        aria-label="Abrir planificador de viajes Cómo llego"
-      >
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-          <circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/>
-          <path d="M8.5 19H12a4 4 0 0 0 0-8h0a4 4 0 0 1 0-8h3.5"/>
-        </svg>
-        <span>Cómo llego</span>
       </button>
 
       <button
@@ -643,31 +627,65 @@
       </div>
     </div>
 
-    <!-- Offline-First "¿Cómo llego?" Trip Planner Modal -->
-    <div id="trip-planner-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="planner-modal-title">
-      <div class="modal-card fleet-roster-card">
+    <!-- Customizable Schedule Image Exporter Modal (PNG / JPG — Ida, Vuelta, Servicio & Paradas) -->
+    <div id="schedule-export-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sched-exp-title">
+      <div class="modal-card sched-export-card">
         <div class="modal-head">
           <div>
-            <h2 id="planner-modal-title">¿Cómo llego?</h2>
-            <p class="modal-sub">Combinaciones directas o con 1 trasbordo en las 26 líneas</p>
+            <h2 id="sched-exp-title">Exportar grilla como imagen</h2>
+            <p id="sched-exp-sub" class="modal-sub">Elegí sentido, servicio, paradas y formato PNG/JPG</p>
           </div>
-          <button type="button" id="btn-planner-close" class="mini-close-btn" aria-label="Cerrar planificador">✕</button>
+          <button type="button" id="btn-sched-exp-close" class="mini-close-btn" aria-label="Cerrar exportador de imagen">✕</button>
         </div>
-        <div class="planner-form">
-          <div class="planner-input-group">
-            <input id="planner-origin-input" type="search" class="modal-input" placeholder="Origen: parada, calle o zona..." autocomplete="off" aria-label="Origen del viaje" />
-            <button type="button" id="btn-planner-origin-gps" class="mini-action-btn" title="Usar mi ubicación GPS" aria-label="Usar mi ubicación GPS">📍</button>
-            <div id="planner-origin-dropdown" class="planner-ac-dropdown hidden"></div>
+
+        <div class="sched-export-scroll">
+          <div class="settings-section-label">Sentido / Ramal a incluir</div>
+          <div id="sched-exp-dir-row" class="settings-seg-row" role="group" aria-label="Elegir sentido para exportar">
+            <button type="button" class="seg-btn seg-btn-xs active" data-exp-dir="active" aria-pressed="true">Solo sentido actual</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-exp-dir="both" aria-pressed="false">Ida y Vuelta</button>
           </div>
-          <div class="planner-input-group">
-            <input id="planner-dest-input" type="search" class="modal-input" placeholder="Destino: parada, calle o zona..." autocomplete="off" aria-label="Destino del viaje" />
-            <button type="button" id="btn-planner-swap" class="mini-action-btn" title="Invertir origen y destino" aria-label="Invertir origen y destino">⇅</button>
-            <div id="planner-dest-dropdown" class="planner-ac-dropdown hidden"></div>
+
+          <div class="settings-section-label">Servicio</div>
+          <div id="sched-exp-srv-pills" class="sched-exp-srv-pills" role="group" aria-label="Elegir servicio a exportar"></div>
+
+          <div class="sched-exp-stops-head">
+            <span class="settings-section-label">Paradas incluidas</span>
+            <div class="sched-exp-stop-quick">
+              <button type="button" id="btn-sched-exp-stops-all" class="mini-pill-btn">Todas</button>
+              <button type="button" id="btn-sched-exp-stops-key" class="mini-pill-btn">Cabeceras y claves</button>
+              <button type="button" id="btn-sched-exp-stops-none" class="mini-pill-btn">Ninguna</button>
+            </div>
           </div>
-          <button type="button" id="btn-planner-go" class="primary-action-btn">Buscar cómo llegar</button>
+          <div id="sched-exp-branch-tabs" class="flota-tabs-bar hidden" role="tablist" aria-label="Elegir ramal para seleccionar paradas"></div>
+          <div id="sched-exp-stops-list" class="sched-exp-stops-list" role="group" aria-label="Lista de paradas seleccionables"></div>
+
+          <div class="sched-exp-opts-grid">
+            <div>
+              <div class="settings-section-label">Formato</div>
+              <div class="settings-seg-row" role="group" aria-label="Formato de imagen">
+                <button type="button" class="seg-btn seg-btn-xs active" data-exp-format="png" aria-pressed="true">PNG</button>
+                <button type="button" class="seg-btn seg-btn-xs" data-exp-format="jpg" aria-pressed="false">JPG</button>
+              </div>
+            </div>
+            <div>
+              <div class="settings-section-label">Estilo</div>
+              <div class="settings-seg-row" role="group" aria-label="Tema visual de la imagen">
+                <button type="button" class="seg-btn seg-btn-xs active" data-exp-theme="dark" aria-pressed="true">Oscuro</button>
+                <button type="button" class="seg-btn seg-btn-xs" data-exp-theme="light" aria-pressed="false">Claro</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section-label">Vista previa</div>
+          <div class="sched-exp-preview-wrap">
+            <canvas id="sched-exp-canvas" class="sched-exp-canvas"></canvas>
+            <div id="sched-exp-empty-msg" class="fleet-roster-empty hidden">Seleccioná al menos 1 parada para generar la imagen.</div>
+          </div>
         </div>
-        <div id="planner-results" class="fleet-roster-body">
-          <div class="fleet-roster-empty">Elegí un origen y un destino (ej. Puerto → Campus UNNE o tu GPS → Terminal).</div>
+
+        <div class="sched-export-foot">
+          <button type="button" id="btn-sched-exp-share" class="secondary-action-btn">Compartir</button>
+          <button type="button" id="btn-sched-exp-download" class="primary-action-btn">Descargar PNG</button>
         </div>
       </div>
     </div>

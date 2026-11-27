@@ -52,10 +52,8 @@ export class TransitMap {
     // Layers
     this.routeLayer = L.layerGroup().addTo(this.map);
     this.routeStopsLayer = L.layerGroup().addTo(this.map);
-    this.tripPlanLayer = L.layerGroup().addTo(this.map);
     this.nearbyLayer = L.layerGroup().addTo(this.map);
     this.vectorLayer = L.layerGroup().addTo(this.map);
-    this.trailLayer = L.layerGroup().addTo(this.map);
     this.allFleetLayer = L.layerGroup().addTo(this.map);
     this.stopLayer = L.layerGroup().addTo(this.map);
     this.busLayer = L.layerGroup().addTo(this.map);
@@ -91,28 +89,69 @@ export class TransitMap {
   _getPadding() {
     const shell = document.getElementById('app-shell');
     const header = document.querySelector('.top-bar');
+    const hudTop = document.querySelector('.map-hud-top');
     const dock = document.getElementById('transit-dock');
+    const insp = document.getElementById('bus-inspector');
+    const mapRect = this.map.getContainer?.()?.getBoundingClientRect() || {
+      top: 0,
+      bottom: window.innerHeight,
+      height: window.innerHeight,
+      width: window.innerWidth
+    };
+    const H = Math.max(240, mapRect.height || window.innerHeight);
     const isLandscapeRail = window.matchMedia('(max-height: 540px) and (min-width: 560px)').matches;
     const isBottomSheet = window.innerWidth <= 860 && !isLandscapeRail;
 
     if (isBottomSheet) {
-      const topPad = header ? Math.max(108, Math.round(header.getBoundingClientRect().bottom + 42)) : 136;
+      const headerBottom = header ? Math.round(header.getBoundingClientRect().bottom - mapRect.top) : 96;
+      const hudBottom = hudTop ? Math.round(hudTop.getBoundingClientRect().bottom - mapRect.top) : 0;
+      let topPad = Math.max(96, headerBottom + 12, hudBottom + 14);
+
+      let bottomPad = 28;
+      if (dock) {
+        const dockTop = Math.round(dock.getBoundingClientRect().top - mapRect.top);
+        if (dockTop > 0 && dockTop < H) {
+          bottomPad = Math.max(bottomPad, H - dockTop + 14);
+        }
+      }
+      if (insp && !insp.classList.contains('hidden')) {
+        const inspRect = insp.getBoundingClientRect();
+        if (inspRect.height > 20) {
+          const inspTop = Math.round(inspRect.top - mapRect.top);
+          if (inspTop > 0 && inspTop < H) {
+            bottomPad = Math.max(bottomPad, H - inspTop + 16);
+          }
+        }
+      }
+
+      // Guarantee a positive unobstructed vertical band so offsetY never overshoots on compact screens
+      const maxUsed = H - 64;
+      if (topPad + bottomPad > maxUsed) {
+        const overflow = topPad + bottomPad - maxUsed;
+        bottomPad = Math.max(28, bottomPad - Math.round(overflow * 0.65));
+        topPad = Math.max(72, topPad - Math.round(overflow * 0.35));
+      }
+
       return {
         paddingTopLeft: [18, topPad],
-        paddingBottomRight: [58, 28]
+        paddingBottomRight: [56, bottomPad]
       };
     }
 
     const isCollapsed = Boolean(shell?.classList.contains('desktop-collapsed'));
     const leftPad = !isCollapsed && dock ? Math.round(dock.getBoundingClientRect().right + 20) : 28;
-    const insp = document.getElementById('bus-inspector');
-    const bottomPad =
-      insp && !insp.classList.contains('hidden')
-        ? Math.min(220, Math.round(insp.offsetHeight + 28))
-        : 44;
+    const hudBottom = hudTop ? Math.round(hudTop.getBoundingClientRect().bottom - mapRect.top) : 0;
+    const topPad = Math.max(64, hudBottom + 16);
+    let bottomPad = 44;
+    if (insp && !insp.classList.contains('hidden')) {
+      const inspRect = insp.getBoundingClientRect();
+      if (inspRect.height > 20) {
+        bottomPad = Math.min(Math.round(H * 0.48), Math.round(H - (inspRect.top - mapRect.top) + 20));
+      }
+    }
 
     return {
-      paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.56)), 64],
+      paddingTopLeft: [Math.min(leftPad, Math.round(window.innerWidth * 0.56)), topPad],
       paddingBottomRight: [68, bottomPad]
     };
   }
@@ -246,23 +285,39 @@ export class TransitMap {
     requestAnimationFrame(step);
   }
 
+  _resolveBusChipEta(bus) {
+    if (bus.serviceFinished) return 'FIN';
+    if (bus.isFreeTracked) return bus.enLineaAhora === false ? 'ÚLT' : '';
+    return bus.eta?.minutes === 0 ? 'YA' : `${bus.eta?.display ?? '—'}'`;
+  }
+
   _buildBusIcon(bus, { selected, dimmed }) {
     const color = getLineColor(bus.descripcionLinea);
     const cls = ['bus-marker-wrap'];
     if (selected) cls.push('is-selected');
     if (dimmed) cls.push('is-dimmed');
-    if ((bus.isPredicted && !bus.nextLapSourceLive) || bus.gpsLost) cls.push('is-predicted');
+    if (
+      (bus.isPredicted && !bus.nextLapSourceLive) ||
+      bus.gpsLost ||
+      bus.serviceFinished ||
+      (bus.isFreeTracked && bus.enLineaAhora === false)
+    ) {
+      cls.push('is-predicted');
+    }
 
-    const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
+    const etaShort = this._resolveBusChipEta(bus);
     const cocheHtml = bus.identificadorCoche
       ? `<span class="bus-pill-coche">${escHtml(bus.identificadorCoche)}</span>`
       : '';
+    const etaHtml = etaShort ? `<span class="bus-pill-eta">${escHtml(etaShort)}</span>` : '';
     const dotHtml =
-      bus.desvio && bus.desvio.status !== 'none'
-        ? `<span class="bus-desvio-dot ${escHtml(bus.desvio.status)}"></span>`
-        : bus.isPredicted || bus.gpsLost
-          ? `<span class="bus-desvio-dot pred"></span>`
-          : '';
+      bus.serviceFinished || (bus.isFreeTracked && bus.enLineaAhora === false)
+        ? `<span class="bus-desvio-dot pred"></span>`
+        : bus.desvio && bus.desvio.status !== 'none'
+          ? `<span class="bus-desvio-dot ${escHtml(bus.desvio.status)}"></span>`
+          : bus.isPredicted || bus.gpsLost
+            ? `<span class="bus-desvio-dot pred"></span>`
+            : '';
 
     return L.divIcon({
       className: 'bus-leaflet-icon',
@@ -272,7 +327,7 @@ export class TransitMap {
             ${dotHtml}
             <span class="bus-pill-line">${escHtml(bus.descripcionLinea)}</span>
             ${cocheHtml}
-            <span class="bus-pill-eta">${escHtml(etaShort)}</span>
+            ${etaHtml}
           </div>
           <div class="bus-heading-dot"></div>
         </div>
@@ -320,8 +375,14 @@ export class TransitMap {
       incomingKeys.add(bus.key);
 
       const isSelected = bus.key === selectedBusKey;
-      const etaShort = bus.eta.minutes === 0 ? 'YA' : `${bus.eta.display}'`;
-      const isPredStyle = (bus.isPredicted && !bus.nextLapSourceLive) || bus.gpsLost ? 1 : 0;
+      const etaShort = this._resolveBusChipEta(bus);
+      const isPredStyle =
+        (bus.isPredicted && !bus.nextLapSourceLive) ||
+        bus.gpsLost ||
+        bus.serviceFinished ||
+        (bus.isFreeTracked && bus.enLineaAhora === false)
+          ? 1
+          : 0;
       const iconSig = `${bus.descripcionLinea}|${bus.identificadorCoche || ''}|${etaShort}|${bus.desvio?.status || ''}|${isPredStyle}|${isSelected ? 1 : 0}`;
 
       const existing = this.busMarkers.get(bus.key);
@@ -763,169 +824,5 @@ export class TransitMap {
     })
       .bindTooltip('Tu ubicación GPS')
       .addTo(this.userLayer);
-  }
-
-  clearBusTrail() {
-    this.trailLayer?.clearLayers();
-  }
-
-  drawBusTrail(points = [], color = '#10b981') {
-    this.trailLayer?.clearLayers();
-    if (!Array.isArray(points) || points.length < 2) return;
-    L.polyline(points, {
-      renderer: this.canvasRenderer,
-      color,
-      weight: 6,
-      opacity: 0.25,
-      lineCap: 'round',
-      interactive: false
-    }).addTo(this.trailLayer);
-    L.polyline(points, {
-      renderer: this.canvasRenderer,
-      color,
-      weight: 3,
-      opacity: 0.85,
-      dashArray: '5 6',
-      lineCap: 'round',
-      interactive: false
-    }).addTo(this.trailLayer);
-    for (let i = 0; i < points.length - 1; i++) {
-      L.circleMarker(points[i], {
-        renderer: this.canvasRenderer,
-        radius: 2.8,
-        color: '#ffffff',
-        weight: 1,
-        fillColor: color,
-        fillOpacity: 0.55 + (i / points.length) * 0.4,
-        interactive: false
-      }).addTo(this.trailLayer);
-    }
-  }
-
-  clearTripPlanRoute() {
-    this.tripPlanLayer?.clearLayers();
-  }
-
-  drawTripPlanRoute(plan, origin, dest, routeBranchesByLine = null) {
-    this.tripPlanLayer?.clearLayers();
-    if (!plan || !origin || !dest) return;
-    const allPts = [];
-
-    const drawWalk = (a, b) => {
-      if (!a || !b) return;
-      const seg = [[a.lat, a.lng], [b.lat, b.lng]];
-      allPts.push(...seg);
-      L.polyline(seg, {
-        renderer: this.canvasRenderer,
-        color: '#94a3b8',
-        weight: 3.5,
-        opacity: 0.9,
-        dashArray: '4 7',
-        interactive: false
-      }).addTo(this.tripPlanLayer);
-    };
-
-    const legs = Array.isArray(plan.legs) ? plan.legs : [];
-    if (legs.length > 0) {
-      drawWalk(origin, legs[0].boardStop);
-    }
-
-    legs.forEach((leg, idx) => {
-      const color = getLineColor(leg.lineName);
-      const branches = routeBranchesByLine?.get(Number(leg.codLinea)) || [];
-      const br = branches[leg.branchIdx] || null;
-      let segPts = [];
-      if (br && Array.isArray(br.pts) && Array.isArray(br.cum)) {
-        const startAlong = Number(leg.boardStop?.along) || 0;
-        const endAlong = Number(leg.alightStop?.along) || br.totalLen;
-        for (let i = 0; i < br.pts.length; i++) {
-          if (br.cum[i] >= startAlong - 20 && br.cum[i] <= endAlong + 20) {
-            segPts.push(br.pts[i]);
-          }
-        }
-      }
-      if (segPts.length < 2) {
-        segPts = [[leg.boardStop.lat, leg.boardStop.lng], [leg.alightStop.lat, leg.alightStop.lng]];
-      }
-      allPts.push(...segPts);
-      L.polyline(segPts, {
-        renderer: this.canvasRenderer,
-        color: '#0f172a',
-        weight: 8,
-        opacity: 0.35,
-        lineCap: 'round',
-        interactive: false
-      }).addTo(this.tripPlanLayer);
-      L.polyline(segPts, {
-        renderer: this.canvasRenderer,
-        color,
-        weight: 5,
-        opacity: 0.95,
-        lineCap: 'round',
-        interactive: false
-      }).addTo(this.tripPlanLayer);
-
-      // Boarding & alighting markers
-      L.circleMarker([leg.boardStop.lat, leg.boardStop.lng], {
-        renderer: this.canvasRenderer,
-        radius: 7,
-        color: '#ffffff',
-        weight: 2.5,
-        fillColor: color,
-        fillOpacity: 1
-      })
-        .bindTooltip(`Subir ${escHtml(leg.lineName)} · ${escHtml(leg.boardStop.nombre)}`)
-        .addTo(this.tripPlanLayer);
-
-      L.circleMarker([leg.alightStop.lat, leg.alightStop.lng], {
-        renderer: this.canvasRenderer,
-        radius: 6.5,
-        color: color,
-        weight: 2.5,
-        fillColor: '#ffffff',
-        fillOpacity: 1
-      })
-        .bindTooltip(`Bajar ${escHtml(leg.lineName)} · ${escHtml(leg.alightStop.nombre)}`)
-        .addTo(this.tripPlanLayer);
-
-      if (idx + 1 < legs.length) {
-        drawWalk(leg.alightStop, legs[idx + 1].boardStop);
-      }
-    });
-
-    if (legs.length > 0) {
-      drawWalk(legs[legs.length - 1].alightStop, dest);
-    }
-
-    // Origin (A) & Destination (B) pins
-    L.circleMarker([origin.lat, origin.lng], {
-      renderer: this.canvasRenderer,
-      radius: 8,
-      color: '#ffffff',
-      weight: 3,
-      fillColor: '#10b981',
-      fillOpacity: 1
-    })
-      .bindTooltip(`Origen · ${escHtml(origin.label || 'Inicio')}`)
-      .addTo(this.tripPlanLayer);
-
-    L.circleMarker([dest.lat, dest.lng], {
-      renderer: this.canvasRenderer,
-      radius: 8,
-      color: '#ffffff',
-      weight: 3,
-      fillColor: '#ef4444',
-      fillOpacity: 1
-    })
-      .bindTooltip(`Destino · ${escHtml(dest.label || 'Llegada')}`)
-      .addTo(this.tripPlanLayer);
-
-    if (allPts.length > 0) {
-      this.map.fitBounds(L.latLngBounds(allPts), {
-        ...this._getPadding(),
-        maxZoom: 15,
-        animate: true
-      });
-    }
   }
 }

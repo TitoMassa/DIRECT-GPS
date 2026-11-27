@@ -1,11 +1,17 @@
 import { getLineColor } from './config.js';
 import { formatDistance, formatBlocks } from './api.js';
-import { buildTripPlannerIndex, planTripsOffline } from './trip-planner.js';
+import { formatSecHHMM } from './predictor.js';
 import {
   buildEntitySevenDayProfile,
-  buildPrintableScheduleHtml,
   formatServiceShareText
 } from './telemetry.js';
+import {
+  dedupeOrderedStops,
+  pickKeyStopsForBranch,
+  buildScheduleExportSections,
+  renderScheduleImageToCanvas,
+  exportCanvasAsImage
+} from './schedule-image.js';
 import { RideModeController, speakText, isSpeechSupported } from './ride-mode.js';
 
 const STORAGE_MAP_STYLE_KEY = 'directgps_map_style_v1'; // 'auto' | 'osm' | 'dark'
@@ -28,10 +34,7 @@ export function createUiExtras(ctx) {
     transitMap,
     showToast,
     announce,
-    getUserGps,
-    openStop,
     locateUnitOnMap,
-    ensureAllRoutesLoaded,
     onFavoritesChanged,
     getOfflineBundleData,
     getAllLiveUnits,
@@ -75,12 +78,6 @@ export function createUiExtras(ctx) {
   // Per-unit specific alerts (`codLinea:coche`)
   const armedCarAlerts = new Set();
   const triggeredCarAlerts = new Set();
-
-  // Trip planner state
-  let plannerIndex = null;
-  let plannerOrigin = null; // { lat, lng, label, stopId? }
-  let plannerDest = null;
-  let lastPlans = [];
 
   // LED board clock timer
   let ledClockTimer = null;
@@ -444,268 +441,327 @@ export function createUiExtras(ctx) {
     profileModal.classList.remove('hidden');
   }
 
-  // ── 6. "¿Cómo llego?" Offline-First Trip Planner Modal ────────────────────
-  const plannerModal = document.getElementById('trip-planner-modal');
-  const btnPlannerClose = document.getElementById('btn-planner-close');
-  const plannerOrigInput = document.getElementById('planner-origin-input');
-  const plannerDestInput = document.getElementById('planner-dest-input');
-  const plannerOrigDrop = document.getElementById('planner-origin-dropdown');
-  const plannerDestDrop = document.getElementById('planner-dest-dropdown');
-  const btnPlannerOrigGps = document.getElementById('btn-planner-origin-gps');
-  const btnPlannerSwap = document.getElementById('btn-planner-swap');
-  const btnPlannerGo = document.getElementById('btn-planner-go');
-  const plannerResultsEl = document.getElementById('planner-results');
+  // ── 6. Customizable Schedule Image Exporter (PNG / JPG — Ida/Vuelta + Paradas) ──
+  const expModal = document.getElementById('schedule-export-modal');
+  const expSub = document.getElementById('sched-exp-sub');
+  const btnExpClose = document.getElementById('btn-sched-exp-close');
+  const expDirRow = document.getElementById('sched-exp-dir-row');
+  const expSrvPills = document.getElementById('sched-exp-srv-pills');
+  const expBranchTabs = document.getElementById('sched-exp-branch-tabs');
+  const expStopsList = document.getElementById('sched-exp-stops-list');
+  const btnExpStopsAll = document.getElementById('btn-sched-exp-stops-all');
+  const btnExpStopsKey = document.getElementById('btn-sched-exp-stops-key');
+  const btnExpStopsNone = document.getElementById('btn-sched-exp-stops-none');
+  const expCanvas = document.getElementById('sched-exp-canvas');
+  const expEmptyMsg = document.getElementById('sched-exp-empty-msg');
+  const btnExpShare = document.getElementById('btn-sched-exp-share');
+  const btnExpDownload = document.getElementById('btn-sched-exp-download');
 
-  function closePlannerModal() {
-    plannerModal?.classList.add('hidden');
+  let expCtx = null; // { linea, model, branches, activeBranchIdx, tipoDia, tipoLabel, dirMode, serviceFilter, editBranchIdx, selectedStopsByBranch, format, theme }
+
+  function closeScheduleExportModal() {
+    expModal?.classList.add('hidden');
+    expCtx = null;
   }
 
-  btnPlannerClose?.addEventListener('click', closePlannerModal);
-  plannerModal?.addEventListener('click', (e) => {
-    if (e.target === plannerModal) closePlannerModal();
+  btnExpClose?.addEventListener('click', closeScheduleExportModal);
+  expModal?.addEventListener('click', (e) => {
+    if (e.target === expModal) closeScheduleExportModal();
   });
 
-  function searchPlaces(query) {
-    const q = String(query || '').trim().toLowerCase();
-    const out = [];
-    for (const h of state.hubs || []) {
-      if (!q || h.name.toLowerCase().includes(q)) {
-        out.push({ kind: 'hub', label: h.name, sub: 'Zona / Referencia', lat: h.lat, lng: h.lng });
-      }
-    }
-    if (q.length >= 2 && Array.isArray(state.catalogo?.paradas)) {
-      for (const p of state.catalogo.paradas) {
-        const hay = `${p.id} ${p.nombre}`.toLowerCase();
-        if (hay.includes(q)) {
-          out.push({
-            kind: 'stop',
-            stopId: p.id,
-            label: p.nombre,
-            sub: `Parada ${p.id}`,
-            lat: p.lat,
-            lng: p.lng
-          });
-          if (out.length >= 14) break;
-        }
-      }
-    }
-    return out.slice(0, 10);
-  }
+  function renderScheduleExportPreview() {
+    if (!expCtx || !expCanvas) return;
+    const { linea, model, branches, activeBranchIdx, tipoLabel, dirMode, serviceFilter, selectedStopsByBranch, format, theme } = expCtx;
 
-  function wirePlannerAutocomplete(inputEl, dropEl, setter) {
-    if (!inputEl || !dropEl) return;
-    const renderDrop = () => {
-      const items = searchPlaces(inputEl.value);
-      if (items.length === 0) {
-        dropEl.classList.add('hidden');
-        dropEl.innerHTML = '';
-        return;
-      }
-      dropEl.innerHTML = items
-        .map(
-          (it, idx) => `
-          <button type="button" class="planner-ac-item" data-idx="${idx}">
-            <strong>${esc(it.label)}</strong>
-            <span>${esc(it.sub)}</span>
-          </button>
-        `
-        )
-        .join('');
-      dropEl.classList.remove('hidden');
-      dropEl.querySelectorAll('.planner-ac-item').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const picked = items[Number(btn.dataset.idx)];
-          if (!picked) return;
-          setter(picked);
-          inputEl.value = picked.label;
-          dropEl.classList.add('hidden');
-        });
-      });
-    };
-    inputEl.addEventListener('input', () => {
-      setter(null);
-      renderDrop();
+    // Sync direction pills
+    expDirRow?.querySelectorAll('[data-exp-dir]').forEach((b) => {
+      const val = b.dataset.expDir;
+      const disabled = val === 'both' && branches.length < 2;
+      b.disabled = disabled;
+      const active = val === dirMode;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-pressed', String(active));
     });
-    inputEl.addEventListener('focus', renderDrop);
-    inputEl.addEventListener('blur', () => setTimeout(() => dropEl.classList.add('hidden'), 180));
-  }
 
-  wirePlannerAutocomplete(plannerOrigInput, plannerOrigDrop, (v) => {
-    plannerOrigin = v;
-  });
-  wirePlannerAutocomplete(plannerDestInput, plannerDestDrop, (v) => {
-    plannerDest = v;
-  });
-
-  btnPlannerOrigGps?.addEventListener('click', async () => {
-    try {
-      if (plannerOrigInput) plannerOrigInput.value = 'Obteniendo GPS...';
-      const pos = await getUserGps();
-      plannerOrigin = { lat: pos.lat, lng: pos.lng, label: 'Mi ubicación GPS' };
-      if (plannerOrigInput) plannerOrigInput.value = 'Mi ubicación GPS';
-    } catch {
-      if (plannerOrigInput) plannerOrigInput.value = '';
-      showToast('No se pudo obtener tu GPS. Escribí una calle o parada.', 'warn', 3200);
-    }
-  });
-
-  btnPlannerSwap?.addEventListener('click', () => {
-    const tmp = plannerOrigin;
-    plannerOrigin = plannerDest;
-    plannerDest = tmp;
-    if (plannerOrigInput) plannerOrigInput.value = plannerOrigin?.label || '';
-    if (plannerDestInput) plannerDestInput.value = plannerDest?.label || '';
-  });
-
-  async function runTripPlanner() {
-    if (!plannerResultsEl) return;
-    // Allow automatic match if user typed text without tapping dropdown
-    if (!plannerOrigin && plannerOrigInput?.value.trim()) {
-      plannerOrigin = searchPlaces(plannerOrigInput.value)[0] || null;
-      if (plannerOrigin) plannerOrigInput.value = plannerOrigin.label;
-    }
-    if (!plannerDest && plannerDestInput?.value.trim()) {
-      plannerDest = searchPlaces(plannerDestInput.value)[0] || null;
-      if (plannerDest) plannerDestInput.value = plannerDest.label;
-    }
-    if (!plannerOrigin || !plannerDest) {
-      showToast('Elegí un origen y un destino de la lista.', 'warn', 2800);
-      return;
+    // Sync format & theme pills
+    expModal?.querySelectorAll('[data-exp-format]').forEach((b) => {
+      const active = b.dataset.expFormat === format;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-pressed', String(active));
+    });
+    expModal?.querySelectorAll('[data-exp-theme]').forEach((b) => {
+      const active = b.dataset.expTheme === theme;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-pressed', String(active));
+    });
+    if (btnExpDownload) {
+      btnExpDownload.textContent = `Descargar ${format.toUpperCase()}`;
     }
 
-    plannerResultsEl.innerHTML = `<div class="fleet-roster-empty">Calculando combinaciones en las 26 líneas...</div>`;
-    await ensureAllRoutesLoaded?.();
-
-    if (!plannerIndex || state.routeBranchesCache.size > 0) {
-      plannerIndex = buildTripPlannerIndex(state.routeBranchesCache, state.catalogo?.lineByCode);
-    }
-
-    let plans = planTripsOffline(plannerIndex, plannerOrigin, plannerDest, { maxResults: 8 });
-
-    // Enrich top 3 unique boarding stops with live ETA when online
-    if (!state.isOffline && plans.length > 0) {
-      const liveEtaByLineStop = new Map();
-      const boardStopIds = Array.from(new Set(plans.slice(0, 4).map((p) => p.legs[0]?.boardStop?.id).filter(Boolean))).slice(0, 3);
-      await Promise.all(
-        boardStopIds.map(async (sid) => {
-          try {
-            const res = await api.arribos(sid, '000', { skipCorridor: true });
-            for (const a of res?.data?.arribos || []) {
-              const cod = Number(a.codigoLinea);
-              const txt = String(a.tiempoRestanteArribo || '').toLowerCase();
-              const mins = txt.includes('arriband') || txt.includes('llegand') ? 0 : parseInt(txt.match(/(\d+)/)?.[1] || '', 10);
-              if (cod && Number.isFinite(mins)) {
-                const k = `${cod}:${sid}`;
-                if (!liveEtaByLineStop.has(k) || mins < liveEtaByLineStop.get(k)) {
-                  liveEtaByLineStop.set(k, mins);
-                }
-              }
-            }
-          } catch {
-            // Non-fatal offline/timeout
-          }
-        })
-      );
-      if (liveEtaByLineStop.size > 0) {
-        plans = planTripsOffline(plannerIndex, plannerOrigin, plannerDest, { maxResults: 8, liveEtaByLineStop });
+    // Build service summary lines when a specific service is chosen
+    const serviceSummaryLines = [];
+    if (serviceFilter !== 'ALL' && Array.isArray(model?.blocks)) {
+      const srvBlocks = model.blocks
+        .filter((b) => String(b.serviceNumber) === String(serviceFilter))
+        .sort((a, b) => a.startSec - b.startSec);
+      for (const blk of srvBlocks) {
+        const tTag = srvBlocks.length > 1 ? `T${blk.turnoIndex}/${srvBlocks.length}` : 'Turno corrido';
+        const places = [blk.startPlace || '', blk.endPlace || ''].filter(Boolean).join(' → ');
+        const reg = blk.isCortado ? ' [Cortado]' : blk.relevoToNext ? ' [Relevo]' : '';
+        serviceSummaryLines.push(
+          `${tTag} (${formatSecHHMM(blk.startSec)}–${formatSecHHMM(blk.endSec)})${reg}${places ? ` · ${places}` : ''}`
+        );
       }
     }
 
-    lastPlans = plans;
-    if (plans.length === 0) {
-      plannerResultsEl.innerHTML = `<div class="fleet-roster-empty">No encontramos una combinación directa o con 1 trasbordo a menos de 650 m. Probá con una parada o avenida cercana.</div>`;
+    const built = buildScheduleExportSections(model, branches, {
+      mode: dirMode,
+      activeBranchIdx,
+      serviceFilter,
+      selectedStopIdsByBranch: selectedStopsByBranch
+    });
+
+    if (built.sections.length === 0) {
+      expCanvas.classList.add('hidden');
+      expEmptyMsg?.classList.remove('hidden');
+      if (btnExpDownload) btnExpDownload.disabled = true;
+      if (btnExpShare) btnExpShare.disabled = true;
       return;
     }
 
-    plannerResultsEl.innerHTML = plans
-      .map((p, idx) => {
-        const pills = p.legs
-          .map(
-            (l) =>
-              `<span class="fleet-roster-line-pill" style="background:${getLineColor(l.lineName)}">${esc(l.lineName)}</span>`
-          )
-          .join('<span class="planner-arrow">→</span>');
-        const waitBadge =
-          typeof p.liveWaitMin === 'number'
-            ? `<span class="planner-live-badge">● Pasa en ${p.liveWaitMin === 0 ? 'ahora' : `${p.liveWaitMin} min`}</span>`
-            : `<span class="planner-offline-badge">${p.transfers === 0 ? 'Directo' : '1 trasbordo'}</span>`;
-        const stepsHtml = p.legs
-          .map(
-            (l, li) => `
-            <div class="planner-leg-step">
-              <span>${li === 0 ? 'Subí' : 'Trasbordá'} en <strong>${esc(l.boardStop.nombre)}</strong> (${esc(l.boardStop.id)}) · ${l.stopsCount} paradas (~${l.rideMin} min)</span>
-              <span>Bajá en <strong>${esc(l.alightStop.nombre)}</strong> (${esc(l.alightStop.id)})</span>
-            </div>
-          `
-          )
+    expCanvas.classList.remove('hidden');
+    expEmptyMsg?.classList.add('hidden');
+    if (btnExpDownload) btnExpDownload.disabled = false;
+    if (btnExpShare) btnExpShare.disabled = false;
+
+    const dirSuffix = dirMode === 'both' && branches.length >= 2 ? 'Ida y Vuelta' : branches[activeBranchIdx]?.bandera || '';
+    const srvLabel = serviceFilter === 'ALL' ? 'Todos los servicios' : `Servicio ${serviceFilter}`;
+
+    renderScheduleImageToCanvas(
+      expCanvas,
+      {
+        lineName: linea.descripcion,
+        tipoLabel: `${tipoLabel}${dirMode === 'both' && branches.length >= 2 ? ' · Ida y Vuelta' : ''}`,
+        serviceLabel: dirMode === 'both' && branches.length >= 2 ? srvLabel : `${srvLabel}${dirSuffix ? ` · ${dirSuffix}` : ''}`,
+        serviceSummaryLines,
+        sections: built.sections
+      },
+      { theme }
+    );
+  }
+
+  function renderScheduleExportStopPicker() {
+    if (!expCtx || !expStopsList) return;
+    const { branches, dirMode, activeBranchIdx, selectedStopsByBranch } = expCtx;
+
+    // Show branch selector tabs when "Ida y Vuelta" is active so user can pick stops for EACH direction
+    if (expBranchTabs) {
+      if (dirMode === 'both' && branches.length >= 2) {
+        expBranchTabs.classList.remove('hidden');
+        expBranchTabs.innerHTML = branches
+          .map((br, idx) => {
+            const allSt = dedupeOrderedStops(br);
+            const chosen = selectedStopsByBranch.get(idx)?.size ?? allSt.length;
+            const lbl = branches.length === 2 ? (idx === 0 ? 'Ida' : 'Vuelta') : `Ramal ${idx + 1}`;
+            const active = expCtx.editBranchIdx === idx;
+            return `<button type="button" class="flota-tab-btn ${active ? 'active' : ''}" data-exp-edit-br="${idx}" role="tab" aria-selected="${active}">${lbl} (${chosen}/${allSt.length})</button>`;
+          })
           .join('');
+        expBranchTabs.querySelectorAll('[data-exp-edit-br]').forEach((b) => {
+          b.addEventListener('click', () => {
+            expCtx.editBranchIdx = Number(b.dataset.expEditBr) || 0;
+            renderScheduleExportStopPicker();
+          });
+        });
+      } else {
+        expBranchTabs.classList.add('hidden');
+        expCtx.editBranchIdx = activeBranchIdx;
+      }
+    }
+
+    const brIdx = expCtx.editBranchIdx;
+    const br = branches[brIdx];
+    const allStops = dedupeOrderedStops(br);
+    const chosenSet = selectedStopsByBranch.get(brIdx) || new Set(allStops.map((s) => s.id));
+    selectedStopsByBranch.set(brIdx, chosenSet);
+
+    expStopsList.innerHTML = allStops
+      .map((st, idx) => {
+        const checked = chosenSet.has(st.id);
+        const isEnd = idx === 0 || idx === allStops.length - 1;
         return `
-          <div class="planner-result-card" data-plan-idx="${idx}">
-            <div class="planner-result-head">
-              <div class="planner-pills-wrap">${pills} ${waitBadge}</div>
-              <strong class="planner-total-min mono">~${p.totalMin} min</strong>
-            </div>
-            <div class="planner-walk-meta">Caminata total: ${formatDistance(p.walkTotalM)} (${formatBlocks(p.walkTotalM)} c.)</div>
-            ${stepsHtml}
-            <div class="planner-card-actions">
-              <button type="button" class="seg-btn seg-btn-xs btn-plan-map" data-idx="${idx}">Ver en mapa</button>
-              <button type="button" class="seg-btn seg-btn-xs btn-plan-board" data-idx="${idx}">Abrir parada</button>
-              <button type="button" class="seg-btn seg-btn-xs btn-plan-ride" data-idx="${idx}">Alarma bajada</button>
-            </div>
-          </div>
+          <label class="sched-exp-stop-row ${checked ? 'is-checked' : ''}">
+            <input type="checkbox" class="sched-exp-stop-chk" data-stop-id="${esc(st.id)}" ${checked ? 'checked' : ''} />
+            <span class="sched-exp-stop-num mono">#${idx + 1}</span>
+            <span class="sched-exp-stop-name">${esc(st.nombre)}${isEnd ? ' <small>(Cabecera)</small>' : ''}</span>
+            <span class="sched-exp-stop-code mono">${esc(st.id)}</span>
+          </label>
         `;
       })
       .join('');
 
-    plannerResultsEl.querySelectorAll('.btn-plan-map').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const plan = lastPlans[Number(btn.dataset.idx)];
-        if (!plan) return;
-        transitMap?.drawTripPlanRoute(plan, plannerOrigin, plannerDest, state.routeBranchesCache);
-        closePlannerModal();
-        showToast('Recorrido trazado en el mapa', 'success', 2600);
-      });
-    });
-
-    plannerResultsEl.querySelectorAll('.btn-plan-board').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const plan = lastPlans[Number(btn.dataset.idx)];
-        const st = plan?.legs?.[0]?.boardStop;
-        if (!st) return;
-        closePlannerModal();
-        openStop?.({ id: st.id, nombre: st.nombre, lat: st.lat, lng: st.lng }, { focusLineCode: plan.legs[0].codLinea });
-      });
-    });
-
-    plannerResultsEl.querySelectorAll('.btn-plan-ride').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const plan = lastPlans[Number(btn.dataset.idx)];
-        const lastLeg = plan?.legs?.[plan.legs.length - 1];
-        if (!lastLeg?.alightStop) return;
-        closePlannerModal();
-        startRideAlarm({ ...lastLeg.alightStop, lineName: lastLeg.lineName });
+    expStopsList.querySelectorAll('.sched-exp-stop-chk').forEach((chk) => {
+      chk.addEventListener('change', () => {
+        const sid = chk.dataset.stopId;
+        if (!sid) return;
+        if (chk.checked) chosenSet.add(sid);
+        else chosenSet.delete(sid);
+        chk.closest('.sched-exp-stop-row')?.classList.toggle('is-checked', chk.checked);
+        // Update tab counters if Ida y Vuelta
+        if (expCtx.dirMode === 'both' && expBranchTabs) {
+          const tabBtn = expBranchTabs.querySelector(`[data-exp-edit-br="${brIdx}"]`);
+          if (tabBtn) {
+            const lbl = branches.length === 2 ? (brIdx === 0 ? 'Ida' : 'Vuelta') : `Ramal ${brIdx + 1}`;
+            tabBtn.textContent = `${lbl} (${chosenSet.size}/${allStops.length})`;
+          }
+        }
+        renderScheduleExportPreview();
       });
     });
   }
 
-  btnPlannerGo?.addEventListener('click', runTripPlanner);
-
-  function openTripPlannerModal(presetOrigin = null) {
-    if (!plannerModal) return;
-    if (presetOrigin) {
-      plannerOrigin = presetOrigin;
-      if (plannerOrigInput) plannerOrigInput.value = presetOrigin.label || '';
-    } else if (!plannerOrigin && state.activeStop) {
-      plannerOrigin = {
-        lat: state.activeStop.lat,
-        lng: state.activeStop.lng,
-        label: state.activeStop.nombre || state.activeStop.id,
-        stopId: state.activeStop.id
-      };
-      if (plannerOrigInput) plannerOrigInput.value = plannerOrigin.label;
+  function renderScheduleExportServicePills() {
+    if (!expCtx || !expSrvPills) return;
+    const { model, branches, serviceFilter } = expCtx;
+    const srvSet = new Set();
+    for (const br of branches) {
+      for (const tr of model.getTripsForBranch(br) || []) {
+        if (Number.isFinite(tr.serviceNumber) && tr.serviceNumber > 0) srvSet.add(tr.serviceNumber);
+      }
     }
-    plannerModal.classList.remove('hidden');
-    setTimeout(() => (plannerOrigin ? plannerDestInput : plannerOrigInput)?.focus(), 80);
+    const nums = Array.from(srvSet).sort((a, b) => a - b);
+    const items = [{ val: 'ALL', label: 'Todos' }, ...nums.map((n) => ({ val: String(n), label: `Srv ${n}` }))];
+    expSrvPills.innerHTML = items
+      .map(
+        (it) =>
+          `<button type="button" class="events-pill ${String(serviceFilter) === it.val ? 'active' : ''}" data-exp-srv="${esc(it.val)}" aria-pressed="${String(serviceFilter) === it.val}">${esc(it.label)}</button>`
+      )
+      .join('');
+
+    expSrvPills.querySelectorAll('[data-exp-srv]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        expCtx.serviceFilter = btn.dataset.expSrv || 'ALL';
+        renderScheduleExportServicePills();
+        renderScheduleExportPreview();
+      });
+    });
+  }
+
+  expDirRow?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-exp-dir]');
+    if (!btn || btn.disabled || !expCtx) return;
+    expCtx.dirMode = btn.dataset.expDir === 'both' ? 'both' : 'active';
+    if (expCtx.dirMode === 'active') expCtx.editBranchIdx = expCtx.activeBranchIdx;
+    renderScheduleExportStopPicker();
+    renderScheduleExportPreview();
+  });
+
+  expModal?.addEventListener('click', (e) => {
+    const fmtBtn = e.target.closest('[data-exp-format]');
+    if (fmtBtn && expCtx) {
+      expCtx.format = fmtBtn.dataset.expFormat === 'jpg' ? 'jpg' : 'png';
+      renderScheduleExportPreview();
+      return;
+    }
+    const thBtn = e.target.closest('[data-exp-theme]');
+    if (thBtn && expCtx) {
+      expCtx.theme = thBtn.dataset.expTheme === 'light' ? 'light' : 'dark';
+      renderScheduleExportPreview();
+    }
+  });
+
+  btnExpStopsAll?.addEventListener('click', () => {
+    if (!expCtx) return;
+    const br = expCtx.branches[expCtx.editBranchIdx];
+    expCtx.selectedStopsByBranch.set(expCtx.editBranchIdx, new Set(dedupeOrderedStops(br).map((s) => s.id)));
+    renderScheduleExportStopPicker();
+    renderScheduleExportPreview();
+  });
+
+  btnExpStopsKey?.addEventListener('click', () => {
+    if (!expCtx) return;
+    const br = expCtx.branches[expCtx.editBranchIdx];
+    expCtx.selectedStopsByBranch.set(expCtx.editBranchIdx, pickKeyStopsForBranch(br, 7));
+    renderScheduleExportStopPicker();
+    renderScheduleExportPreview();
+  });
+
+  btnExpStopsNone?.addEventListener('click', () => {
+    if (!expCtx) return;
+    expCtx.selectedStopsByBranch.set(expCtx.editBranchIdx, new Set());
+    renderScheduleExportStopPicker();
+    renderScheduleExportPreview();
+  });
+
+  const buildExportFileName = () => {
+    if (!expCtx) return 'direct-gps-horarios';
+    const ln = String(expCtx.linea?.descripcion || 'linea').replace(/[^a-z0-9]+/gi, '');
+    const srv = expCtx.serviceFilter === 'ALL' ? 'todos' : `srv${expCtx.serviceFilter}`;
+    const dir = expCtx.dirMode === 'both' ? 'ida-vuelta' : `r${expCtx.activeBranchIdx + 1}`;
+    return `direct-gps-${ln}-${expCtx.tipoDia || 'habil'}-${srv}-${dir}`.toLowerCase();
+  };
+
+  btnExpDownload?.addEventListener('click', async () => {
+    if (!expCtx || !expCanvas) return;
+    const res = await exportCanvasAsImage(expCanvas, {
+      format: expCtx.format,
+      fileName: buildExportFileName(),
+      share: false
+    });
+    if (res.ok) {
+      showToast(`Imagen ${expCtx.format.toUpperCase()} descargada`, 'success', 2600);
+    }
+  });
+
+  btnExpShare?.addEventListener('click', async () => {
+    if (!expCtx || !expCanvas) return;
+    const res = await exportCanvasAsImage(expCanvas, {
+      format: expCtx.format,
+      fileName: buildExportFileName(),
+      share: true
+    });
+    if (res.ok && res.mode === 'downloaded') {
+      showToast(`Imagen ${expCtx.format.toUpperCase()} guardada (lista para enviar por WhatsApp)`, 'success', 3000);
+    }
+  });
+
+  function openScheduleExportModal({ linea, model, branches, activeBranchIdx = 0, tipoDia = 'habil', tipoLabel = 'Lun–Vie', serviceFilter = 'ALL' }) {
+    if (!expModal || !model || !Array.isArray(branches) || branches.length === 0) return;
+    const safeIdx = Math.max(0, Math.min(branches.length - 1, Number(activeBranchIdx) || 0));
+    const selectedStopsByBranch = new Map();
+    branches.forEach((br, idx) => {
+      // Pre-select smart key stops if branch is very long (>18 stops), or all stops if compact — user can click "Todas" in 1 tap!
+      const ordered = dedupeOrderedStops(br);
+      selectedStopsByBranch.set(
+        idx,
+        ordered.length > 18 ? pickKeyStopsForBranch(br, 9) : new Set(ordered.map((s) => s.id))
+      );
+    });
+
+    expCtx = {
+      linea,
+      model,
+      branches,
+      activeBranchIdx: safeIdx,
+      editBranchIdx: safeIdx,
+      tipoDia,
+      tipoLabel,
+      // If user already isolated a specific service, default to "Ida y Vuelta" (when 2+ branches exist) so they immediately see the full round-trip service!
+      dirMode: serviceFilter !== 'ALL' && branches.length >= 2 ? 'both' : 'active',
+      serviceFilter: String(serviceFilter || 'ALL'),
+      selectedStopsByBranch,
+      format: 'png',
+      theme: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'
+    };
+
+    if (expSub) {
+      expSub.textContent = `Línea ${linea.descripcion} · ${tipoLabel} · Elegí sentido, servicio y paradas`;
+    }
+
+    renderScheduleExportServicePills();
+    renderScheduleExportStopPicker();
+    renderScheduleExportPreview();
+    expModal.classList.remove('hidden');
   }
 
   // ── 7. Modo Tablero LED (Pantalla de Parada) ──────────────────────────────
@@ -986,19 +1042,6 @@ export function createUiExtras(ctx) {
     }
   }
 
-  function printScheduleTable(title, subtitle, tableEl) {
-    if (!tableEl) return;
-    const html = buildPrintableScheduleHtml(title, subtitle, tableEl.outerHTML);
-    const win = window.open('', '_blank', 'width=1024,height=740');
-    if (!win) {
-      showToast('Habilitá las ventanas emergentes para imprimir/guardar PDF.', 'warn', 3500);
-      return;
-    }
-    win.document.open();
-    win.document.write(html);
-    win.document.close();
-  }
-
   // Initialize controls on creation
   wireSettingsModalTabs();
   applyMapStyle(mapStylePref, { silent: true });
@@ -1023,12 +1066,11 @@ export function createUiExtras(ctx) {
     isRideAlarmActive: () => rideController.isActive(),
     openEntityProfileModal,
     closeProfileModal,
-    openTripPlannerModal,
-    closePlannerModal,
+    openScheduleExportModal,
+    closeScheduleExportModal,
     openLedBoard,
     closeLedBoard,
     renderLedBoard,
-    shareServiceSummary,
-    printScheduleTable
+    shareServiceSummary
   };
 }

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v96';
+const CACHE_NAME = 'direct-gps-v97';
 const DATA_CACHE = 'direct-gps-data-v5';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
@@ -24,7 +24,7 @@ const SHELL_ASSETS = [
   './js/predictor.js',
   './js/simulator.js',
   './js/holidays.js',
-  './js/trip-planner.js',
+  './js/schedule-image.js',
   './js/telemetry.js',
   './js/ride-mode.js',
   './js/ui-extras.js',

@@ -64,6 +64,7 @@ import {
   detectBunchingAndGaps,
   computeNetworkPunctuality,
   classifyBusEndingBadge,
+  evaluateServiceCompletionStatus,
   computeBusPhysicalTelemetry,
   buildBusUpcomingStops,
   findOppositeStop
@@ -308,7 +309,6 @@ const el = {
   btnOppositeStop: document.getElementById('btn-opposite-stop'),
   btnLedBoard: document.getElementById('btn-led-board'),
   bunchingBanner: document.getElementById('bunching-banner'),
-  btnOpenPlanner: document.getElementById('btn-open-planner'),
 
   btnAllBuses: document.getElementById('btn-all-buses'),
   allBusesCount: document.getElementById('all-buses-count'),
@@ -370,16 +370,25 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.6.1',
+    date: '27/11/2026 · 16:00 hs',
+    items: [
+      '<strong>Exportador de Grilla como Imagen (PNG / JPG) totalmente personalizable:</strong> reemplazamos el PDF por un generador de imágenes en alta resolución listo para compartir por WhatsApp. Podés elegir <strong>Solo este sentido</strong> o <strong>Ida y Vuelta</strong>, aislar un <strong>Servicio</strong> puntual o todos, tildar exactamente qué <strong>paradas</strong> querés incluir (con atajos <em>Todas / Cabeceras y claves / Ninguna</em>), elegir estilo <strong>Oscuro o Claro</strong>, ver la vista previa en vivo y descargar o compartir directo en <strong>PNG o JPG</strong>.',
+      '<strong>Centrado exacto sobre el área visible del mapa:</strong> al tocar un colectivo o apretar <strong>Centrar</strong>, el mapa ahora calcula en tiempo real la altura del inspector y el panel inferior para dejar el colectivo siempre visible y despejado arriba de la tarjeta (nunca tapado). También se liberó el botón de mapa nocturno en pantallas angostas.',
+      '<strong>Detección inteligente de fin de servicio y turno (adiós coches fantasma en movimiento):</strong> al cruzar horario de fin de servicio/turno, desvío real, última posición GPS, distancia a la punta de línea y hora actual, las unidades que ya finalizaron dejan de figurar <strong>En línea</strong> al instante, nunca simulan seguir circulando en modo <strong>EN VIVO</strong> y muestran su ubicación detenida en la <strong>punta de línea donde finalizaron</strong> (conservando como activos a quienes vienen atrasados lejos de cabecera).',
+      '<strong>Corrección de filtros rápidos en "En línea ahora" e interfaz más limpia:</strong> se corrigió el aplastamiento de los botones <em>Todos / Atrasados / Adelantados / ♿ Adaptados / Última vuelta</em> en celulares para que queden 100 % visibles y tocables, y se quitaron el planificador "¿Cómo llego?" y la estela GPS para mantener el mapa limpio y ágil.'
+    ]
+  },
+  {
     version: 'v2.6.0',
     date: '27/11/2026 · 15:00 hs',
     items: [
       '<strong>Mapa Nocturno 100 % offline (sin API externa):</strong> nuevo botón de luna sobre el mapa y selector <strong>Claro / Nocturno / Auto</strong> en Ajustes que reutiliza los mismos mosaicos cacheados de OpenStreetMap mediante filtro oscuro nativo, garantizando cero errores de API y funcionamiento total sin conexión.',
-      '<strong>Planificador "¿Cómo llego?" (offline + vivo):</strong> elegí origen (tu GPS, zona o parada) y destino en Corrientes para ver combinaciones directas y con 1 trasbordo en las 26 líneas, con tiempos en vivo cuando hay conexión, trazado del viaje en el mapa y acceso directo a la parada de subida o alarma de bajada.',
-      '<strong>Modo Viaje (alarma GPS de bajada) y Próximas paradas en vivo:</strong> al tocar cualquier colectivo ahora podés desplegar sus próximas paradas con horario estimado por desvío real, ver su <strong>estela GPS reciente</strong>, velocidad en <code>km/h</code>, estado físico (<em>En marcha / Detenido / En cabecera</em>) e insignia de <strong>Última vuelta / Corta al llegar</strong>, y activar una <strong>alarma de bajada a 300 m</strong> de tu parada.',
+      '<strong>Modo Viaje (alarma GPS de bajada) y Próximas paradas en vivo:</strong> al tocar cualquier colectivo activo podés desplegar sus próximas paradas con horario estimado por desvío real, ver su velocidad en <code>km/h</code>, estado físico (<em>En marcha / Detenido / En cabecera</em>) e insignia de <strong>Última vuelta / Corta al llegar</strong>, y activar una <strong>alarma de bajada a 300 m</strong> de tu parada.',
       '<strong>Alertas configurables (3 / 5 / 8 / 10 min), alerta por coche puntual y avisos por voz (<code>es-AR</code>):</strong> elegí con cuántos minutos avisar, activá la lectura en voz alta y marcá alertas sobre un coche específico desde el inspector.',
       '<strong>Favoritos de Coches y Choferes + Ficha histórica de 7 días cruzada:</strong> guardá tus coches y choferes favoritos junto a tus paradas, consultá su ficha completa de 7 días en todas las líneas (días, servicios, turnos y compañeros) y saltá con 1 toque a su posición en vivo.',
-      '<strong>Monitor del Puente General Belgrano, Termómetro de puntualidad y Detector de "tren de colectivos":</strong> estado fluido/lento/congestionado del puente (904A/B/C y 902), % a horario global y por línea, filtros rápidos en <strong>En línea ahora</strong> (<em>Atrasados, Adelantados, ♿ Adaptados, Última vuelta</em>) y alertas cuando vienen coches pegados o con huecos grandes.',
-      '<strong>Atajo ⇄ Mano de enfrente, Modo Tablero LED, Feriados de Argentina/Corrientes, Exportar/Compartir y Respaldo:</strong> cambiá de vereda con un toque, abrí la parada en pantalla gigante estilo cartel LED, anticipá feriados nacionales y locales de Corrientes, compartí servicios por WhatsApp, imprimí/guardá grillas en PDF, exportá/importá tu respaldo JSON y consultá el diagnóstico en vivo del servidor.',
+      '<strong>Monitor del Puente General Belgrano, Termómetro de puntualidad y Detector de "tren de colectivos":</strong> estado fluido/lento/congestionado del puente (904A/B/C y 902), % a horario global y por línea, filtros rápidos en <strong>En línea ahora</strong> y alertas cuando vienen coches pegados o con huecos grandes.',
+      '<strong>Atajo ⇄ Mano de enfrente, Modo Tablero LED, Feriados de Argentina/Corrientes, Compartir servicios y Respaldo:</strong> cambiá de vereda con un toque, abrí la parada en pantalla gigante estilo cartel LED, anticipá feriados nacionales y locales de Corrientes, compartí servicios por WhatsApp, exportá/importá tu respaldo JSON y consultá el diagnóstico en vivo del servidor.',
       '<strong>Robustez técnica e íconos PWA nativos:</strong> fuente única de nombres de choferes (<code>docs/data/driver-overrides.json</code>), íconos PNG <code>192×192</code>, <code>512×512</code> y <code>maskable</code> para Android/iOS, suite permanente de pruebas automatizadas (<code>npm test</code>) y validación continua en GitHub Actions.'
     ]
   },
@@ -673,11 +682,6 @@ const uiExtras = createUiExtras({
   transitMap,
   showToast: (...args) => showToast(...args),
   announce: (...args) => announce(...args),
-  getUserGps: async () => {
-    const pos = await getCurrentPosition({ enableHighAccuracy: true, timeout: 9000 });
-    return { lat: pos.latitude, lng: pos.longitude, accuracy: pos.accuracy };
-  },
-  openStop: (st, opts) => openStopRadar(st, opts?.focusLineCode ? String(opts.focusLineCode) : '000'),
   locateUnitOnMap: (u) => {
     if (!u) return;
     if (state.allFleetMode && u.key && state.allFleetBuses.some((b) => b.key === u.key)) {
@@ -702,13 +706,6 @@ const uiExtras = createUiExtras({
       desvioSec: u.desvio?.seconds || u.lastDesvioSec || 0,
       enLineaAhora: true
     });
-  },
-  ensureAllRoutesLoaded: async () => {
-    if (!state.catalogo) {
-      state.catalogo = await api.catalogo().catch(() => null);
-    }
-    const codes = (state.catalogo?.lineas || state.lineas || []).map((l) => Number(l.codigo)).filter(Boolean);
-    await ensureBranchesLoaded(codes);
   },
   onFavoritesChanged: () => renderFavorites(),
   getOfflineBundleData: () => getCachedOfflineBundle(),
@@ -1424,7 +1421,8 @@ function renderFavorites() {
         lastStopId: live.lastStopId || '',
         desvioRaw: live.desvio?.raw || live.lastDesvioRaw || '',
         desvioSec: live.desvio?.seconds || live.lastDesvioSec || 0,
-        enLineaAhora: true
+        enLineaAhora: true,
+        entityType: ent.type === 'chofer' ? 'chofer' : 'coche'
       });
     });
   });
@@ -1867,22 +1865,6 @@ function renderRadarWelcome() {
         </button>
       </div>
 
-      <button type="button" id="btn-welcome-planner" class="welcome-free-banner">
-        <span class="welcome-free-left">
-          <span class="welcome-tile-ico" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/>
-              <path d="M8.5 19H12a4 4 0 0 0 0-8h0a4 4 0 0 1 0-8h3.5"/>
-            </svg>
-          </span>
-          <span class="list-row-main">
-            <span class="list-row-title">¿Cómo llego? Planificador de viajes</span>
-            <span class="list-row-sub">Directos y trasbordos en las 26 líneas (offline + vivo)</span>
-          </span>
-        </span>
-        <span class="row-chevron" aria-hidden="true">›</span>
-      </button>
-
       <button type="button" id="btn-welcome-free-fleet" class="welcome-free-banner ${state.allFleetMode ? 'is-active' : ''}">
         <span class="welcome-free-left">
           <span class="welcome-tile-ico" aria-hidden="true">
@@ -1922,10 +1904,6 @@ function renderRadarWelcome() {
 
   document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => switchTab('lineas'));
   document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => switchTab('cercanas'));
-  document.getElementById('btn-welcome-planner')?.addEventListener('click', () => {
-    haptic('light');
-    uiExtras?.openTripPlannerModal();
-  });
   document.getElementById('btn-welcome-free-fleet')?.addEventListener('click', () => {
     toggleAllFleetMode(!state.allFleetMode);
     if (state.allFleetMode && isBottomSheetLayout()) {
@@ -1949,7 +1927,6 @@ function renderRadarWelcome() {
 
 function resetToWelcome() {
   state.activeStop = null;
-  transitMap.clearTripPlanRoute?.();
   state.arribos = [];
   state.selectedBusKey = null;
   state.filterLine = 'ALL';
@@ -3459,8 +3436,14 @@ function updateInspectorFields(bus) {
       : bus.shiftLaps
         ? formatShiftLaps(bus.shiftLaps)
         : '';
-    el.inspDist.textContent = bus.enLineaAhora ? 'En línea' : 'Últ. posición';
-    el.inspBlocks.textContent = lapPart || (bus.serviceNumber ? `Srv ${bus.serviceNumber}` : 'GPS');
+    el.inspDist.textContent = bus.serviceFinished
+      ? bus.finishedLabel || 'Finalizó'
+      : bus.enLineaAhora
+        ? 'En línea'
+        : 'Últ. posición';
+    el.inspBlocks.textContent = bus.serviceFinished
+      ? bus.finishedPlace || lapPart || 'Cabecera'
+      : lapPart || (bus.serviceNumber ? `Srv ${bus.serviceNumber}` : 'GPS');
   } else {
     if (etaLabelEl) etaLabelEl.textContent = 'Arribo';
     if (distLabelEl) distLabelEl.textContent = 'Distancia';
@@ -3507,21 +3490,26 @@ function updateInspectorFields(bus) {
 
   const gpsParts = [];
   const isFollowing = Boolean(state.followSelectedBus && state.selectedBusKey === bus.key);
-  if (isFollowing) gpsParts.push('Siguiendo');
-  if (bus.isFreeTracked) {
-    if (bus.gpsLost) {
-      const clock = getBusGpsClockHHMM(bus);
-      gpsParts.push(clock ? `Sin GPS · últ. ${clock}` : 'Sin GPS');
-    } else {
-      if (bus.enLineaAhora && !isFollowing) gpsParts.push('En vivo');
-      else if (!bus.enLineaAhora) gpsParts.push('Última ubicación');
-      if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
-      else if (bus.lastSeenLabel) gpsParts.push(bus.lastSeenLabel);
-    }
+  if (bus.serviceFinished) {
+    gpsParts.push(bus.finishedPlace ? `Punta de línea · ${bus.finishedPlace}` : 'Finalizó servicio');
+    if (bus.gpsTimeOnly) gpsParts.push(`Últ. GPS ${bus.gpsTimeOnly}`);
   } else {
-    const gpsStatus = describeArrivalGpsStatus(bus);
-    if (gpsStatus.inspText) gpsParts.push(gpsStatus.inspText);
-    if (gpsStatus.mode === 'live' && bus.esExtendido) gpsParts.push('+Flota');
+    if (isFollowing) gpsParts.push('Siguiendo');
+    if (bus.isFreeTracked) {
+      if (bus.gpsLost) {
+        const clock = getBusGpsClockHHMM(bus);
+        gpsParts.push(clock ? `Sin GPS · últ. ${clock}` : 'Sin GPS');
+      } else {
+        if (bus.enLineaAhora && !isFollowing) gpsParts.push('En vivo');
+        else if (!bus.enLineaAhora) gpsParts.push('Última ubicación');
+        if (bus.gpsTimeOnly) gpsParts.push(`GPS ${bus.gpsTimeOnly}`);
+        else if (bus.lastSeenLabel) gpsParts.push(bus.lastSeenLabel);
+      }
+    } else {
+      const gpsStatus = describeArrivalGpsStatus(bus);
+      if (gpsStatus.inspText) gpsParts.push(gpsStatus.inspText);
+      if (gpsStatus.mode === 'live' && bus.esExtendido) gpsParts.push('+Flota');
+    }
   }
   el.inspGps.textContent = gpsParts.join(' · ') || '—';
 
@@ -3533,14 +3521,13 @@ function updateInspectorFields(bus) {
     el.btnInspTrack.dataset.busKey = bus.key || '';
   }
 
-  // v2.6.0: Live physical telemetry (km/h, state, recent GPS trail) + Última vuelta / Corta badge
+  // Live physical telemetry (km/h, state) + Última vuelta / Corta badge (only when still active)
   const gpsHistKey = bus.identificadorCoche ? `${bus.codigoLinea}-c${bus.identificadorCoche}` : '';
   const gpsHist = gpsHistKey ? state.lastRealGpsByUnit.get(gpsHistKey) : null;
   const simState = busSimulator.tracks?.get(bus.key) || cityFleetSim.get(bus.key) || null;
   const phys = computeBusPhysicalTelemetry(bus, gpsHist, simState);
-  transitMap.drawBusTrail?.(phys.trail, dirColor);
 
-  let endingBadge = classifyBusEndingBadge(bus, null);
+  let endingBadge = bus.serviceFinished ? null : classifyBusEndingBadge(bus, null);
   if (endingBadge && bus.isCortadoBlock && !bus.resumesFromCortado) {
     endingBadge = { kind: 'cortado', label: 'Corta al llegar', detail: endingBadge.detail || 'Entra en corte al finalizar vuelta' };
   }
@@ -3674,6 +3661,11 @@ function focusBusOnMap(busKey) {
     simulateMode: state.simulateMode
   });
   transitMap.focusBus(mapTarget, 16);
+  requestAnimationFrame(() => {
+    if (state.inspectorOpen && state.selectedBusKey === mapTarget.key) {
+      transitMap.focusBus(mapTarget, 16);
+    }
+  });
   announce(`Siguiendo: ${buildArrivalAriaLabel(mapTarget)}`);
 }
 
@@ -3694,7 +3686,7 @@ function openBusInspector(busKey) {
 
   state.selectedBusKey = bus.key;
   state.inspectorOpen = true;
-  state.followSelectedBus = true;
+  state.followSelectedBus = !bus.serviceFinished;
   if (bus.isFreeTracked && state.trackedUnit) {
     state.trackedUnit.bus = bus;
     state.trackedUnit.coche = bus.identificadorCoche || state.trackedUnit.coche;
@@ -3717,7 +3709,13 @@ function openBusInspector(busKey) {
   if (state.allFleetMode) {
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
   }
-  transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
+  const targetZoom = Math.max(15.5, transitMap.map.getZoom());
+  transitMap.focusBus(bus, targetZoom);
+  requestAnimationFrame(() => {
+    if (state.inspectorOpen && state.selectedBusKey === bus.key) {
+      transitMap.focusBus(bus, targetZoom);
+    }
+  });
 }
 
 function stopTrackedUnit() {
@@ -3742,7 +3740,6 @@ function closeBusInspector() {
   if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = '▾';
   syncInspectorLayoutHeight();
   transitMap.drawFocusVector(null);
-  transitMap.clearBusTrail?.();
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
     selectedBusKey: null,
@@ -4300,9 +4297,38 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
   const seenKeys = new Set();
 
   for (const bus of buses) {
+    // Offline or finished-service units MUST stay stationary at their last/terminal position — NEVER simulated moving!
+    if (bus.serviceFinished || bus.enLineaAhora === false) {
+      cityFleetSim.delete(bus.key);
+      bus.gpsLost = false;
+      continue;
+    }
+
     const rawLat = typeof bus.rawLat === 'number' ? bus.rawLat : bus.lat;
     const rawLng = typeof bus.rawLng === 'number' ? bus.rawLng : bus.lng;
     if (typeof rawLat !== 'number' || typeof rawLng !== 'number') continue;
+
+    // Cross-check schedule/GPS coherence: if this unit already finished its service/turno, freeze it at terminal!
+    const completion = evaluateServiceCompletionStatus(bus, bus._scheduleModel || null, nowSec, {
+      entityType: 'coche',
+      nowMs
+    });
+    if (completion.finished) {
+      bus.serviceFinished = true;
+      bus.enLineaAhora = false;
+      bus.finishedReason = completion.reason;
+      bus.finishedLabel = completion.label;
+      bus.finishedPlace = completion.endPlace;
+      bus.finishedAtHHMM = completion.expectedEndHHMM;
+      bus.gpsLost = false;
+      if (completion.snapToTerminal && Number.isFinite(completion.terminalLat) && Number.isFinite(completion.terminalLng)) {
+        bus.lat = completion.terminalLat;
+        bus.lng = completion.terminalLng;
+      }
+      cityFleetSim.delete(bus.key);
+      continue;
+    }
+
     seenKeys.add(bus.key);
 
     const baseId = `${bus.codigoLinea}-c${bus.identificadorCoche}`;
@@ -4732,6 +4758,160 @@ function stepCityFleetSim(dtSec, busesList = state.allFleetBuses) {
   }
 }
 
+function filterActiveCityFleetBuses(buses, nowSec = getArgentinaSecOfDay(), nowMs = Date.now()) {
+  if (!Array.isArray(buses) || buses.length === 0) return [];
+  const active = [];
+  for (const bus of buses) {
+    if (bus.serviceFinished || bus.enLineaAhora === false) {
+      cityFleetSim.delete(bus.key);
+      continue;
+    }
+    const comp = evaluateServiceCompletionStatus(bus, bus._scheduleModel || null, nowSec, {
+      entityType: 'coche',
+      nowMs
+    });
+    if (comp.finished) {
+      bus.serviceFinished = true;
+      bus.enLineaAhora = false;
+      bus.finishedReason = comp.reason;
+      bus.finishedLabel = comp.label;
+      bus.finishedPlace = comp.endPlace;
+      bus.finishedAtHHMM = comp.expectedEndHHMM;
+      if (comp.snapToTerminal && Number.isFinite(comp.terminalLat) && Number.isFinite(comp.terminalLng)) {
+        bus.lat = comp.terminalLat;
+        bus.lng = comp.terminalLng;
+      }
+      cityFleetSim.delete(bus.key);
+      continue;
+    }
+    active.push(bus);
+  }
+  return active;
+}
+
+/**
+ * Reconciles stale Worker "enLineaAhora" flags against the real schedule + GPS + terminal
+ * coherence engine (`evaluateServiceCompletionStatus`), returning shallow copies where cars
+ * or drivers whose service/turno already finished are immediately marked offline (`Finalizó`).
+ */
+function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec) {
+  const rawCars = Array.isArray(allCoches) ? allCoches : [];
+  const rawDrivers = Array.isArray(allChoferes) ? allChoferes : [];
+  if (!model) {
+    return { coches: rawCars, choferes: rawDrivers, liveMatchByCoche: new Map() };
+  }
+  const nowMs = Date.now();
+  const rawLiveCoches = rawCars.filter((c) => c.enLineaAhora);
+  const rawMatchByCoche =
+    rawLiveCoches.length > 0
+      ? matchFreeFleetUnitsToModel(model, rawLiveCoches, nowSec, state.lastRealGpsByUnit)
+      : new Map();
+
+  const normDrv = (s) => String(s || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  const sameDrv = (legA, nameA, legB, nameB) => {
+    const la = String(legA || '').trim().toUpperCase();
+    const lb = String(legB || '').trim().toUpperCase();
+    if (la && lb) return la === lb;
+    const na = normDrv(nameA);
+    const nb = normDrv(nameB);
+    return Boolean(na && nb && na === nb);
+  };
+
+  const liveCarById = new Map();
+  const finishedCarIds = new Set();
+  const coches = rawCars.map((c) => {
+    const meta = c.enLineaAhora
+      ? rawMatchByCoche.get(c.coche) || resolveUnitScheduleMeta(model, c, nowSec)
+      : resolveUnitScheduleMeta(model, c, nowSec);
+    const comp = meta
+      ? evaluateServiceCompletionStatus(c, model, nowSec, {
+          entityType: 'coche',
+          srvMeta: meta,
+          nowMs
+        })
+      : null;
+    if (c.enLineaAhora) {
+      if (comp?.finished) {
+        finishedCarIds.add(c.coche);
+        return {
+          ...c,
+          enLineaAhora: false,
+          serviceFinished: true,
+          finishedReason: comp.reason,
+          finishedLabel: comp.label,
+          finishedPlace: comp.endPlace,
+          finishedAtHHMM: comp.expectedEndHHMM
+        };
+      }
+      liveCarById.set(c.coche, c);
+      return c;
+    }
+    if (comp?.finished) {
+      return {
+        ...c,
+        serviceFinished: true,
+        finishedReason: comp.reason,
+        finishedLabel: comp.label,
+        finishedPlace: comp.endPlace,
+        finishedAtHHMM: comp.expectedEndHHMM
+      };
+    }
+    return c;
+  });
+
+  const liveMatchByCoche = new Map();
+  for (const [carId, meta] of rawMatchByCoche.entries()) {
+    if (!finishedCarIds.has(carId)) liveMatchByCoche.set(carId, meta);
+  }
+
+  const choferes = rawDrivers.map((d) => {
+    const liveCar = d.lastCoche ? liveCarById.get(d.lastCoche) || null : null;
+    const carTakenByOtherDriver = Boolean(
+      liveCar &&
+        (liveCar.lastChoferLegajo || liveCar.lastChoferNombre) &&
+        !sameDrv(d.choferLegajo, d.choferNombre, liveCar.lastChoferLegajo, liveCar.lastChoferNombre)
+    );
+    const meta =
+      (!carTakenByOtherDriver && d.enLineaAhora && d.lastCoche && rawMatchByCoche.get(d.lastCoche)) ||
+      resolveUnitScheduleMeta(model, d, nowSec);
+    const comp = meta
+      ? evaluateServiceCompletionStatus(d, model, nowSec, {
+          entityType: 'chofer',
+          srvMeta: meta,
+          nowMs
+        })
+      : null;
+
+    if (d.enLineaAhora) {
+      if (comp?.finished || carTakenByOtherDriver || (d.lastCoche && finishedCarIds.has(d.lastCoche))) {
+        return {
+          ...d,
+          enLineaAhora: false,
+          serviceFinished: true,
+          finishedReason: comp?.reason || (carTakenByOtherDriver ? 'turno_ended' : 'service_ended'),
+          finishedLabel: comp?.label || (carTakenByOtherDriver ? 'Turno finalizado' : 'Servicio finalizado'),
+          finishedPlace: comp?.endPlace || '',
+          finishedAtHHMM: comp?.expectedEndHHMM || ''
+        };
+      }
+      return d;
+    }
+    if (comp?.finished) {
+      return {
+        ...d,
+        serviceFinished: true,
+        finishedReason: comp.reason,
+        finishedLabel: comp.label,
+        finishedPlace: comp.endPlace,
+        finishedAtHHMM: comp.expectedEndHHMM
+      };
+    }
+    return d;
+  });
+
+  return { coches, choferes, liveMatchByCoche };
+}
+
 let allFleetFetchSeq = 0;
 async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
   if (!state.allFleetMode) return;
@@ -4751,7 +4931,7 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     }
     // Also merge any fresh live buses currently seen at the active stop or corridor radar
     for (const b of [...(state.arribos || []), ...(state.corridorFleet || [])]) {
-      if (b.isPredicted || b.gpsLost) continue;
+      if (b.isPredicted || b.gpsLost || b.serviceFinished) continue;
       const cod = Number(b.codigoLinea);
       const coche = String(b.identificadorCoche || b.coche || '').trim();
       const la = typeof b.lat === 'number' ? b.lat : parseFloat(b.latitud);
@@ -4785,29 +4965,35 @@ async function refreshAllFleetBuses({ fit = false, silent = true } = {}) {
     // Enrich with cached immutable schedule models immediately when already loaded
     const nowSec = getArgentinaSecOfDay();
     const todayTipo = getArgentinaTodayTipo();
-    state.allFleetBuses = Array.from(byKey.values());
-    const missingAssetLines = enrichCityFleetWithSchedules(state.allFleetBuses, nowSec, todayTipo);
+    const candidateBuses = Array.from(byKey.values());
+    const missingAssetLines = enrichCityFleetWithSchedules(candidateBuses, nowSec, todayTipo);
+    state.allFleetBuses = filterActiveCityFleetBuses(candidateBuses, nowSec);
 
     reconcileCityFleetSim(state.allFleetBuses);
     transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
+    updateAllFleetButtonUi();
     if (state.allFleetRosterOpen) renderAllFleetRoster();
     if (state.simulateMode && state.allFleetBuses.length > 0) {
       startSimLoop();
     }
 
     // Load both street polylines AND immutable schedules for active lines in the background (cached forever)
-    // so every bus has exact BANDERA direction lock + Service/Turno/Vuelta in EN VIVO mode
+    // so every bus has exact BANDERA direction lock + Service/Turno/Vuelta + completion coherence in EN VIVO mode
     if (missingAssetLines.length > 0) {
       ensureScheduleAssetsLoaded(missingAssetLines)
         .then(() => {
           if (!state.allFleetMode || seq !== allFleetFetchSeq) return;
-          enrichCityFleetWithSchedules(state.allFleetBuses, getArgentinaSecOfDay(), getArgentinaTodayTipo());
+          const postNowSec = getArgentinaSecOfDay();
+          enrichCityFleetWithSchedules(state.allFleetBuses, postNowSec, getArgentinaTodayTipo());
+          state.allFleetBuses = filterActiveCityFleetBuses(state.allFleetBuses, postNowSec);
           reconcileCityFleetSim(state.allFleetBuses);
           transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
+          updateAllFleetButtonUi();
           if (state.allFleetRosterOpen) renderAllFleetRoster();
           if (state.inspectorOpen && state.selectedBusKey?.startsWith('city:')) {
             const refreshed = state.allFleetBuses.find((b) => b.key === state.selectedBusKey);
             if (refreshed) updateInspectorFields(refreshed);
+            else closeBusInspector();
           }
           if (state.simulateMode && state.allFleetBuses.length > 0) {
             startSimLoop();
@@ -4865,12 +5051,19 @@ async function openAllFleetBusInspector(busKey) {
   haptic('light');
   state.selectedBusKey = bus.key;
   state.inspectorOpen = true;
-  state.followSelectedBus = true;
+  state.followSelectedBus = !bus.serviceFinished;
   updateInspectorFields(bus);
   el.busInspector.classList.remove('hidden');
   syncInspectorLayoutHeight();
   transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: bus.key, simulateMode: state.simulateMode });
-  transitMap.focusBus(bus, Math.max(15.5, transitMap.map.getZoom()));
+  const targetZoom = Math.max(15.5, transitMap.map.getZoom());
+  transitMap.focusBus(bus, targetZoom);
+  requestAnimationFrame(() => {
+    if (state.inspectorOpen && state.selectedBusKey === bus.key) {
+      syncInspectorLayoutHeight();
+      transitMap.focusBus(bus, targetZoom);
+    }
+  });
 
   // Resolve exact immutable Service / Turno / Vuelta & true BANDERA asynchronously if that line's archive wasn't loaded yet
   await ensureScheduleAssetsLoaded([bus.codigoLinea]);
@@ -4878,6 +5071,7 @@ async function openAllFleetBusInspector(busKey) {
   const horFile = state.horariosArchiveCache.get(bus.codigoLinea) || null;
   if (branches.length && horFile) {
     const { model } = buildEffectiveLineScheduleModel(bus.codigoLinea, branches, getArgentinaDayKey());
+    const nowSec = getArgentinaSecOfDay();
     const meta = resolveUnitScheduleMeta(
       model,
       {
@@ -4890,10 +5084,11 @@ async function openAllFleetBusInspector(busKey) {
         lastSeenAt: bus.lastSeenAt,
         enLineaAhora: true
       },
-      getArgentinaSecOfDay()
+      nowSec
     );
     if (meta) {
       applyScheduleMetaToCityBus(bus, meta);
+      bus._scheduleModel = model;
       reconcileCityFleetSim(state.allFleetBuses);
       transitMap.updateAllFleetBuses(state.allFleetBuses, { selectedBusKey: state.selectedBusKey, simulateMode: state.simulateMode });
       if (state.inspectorOpen && state.selectedBusKey === bus.key) {
@@ -5052,23 +5247,21 @@ function buildGlobalEventsForDay(dayOffset = 0, bundleData = null) {
         allCoches.push(...byNum.values());
       }
 
-      const liveCoches = isToday ? allCoches.filter((c) => c.enLineaAhora) : [];
-      const liveMatchByCoche =
-        isToday && liveCoches.length > 0
-          ? matchFreeFleetUnitsToModel(model, liveCoches, nowSec, state.lastRealGpsByUnit)
-          : new Map();
+      const sanitized = isToday
+        ? sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
+        : { coches: allCoches, choferes: allChoferes, liveMatchByCoche: new Map() };
 
       const built = buildFlotaDayAssignments({
         model,
         schedSummary: model.fleetSummary,
         trips: dayTrips,
         dayObs,
-        allCoches,
-        allChoferes,
+        allCoches: sanitized.coches,
+        allChoferes: sanitized.choferes,
         dayKey: targetDayKey,
         isToday,
         nowSec: isToday ? nowSec : 26 * 3600,
-        liveMatchByCoche
+        liveMatchByCoche: sanitized.liveMatchByCoche
       });
       blockAssignMap = built.blockAssignMap || new Map();
     }
@@ -5763,12 +5956,14 @@ async function locateFleetUnitOnMap({
   desvioSec = 0,
   enLineaAhora = false,
   lastSeenLabel = '',
-  serviceMeta = null
+  serviceMeta = null,
+  entityType = 'coche'
 } = {}) {
   const numCod = Number(codLinea);
   if (!numCod) return;
   stopTrackedUnit();
   const mySeq = ++trackedUnitSeq;
+  const resolvedEntityType = entityType === 'chofer' ? 'chofer' : 'coche';
 
   const resolvedLineName =
     lineName ||
@@ -5812,7 +6007,18 @@ async function locateFleetUnitOnMap({
     return '';
   };
 
-  const buildTrackedBusObj = (raw, meta, isLiveNow) => {
+  const focusBusAfterLayout = (targetBus, zoom = 15.5) => {
+    if (!targetBus) return;
+    transitMap.focusBus(targetBus, zoom);
+    requestAnimationFrame(() => {
+      if (state.trackedUnit?.seq === mySeq && state.inspectorOpen && state.selectedBusKey === targetBus.key) {
+        syncInspectorLayoutHeight();
+        transitMap.focusBus(targetBus, zoom);
+      }
+    });
+  };
+
+  const buildTrackedBusObj = (raw, meta, isLiveNow, evalEntityType = 'coche') => {
     const bLat = parseFloat(raw.lat ?? raw.latitud);
     const bLng = parseFloat(raw.lng ?? raw.longitud);
     const hasCoords = !Number.isNaN(bLat) && !Number.isNaN(bLng) && (bLat !== 0 || bLng !== 0);
@@ -5824,7 +6030,9 @@ async function locateFleetUnitOnMap({
       (meta?.serviceNumber && model?.blocks
         ? model.blocks.find(
             (b) => b.serviceNumber === Number(meta.serviceNumber) && b.turnoIndex === Number(meta.turnoIndex || 1)
-          ) || null
+          ) ||
+          model.blocks.find((b) => b.serviceNumber === Number(meta.serviceNumber)) ||
+          null
         : null);
     const startHHMM = meta?.startHHMM || (resolvedBi ? formatSecHHMM(resolvedBi.startSec) : '');
     const endHHMM = meta?.endHHMM || (resolvedBi ? formatSecHHMM(resolvedBi.endSec) : '');
@@ -5858,8 +6066,8 @@ async function locateFleetUnitOnMap({
       ultimaFechaHoraGPS: gpsRaw,
       gpsTimeOnly: formatGpsTimeOnly(gpsRaw),
       lastSeenLabel,
-      serviceNumber: meta?.serviceNumber || null,
-      turnoIndex: meta?.turnoIndex || 1,
+      serviceNumber: meta?.serviceNumber || resolvedBi?.serviceNumber || null,
+      turnoIndex: meta?.turnoIndex || resolvedBi?.turnoIndex || 1,
       serviceTurnosCount: meta?.serviceTurnosCount || resolvedBi?.serviceTurnosCount || 1,
       lapNumber: meta?.lapNumber || null,
       shiftLaps: meta?.shiftLaps || resolvedBi?.shiftLaps || null,
@@ -5877,12 +6085,41 @@ async function locateFleetUnitOnMap({
       turnoEndSec: typeof meta?.endSec === 'number' ? meta.endSec : resolvedBi?.endSec ?? null,
       serviceSpan,
       enLineaAhora: Boolean(isLiveNow),
+      serviceFinished: false,
       isFreeTracked: true,
       isPredicted: false
     };
-    // Resolve the bus's true current BANDERA from physical GPS vector, trail, carriageway lane, or schedule
-    // (NEVER showing the queried anchor stop's bandera when the bus is physically heading the opposite way!)
-    if (hasCoords && branches.length > 0) {
+
+    // Cross-check schedule + desvio + last GPS + terminal distance coherence:
+    // If service/turno already finished, park stationary at the finishing punta de línea and never simulate movement!
+    const completion = evaluateServiceCompletionStatus(obj, model, getArgentinaSecOfDay(), {
+      entityType: evalEntityType,
+      srvMeta: meta,
+      blockInfo: resolvedBi
+    });
+    if (completion.finished) {
+      obj.serviceFinished = true;
+      obj.enLineaAhora = false;
+      obj.finishedReason = completion.reason;
+      obj.finishedLabel = completion.label;
+      obj.finishedPlace = completion.endPlace;
+      obj.finishedAtHHMM = completion.expectedEndHHMM;
+      if (completion.snapToTerminal && Number.isFinite(completion.terminalLat) && Number.isFinite(completion.terminalLng)) {
+        obj.lat = completion.terminalLat;
+        obj.lng = completion.terminalLng;
+        obj.terminalSnapped = true;
+      }
+      const lastBiTrip = Array.isArray(resolvedBi?.trips) && resolvedBi.trips.length > 0
+        ? resolvedBi.trips[resolvedBi.trips.length - 1]
+        : null;
+      if (lastBiTrip?.branch?.bandera) {
+        obj._matchedBranch = lastBiTrip.branch;
+        obj.realBandera = lastBiTrip.branch.bandera;
+        obj.realBanderaColor = lastBiTrip.branch.color || getLineColor(resolvedLineName);
+      }
+    } else if (hasCoords && branches.length > 0) {
+      // Resolve the bus's true current BANDERA from physical GPS vector, trail, carriageway lane, or schedule
+      // (NEVER showing the queried anchor stop's bandera when the bus is physically heading the opposite way!)
       const gpsMs = parseGpsTimestampMs(gpsRaw);
       const rec = bCoche
         ? recordUnitGpsFix(`${numCod}-c${bCoche}`, numCod, bCoche, bLat, bLng, gpsRaw, Date.now())
@@ -5919,12 +6156,14 @@ async function locateFleetUnitOnMap({
   const initBus = buildTrackedBusObj(
     { lat, lng, coche, choferNombre, choferLegajo, esAdaptado, bandera, lastGps, desvioRaw, desvioSec },
     initialMeta,
-    enLineaAhora
+    enLineaAhora,
+    resolvedEntityType
   );
 
   const tracker = {
     codLinea: numCod,
     lineName: resolvedLineName,
+    entityType: resolvedEntityType,
     coche: String(coche || '').trim(),
     choferNombre: String(choferNombre || '').trim(),
     choferLegajo: String(choferLegajo || '').trim(),
@@ -5939,7 +6178,7 @@ async function locateFleetUnitOnMap({
     reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
     state.selectedBusKey = initBus.key;
     state.inspectorOpen = true;
-    state.followSelectedBus = true;
+    state.followSelectedBus = !initBus.serviceFinished;
     updateInspectorFields(initBus);
     el.busInspector.classList.remove('hidden');
     syncInspectorLayoutHeight();
@@ -5948,8 +6187,10 @@ async function locateFleetUnitOnMap({
       selectedBusKey: initBus.key,
       simulateMode: state.simulateMode
     });
-    if (state.simulateMode) startSimLoop();
-    transitMap.focusBus(initBus, 15.5);
+    if (state.simulateMode && tracker.buses.some((b) => !b.serviceFinished && b.enLineaAhora !== false)) {
+      startSimLoop();
+    }
+    focusBusAfterLayout(initBus, 15.5);
   } else {
     showToast(`Buscando ubicación en vivo de ${choferNombre || `Coche #${coche}`} (${resolvedLineName})...`, 'info', 2200);
   }
@@ -5988,27 +6229,55 @@ async function locateFleetUnitOnMap({
       const liveBuses = liveUnits.map((u) => {
         const c = String(u.identificadorCoche || '').trim();
         const meta = matchedMap.get(c) || resolveUnitScheduleMeta(model, u, nowSec, state.lastRealGpsByUnit);
-        return buildTrackedBusObj(u, meta, true);
+        return buildTrackedBusObj(u, meta, true, 'coche');
       });
 
       const normTargetName = tracker.choferNombre.toUpperCase();
-      const found =
-        liveBuses.find(
-          (b) =>
-            (tracker.choferLegajo && b.choferLegajo && b.choferLegajo === tracker.choferLegajo) ||
-            (normTargetName && b.choferNombre && b.choferNombre.toUpperCase().includes(normTargetName))
-        ) ||
-        liveBuses.find((b) => tracker.coche && b.identificadorCoche === tracker.coche) ||
-        null;
+      const matchesDriver = (b) =>
+        (tracker.choferLegajo && b.choferLegajo && b.choferLegajo === tracker.choferLegajo) ||
+        (normTargetName && b.choferNombre && b.choferNombre.toUpperCase().includes(normTargetName));
+
+      let found = null;
+      if (tracker.entityType === 'chofer') {
+        found =
+          liveBuses.find(matchesDriver) ||
+          (!initBus.serviceFinished
+            ? liveBuses.find((b) => tracker.coche && b.identificadorCoche === tracker.coche && !b.choferNombre && !b.choferLegajo)
+            : null) ||
+          null;
+        if (found) {
+          const drvComp = evaluateServiceCompletionStatus(found, model, nowSec, { entityType: 'chofer' });
+          if (drvComp.finished) {
+            found.serviceFinished = true;
+            found.enLineaAhora = false;
+            found.finishedReason = drvComp.reason;
+            found.finishedLabel = drvComp.label;
+            found.finishedPlace = drvComp.endPlace;
+            found.finishedAtHHMM = drvComp.expectedEndHHMM;
+            if (drvComp.snapToTerminal && Number.isFinite(drvComp.terminalLat) && Number.isFinite(drvComp.terminalLng)) {
+              found.lat = drvComp.terminalLat;
+              found.lng = drvComp.terminalLng;
+              found.terminalSnapped = true;
+            }
+          }
+        }
+      } else {
+        found =
+          liveBuses.find((b) => tracker.coche && b.identificadorCoche === tracker.coche) ||
+          liveBuses.find(matchesDriver) ||
+          null;
+      }
+
+      const activeOtherBuses = liveBuses.filter((b) => !b.serviceFinished);
 
       if (found) {
         tracker.bus = found;
         tracker.coche = found.identificadorCoche || tracker.coche;
-        tracker.buses = liveBuses;
+        tracker.buses = [found, ...activeOtherBuses.filter((b) => b.key !== found.key)];
         reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
         state.selectedBusKey = found.key;
         state.inspectorOpen = true;
-        if (isFirst) state.followSelectedBus = true;
+        if (isFirst) state.followSelectedBus = !found.serviceFinished;
         updateInspectorFields(found);
         el.busInspector.classList.remove('hidden');
         syncInspectorLayoutHeight();
@@ -6017,18 +6286,24 @@ async function locateFleetUnitOnMap({
           selectedBusKey: found.key,
           simulateMode: state.simulateMode
         });
-        if (state.simulateMode) startSimLoop();
+        if (state.simulateMode && tracker.buses.some((b) => !b.serviceFinished && b.enLineaAhora !== false)) {
+          startSimLoop();
+        }
         if (isFirst) {
-          transitMap.focusBus(found, 15.5);
+          focusBusAfterLayout(found, 15.5);
           const srvTxt = found.serviceNumber ? `Servicio ${found.serviceNumber}` : '';
           const lapTxt = found.lapNumber ? `, vuelta ${formatLapSpoken(found.lapNumber)}` : '';
           const spanTxt = found.serviceSpan ? `, horario ${found.serviceSpan}` : '';
           announce(
-            `Ubicado en vivo: Línea ${resolvedLineName}, coche ${found.identificadorCoche}${
-              found.choferNombre ? `, chofer ${found.choferNombre}` : ''
-            }${srvTxt ? `, ${srvTxt}` : ''}${lapTxt}${spanTxt}.`
+            found.serviceFinished
+              ? `Línea ${resolvedLineName}, coche ${found.identificadorCoche}, ${found.finishedLabel || 'servicio finalizado'}${
+                  found.finishedPlace ? ` en ${found.finishedPlace}` : ''
+                }.`
+              : `Ubicado en vivo: Línea ${resolvedLineName}, coche ${found.identificadorCoche}${
+                  found.choferNombre ? `, chofer ${found.choferNombre}` : ''
+                }${srvTxt ? `, ${srvTxt}` : ''}${lapTxt}${spanTxt}.`
           );
-        } else if (state.followSelectedBus) {
+        } else if (state.followSelectedBus && !found.serviceFinished) {
           transitMap.followBus(found);
         }
       } else if (isFirst) {
@@ -6041,31 +6316,63 @@ async function locateFleetUnitOnMap({
           if (recorridos.length > 0) {
             transitMap.drawRouteCollection(recorridos, resolvedLineName, { showStops: true, fit: true });
           }
-          if (liveBuses.length > 0) {
-            tracker.buses = liveBuses;
+          if (activeOtherBuses.length > 0) {
+            tracker.buses = activeOtherBuses;
             reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
-            transitMap.updateBuses(liveBuses, { filterLine: 'ALL', selectedBusKey: null, simulateMode: state.simulateMode });
+            transitMap.updateBuses(activeOtherBuses, { filterLine: 'ALL', selectedBusKey: null, simulateMode: state.simulateMode });
             if (state.simulateMode) startSimLoop();
           }
         } else {
-          // Keep last-known pin + also show any other currently live buses of the line
-          const merged = [initBus, ...liveBuses.filter((b) => b.key !== initBus.key)];
+          // Keep last-known/terminal pin + also show any other currently active buses of the line
+          const merged = [initBus, ...activeOtherBuses.filter((b) => b.key !== initBus.key)];
           tracker.buses = merged;
           reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
           transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: initBus.key, simulateMode: state.simulateMode });
-          if (state.simulateMode) startSimLoop();
+          if (state.inspectorOpen && state.selectedBusKey === initBus.key) {
+            updateInspectorFields(initBus);
+          }
+          if (state.simulateMode && merged.some((b) => !b.serviceFinished && b.enLineaAhora !== false)) {
+            startSimLoop();
+          }
+          if (initBus.serviceFinished) {
+            announce(
+              `Línea ${resolvedLineName}, coche ${initBus.identificadorCoche}${
+                initBus.choferNombre ? `, chofer ${initBus.choferNombre}` : ''
+              }, ${initBus.finishedLabel || 'servicio finalizado'}${
+                initBus.finishedPlace ? ` en ${initBus.finishedPlace}` : ''
+              }.`
+            );
+          }
         }
       } else if (tracker.bus && tracker.bus.lat !== null) {
-        // Tracked bus is currently absent from live GPS -> keep running smooth schedule-driven simulation!
+        // Tracked bus is currently absent from live GPS -> re-check completion; if still active, keep smooth simulation, if finished, keep stationary at terminal!
         const keptBus = tracker.bus;
-        const merged = [keptBus, ...liveBuses.filter((b) => b.key !== keptBus.key)];
+        if (!keptBus.serviceFinished) {
+          const reComp = evaluateServiceCompletionStatus(keptBus, model, nowSec, { entityType: tracker.entityType });
+          if (reComp.finished) {
+            keptBus.serviceFinished = true;
+            keptBus.enLineaAhora = false;
+            keptBus.finishedReason = reComp.reason;
+            keptBus.finishedLabel = reComp.label;
+            keptBus.finishedPlace = reComp.endPlace;
+            keptBus.finishedAtHHMM = reComp.expectedEndHHMM;
+            if (reComp.snapToTerminal && Number.isFinite(reComp.terminalLat) && Number.isFinite(reComp.terminalLng)) {
+              keptBus.lat = reComp.terminalLat;
+              keptBus.lng = reComp.terminalLng;
+              keptBus.terminalSnapped = true;
+            }
+          }
+        }
+        const merged = [keptBus, ...activeOtherBuses.filter((b) => b.key !== keptBus.key)];
         tracker.buses = merged;
         reconcileCityFleetSim(tracker.buses, { keepOtherKeys: true });
         transitMap.updateBuses(merged, { filterLine: 'ALL', selectedBusKey: keptBus.key, simulateMode: state.simulateMode });
         if (state.inspectorOpen && state.selectedBusKey === keptBus.key) {
           updateInspectorFields(keptBus);
         }
-        if (state.simulateMode) startSimLoop();
+        if (state.simulateMode && merged.some((b) => !b.serviceFinished && b.enLineaAhora !== false)) {
+          startSimLoop();
+        }
       }
     } catch {
       // Keep last-known pin on transient error
@@ -8637,16 +8944,17 @@ function renderLineFlotaView() {
   const meta = data.meta || {};
   const model = fv.model || null;
   const nowSec = getArgentinaSecOfDay();
-  const allCoches = Array.isArray(data.coches) ? data.coches : [];
-  const allChoferes = Array.isArray(data.choferes) ? data.choferes : [];
+  const rawAllCoches = Array.isArray(data.coches) ? data.coches : [];
+  const rawAllChoferes = Array.isArray(data.choferes) ? data.choferes : [];
   const todayTrips = Array.isArray(data.todayTrips) ? data.todayTrips : [];
   const todayDayObs = Array.isArray(data.dayObs) && (!data.selectedDayKey || data.selectedDayKey === todayKey) ? data.dayObs : [];
 
-  // Globally match currently live cars to unique services so live cards never collide
-  const liveCoches = allCoches.filter((c) => c.enLineaAhora);
-  const liveMatchByCoche = model
-    ? matchFreeFleetUnitsToModel(model, liveCoches, nowSec, state.lastRealGpsByUnit)
-    : new Map();
+  // Reconcile stale Worker "enLineaAhora" flags against real schedule + GPS + terminal coherence
+  // and globally match genuinely active cars to unique services so live cards never collide
+  const sanitizedFleet = sanitizeLiveFleetAgainstSchedule(rawAllCoches, rawAllChoferes, model, nowSec);
+  const allCoches = sanitizedFleet.coches;
+  const allChoferes = sanitizedFleet.choferes;
+  const liveMatchByCoche = sanitizedFleet.liveMatchByCoche;
 
   const {
     blockAssignMap,
@@ -8929,6 +9237,10 @@ function renderLineFlotaView() {
           esAdaptado: Boolean(rec.esAdaptado || baseCar?.esAdaptado),
           vistoHoy: !isHistoricalSrvDay,
           enLineaAhora: Boolean(!isHistoricalSrvDay && rec.enLineaAhora),
+          serviceFinished: Boolean(!isHistoricalSrvDay && (rec.serviceFinished || baseCar?.serviceFinished)),
+          finishedLabel: rec.finishedLabel || baseCar?.finishedLabel || '',
+          finishedPlace: rec.finishedPlace || baseCar?.finishedPlace || '',
+          finishedAtHHMM: rec.finishedAtHHMM || baseCar?.finishedAtHHMM || '',
           lastChoferNombre: dName,
           lastChoferLegajo: dLeg,
           dayDrivers: driversList,
@@ -8949,6 +9261,12 @@ function renderLineFlotaView() {
         prev.dayDrivers = driversList;
         prev.esAdaptado = Boolean(prev.esAdaptado || rec.esAdaptado);
         prev.enLineaAhora = Boolean(prev.enLineaAhora || (!isHistoricalSrvDay && rec.enLineaAhora));
+        if (!isHistoricalSrvDay && rec.serviceFinished && !prev.enLineaAhora) {
+          prev.serviceFinished = true;
+          if (rec.finishedLabel) prev.finishedLabel = rec.finishedLabel;
+          if (rec.finishedPlace) prev.finishedPlace = rec.finishedPlace;
+          if (rec.finishedAtHHMM) prev.finishedAtHHMM = rec.finishedAtHHMM;
+        }
         if (seenAt >= prev.lastSeenAt) {
           prev.lastSeenAt = seenAt;
           if (dName) {
@@ -9002,6 +9320,10 @@ function renderLineFlotaView() {
           lastEsAdaptado: Boolean(rec.lastEsAdaptado || (coche && carMetaFallback.get(coche)?.esAdaptado)),
           vistoHoy: !isHistoricalSrvDay,
           enLineaAhora: Boolean(!isHistoricalSrvDay && rec.enLineaAhora),
+          serviceFinished: Boolean(!isHistoricalSrvDay && (rec.serviceFinished || baseDrv?.serviceFinished)),
+          finishedLabel: rec.finishedLabel || baseDrv?.finishedLabel || '',
+          finishedPlace: rec.finishedPlace || baseDrv?.finishedPlace || '',
+          finishedAtHHMM: rec.finishedAtHHMM || baseDrv?.finishedAtHHMM || '',
           lastBandera: rec.lastBandera || '',
           lastGps: rec.lastGps || '',
           lastStopId: rec.lastStopId || '',
@@ -9022,6 +9344,12 @@ function renderLineFlotaView() {
           prev.choferNombre = finalName;
         }
         prev.enLineaAhora = Boolean(prev.enLineaAhora || (!isHistoricalSrvDay && rec.enLineaAhora));
+        if (!isHistoricalSrvDay && rec.serviceFinished && !prev.enLineaAhora) {
+          prev.serviceFinished = true;
+          if (rec.finishedLabel) prev.finishedLabel = rec.finishedLabel;
+          if (rec.finishedPlace) prev.finishedPlace = rec.finishedPlace;
+          if (rec.finishedAtHHMM) prev.finishedAtHHMM = rec.finishedAtHHMM;
+        }
         if (seenAt >= prev.lastSeenAt) {
           prev.lastSeenAt = seenAt;
           if (coche) prev.lastCoche = coche;
@@ -9384,7 +9712,14 @@ function renderLineFlotaView() {
             .map((c) => {
               const seen = formatRosterSeenInfo(c.lastSeenAt, selectedServiceDayKey, todayKey);
               const isLiveNow = Boolean(!isHistoricalSrvDay && c.enLineaAhora);
-              const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
+              const isFinishedNow = Boolean(!isHistoricalSrvDay && !isLiveNow && c.serviceFinished);
+              const badgeLabel = isLiveNow
+                ? 'En línea'
+                : isFinishedNow
+                  ? c.finishedAtHHMM
+                    ? `Fin ${c.finishedAtHHMM}`
+                    : 'Finalizó'
+                  : seen.badge;
               const srvMeta = resolveDayCarMeta(c);
               const realBanderaTxt = resolveFlotaBandera(c.lastLat, c.lastLng, c.coche, srvMeta, c.lastBandera);
               const dayDrvs = Array.isArray(c.dayDrivers) ? c.dayDrivers : [];
@@ -9413,15 +9748,18 @@ function renderLineFlotaView() {
                 desvioSec: c.lastDesvioSec || 0,
                 enLineaAhora: isLiveNow,
                 lastSeenLabel: seen.whenShort,
-                serviceMeta: srvMeta
+                serviceMeta: srvMeta,
+                entityType: 'coche'
               });
               const srParts = [
                 `Coche ${c.coche}${c.esAdaptado ? ', unidad adaptada' : ''}`,
                 isLiveNow
                   ? `en línea ahora, visto ${seen.whenSpoken}`
-                  : seen.isToday
-                    ? `en servicio hoy, visto ${seen.whenSpoken}`
-                    : `visto ${seen.whenSpoken}`,
+                  : isFinishedNow
+                    ? `servicio finalizado${c.finishedPlace ? ` en ${c.finishedPlace}` : ''}, visto ${seen.whenSpoken}`
+                    : seen.isToday
+                      ? `en servicio hoy, visto ${seen.whenSpoken}`
+                      : `visto ${seen.whenSpoken}`,
                 formatServiceSpoken(srvMeta, isLiveNow),
                 dayDrvs.length > 0
                   ? `chofer: ${dayDrvs.map((x) => x.nombre).join(', ')}`
@@ -9516,7 +9854,14 @@ function renderLineFlotaView() {
             .map((d) => {
               const seen = formatRosterSeenInfo(d.lastSeenAt, selectedServiceDayKey, todayKey);
               const isLiveNow = Boolean(!isHistoricalSrvDay && d.enLineaAhora);
-              const badgeLabel = isLiveNow ? 'En línea' : seen.badge;
+              const isFinishedNow = Boolean(!isHistoricalSrvDay && !isLiveNow && d.serviceFinished);
+              const badgeLabel = isLiveNow
+                ? 'En línea'
+                : isFinishedNow
+                  ? d.finishedAtHHMM
+                    ? `Fin ${d.finishedAtHHMM}`
+                    : 'Finalizó'
+                  : seen.badge;
               const srvMeta = resolveDayDriverMeta(d);
               const realBanderaTxt = resolveFlotaBandera(d.lastLat, d.lastLng, d.lastCoche, srvMeta, d.lastBandera);
               const dayCars = Array.isArray(d.dayCars) && d.dayCars.length > 0 ? d.dayCars : d.lastCoche ? [d.lastCoche] : [];
@@ -9541,11 +9886,16 @@ function renderLineFlotaView() {
                 desvioSec: d.lastDesvioSec || 0,
                 enLineaAhora: isLiveNow,
                 lastSeenLabel: seen.whenShort,
-                serviceMeta: srvMeta
+                serviceMeta: srvMeta,
+                entityType: 'chofer'
               });
               const srParts = [
                 `Chofer ${d.choferNombre}${d.choferLegajo ? `, legajo ${d.choferLegajo}` : ''}`,
-                isLiveNow ? 'en línea ahora' : seen.whenSpoken,
+                isLiveNow
+                  ? 'en línea ahora'
+                  : isFinishedNow
+                    ? `${d.finishedLabel || 'servicio finalizado'}${d.finishedPlace ? ` en ${d.finishedPlace}` : ''}`
+                    : seen.whenSpoken,
                 formatServiceSpoken(srvMeta, isLiveNow),
                 dayCars.length > 0
                   ? `${isLiveNow ? 'en el coche' : 'coche'} ${dayCars.join(', ')}${d.lastEsAdaptado ? ', unidad adaptada' : ''}`
@@ -9631,7 +9981,16 @@ function renderLineFlotaView() {
                   const startHH = formatSecHHMM(t.startSec);
                   const endHH = formatSecHHMM(t.endSec);
                   const assign = activeSrvAssignMap.get(t.blockId) || null;
-                  const isLiveNow = !isHistoricalSrvDay && Boolean(assign?.enLineaAhora);
+                  const turnoBlockInfo = activeSrvModel?.blockInfoById?.get(t.blockId) || t;
+                  const turnoComp =
+                    !isHistoricalSrvDay && assign
+                      ? evaluateServiceCompletionStatus(assign, activeSrvModel || model, nowSec, {
+                          entityType: t.relevoToNext ? 'chofer' : 'coche',
+                          blockInfo: turnoBlockInfo
+                        })
+                      : null;
+                  const isLiveNow = !isHistoricalSrvDay && Boolean(assign?.enLineaAhora) && !turnoComp?.finished;
+                  const isTurnoFinished = !isHistoricalSrvDay && !isLiveNow && Boolean(turnoComp?.finished);
                   const regimeTxt = t.isCortado ? 'Cortado' : t.isRelevoEnLinea ? 'Relevo' : 'Corrido';
                   const lapsTxt = t.shiftLaps ? formatShiftLaps(t.shiftLaps) : '';
                   const tPlaces = describeTurnoPlaces(t, sTurnos.length);
@@ -9676,7 +10035,8 @@ function renderLineFlotaView() {
                         desvioRaw: assign.desvioRaw,
                         desvioSec: assign.desvioSec,
                         enLineaAhora: isLiveNow,
-                        lastSeenLabel: isLiveNow ? 'En línea' : 'Hoy',
+                        lastSeenLabel: isLiveNow ? 'En línea' : isTurnoFinished ? 'Finalizó' : 'Hoy',
+                        entityType: t.relevoToNext && assign.choferNombre ? 'chofer' : 'coche',
                         serviceMeta: {
                           serviceNumber: s.serviceNumber,
                           turnoIndex: t.turnoIndex,
@@ -9702,14 +10062,20 @@ function renderLineFlotaView() {
                           <strong>#${escapeHtml(assign.coche)}</strong>${drvLabel}
                         </span>
                         <span class="flota-status-pill ${isLiveNow ? 'is-live' : 'is-today'}">${escapeHtml(
-                          isLiveNow ? (lapLiveTxt ? `En línea · ${lapLiveTxt}` : 'En línea') : 'Hoy · Mapa ›'
+                          isLiveNow
+                            ? lapLiveTxt
+                              ? `En línea · ${lapLiveTxt}`
+                              : 'En línea'
+                            : isTurnoFinished
+                              ? 'Finalizó · Mapa ›'
+                              : 'Hoy · Mapa ›'
                         )}</span>
                       `;
                       const srLbl = `Servicio ${s.serviceNumber}, Turno ${t.turnoIndex} de ${startHH} a ${endHH}, ${lapsTxt}${
                         tPlaces.spoken ? `, ${tPlaces.spoken}` : ''
                       }. Coche ${assign.coche}${
                         assign.choferNombre ? `, chofer ${assign.choferNombre}` : ''
-                      }${isLiveNow ? ', en línea ahora' : ''}. Tocá para ver en el mapa.`;
+                      }${isLiveNow ? ', en línea ahora' : isTurnoFinished ? ', finalizado' : ''}. Tocá para ver en el mapa.`;
                       btnOpen = `<button type="button" class="srv-turno-row is-clickable ${isLiveNow ? 'is-live' : ''}" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srLbl)}">`;
                       btnClose = `</button>`;
                     }
@@ -9755,10 +10121,13 @@ function renderLineFlotaView() {
 
   const sched = fv.schedSummary;
   const cap = data.capacity || null;
+  const sanitizedActiveCars = allCoches.filter((c) => c.enLineaAhora).length;
   const activeNowCount =
-    typeof cap?.activeNow === 'number'
-      ? cap.activeNow
-      : allCoches.filter((c) => c.enLineaAhora).length;
+    allCoches.length > 0
+      ? sanitizedActiveCars
+      : typeof cap?.activeNow === 'number'
+        ? cap.activeNow
+        : 0;
   const peakSimultaneousToday =
     typeof cap?.peakSimultaneousToday === 'number' && cap.peakSimultaneousToday > 0
       ? cap.peakSimultaneousToday
@@ -10731,7 +11100,10 @@ function renderLineRecorridoView() {
               ? `<button type="button" id="btn-rec-scroll-now" class="seg-btn seg-btn-xs active">Ir a ahora</button>`
               : ''
           }
-          <button type="button" id="btn-rec-print" class="seg-btn seg-btn-xs" title="Imprimir o guardar esta grilla en PDF">PDF</button>
+          <button type="button" id="btn-rec-export-img" class="seg-btn seg-btn-xs" title="Exportar esta grilla de horarios como imagen PNG o JPG">
+            <svg viewBox="0 0 20 20" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><circle cx="7" cy="8" r="1.4"/><path d="M17.5 13l-4.2-4.2-5.3 5.3-2.2-2.2L2.5 15"/></svg>
+            <span>Imagen</span>
+          </button>
           <button type="button" id="btn-rec-fullscreen" class="seg-btn seg-btn-xs ${rv.fullscreen ? 'active' : ''}" aria-pressed="${Boolean(rv.fullscreen)}" aria-label="${rv.fullscreen ? 'Salir de pantalla completa' : 'Ver grilla en pantalla completa'}" title="${rv.fullscreen ? 'Volver al panel normal' : 'Expandir grilla a toda la pantalla'}">
             ${fullIconSvg}
             <span>${rv.fullscreen ? 'Reducir' : 'Pantalla completa'}</span>
@@ -10933,13 +11305,19 @@ function renderLineRecorridoView() {
     haptic('light');
     scrollNowCol(true);
   });
-  document.getElementById('btn-rec-print')?.addEventListener('click', () => {
-    const tbl = el.lineasContent.querySelector('.rec-matrix-table');
-    if (!tbl) return;
+  document.getElementById('btn-rec-export-img')?.addEventListener('click', () => {
+    if (!model || !branches.length) return;
     haptic('light');
-    const tipoTxt = rv.tipoDia === 'domingo' ? 'Domingo / Feriado' : rv.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie';
-    const subTxt = `${activeBranch.bandera || 'Recorrido'} · ${tipoTxt}${rv.serviceFilter !== 'ALL' ? ` · Servicio ${rv.serviceFilter}` : ''}`;
-    uiExtras?.printScheduleTable(`Línea ${linea.descripcion} — Horarios`, subTxt, tbl);
+    const tipoLabel = rv.tipoDia === 'domingo' ? 'Domingo / Feriado' : rv.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    uiExtras?.openScheduleExportModal({
+      linea,
+      model,
+      branches,
+      activeBranchIdx: rv.branchIdx,
+      tipoDia: rv.tipoDia,
+      tipoLabel,
+      serviceFilter: rv.serviceFilter
+    });
   });
   document.getElementById('btn-rec-fullscreen')?.addEventListener('click', () => {
     const wrap = document.getElementById('rec-matrix-scroll');
@@ -11493,9 +11871,61 @@ function renderGlobalSearchResults(rawQuery) {
         if (el.globalSearch.value.trim() !== q) return;
         const hits = Array.isArray(res?.data?.results) ? res.data.results : [];
         const todayKey = res?.data?.dayKey || getArgentinaDayKey();
+        const nowSecSearch = getArgentinaSecOfDay();
+        const parseHHMMSecQuick = (hhmm) => {
+          const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})/);
+          if (!m) return null;
+          let s = Number(m[1]) * 3600 + Number(m[2]) * 60;
+          if (s < 3 * 3600) s += 86400;
+          return s;
+        };
         const fleetItems = hits.slice(0, 6).map((h) => {
           const seen = formatRosterSeenInfo(h.lastSeenAt, h.lastDayKey, todayKey);
-          const statusTxt = h.enLineaAhora ? 'En línea' : seen.badge;
+          const hitEntityType = h.type === 'chofer' ? 'chofer' : 'coche';
+          const cachedBranches = state.routeBranchesCache.get(Number(h.codigoLinea)) || [];
+          const cachedHor = state.horariosArchiveCache.get(Number(h.codigoLinea)) || null;
+          const cachedModel =
+            cachedBranches.length && cachedHor
+              ? buildEffectiveLineScheduleModel(Number(h.codigoLinea), cachedBranches, todayKey).model
+              : null;
+          const endSecQuick = parseHHMMSecQuick(h.lastTurnoEnd);
+          const hitComp =
+            h.lastDayKey === todayKey && (cachedModel || endSecQuick !== null)
+              ? evaluateServiceCompletionStatus(
+                  {
+                    lat: h.lastLat,
+                    lng: h.lastLng,
+                    ultimaFechaHoraGPS: h.lastGps,
+                    lastSeenAt: h.lastSeenAt,
+                    desvioSec: h.lastDesvioSec,
+                    desvioRaw: h.lastDesvioRaw,
+                    serviceNumber: h.lastServiceNum,
+                    turnoIndex: h.lastTurnoIdx || 1,
+                    turnoEndSec: endSecQuick
+                  },
+                  cachedModel,
+                  nowSecSearch,
+                  {
+                    entityType: hitEntityType,
+                    srvMeta:
+                      h.lastServiceNum > 0 || endSecQuick !== null
+                        ? {
+                            serviceNumber: h.lastServiceNum,
+                            turnoIndex: h.lastTurnoIdx || 1,
+                            endSec: endSecQuick
+                          }
+                        : null
+                  }
+                )
+              : null;
+          const effLive = Boolean(h.enLineaAhora && !hitComp?.finished);
+          const statusTxt = effLive
+            ? 'En línea'
+            : hitComp?.finished
+              ? hitComp.expectedEndHHMM
+                ? `Fin ${hitComp.expectedEndHHMM}`
+                : 'Finalizó'
+              : seen.badge;
           const srvPart =
             h.lastServiceNum > 0
               ? `Srv ${h.lastServiceNum}${h.lastTurnoStart && h.lastTurnoEnd ? ` (${h.lastTurnoStart}–${h.lastTurnoEnd})` : ''}`
@@ -11534,8 +11964,9 @@ function renderGlobalSearchResults(rawQuery) {
                 lastStopId: h.lastStopId,
                 desvioRaw: h.lastDesvioRaw,
                 desvioSec: h.lastDesvioSec,
-                enLineaAhora: h.enLineaAhora,
+                enLineaAhora: effLive,
                 lastSeenLabel: seen.whenShort,
+                entityType: hitEntityType,
                 serviceMeta:
                   h.lastServiceNum > 0
                     ? {
@@ -11639,7 +12070,9 @@ function bindEvents() {
           selectedBusKey: state.selectedBusKey,
           simulateMode: true
         });
-        startSimLoop();
+        if (state.trackedUnit.buses.some((b) => !b.serviceFinished && b.enLineaAhora !== false)) {
+          startSimLoop();
+        }
       }
       if (state.allFleetMode && state.allFleetBuses.length > 0) {
         reconcileCityFleetSim(state.allFleetBuses);
@@ -11660,7 +12093,7 @@ function bindEvents() {
       }
       if (state.trackedUnit?.buses?.length > 0) {
         for (const b of state.trackedUnit.buses) {
-          if (typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
+          if (!b.serviceFinished && typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
             b.lat = b.rawLat;
             b.lng = b.rawLng;
           }
@@ -11673,7 +12106,7 @@ function bindEvents() {
       }
       if (state.allFleetMode && state.allFleetBuses.length > 0) {
         for (const b of state.allFleetBuses) {
-          if (typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
+          if (!b.serviceFinished && typeof b.rawLat === 'number' && typeof b.rawLng === 'number') {
             b.lat = b.rawLat;
             b.lng = b.rawLng;
           }
@@ -11705,11 +12138,6 @@ function bindEvents() {
   el.btnLedBoard?.addEventListener('click', () => {
     haptic('light');
     uiExtras?.openLedBoard();
-  });
-
-  el.btnOpenPlanner?.addEventListener('click', () => {
-    haptic('light');
-    uiExtras?.openTripPlannerModal();
   });
 
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
@@ -11848,7 +12276,8 @@ function bindEvents() {
     const bus = getCurrentlySelectedBus();
     if (bus) {
       haptic('light');
-      state.followSelectedBus = true;
+      state.followSelectedBus = !bus.serviceFinished;
+      syncInspectorLayoutHeight();
       transitMap.focusBus(bus, Math.max(16, transitMap.map.getZoom()));
       updateInspectorFields(bus);
     }
@@ -12124,7 +12553,7 @@ function bindEvents() {
     }
 
     const ledOverlayEl = document.getElementById('led-board-overlay');
-    const plannerModalEl = document.getElementById('trip-planner-modal');
+    const schedExportModalEl = document.getElementById('schedule-export-modal');
     const profileModalEl = document.getElementById('profile-modal');
 
     if (ledOverlayEl && !ledOverlayEl.classList.contains('hidden')) {
@@ -12137,9 +12566,9 @@ function bindEvents() {
         uiExtras?.closeProfileModal();
         return;
       }
-    } else if (plannerModalEl && !plannerModalEl.classList.contains('hidden')) {
+    } else if (schedExportModalEl && !schedExportModalEl.classList.contains('hidden')) {
       if (e.key === 'Escape') {
-        uiExtras?.closePlannerModal();
+        uiExtras?.closeScheduleExportModal();
         return;
       }
     } else if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
@@ -12349,7 +12778,11 @@ function resumeRealtime() {
       startSimLoop();
     }
   }
-  if (state.trackedUnit?.buses?.length > 0 && state.simulateMode) {
+  if (
+    state.trackedUnit?.buses?.length > 0 &&
+    state.simulateMode &&
+    state.trackedUnit.buses.some((b) => !b.serviceFinished && b.enLineaAhora !== false)
+  ) {
     startSimLoop();
   }
   if (state.allFleetMode) {
@@ -12378,9 +12811,9 @@ async function handleNativeBack() {
     uiExtras?.closeProfileModal();
     return true;
   }
-  const plannerModalEl = document.getElementById('trip-planner-modal');
-  if (plannerModalEl && !plannerModalEl.classList.contains('hidden')) {
-    uiExtras?.closePlannerModal();
+  const schedExportModalEl = document.getElementById('schedule-export-modal');
+  if (schedExportModalEl && !schedExportModalEl.classList.contains('hidden')) {
+    uiExtras?.closeScheduleExportModal();
     return true;
   }
   if (el.eventsModal && !el.eventsModal.classList.contains('hidden')) {

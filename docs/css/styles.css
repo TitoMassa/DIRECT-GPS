@@ -4384,10 +4384,26 @@ input:focus-visible,
 /* Modo Libre Roster Modal */
 .fleet-roster-card {
   width: min(480px, calc(100vw - 20px));
-  max-height: min(85vh, 660px);
+  max-height: min(86dvh, 680px);
 }
 
-.fleet-roster-card .flota-tabs {
+.fleet-roster-card > .modal-head,
+.fleet-roster-card > .fleet-bridge-bar,
+.fleet-roster-card > .flota-tabs-bar,
+.fleet-roster-card > .fleet-roster-search-wrap,
+.fleet-roster-card > #fleet-roster-quick-filters {
+  flex-shrink: 0;
+}
+
+.fleet-roster-card > #fleet-roster-quick-filters {
+  flex-wrap: wrap;
+  overflow: visible;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.fleet-roster-card .flota-tabs,
+.fleet-roster-card .flota-tabs-bar {
   min-width: 0;
   width: 100%;
 }
@@ -4416,10 +4432,11 @@ input:focus-visible,
   gap: 7px;
   width: 100%;
   min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  min-height: 160px;
-  max-height: 55vh;
+  -webkit-overflow-scrolling: touch;
   padding-right: 2px;
 }
 
@@ -5106,8 +5123,8 @@ button.ev-card:hover {
   }
 
   .map-ctrl-btn {
-    width: 37px;
-    height: 37px;
+    width: 34px;
+    height: 34px;
   }
 
   .app-shell.dock-expanded .map-controls,
@@ -5117,7 +5134,8 @@ button.ev-card:hover {
   }
 
   .app-shell.inspector-open.dock-peek .map-controls {
-    bottom: calc(var(--sheet-live-h, var(--sheet-cur-h)) + var(--insp-h, 138px) + 14px);
+    top: calc(var(--header-h, 114px) + 52px);
+    bottom: auto;
   }
 
   .bus-inspector {
@@ -5438,6 +5456,17 @@ button.ev-card:hover {
   color: #fbbf24;
 }
 
+.telemetry-chip.is-finished {
+  border-color: rgba(244, 63, 94, 0.42);
+  background: rgba(244, 63, 94, 0.14);
+  color: #fb7185;
+}
+
+.telemetry-chip.is-offline {
+  border-color: var(--border-strong);
+  color: var(--text-2);
+}
+
 .ending-pill {
   display: inline-flex;
   align-items: center;
@@ -5686,131 +5715,153 @@ button.ev-card:hover {
   color: #f87171 !important;
 }
 
-/* Trip Planner ("¿Cómo llego?") */
-.planner-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+/* Schedule Image Exporter Modal (PNG / JPG) */
+.sched-export-card {
+  width: min(540px, calc(100vw - 18px));
+  max-height: min(90dvh, 760px);
 }
 
-.planner-input-group {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.sched-export-card > .modal-head,
+.sched-export-foot {
+  flex-shrink: 0;
 }
 
-.planner-input-group .modal-input {
-  flex: 1;
-  min-width: 0;
-}
-
-.planner-ac-dropdown {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  z-index: 40;
-  max-height: 210px;
+.sched-export-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
-  border-radius: var(--radius-md);
-  background: var(--surface-0);
-  border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-island);
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
+  gap: 10px;
+  padding-right: 2px;
 }
 
-.planner-ac-item {
-  width: 100%;
-  padding: 8px 12px;
-  border: none;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-1);
-  text-align: left;
+.sched-exp-srv-pills {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.planner-ac-item:hover {
-  background: var(--surface-hover);
-}
-
-.planner-ac-item span {
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-
-.planner-result-card {
-  padding: 10px 12px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border);
-  background: var(--surface-1);
-  display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
-.planner-result-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.planner-pills-wrap {
+.sched-exp-stops-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.sched-exp-stop-quick {
+  display: flex;
+  flex-wrap: wrap;
   gap: 5px;
 }
 
-.planner-arrow {
-  color: var(--text-3);
-  font-weight: 700;
-}
-
-.planner-total-min {
-  font-size: 14px;
-  font-weight: 800;
-  color: var(--accent);
-}
-
-.planner-live-badge {
-  font-size: 10.5px;
-  font-weight: 700;
-  color: #34d399;
-}
-
-.planner-offline-badge {
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-
-.planner-walk-meta {
-  font-size: 11px;
-  color: var(--text-2);
-}
-
-.planner-leg-step {
+.sched-exp-stops-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  font-size: 11.5px;
-  color: var(--text-2);
-  padding-left: 8px;
-  border-left: 2px solid var(--border-strong);
+  gap: 4px;
+  max-height: 185px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
 }
 
-.planner-card-actions {
+.sched-exp-stop-row {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.sched-exp-stop-row:hover {
+  background: var(--surface-hover);
+}
+
+.sched-exp-stop-row.is-checked {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text-1);
+}
+
+.sched-exp-stop-chk {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.sched-exp-stop-num {
+  font-size: 10.5px;
+  color: var(--text-3);
+  min-width: 24px;
+  flex-shrink: 0;
+}
+
+.sched-exp-stop-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sched-exp-stop-name small {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.sched-exp-stop-code {
+  font-size: 10px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
+.sched-exp-opts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sched-exp-opts-grid > div {
+  display: flex;
+  flex-direction: column;
   gap: 6px;
-  margin-top: 2px;
+}
+
+.sched-exp-preview-wrap {
+  width: 100%;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-1);
+  padding: 6px;
+  overflow: auto;
+  max-height: 240px;
+}
+
+.sched-exp-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+.sched-export-foot {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
 }
 
 /* 7-Day Profile Modal */

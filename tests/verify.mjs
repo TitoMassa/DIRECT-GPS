@@ -37,18 +37,22 @@ const { BusSimulator } = await importLocal('docs/js/simulator.js');
 const { parseDesvioHorario, distanceMeters } = await importLocal('docs/js/api.js');
 const { MAP_TILES } = await importLocal('docs/js/config.js');
 const { getHolidayInfo, getCalendarTipoDiaWithHolidays } = await importLocal('docs/js/holidays.js');
-const { buildTripPlannerIndex, planTripsOffline } = await importLocal('docs/js/trip-planner.js');
+const {
+  dedupeOrderedStops,
+  pickKeyStopsForBranch,
+  buildScheduleExportSections
+} = await importLocal('docs/js/schedule-image.js');
 const {
   computeBridgeStatus,
   detectBunchingAndGaps,
   computeNetworkPunctuality,
   classifyBusEndingBadge,
+  evaluateServiceCompletionStatus,
   computeBusPhysicalTelemetry,
   buildBusUpcomingStops,
   findOppositeStop,
   buildEntitySevenDayProfile,
-  formatServiceShareText,
-  buildPrintableScheduleHtml
+  formatServiceShareText
 } = await importLocal('docs/js/telemetry.js');
 const { RideModeController } = await importLocal('docs/js/ride-mode.js');
 
@@ -282,7 +286,7 @@ console.log('5. Testing 103C CT32247 rawStopTimeMap & shared multi-direction sto
   console.log('  ✓ Verified 103C CT32247 exact HH:MM matching and 108A CT31509 same-minute bidirectional disambiguation');
 }
 
-console.log('6. Testing local server.js HTTP endpoints, SW v96, and new v2.6.0 assets...');
+console.log('6. Testing local server.js HTTP endpoints, SW v97, and v2.6.1 assets...');
 {
   const port = 3987;
   const proc = spawn('node', ['server.js'], {
@@ -313,14 +317,14 @@ console.log('6. Testing local server.js HTTP endpoints, SW v96, and new v2.6.0 a
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v96') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v96 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v97') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v97 & direct-gps-data-v5');
     for (const asset of [
       '/icons/icon-192.png',
       '/icons/icon-512.png',
       '/icons/icon-maskable-512.png',
       '/icons/apple-touch-icon.png',
       '/js/holidays.js',
-      '/js/trip-planner.js',
+      '/js/schedule-image.js',
       '/js/telemetry.js',
       '/js/ride-mode.js',
       '/js/ui-extras.js'
@@ -335,7 +339,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v96, and new v2.6.0 a
     assert.ok(buscar.data.results.some((r) => r.coche === '2967'), '/api/flota-buscar should find simulated coche 2967');
     const bundle = await (await checkUrl('/api/offline-bundle')).json();
     assert.ok(bundle.data.cars.length > 0 && bundle.data.drivers.length > 0, '/api/offline-bundle should include rosterCars and rosterDrivers');
-    console.log('  ✓ Local server.js static, v2.6.0 assets, SW v96 & API endpoints verified');
+    console.log('  ✓ Local server.js static, v2.6.1 assets, SW v97 & API endpoints verified');
   } finally {
     proc.kill('SIGTERM');
   }
@@ -609,7 +613,7 @@ console.log('9. Testing 7-day retention, Cloudflare DO SQLite write optimization
   console.log('  ✓ Verified 7-day retention, 2-window horarios scanner, DO optimizations, CSS overflow fix, and 904B ending-service guards');
 }
 
-console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Planner, Telemetry, Ride Mode, PNG icons, Driver Overrides sync, strict exclusions)...');
+console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule PNG/JPG Exporter, Finished-Service Coherence, Telemetry, Ride Mode, Centering/Filter fixes, strict exclusions)...');
 {
   // 10a) Holidays (Argentina national + movable Easter/Carnival + Corrientes local)
   assert.equal(getHolidayInfo('2026-05-01')?.name, 'Día del Trabajador');
@@ -621,40 +625,163 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
   assert.equal(getCalendarTipoDiaWithHolidays('2026-06-10').tipo, 'habil');
   assert.equal(getCalendarTipoDiaWithHolidays('2026-06-10').holiday, null);
 
-  // 10b) Offline Trip Planner across all 26 real routes (direct + 1-transfer)
+  // Load route branches cache for telemetry & schedule export checks
   const routeBranchesCache = new Map();
   for (const l of catalogo.lineas) {
     const rec = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'recorridos', `${l.codigo}.json`), 'utf8'));
     routeBranchesCache.set(Number(l.codigo), parseRouteBranches(rec));
   }
-  const plannerIndex = buildTripPlannerIndex(routeBranchesCache, lineByCode);
-  assert.ok(plannerIndex.legs.length >= 40, 'Planner index should cover >=40 directional branches');
 
-  const stPuerto = stopMap.get('CT31181');
-  const stUnne = stopMap.get('CT31498'); // Campus / Av. Libertad or Junin
-  const directPlans = planTripsOffline(
-    plannerIndex,
-    { lat: stPuerto.lat, lng: stPuerto.lng, label: 'Puerto' },
-    { lat: stUnne.lat, lng: stUnne.lng, label: stUnne.nombre }
+  // 10b) Customizable PNG/JPG Schedule Image Exporter (Ida/Vuelta, Service filter, Custom stop selection)
+  const br106 = routeBranchesCache.get(351);
+  const hor106B = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'horarios', '351.json'), 'utf8'));
+  const m106B = buildLineScheduleModel(351, br106, hor106B, 'habil');
+
+  const keyStops0 = pickKeyStopsForBranch(br106[0], 7);
+  const ordered0 = dedupeOrderedStops(br106[0]);
+  assert.ok(keyStops0.has(ordered0[0].id), 'Key stops must always include first cabecera');
+  assert.ok(keyStops0.has(ordered0[ordered0.length - 1].id), 'Key stops must always include final cabecera');
+  assert.ok(keyStops0.size <= 7 && keyStops0.size >= 2);
+
+  const customSet0 = new Set([ordered0[0].id, ordered0[3].id, ordered0[10].id, ordered0[ordered0.length - 1].id]);
+  const ordered1 = dedupeOrderedStops(br106[1]);
+  const customSet1 = new Set([ordered1[0].id, ordered1[5].id, ordered1[ordered1.length - 1].id]);
+  const exportBothS5 = buildScheduleExportSections(m106B, br106, {
+    mode: 'both',
+    activeBranchIdx: 0,
+    serviceFilter: '5',
+    selectedStopIdsByBranch: new Map([
+      [0, customSet0],
+      [1, customSet1]
+    ])
+  });
+  assert.equal(exportBothS5.sections.length, 2, 'Mode "both" must produce both Ida and Vuelta sections');
+  assert.equal(exportBothS5.sections[0].dirLabel, 'IDA');
+  assert.equal(exportBothS5.sections[1].dirLabel, 'VUELTA');
+  assert.equal(exportBothS5.sections[0].stops.length, customSet0.size, 'Ida section must include ONLY user-selected stops');
+  assert.equal(exportBothS5.sections[1].stops.length, customSet1.size, 'Vuelta section must include ONLY user-selected stops');
+  assert.ok(exportBothS5.sections[0].columns.every((c) => c.srv === 5), 'Service filter "5" must only include Srv 5 trips');
+  assert.ok(exportBothS5.sections[1].columns.every((c) => c.srv === 5), 'Service filter "5" must only include Srv 5 trips on Vuelta');
+
+  // 10c) Coherent Service/Turno Completion Engine (Dabrio 106B Srv 5, Galvez 904B Srv 4 delayed, Relevo chofer vs coche)
+  const s5Block106B = m106B.blocks.find((b) => b.serviceNumber === 5 && b.turnoIndex === 1);
+  assert.ok(s5Block106B, '106B Lun–Vie must have Servicio 5 Turno 1');
+  const s5LastTrip = s5Block106B.trips[s5Block106B.trips.length - 1];
+  const s5EndStops = s5LastTrip.branch.orderedStops;
+  const s5TerminalStop = s5EndStops[s5EndStops.length - 1];
+  const s5ApproachStop = s5EndStops[Math.max(0, s5EndStops.length - 5)]; // ~1 km before Cabecera Barrio Nuevo
+
+  const dabrioUnit = {
+    identificadorCoche: '2976',
+    choferNombre: 'DABRIO JUAN',
+    lat: s5ApproachStop.lat,
+    lng: s5ApproachStop.lng,
+    rawLat: s5ApproachStop.lat,
+    rawLng: s5ApproachStop.lng,
+    ultimaFechaHoraGPS: '27/11/2026 13:46:51',
+    desvio: { status: 'late', seconds: -90, raw: '-01:30' },
+    serviceNumber: 5,
+    turnoIndex: 1,
+    _matchedTrip: s5LastTrip
+  };
+  // At 15:24 (real mobile screenshot case): MUST be finished & snapped to Cabecera Barrio Nuevo!
+  const dabrio1524 = evaluateServiceCompletionStatus(dabrioUnit, m106B, 15 * 3600 + 24 * 60, {
+    entityType: 'chofer',
+    blockInfo: s5Block106B
+  });
+  assert.equal(dabrio1524.finished, true, 'Dabrio 106B Srv 5 at 15:24 must be marked finished');
+  assert.equal(dabrio1524.snapToTerminal, true, 'Dabrio 106B Srv 5 must snap to finishing terminal');
+  assert.ok(
+    distanceMeters(dabrio1524.terminalLat, dabrio1524.terminalLng, s5TerminalStop.lat, s5TerminalStop.lng) < 5,
+    'Dabrio terminal snap coordinates must match final stop of Srv 5'
   );
-  assert.ok(directPlans.length > 0, 'Trip planner must find routes from Puerto to CT31498');
-  assert.ok(directPlans.some((p) => p.transfers === 0), 'Should include direct (0-transfer) routes');
+  // At 13:53 (just 4 min after 13:49 scheduled end, 2.5 min after delay-adjusted 13:50:30): MUST already be finished (no 15-min lingering "En línea")!
+  const dabrio1353 = evaluateServiceCompletionStatus(dabrioUnit, m106B, 13 * 3600 + 53 * 60, {
+    entityType: 'coche',
+    blockInfo: s5Block106B
+  });
+  assert.equal(dabrio1353.finished, true, 'Dabrio 106B Srv 5 at 13:53 must already be marked finished');
+  // At 13:47:10 (still before scheduled end, fresh 19 s GPS, >850 m away): MUST stay active!
+  const s5MidStop = s5EndStops[Math.floor(s5EndStops.length * 0.55)];
+  const dabrio1347Active = evaluateServiceCompletionStatus(
+    { ...dabrioUnit, lat: s5MidStop.lat, lng: s5MidStop.lng, rawLat: s5MidStop.lat, rawLng: s5MidStop.lng },
+    m106B,
+    13 * 3600 + 47 * 60 + 10,
+    { entityType: 'coche', blockInfo: s5Block106B }
+  );
+  assert.equal(dabrio1347Active.finished, false, 'Dabrio while still mid-route with fresh GPS before end must stay active');
 
-  // Test transfer planning between two distant neighborhoods (Laguna Brava -> Resistencia UNNE)
-  const br904B = routeBranchesCache.get(1038)?.[0];
-  const unneResStop = br904B?.orderedStops?.[br904B.orderedStops.length - 1];
-  const br106B = routeBranchesCache.get(351)?.[0];
-  const farOriginStop = br106B?.orderedStops?.[0];
-  if (unneResStop && farOriginStop) {
-    const xferPlans = planTripsOffline(
-      plannerIndex,
-      { lat: farOriginStop.lat, lng: farOriginStop.lng, label: farOriginStop.nombre },
-      { lat: unneResStop.lat, lng: unneResStop.lng, label: unneResStop.nombre }
-    );
-    assert.ok(xferPlans.length > 0, 'Trip planner must find 1-transfer routes across city + bridge');
-  }
+  // Galvez 904B Srv 4 (scheduled end 21:21, delayed -20:46 -> expected finish ~21:41:46):
+  const brs904B = routeBranchesCache.get(1038);
+  const hor904B = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'horarios', '1038.json'), 'utf8'));
+  const m904B = buildLineScheduleModel(1038, brs904B, hor904B, 'habil');
+  const s4Block904B = m904B.blocks.find((b) => b.serviceNumber === 4 && b.turnoIndex === 2) ||
+    m904B.blocks.filter((b) => b.serviceNumber === 4).slice(-1)[0];
+  const s4LastTrip = s4Block904B.trips[s4Block904B.trips.length - 1];
+  const s4MidPt = s4LastTrip.branch.pts[Math.floor(s4LastTrip.branch.pts.length * 0.65)]; // ~5+ km from Puerto
+  const galvezDelayedUnit = {
+    identificadorCoche: '4127',
+    choferNombre: 'GALVEZ',
+    lat: s4MidPt[0],
+    lng: s4MidPt[1],
+    rawLat: s4MidPt[0],
+    rawLng: s4MidPt[1],
+    ultimaFechaHoraGPS: '27/11/2026 21:26:50',
+    desvio: { status: 'late', seconds: -(20 * 60 + 46), raw: '-20:46' },
+    serviceNumber: 4,
+    turnoIndex: s4Block904B.turnoIndex,
+    _matchedTrip: s4LastTrip
+  };
+  const galvezAt2127 = evaluateServiceCompletionStatus(galvezDelayedUnit, m904B, 21 * 3600 + 27 * 60 + 15, {
+    entityType: 'coche',
+    blockInfo: s4Block904B
+  });
+  assert.equal(galvezAt2127.finished, false, 'Heavily delayed Galvez 5+ km from Puerto at 21:27 MUST stay En línea');
+  const s4PuertoStop = s4LastTrip.branch.orderedStops[s4LastTrip.branch.orderedStops.length - 1];
+  const galvezAt2144 = evaluateServiceCompletionStatus(
+    {
+      ...galvezDelayedUnit,
+      lat: s4PuertoStop.lat,
+      lng: s4PuertoStop.lng,
+      rawLat: s4PuertoStop.lat,
+      rawLng: s4PuertoStop.lng,
+      ultimaFechaHoraGPS: '27/11/2026 21:41:50'
+    },
+    m904B,
+    21 * 3600 + 44 * 60,
+    { entityType: 'coche', blockInfo: s4Block904B }
+  );
+  assert.equal(galvezAt2144.finished, true, 'Galvez at 21:44 after arriving at Puerto must be marked finished');
+  assert.equal(galvezAt2144.snapToTerminal, true);
 
-  // 10c) Telemetry module (Bridge monitor, Bunching, Punctuality, Ending badge, Physical telemetry, Upcoming stops, Opposite stop, 7-day profile, Share/Print)
+  // Relevo-en-línea block: driver finishes turno, car stays active with relieving driver!
+  const relevoBlock = m904B.blocks.find((b) => b.relevoToNext) || m106B.blocks.find((b) => b.relevoToNext);
+  assert.ok(relevoBlock, 'Expected at least one relevoToNext block on 904B or 106B');
+  const relModel = m904B.blocks.includes(relevoBlock) ? m904B : m106B;
+  const relEndSec = relevoBlock.endSec;
+  const relHH = String(Math.floor((relEndSec - 120) / 3600) % 24).padStart(2, '0');
+  const relMM = String(Math.floor(((relEndSec - 120) % 3600) / 60)).padStart(2, '0');
+  const relLastTr = relevoBlock.trips[relevoBlock.trips.length - 1];
+  const relEndPt = relLastTr.branch.pts[relLastTr.branch.pts.length - 1];
+  const relUnit = {
+    lat: relEndPt[0],
+    lng: relEndPt[1],
+    ultimaFechaHoraGPS: `27/11/2026 ${relHH}:${relMM}:00`,
+    desvio: { status: 'ok', seconds: 0 }
+  };
+  assert.equal(
+    evaluateServiceCompletionStatus(relUnit, relModel, relEndSec + 180, { entityType: 'coche', blockInfo: relevoBlock }).finished,
+    false,
+    'Car on relevoToNext block continues with relieving driver'
+  );
+  const relDrvComp = evaluateServiceCompletionStatus(relUnit, relModel, relEndSec + 180, {
+    entityType: 'chofer',
+    blockInfo: relevoBlock
+  });
+  assert.equal(relDrvComp.finished, true, 'Driver on relevoToNext block MUST be marked finished after relevo');
+  assert.equal(relDrvComp.reason, 'turno_ended');
+
+  // 10d) Telemetry module (Bridge monitor, Bunching, Punctuality, Ending badge, Physical telemetry without trail, Upcoming stops, Opposite stop, 7-day profile, Share)
   const bridgeHeavy = computeBridgeStatus([
     { codigoLinea: 1038, lat: -27.465, lng: -58.862, desvio: { status: 'late', seconds: -18 * 60 } },
     { codigoLinea: 1039, lat: -27.468, lng: -58.865, desvio: { status: 'late', seconds: -16 * 60 } }
@@ -698,9 +825,12 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
     null
   );
   assert.ok(phys.speedKmh > 15 && phys.speedKmh < 40, `Expected realistic speed, got ${phys.speedKmh}`);
-  assert.ok(phys.trail.length >= 2);
+  assert.equal('trail' in phys, false, 'GPS trail ("estela") must be removed from telemetry output');
 
-  const br106 = routeBranchesCache.get(351);
+  const physFin = computeBusPhysicalTelemetry({ serviceFinished: true, finishedPlace: 'Barrio Nuevo' }, null, null);
+  assert.equal(physFin.stateKind, 'finished');
+  assert.ok(physFin.stateLabel.includes('Servicio finalizado') && physFin.stateLabel.includes('Barrio Nuevo'));
+
   const sampleStart = br106[0].orderedStops[2];
   const upcoming = buildBusUpcomingStops(
     { lat: sampleStart.lat, lng: sampleStart.lng, descripcionBandera: br106[0].bandera, desvio: { status: 'ok', seconds: 0 } },
@@ -710,6 +840,11 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
   );
   assert.ok(upcoming.length >= 5, 'Should compute upcoming stops along branch');
   assert.ok(upcoming[0].distM < upcoming[upcoming.length - 1].distM, 'Upcoming stops must be monotonically ordered');
+  assert.deepEqual(
+    buildBusUpcomingStops({ serviceFinished: true, lat: sampleStart.lat, lng: sampleStart.lng }, null, br106, 15 * 3600),
+    [],
+    'Finished buses must not display upcoming stops'
+  );
 
   const opp = findOppositeStop(
     { id: sampleStart.id, lat: sampleStart.lat, lng: sampleStart.lng },
@@ -743,10 +878,8 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
     { turnoIndex: 1, startSec: 5 * 3600, endSec: 13 * 3600, lapsCount: 4, startPlace: 'Puerto', endPlace: 'Puerto', trips: [] }
   ]);
   assert.ok(shareTxt.includes('DIRECT GPS') && shareTxt.includes('Servicio 4'));
-  const printHtml = buildPrintableScheduleHtml('Línea 106B', 'Lun–Vie', '<table><tr><td>05:00</td></tr></table>');
-  assert.ok(printHtml.includes('window.print()') && printHtml.includes('Línea 106B'));
 
-  // 10d) RideModeController (GPS proximity trigger <= 300 m)
+  // 10e) RideModeController (GPS proximity trigger <= 300 m)
   let watchCb = null;
   let clearedId = null;
   const origNav = globalThis.navigator;
@@ -773,7 +906,7 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
       }
     });
     assert.equal(rc.start({ id: 'CT31498', nombre: 'Junín y Mendoza', lat: -27.468, lng: -58.836 }, { sound: false, tts: false }), true);
-    watchCb({ coords: { latitude: -27.48, lng: -58.836, longitude: -58.836 } }); // ~1.3 km away
+    watchCb({ coords: { latitude: -27.48, longitude: -58.836 } }); // ~1.3 km away
     assert.equal(triggeredPayload, null);
     watchCb({ coords: { latitude: -27.4685, longitude: -58.836 } }); // ~55 m away -> triggers!
     assert.ok(triggeredPayload && triggeredPayload.distM < 300, 'RideModeController must trigger within 300 m');
@@ -783,28 +916,42 @@ console.log('10. Testing v2.6.0 features (Night Map zero-API, Holidays, Trip Pla
     Object.defineProperty(globalThis, 'navigator', { configurable: true, value: origNav });
   }
 
-  // 10e) Night Map zero-API + Strict Exclusions (NO satellite map, NO battery/data saver)
+  // 10f) Night Map zero-API + Foto 1/2 centering + Foto 3 filter pills + Strict Exclusions (NO satellite, NO battery saver, NO Trip Planner, NO PDF, NO GPS trail)
   assert.ok(MAP_TILES.dark && MAP_TILES.dark.darkFilter === true, 'MAP_TILES.dark must use darkFilter: true');
   assert.ok(MAP_TILES.dark.url.includes('tile.openstreetmap.org'), 'Night map must reuse cached OSM tiles with zero external API');
   const cssSrc = await fs.readFile(path.join(ROOT, 'docs', 'css', 'styles.css'), 'utf8');
   assert.ok(cssSrc.includes('.leaflet-tile-pane.osm-dark-filter'), 'styles.css must define .osm-dark-filter for night map');
-  for (const rel of ['docs/index.html', 'docs/js/config.js', 'docs/js/map.js', 'docs/js/ui-extras.js', 'docs/js/app.js']) {
+  assert.ok(
+    cssSrc.includes('#fleet-roster-quick-filters') && cssSrc.includes('flex-shrink: 0') && cssSrc.includes('flex-wrap: wrap'),
+    'styles.css must prevent vertical squashing of #fleet-roster-quick-filters'
+  );
+  const mapSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'map.js'), 'utf8');
+  assert.ok(mapSrc.includes("getElementById('bus-inspector')") && mapSrc.includes('getBoundingClientRect'), 'map.js _getPadding must account for live #bus-inspector height');
+  assert.ok(mapSrc.includes('_resolveBusChipEta'), 'map.js must render FIN/ÚLT badge instead of bogus YA on finished/offline tracked buses');
+  const tripPlannerExists = await fs
+    .access(path.join(ROOT, 'docs', 'js', 'trip-planner.js'))
+    .then(() => true)
+    .catch(() => false);
+  assert.equal(tripPlannerExists, false, 'docs/js/trip-planner.js must be deleted');
+
+  for (const rel of ['docs/index.html', 'docs/js/config.js', 'docs/js/map.js', 'docs/js/telemetry.js', 'docs/js/ui-extras.js']) {
     const content = await fs.readFile(path.join(ROOT, rel), 'utf8');
     assert.equal(/arcgisonline|world_imagery|map-style="sat|mapa satelital/i.test(content), false, `${rel} must NOT contain satellite map`);
     assert.equal(/batterySaver|dataSaver|ahorro de bater[íi]a/i.test(content), false, `${rel} must NOT contain battery/data saver mode`);
+    assert.equal(/trip-planner|cómo llego|como llego|drawBusTrail|buildPrintableScheduleHtml|btn-rec-print/i.test(content), false, `${rel} must NOT contain removed Trip Planner / PDF / GPS trail`);
   }
 
-  // 10f) Real PNG PWA icons exist & have valid PNG signature
+  // 10g) Real PNG PWA icons exist & have valid PNG signature
   const pngSig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   for (const fn of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png']) {
     const buf = await fs.readFile(path.join(ROOT, 'docs', 'icons', fn));
     assert.ok(buf.length > 500 && buf.subarray(0, 8).equals(pngSig), `${fn} must be a valid PNG file`);
   }
 
-  // 10g) Unified driver-overrides.json sync check across all 3 runtime files
+  // 10h) Unified driver-overrides.json sync check across all 3 runtime files
   execFileSync('node', ['scripts/sync-drivers.mjs', '--check'], { cwd: ROOT, stdio: 'pipe' });
 
-  console.log('  ✓ Verified Night Map (zero-API), Holidays, Trip Planner (26 lines), Telemetry, Ride Mode, PNG icons, driver sync & strict exclusions');
+  console.log('  ✓ Verified Night Map (zero-API), Holidays, PNG/JPG Schedule Exporter, Dabrio/Galvez/Relevo Completion, Map Centering, Filter CSS, Ride Mode, PNG icons, driver sync & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');
