@@ -66,9 +66,9 @@ import {
   classifyBusEndingBadge,
   evaluateServiceCompletionStatus,
   computeBusPhysicalTelemetry,
-  buildBusUpcomingStops,
   findOppositeStop
 } from './telemetry.js';
+import { buildArrivalSpeechMessage } from './ride-mode.js';
 import { createUiExtras } from './ui-extras.js';
 import {
   isNative,
@@ -286,10 +286,6 @@ const el = {
   inspAccessBadge: document.getElementById('insp-access-badge'),
   inspServiceRoute: document.getElementById('insp-service-route'),
   inspTelemetryStrip: document.getElementById('insp-telemetry-strip'),
-  inspUpcomingWrap: document.getElementById('insp-upcoming-wrap'),
-  btnInspUpcomingToggle: document.getElementById('btn-insp-upcoming-toggle'),
-  inspUpcomingArrow: document.getElementById('insp-upcoming-arrow'),
-  inspUpcomingList: document.getElementById('insp-upcoming-list'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
   inspEta: document.getElementById('insp-eta'),
@@ -299,6 +295,7 @@ const el = {
   inspNextLap: document.getElementById('insp-nextlap'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
+  btnInspBoard: document.getElementById('btn-insp-board'),
   btnInspFavCar: document.getElementById('btn-insp-fav-car'),
   btnInspProfile: document.getElementById('btn-insp-profile'),
   btnInspCarAlert: document.getElementById('btn-insp-car-alert'),
@@ -369,6 +366,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.7.0',
+    date: '27/11/2026 · 17:50 hs',
+    items: [
+      '<strong>Notificación en barra de estado Android estilo Uber (con línea de progreso izquierda → derecha):</strong> al seleccionar una línea en concreto en una parada, se despliega una notificación nativa en la barra de estado con el avance del colectivo en línea recta, <strong>chofer, coche, minutos de arribo y hora programada real</strong> (nunca estimada), además de botones directos <strong>Subir / Bajar / Detener</strong>.',
+      '<strong>Voz TTS natural en español rioplatense después del timbre del celular:</strong> los números de interno ahora se pronuncian en pares naturales (<code>2976</code> → <em>«veintinueve setenta y seis»</em>, <code>3035</code> → <em>«treinta treinta y cinco»</em>, <code>4100</code> → <em>«cuarenta y uno cero cero»</em>, <code>4122</code> → <em>«cuarenta y uno veintidós»</em>), y la voz habla limpiamente <strong>después</strong> del timbre nativo de notificación de tu celular.',
+      '<strong>Avisos minuto a minuto + seguimiento en segundo plano (app minimizada / pantalla bloqueada):</strong> nueva opción <strong>Min a min</strong> (en Ajustes → Alertas y en la barra en vivo) que avisa con timbre y voz cada minuto que baja hasta el arribo, manteniendo la sesión activa mediante <em>Service Worker + MediaSession</em> aunque minimices la app o apagues la pantalla.',
+      '<strong>Modo Subir y Bajar (accesible para personas no videntes):</strong> al tocar <strong>Subir</strong> (desde la barra, el inspector o la propia notificación Android), al llegar el colectivo se activa el modo viaje parada por parada: suena el timbre del celular y la voz anuncia <strong>«Arribando, (nombre limpio de la parada)»</strong> al acercarse a cada parada hasta tocar <strong>Bajar</strong>. También se quitó la lista de próximas paradas basada en desvío del inspector.'
+    ]
+  },
   {
     version: 'v2.6.1',
     date: '27/11/2026 · 16:00 hs',
@@ -728,7 +735,8 @@ const uiExtras = createUiExtras({
   applyThemeColor: (hex) => applyTheme(hex),
   getCurrentThemeHex: () => state.themeColor,
   saveFavorites: () => saveFavorites(),
-  renderFavoritas: () => renderFavorites()
+  renderFavoritas: () => renderFavorites(),
+  ensureLineBranchesLoaded: (codes) => ensureBranchesLoaded(codes)
 });
 
 function getCurrentlySelectedBus() {
@@ -2100,6 +2108,16 @@ async function openStopRadar(stopInfo, codLinea = '000') {
     transitMap.focusStop(15);
   }
 
+  if (state.focusedLineCode && state.filterLine !== 'ALL') {
+    uiExtras?.startLiveLineTrack({
+      stop: state.activeStop,
+      lineName: state.filterLine,
+      codLinea: state.focusedLineCode
+    });
+  } else {
+    uiExtras?.stopLiveTrip({ silent: true });
+  }
+
   await fetchArribos(true, { announceSummary: true });
 }
 
@@ -2829,10 +2847,21 @@ async function handleLineFilterClick(e) {
   });
 
   if (state.focusedLineCode) {
-    showToast(`Buscando toda la flota activa de ${selectedLine}...`, 'info', 2000);
+    showToast(`Siguiendo línea ${selectedLine} en barra en vivo...`, 'info', 2200);
+    // Solicitar permiso de notificación Android dentro del gesto del usuario para mostrar la barra estilo Uber
+    ensureNotificationPermission().catch(() => {});
+    const nextBus = state.arribos.find((b) => !b.isNextLap && b.descripcionLinea === selectedLine) || null;
+    uiExtras?.startLiveLineTrack({
+      stop: state.activeStop,
+      lineName: selectedLine,
+      codLinea: state.focusedLineCode,
+      bus: nextBus
+    });
   } else {
     announce('Mostrando todas las líneas de esta parada.');
+    uiExtras?.stopLiveTrip({ silent: true });
   }
+  syncKeepAwake();
   await fetchArribos(true, { announceSummary: true });
 }
 
@@ -3300,9 +3329,11 @@ function handleArribosListClick(e) {
   }
 }
 
-// Keep the screen on while the user is waiting for an armed arrival alert at an open stop
+// Keep the screen/session awake while waiting for armed arrival alerts or an active Uber/A Bordo trip
 function syncKeepAwake() {
-  setKeepAwake(Boolean(state.activeStop) && state.armedAlerts.size > 0);
+  setKeepAwake(
+    (Boolean(state.activeStop) && state.armedAlerts.size > 0) || Boolean(uiExtras?.hasActiveTrackingSession())
+  );
 }
 
 function checkProximityAlerts() {
@@ -3315,18 +3346,29 @@ function checkProximityAlerts() {
       bus.eta.minutes <= leadMin
     ) {
       state.triggeredAlerts.add(bus.descripcionLinea);
-      if (state.soundEnabled) playArrivalChime();
-      const cocheTag = bus.identificadorCoche ? `, coche ${bus.identificadorCoche}` : '';
+      const cocheTag = bus.identificadorCoche ? `, coche #${bus.identificadorCoche}` : '';
       const etaTxt = bus.eta.minutes === 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
-      const msg = `Atención: Línea ${bus.descripcionLinea}${cocheTag}, ${etaTxt}.`;
-      showToast(msg, 'success', 6000, { silent: true });
-      announce(msg, { assertive: true });
-      uiExtras?.speakIfEnabled(msg);
-      notifyArrival({
-        title: `Línea ${bus.descripcionLinea} llegando a ${state.activeStop.id}`,
-        body: `${bus.tiempoRaw || `${bus.eta.minutes} min`}${cocheTag} · ${state.activeStop.nombre || 'Tu parada'}`,
-        stopId: state.activeStop.id
+      const toastMsg = `Atención: Línea ${bus.descripcionLinea}${cocheTag}, ${etaTxt}.`;
+      const speechMsg = buildArrivalSpeechMessage({
+        lineName: bus.descripcionLinea,
+        coche: bus.identificadorCoche,
+        etaMin: bus.eta.minutes,
+        stopName: state.activeStop.nombre || ''
       });
+      showToast(toastMsg, 'success', 6000, { silent: true });
+      announce(toastMsg, { assertive: true });
+      notifyArrival({
+        title: `🔔 Línea ${bus.descripcionLinea} llegando${bus.identificadorCoche ? ` · #${bus.identificadorCoche}` : ''}`,
+        body: `${bus.tiempoRaw || etaTxt}${bus.choferNombre ? ` · ${bus.choferNombre}` : ''}${
+          bus.turnoProgramado ? ` · Prog. real: ${bus.turnoProgramado}` : ''
+        }\n${state.activeStop.nombre || state.activeStop.id}`,
+        stopId: state.activeStop.id,
+        tag: `direct-gps-line-${bus.descripcionLinea}`
+      }).then((res) => {
+        if (!res?.delivered && state.soundEnabled) playArrivalChime();
+      });
+      // Hablar DESPUÉS del timbre de notificación del celular
+      uiExtras?.speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
     }
   }
   uiExtras?.checkCarAlerts(state.arribos, state.activeStop, {
@@ -3334,6 +3376,7 @@ function checkProximityAlerts() {
     playArrivalChime,
     notifyArrival
   });
+  uiExtras?.updateLiveTripFromArrivals(state.arribos, state.activeStop);
 }
 
 function updateInspectorFields(bus) {
@@ -3543,42 +3586,30 @@ function updateInspectorFields(bus) {
     el.inspTelemetryStrip.classList.remove('hidden');
   }
 
-  // v2.6.0: Collapsible upcoming stops timeline with 1-tap Modo Viaje alighting alarm
-  if (el.inspUpcomingWrap && el.inspUpcomingList) {
-    const branches = state.routeBranchesCache.get(Number(bus.codigoLinea)) || [];
-    const upcoming = buildBusUpcomingStops(bus, null, branches, getArgentinaSecOfDay());
-    if (upcoming.length > 0) {
-      el.inspUpcomingWrap.classList.remove('hidden');
-      el.inspUpcomingList._upcomingStops = upcoming;
-      el.inspUpcomingList._lineName = bus.descripcionLinea || '';
-      el.inspUpcomingList.innerHTML = upcoming
-        .slice(0, 12)
-        .map(
-          (st, idx) => `
-          <div class="insp-upcoming-row">
-            <div class="insp-upcoming-stop">
-              <strong>${escapeHtml(st.nombre)}</strong>
-              <span class="mono">${escapeHtml(st.id)} · ${formatDistance(st.distM)}</span>
-            </div>
-            <div class="insp-upcoming-right">
-              <span class="mono" style="font-weight:700">${escapeHtml(st.clock)} · ${st.etaMin}m</span>
-              <button type="button" class="mini-pill-btn btn-insp-ride-stop" data-up-idx="${idx}" title="Activar alarma de bajada a 300 m">Bajar</button>
-            </div>
-          </div>
-        `
-        )
-        .join('');
-    } else {
-      el.inspUpcomingWrap.classList.add('hidden');
-      el.inspUpcomingList.classList.add('hidden');
-      el.btnInspUpcomingToggle?.setAttribute('aria-expanded', 'false');
-      if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = '▾';
-    }
-  }
-
-  // v2.6.0: Car Favorite, 7-day Profile & Per-Car Alert buttons
+  // v2.7.0: Subir / Bajar button (accessible Uber-style on-board stop narrator) + Car Favorite, 7-day Profile & Per-Car Alert buttons
   const carId = String(bus.identificadorCoche || '').trim();
   const hasCar = Boolean(carId);
+  if (el.btnInspBoard) {
+    const canBoard = Boolean(!bus.serviceFinished && bus.enLineaAhora !== false && Number(bus.codigoLinea) > 0);
+    el.btnInspBoard.classList.toggle('hidden', !canBoard);
+    if (canBoard) {
+      const snap = uiExtras?.getLiveTripSnapshot();
+      const isThisOnboard = Boolean(
+        snap?.phase === 'onboard' &&
+          ((carId && snap.coche === carId) || Number(snap.codLinea) === Number(bus.codigoLinea))
+      );
+      const isThisArmed = Boolean(
+        snap?.phase === 'boarding_armed' &&
+          ((carId && snap.coche === carId) || Number(snap.codLinea) === Number(bus.codigoLinea))
+      );
+      el.btnInspBoard.textContent = isThisOnboard ? 'Bajar' : isThisArmed ? 'Ya subí' : 'Subir';
+      el.btnInspBoard.classList.toggle('active', isThisOnboard || isThisArmed);
+      el.btnInspBoard.classList.toggle('is-alight', isThisOnboard);
+      el.btnInspBoard.title = isThisOnboard
+        ? 'Salir del modo viaje (Bajar del colectivo)'
+        : 'Activar modo viaje (avisa cada próxima parada con timbre y voz)';
+    }
+  }
   if (el.btnInspFavCar) {
     el.btnInspFavCar.classList.toggle('hidden', !hasCar);
     if (hasCar) {
@@ -3735,9 +3766,6 @@ function closeBusInspector() {
   state.followSelectedBus = false;
   state.selectedBusKey = null;
   el.busInspector.classList.add('hidden');
-  el.inspUpcomingList?.classList.add('hidden');
-  el.btnInspUpcomingToggle?.setAttribute('aria-expanded', 'false');
-  if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = '▾';
   syncInspectorLayoutHeight();
   transitMap.drawFocusVector(null);
   transitMap.updateBuses(state.arribos, {
@@ -6279,6 +6307,7 @@ async function locateFleetUnitOnMap({
         state.inspectorOpen = true;
         if (isFirst) state.followSelectedBus = !found.serviceFinished;
         updateInspectorFields(found);
+        uiExtras?.updateLiveTripFromBus(found);
         el.busInspector.classList.remove('hidden');
         syncInspectorLayoutHeight();
         transitMap.updateBuses(tracker.buses, {
@@ -7213,6 +7242,8 @@ async function renderOfflineOrFallback(showSkeleton = false, mySeq = null) {
       closeBusInspector();
     }
   }
+
+  checkProximityAlerts();
 }
 
 function announceArrivalsSummary({ isRefresh = false } = {}) {
@@ -12163,21 +12194,23 @@ function bindEvents() {
   });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
-  el.btnInspUpcomingToggle?.addEventListener('click', () => {
-    if (!el.inspUpcomingList) return;
-    const isHidden = el.inspUpcomingList.classList.toggle('hidden');
-    el.btnInspUpcomingToggle.setAttribute('aria-expanded', String(!isHidden));
-    if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = isHidden ? '▾' : '▴';
-    syncInspectorLayoutHeight();
-  });
-  el.inspUpcomingList?.addEventListener('click', (e) => {
-    const rideBtn = e.target.closest('.btn-insp-ride-stop');
-    if (!rideBtn) return;
-    const stops = el.inspUpcomingList._upcomingStops || [];
-    const st = stops[Number(rideBtn.dataset.upIdx)];
-    if (!st) return;
+  el.btnInspBoard?.addEventListener('click', async () => {
+    const bus = getCurrentlySelectedBus();
+    if (!bus) return;
     haptic('medium');
-    uiExtras?.startRideAlarm({ ...st, lineName: el.inspUpcomingList._lineName || '' });
+    const snap = uiExtras?.getLiveTripSnapshot();
+    const carId = String(bus.identificadorCoche || '').trim();
+    const isThisOnboard = Boolean(
+      snap?.phase === 'onboard' &&
+        ((carId && snap.coche === carId) || Number(snap.codLinea) === Number(bus.codigoLinea))
+    );
+    if (isThisOnboard) {
+      uiExtras?.alightFromBus();
+    } else {
+      await uiExtras?.requestBoardBus(bus);
+    }
+    syncKeepAwake();
+    updateInspectorFields(bus);
   });
   el.btnInspFavCar?.addEventListener('click', () => {
     const carId = el.btnInspFavCar.dataset.carId;
@@ -12710,7 +12743,7 @@ function pauseRealtime() {
   cancelActiveSheetDrag();
   stopSimLoop();
   document.body.classList.add('app-paused');
-  if (state.armedAlerts.size === 0) {
+  if (state.armedAlerts.size === 0 && !uiExtras?.hasActiveTrackingSession()) {
     state.isAppPaused = true;
   }
 }

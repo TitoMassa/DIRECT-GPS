@@ -49,12 +49,22 @@ const {
   classifyBusEndingBadge,
   evaluateServiceCompletionStatus,
   computeBusPhysicalTelemetry,
-  buildBusUpcomingStops,
   findOppositeStop,
   buildEntitySevenDayProfile,
   formatServiceShareText
 } = await importLocal('docs/js/telemetry.js');
-const { RideModeController } = await importLocal('docs/js/ride-mode.js');
+const {
+  formatCocheForTts,
+  formatLineaForTts,
+  formatStopNameForTts
+} = await importLocal('docs/js/tts.js');
+const {
+  RideModeController,
+  LiveTripTracker,
+  buildUberProgressLine,
+  buildUberNotificationPayload,
+  buildArrivalSpeechMessage
+} = await importLocal('docs/js/ride-mode.js');
 
 const catalogo = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'catalogo.json'), 'utf8'));
 const stopMap = new Map(catalogo.paradas.map((p) => [p.id, p]));
@@ -286,7 +296,7 @@ console.log('5. Testing 103C CT32247 rawStopTimeMap & shared multi-direction sto
   console.log('  ✓ Verified 103C CT32247 exact HH:MM matching and 108A CT31509 same-minute bidirectional disambiguation');
 }
 
-console.log('6. Testing local server.js HTTP endpoints, SW v97, and v2.6.1 assets...');
+console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 assets...');
 {
   const port = 3987;
   const proc = spawn('node', ['server.js'], {
@@ -317,13 +327,15 @@ console.log('6. Testing local server.js HTTP endpoints, SW v97, and v2.6.1 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v97') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v97 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v98') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v98 & direct-gps-data-v5');
+    assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
       '/icons/icon-512.png',
       '/icons/icon-maskable-512.png',
       '/icons/apple-touch-icon.png',
       '/js/holidays.js',
+      '/js/tts.js',
       '/js/schedule-image.js',
       '/js/telemetry.js',
       '/js/ride-mode.js',
@@ -339,7 +351,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v97, and v2.6.1 asset
     assert.ok(buscar.data.results.some((r) => r.coche === '2967'), '/api/flota-buscar should find simulated coche 2967');
     const bundle = await (await checkUrl('/api/offline-bundle')).json();
     assert.ok(bundle.data.cars.length > 0 && bundle.data.drivers.length > 0, '/api/offline-bundle should include rosterCars and rosterDrivers');
-    console.log('  ✓ Local server.js static, v2.6.1 assets, SW v97 & API endpoints verified');
+    console.log('  ✓ Local server.js static, v2.7.0 assets, SW v98 & API endpoints verified');
   } finally {
     proc.kill('SIGTERM');
   }
@@ -832,20 +844,6 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.ok(physFin.stateLabel.includes('Servicio finalizado') && physFin.stateLabel.includes('Barrio Nuevo'));
 
   const sampleStart = br106[0].orderedStops[2];
-  const upcoming = buildBusUpcomingStops(
-    { lat: sampleStart.lat, lng: sampleStart.lng, descripcionBandera: br106[0].bandera, desvio: { status: 'ok', seconds: 0 } },
-    null,
-    br106,
-    10 * 3600
-  );
-  assert.ok(upcoming.length >= 5, 'Should compute upcoming stops along branch');
-  assert.ok(upcoming[0].distM < upcoming[upcoming.length - 1].distM, 'Upcoming stops must be monotonically ordered');
-  assert.deepEqual(
-    buildBusUpcomingStops({ serviceFinished: true, lat: sampleStart.lat, lng: sampleStart.lng }, null, br106, 15 * 3600),
-    [],
-    'Finished buses must not display upcoming stops'
-  );
-
   const opp = findOppositeStop(
     { id: sampleStart.id, lat: sampleStart.lat, lng: sampleStart.lng },
     { stopById: stopMap, paradas: catalogo.paradas },
@@ -879,7 +877,47 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   ]);
   assert.ok(shareTxt.includes('DIRECT GPS') && shareTxt.includes('Servicio 4'));
 
-  // 10e) RideModeController (GPS proximity trigger <= 300 m)
+  // 10e) v2.7.0 Natural Spanish TTS formatting (exact user examples + stop cleanup)
+  assert.equal(formatCocheForTts('2976'), 'veintinueve setenta y seis');
+  assert.equal(formatCocheForTts('3035'), 'treinta treinta y cinco');
+  assert.equal(formatCocheForTts('4100'), 'cuarenta y uno cero cero');
+  assert.equal(formatCocheForTts('4122'), 'cuarenta y uno veintidós');
+  assert.equal(formatCocheForTts('2905'), 'veintinueve cero cinco');
+  assert.equal(formatCocheForTts('3000'), 'treinta cero cero');
+  assert.equal(formatLineaForTts('106B'), 'ciento seis B');
+  assert.equal(formatLineaForTts('904B'), 'novecientos cuatro B');
+  assert.equal(formatStopNameForTts('AV. PEDRO FERRÉ - BRASIL IDA'), 'Avenida Pedro Ferré y Brasil');
+  assert.equal(formatStopNameForTts('Bº QUINTANA / GRAL. PAZ VTA'), 'Barrio Quintana y General Paz');
+  const speech2976 = buildArrivalSpeechMessage({ lineName: '106B', coche: '2976', etaMin: 3 });
+  assert.ok(
+    speech2976.includes('ciento seis B') && speech2976.includes('veintinueve setenta y seis') && speech2976.includes('3 minutos'),
+    `Unexpected arrival speech: ${speech2976}`
+  );
+
+  // 10f) v2.7.0 Uber-style Live Notification Payload + LiveTripTracker (Waiting -> Minute-by-Minute -> Subir -> A Bordo stop-by-stop -> Bajar)
+  const bar0 = buildUberProgressLine(0, { segments: 10 });
+  const bar50 = buildUberProgressLine(0.5, { segments: 10 });
+  const bar100 = buildUberProgressLine(1, { segments: 10 });
+  assert.ok(bar0.startsWith('🚌') && bar0.endsWith('◉'));
+  assert.ok(bar50.indexOf('🚌') > bar0.indexOf('🚌') && bar100.indexOf('🚌') > bar50.indexOf('🚌'));
+
+  const notifWaiting = buildUberNotificationPayload({
+    phase: 'waiting',
+    lineName: '106B',
+    coche: '2976',
+    choferNombre: 'DABRIO JUAN',
+    scheduledHHMM: '13:45',
+    etaMin: 4,
+    distM: 1200,
+    progress01: 0.5,
+    minuteByMinute: true,
+    originStop: { id: 'CT31498', nombre: 'AV. PEDRO FERRÉ - BRASIL IDA' }
+  });
+  assert.ok(notifWaiting.title.includes('106B') && notifWaiting.title.includes('4 min') && notifWaiting.title.includes('#2976'));
+  assert.ok(notifWaiting.body.includes('🚌') && notifWaiting.body.includes('◉'), 'Notification must contain left->right bus progress bar');
+  assert.ok(notifWaiting.body.includes('DABRIO JUAN') && notifWaiting.body.includes('Prog. real: 13:45'));
+  assert.ok(notifWaiting.actions.some((a) => a.action === 'board'), 'Waiting notification must expose Subir action');
+
   let watchCb = null;
   let clearedId = null;
   const origNav = globalThis.navigator;
@@ -898,6 +936,94 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     }
   });
   try {
+    const announcedLog = [];
+    const arrivedStops = [];
+    const tracker = new LiveTripTracker({
+      onAnnounce: (msg) => announcedLog.push(msg),
+      onStopArrival: (ev) => arrivedStops.push(ev)
+    });
+
+    const boardStop = br106[0].orderedStops[2];
+    const nextStopA = br106[0].orderedStops[3];
+    const nextStopB = br106[0].orderedStops[4];
+
+    tracker.startWaiting({
+      stop: boardStop,
+      lineName: '106B',
+      codLinea: 351,
+      bus: {
+        codigoLinea: 351,
+        descripcionLinea: '106B',
+        identificadorCoche: '2976',
+        choferNombre: 'DABRIO JUAN',
+        turnoProgramado: '13:45',
+        eta: { minutes: 4, valid: true },
+        routeMeters: 1600,
+        _matchedBranch: br106[0]
+      },
+      minuteByMinute: true,
+      ttsEnabled: false,
+      soundEnabled: false
+    });
+    assert.equal(tracker.phase, 'waiting');
+    assert.equal(tracker.scheduledHHMM, '13:45');
+
+    // Minute-by-minute countdown tick: 4 -> 3 -> 2
+    tracker.updateFromArrivals([
+      {
+        codigoLinea: 351,
+        descripcionLinea: '106B',
+        identificadorCoche: '2976',
+        choferNombre: 'DABRIO JUAN',
+        turnoProgramado: '13:45',
+        eta: { minutes: 3, valid: true },
+        routeMeters: 1200,
+        _matchedBranch: br106[0]
+      }
+    ], boardStop);
+    assert.ok(announcedLog.some((m) => m.includes('veintinueve setenta y seis') && m.includes('3 minutos')));
+
+    // User presses "Subir" while bus is 3 min away -> arms boarding_armed!
+    tracker.requestBoard({ routeBranchesCache });
+    assert.equal(tracker.phase, 'boarding_armed');
+
+    // Bus arrives at stop (eta: 0) -> auto-transitions into A Bordo (onboard)!
+    tracker.updateFromArrivals([
+      {
+        codigoLinea: 351,
+        descripcionLinea: '106B',
+        identificadorCoche: '2976',
+        choferNombre: 'DABRIO JUAN',
+        turnoProgramado: '13:45',
+        eta: { minutes: 0, valid: true },
+        routeMeters: 40,
+        _matchedBranch: br106[0]
+      }
+    ], boardStop, routeBranchesCache);
+    assert.equal(tracker.phase, 'onboard', 'Boarding-armed tracker must auto-enter onboard mode when bus arrives');
+
+    // Simulate passenger GPS approaching stop #3 -> must trigger "Arribando, <cleanName>."!
+    watchCb({ coords: { latitude: nextStopA.lat, longitude: nextStopA.lng } });
+    assert.equal(arrivedStops.length, 1, 'Should announce arrival at first upcoming stop');
+    assert.ok(
+      arrivedStops[0].speech.startsWith('Arribando, '),
+      `Expected "Arribando, ..." phrasing, got "${arrivedStops[0].speech}"`
+    );
+    // Repeated GPS at same stop must NOT duplicate announcement
+    watchCb({ coords: { latitude: nextStopA.lat, longitude: nextStopA.lng } });
+    assert.equal(arrivedStops.length, 1, 'Must not re-announce the same stop twice');
+
+    // Move along to stop #4 -> must advance & announce second stop!
+    watchCb({ coords: { latitude: nextStopB.lat, longitude: nextStopB.lng } });
+    assert.equal(arrivedStops.length, 2, 'Should advance and announce next stop along route');
+    assert.ok(arrivedStops[1].speech.startsWith('Arribando, '));
+
+    // User presses "Bajar" -> exits cleanly and clears watchPosition!
+    tracker.alight({ silent: true });
+    assert.equal(tracker.phase, 'idle');
+    assert.equal(clearedId, 77);
+
+    // Backwards-compatible RideModeController check
     let triggeredPayload = null;
     const rc = new RideModeController({
       radiusMeters: 300,
@@ -906,17 +1032,16 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
       }
     });
     assert.equal(rc.start({ id: 'CT31498', nombre: 'Junín y Mendoza', lat: -27.468, lng: -58.836 }, { sound: false, tts: false }), true);
-    watchCb({ coords: { latitude: -27.48, longitude: -58.836 } }); // ~1.3 km away
+    watchCb({ coords: { latitude: -27.48, longitude: -58.836 } });
     assert.equal(triggeredPayload, null);
-    watchCb({ coords: { latitude: -27.4685, longitude: -58.836 } }); // ~55 m away -> triggers!
-    assert.ok(triggeredPayload && triggeredPayload.distM < 300, 'RideModeController must trigger within 300 m');
+    watchCb({ coords: { latitude: -27.4685, longitude: -58.836 } });
+    assert.ok(triggeredPayload && triggeredPayload.distM < 300);
     rc.stop();
-    assert.equal(clearedId, 77);
   } finally {
     Object.defineProperty(globalThis, 'navigator', { configurable: true, value: origNav });
   }
 
-  // 10f) Night Map zero-API + Foto 1/2 centering + Foto 3 filter pills + Strict Exclusions (NO satellite, NO battery saver, NO Trip Planner, NO PDF, NO GPS trail)
+  // 10g) Night Map zero-API + Foto 1/2 centering + Foto 3 filter pills + Strict Exclusions (NO satellite, NO battery saver, NO Trip Planner, NO PDF, NO GPS trail, NO inspector upcoming stops)
   assert.ok(MAP_TILES.dark && MAP_TILES.dark.darkFilter === true, 'MAP_TILES.dark must use darkFilter: true');
   assert.ok(MAP_TILES.dark.url.includes('tile.openstreetmap.org'), 'Night map must reuse cached OSM tiles with zero external API');
   const cssSrc = await fs.readFile(path.join(ROOT, 'docs', 'css', 'styles.css'), 'utf8');
@@ -938,20 +1063,20 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     const content = await fs.readFile(path.join(ROOT, rel), 'utf8');
     assert.equal(/arcgisonline|world_imagery|map-style="sat|mapa satelital/i.test(content), false, `${rel} must NOT contain satellite map`);
     assert.equal(/batterySaver|dataSaver|ahorro de bater[íi]a/i.test(content), false, `${rel} must NOT contain battery/data saver mode`);
-    assert.equal(/trip-planner|cómo llego|como llego|drawBusTrail|buildPrintableScheduleHtml|btn-rec-print/i.test(content), false, `${rel} must NOT contain removed Trip Planner / PDF / GPS trail`);
+    assert.equal(/trip-planner|cómo llego|como llego|drawBusTrail|buildPrintableScheduleHtml|btn-rec-print|insp-upcoming|buildBusUpcomingStops/i.test(content), false, `${rel} must NOT contain removed features`);
   }
 
-  // 10g) Real PNG PWA icons exist & have valid PNG signature
+  // 10h) Real PNG PWA icons exist & have valid PNG signature
   const pngSig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   for (const fn of ['icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png']) {
     const buf = await fs.readFile(path.join(ROOT, 'docs', 'icons', fn));
     assert.ok(buf.length > 500 && buf.subarray(0, 8).equals(pngSig), `${fn} must be a valid PNG file`);
   }
 
-  // 10h) Unified driver-overrides.json sync check across all 3 runtime files
+  // 10i) Unified driver-overrides.json sync check across all 3 runtime files
   execFileSync('node', ['scripts/sync-drivers.mjs', '--check'], { cwd: ROOT, stdio: 'pipe' });
 
-  console.log('  ✓ Verified Night Map (zero-API), Holidays, PNG/JPG Schedule Exporter, Dabrio/Galvez/Relevo Completion, Map Centering, Filter CSS, Ride Mode, PNG icons, driver sync & strict exclusions');
+  console.log('  ✓ Verified v2.7.0 Natural TTS pairs, Android Uber Status-Bar Notifs, Minute-by-Minute Alerts, Subir/A Bordo/Bajar Narrator, Completion Engine, PNG/JPG Exporter & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

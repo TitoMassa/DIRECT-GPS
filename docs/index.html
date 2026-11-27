@@ -363,17 +363,10 @@
         </div>
       </div>
 
-      <div id="insp-upcoming-wrap" class="insp-upcoming-wrap hidden">
-        <button type="button" id="btn-insp-upcoming-toggle" class="insp-upcoming-toggle" aria-expanded="false">
-          <span>Próximas paradas (en vivo)</span>
-          <span id="insp-upcoming-arrow">▾</span>
-        </button>
-        <div id="insp-upcoming-list" class="insp-upcoming-list hidden"></div>
-      </div>
-
       <div class="bus-inspector-foot">
         <span id="insp-gps" class="mono-meta">—</span>
         <div class="insp-foot-actions">
+          <button type="button" id="btn-insp-board" class="seg-btn seg-btn-xs insp-board-btn hidden" title="Activar Modo Viaje (Subir al colectivo)">Subir</button>
           <button type="button" id="btn-insp-fav-car" class="seg-btn seg-btn-xs hidden" title="Seguir este coche en Favoritos">☆</button>
           <button type="button" id="btn-insp-profile" class="seg-btn seg-btn-xs hidden" title="Ver ficha histórica de 7 días">7d</button>
           <button type="button" id="btn-insp-car-alert" class="seg-btn seg-btn-xs hidden" title="Activar alerta para este coche">🔔</button>
@@ -605,12 +598,22 @@
           </div>
           <div class="settings-toggle-row">
             <div>
+              <strong>Avisar minuto a minuto</strong>
+              <p class="modal-sub">Al seguir una línea, suena el timbre y avisa cada minuto que baja hasta llegar</p>
+            </div>
+            <input id="chk-minute-alerts" type="checkbox" class="settings-checkbox" aria-label="Activar avisos minuto a minuto" />
+          </div>
+          <div class="settings-toggle-row">
+            <div>
               <strong>Avisos hablados por voz (TTS)</strong>
-              <p class="modal-sub">Lee en voz alta el arribo y la alarma de bajada en español</p>
+              <p class="modal-sub">Después del timbre del celular, lee arribos y cada parada en modo Subir/Bajar (ej. 2976 → «veintinueve setenta y seis»)</p>
             </div>
             <input id="chk-tts-alerts" type="checkbox" class="settings-checkbox" aria-label="Activar avisos hablados por voz" />
           </div>
-          <button type="button" id="btn-test-tts" class="secondary-action-btn seg-btn-xs">🔊 Probar voz en español</button>
+          <div class="settings-seg-row">
+            <button type="button" id="btn-enable-android-notifs" class="secondary-action-btn seg-btn-xs">🔔 Activar notificaciones Android</button>
+            <button type="button" id="btn-test-tts" class="secondary-action-btn seg-btn-xs">🔊 Probar timbre y voz</button>
+          </div>
         </div>
 
         <div data-settings-pane="diag" class="settings-pane hidden">
@@ -742,13 +745,32 @@
       </div>
     </div>
 
-    <!-- Modo Viaje (Alarma de Bajada GPS) Floating Banner -->
-    <div id="ride-mode-banner" class="ride-mode-banner hidden" role="status" aria-live="polite">
-      <div class="ride-mode-info">
-        <strong id="ride-mode-title">Modo viaje activo</strong>
-        <span id="ride-mode-sub">Obteniendo GPS del celular...</span>
+    <!-- Uber-Style Live Trip & Accessible Subir/Bajar Floating Bar -->
+    <div id="ride-mode-banner" class="ride-mode-banner live-trip-bar hidden" role="region" aria-label="Seguimiento en vivo estilo Uber">
+      <div class="live-trip-head">
+        <div class="live-trip-title-wrap">
+          <span id="live-trip-line-badge" class="line-badge line-badge-sm">—</span>
+          <div class="ride-mode-info">
+            <strong id="ride-mode-title">Seguimiento en vivo</strong>
+            <span id="ride-mode-sub">Conectando...</span>
+          </div>
+        </div>
+        <button type="button" id="btn-ride-mode-cancel" class="mini-close-btn" aria-label="Detener seguimiento en vivo">✕</button>
       </div>
-      <button type="button" id="btn-ride-mode-cancel" class="mini-close-btn" aria-label="Desactivar alarma de bajada">✕</button>
+      <div class="live-trip-track-wrap" aria-hidden="true">
+        <span class="live-trip-dot-start"></span>
+        <div class="live-trip-track">
+          <div id="live-trip-track-fill" class="live-trip-track-fill" style="width:10%"></div>
+          <span id="live-trip-bus-dot" class="live-trip-bus-dot" style="left:10%">🚌</span>
+        </div>
+        <span class="live-trip-dot-end"></span>
+      </div>
+      <div id="live-trip-meta" class="live-trip-meta"></div>
+      <div class="live-trip-actions">
+        <button type="button" id="btn-live-trip-min" class="mini-pill-btn" aria-pressed="false" title="Avisar con timbre y voz cada minuto que baja">Min a min</button>
+        <button type="button" id="btn-live-trip-notif" class="mini-pill-btn hidden" title="Mostrar barra de progreso en notificaciones de Android">🔔 Barra Android</button>
+        <button type="button" id="btn-live-trip-board" class="primary-action-btn seg-btn-xs live-trip-board-btn">🚌 Subir</button>
+      </div>
     </div>
 
     <!-- Modo Tablero LED (Pantalla de Parada Fullscreen) -->

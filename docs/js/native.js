@@ -1,8 +1,13 @@
 // ============================================================================
-// DIRECT GPS · Web / PWA Platform Layer
+// DIRECT GPS · Web / PWA & Android Native Notification Platform Layer
 // ----------------------------------------------------------------------------
-// Pure standard Web & PWA APIs (Geolocation, Web Share, Vibration, Notifications,
-// Screen Wake Lock, and beforeinstallprompt install prompt).
+// Pure standard Web & PWA APIs:
+//  - Geolocation, Web Share, Vibration, Screen Wake Lock, beforeinstallprompt
+//  - Android-native ServiceWorkerRegistration.showNotification() with phone's
+//    own notification ringtone (timbre), live Uber-style status bar updates,
+//    and direct action buttons (Subir / Bajar / Detener)
+//  - MediaSession + silent PCM WAV keep-alive so active alerts, live tracking,
+//    and A Bordo voice announcements keep running when minimized/screen locked.
 // ============================================================================
 
 export const isNative = false;
@@ -13,6 +18,7 @@ export const PUBLIC_WEB_URL = 'https://titomassa.github.io/DIRECT-GPS/';
 let wakeLockSentinel = null;
 let deferredInstallPrompt = null;
 const installListeners = new Set();
+const swNotifActionListeners = new Set();
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeinstallprompt', (e) => {
@@ -36,6 +42,19 @@ if (typeof window !== 'undefined') {
       }
     }
   });
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const msg = event?.data;
+      if (!msg || msg.type !== 'DIRECT_GPS_NOTIF_ACTION') return;
+      for (const fn of swNotifActionListeners) {
+        try {
+          fn(msg.action, msg.data || {});
+        } catch {
+          // ignore
+        }
+      }
+    });
+  }
 }
 
 export function onPwaInstallAvailable(cb) {
@@ -44,6 +63,11 @@ export function onPwaInstallAvailable(cb) {
     if (deferredInstallPrompt) cb(true);
   }
   return () => installListeners.delete(cb);
+}
+
+export function onSwNotificationAction(cb) {
+  if (typeof cb === 'function') swNotifActionListeners.add(cb);
+  return () => swNotifActionListeners.delete(cb);
 }
 
 export async function promptPwaInstall() {
@@ -88,6 +112,7 @@ export function parseDeepLink(rawUrl) {
   out.stopId = (qp.get('idParada') || qp.get('parada') || '').trim().toUpperCase();
   out.codLinea = qp.get('codLinea') || '000';
   out.tab = (qp.get('tab') || '').trim().toLowerCase();
+  out.action = (qp.get('action') || '').trim().toLowerCase();
 
   if (!out.stopId && !out.tab && !out.action) return null;
   return out;
@@ -179,6 +204,13 @@ export function haptic(kind = 'light') {
   }
 }
 
+// ── Android-Native Service Worker Notifications ───────────────────────────────
+
+export function getNotificationPermissionState() {
+  if (typeof Notification === 'undefined') return 'unsupported';
+  return Notification.permission || 'default';
+}
+
 export async function ensureNotificationPermission() {
   if (typeof Notification === 'undefined') return false;
   if (Notification.permission === 'granted') return true;
@@ -186,9 +218,227 @@ export async function ensureNotificationPermission() {
   return (await safe(() => Notification.requestPermission(), 'denied')) === 'granted';
 }
 
-export async function notifyArrival({ title, body }) {
-  haptic('success');
-  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-    safe(() => new Notification(title, { body, icon: './icon.svg' }));
+async function getActiveSwRegistration() {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+  try {
+    const reg = (await navigator.serviceWorker.getRegistration?.()) || (await navigator.serviceWorker.ready);
+    return reg && typeof reg.showNotification === 'function' ? reg : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Envía o actualiza una notificación nativa de Android vía ServiceWorkerRegistration.showNotification().
+ * - Cuando `silent: false` y `renotify: true`, Android reproduce el timbre de notificación configurado
+ *   en el celular del usuario (ideal antes de que hable el TTS).
+ * - Cuando `silent: true` y `renotify: false`, actualiza en silencio la barra de progreso estilo Uber
+ *   sin hacer sonar el teléfono cada 10 segundos.
+ */
+export async function showSystemNotification({
+  title,
+  body,
+  tag = 'direct-gps-alert',
+  silent = false,
+  renotify = true,
+  requireInteraction = false,
+  vibrate = null,
+  actions = null,
+  data = {}
+} = {}) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+    return { delivered: false, usedNativeSw: false };
+  }
+
+  const options = {
+    body: String(body || ''),
+    icon: './icons/icon-192.png',
+    badge: './icons/icon-192.png',
+    tag,
+    silent: Boolean(silent),
+    renotify: Boolean(!silent && renotify),
+    requireInteraction: Boolean(requireInteraction),
+    timestamp: Date.now(),
+    data: { ...data, tag }
+  };
+
+  if (!silent && Array.isArray(vibrate) && vibrate.length > 0) {
+    options.vibrate = vibrate;
+  }
+  if (Array.isArray(actions) && actions.length > 0) {
+    options.actions = actions.slice(0, 2);
+  }
+
+  const reg = await getActiveSwRegistration();
+  if (reg) {
+    try {
+      await reg.showNotification(String(title || 'DIRECT GPS'), options);
+      return { delivered: true, usedNativeSw: true };
+    } catch {
+      // Retry without actions if platform rejects actions
+      try {
+        const { actions: _a, ...basicOpts } = options;
+        await reg.showNotification(String(title || 'DIRECT GPS'), basicOpts);
+        return { delivered: true, usedNativeSw: true };
+      } catch {
+        // Fall through to desktop Notification API
+      }
+    }
+  }
+
+  try {
+    // Desktop fallback only (Android Chrome throws on `new Notification`)
+    new Notification(String(title || 'DIRECT GPS'), {
+      body: options.body,
+      icon: options.icon,
+      tag: options.tag,
+      silent: options.silent
+    });
+    return { delivered: true, usedNativeSw: false };
+  } catch {
+    return { delivered: false, usedNativeSw: false };
+  }
+}
+
+export async function closeSystemNotification(tag = 'direct-gps-live-track') {
+  const reg = await getActiveSwRegistration();
+  if (!reg || typeof reg.getNotifications !== 'function') return;
+  try {
+    const list = await reg.getNotifications({ tag });
+    for (const n of list) {
+      try {
+        n.close();
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export async function notifyArrival({
+  title,
+  body,
+  stopId = '',
+  tag = 'direct-gps-arrival',
+  silent = false,
+  renotify = true,
+  actions = null,
+  data = {}
+} = {}) {
+  if (!silent) haptic('success');
+  return showSystemNotification({
+    title,
+    body,
+    tag,
+    silent,
+    renotify,
+    vibrate: silent ? null : [140, 80, 140],
+    actions,
+    data: { stopId, ...data }
+  });
+}
+
+// ── Background Keep-Alive for Minimized / Screen-Locked Android Sessions ────
+// Uses a 100% silent in-memory PCM WAV loop + MediaSession metadata while an
+// active alert, Uber live tracker, or A Bordo session is running so Android
+// Chrome keeps timers, GPS polling, notifications, and TTS alive in background.
+
+let keepAliveAudio = null;
+let keepAliveUrl = null;
+let keepAliveActive = false;
+
+function buildSilentWavBlobUrl(durationSec = 2, sampleRate = 8000) {
+  const numSamples = sampleRate * durationSec;
+  const buffer = new ArrayBuffer(44 + numSamples);
+  const view = new DataView(buffer);
+  const writeStr = (off, s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true); // byte rate (8-bit mono)
+  view.setUint16(32, 1, true); // block align
+  view.setUint16(34, 8, true); // bits per sample
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples, true);
+  // 8-bit unsigned PCM silence = 128
+  new Uint8Array(buffer, 44).fill(128);
+  const blob = new Blob([buffer], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
+}
+
+export function startBackgroundKeepAlive({ title = 'DIRECT GPS · Seguimiento activo', artist = 'Corrientes en vivo', onStop = null } = {}) {
+  if (typeof window === 'undefined' || typeof Audio === 'undefined') return false;
+  try {
+    if (!keepAliveUrl) {
+      keepAliveUrl = buildSilentWavBlobUrl(2, 8000);
+    }
+    if (!keepAliveAudio) {
+      keepAliveAudio = new Audio(keepAliveUrl);
+      keepAliveAudio.loop = true;
+      keepAliveAudio.volume = 0.001;
+      keepAliveAudio.setAttribute?.('playsinline', 'true');
+    }
+    keepAliveActive = true;
+    keepAliveAudio.play?.().catch(() => {});
+    updateBackgroundSessionMetadata({ title, artist, onStop });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function updateBackgroundSessionMetadata({ title = 'DIRECT GPS', artist = 'Seguimiento en vivo', onStop = null } = {}) {
+  if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+  try {
+    if (typeof MediaMetadata !== 'undefined') {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: String(title || 'DIRECT GPS'),
+        artist: String(artist || 'Seguimiento en vivo'),
+        album: 'DIRECT GPS · Corrientes',
+        artwork: [
+          { src: './icons/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: './icons/icon-512.png', sizes: '512x512', type: 'image/png' }
+        ]
+      });
+    }
+    navigator.mediaSession.playbackState = keepAliveActive ? 'playing' : 'none';
+    if (typeof onStop === 'function') {
+      try {
+        navigator.mediaSession.setActionHandler('stop', () => onStop());
+      } catch {
+        // ignore unsupported action
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function stopBackgroundKeepAlive() {
+  keepAliveActive = false;
+  if (keepAliveAudio) {
+    try {
+      keepAliveAudio.pause();
+      keepAliveAudio.currentTime = 0;
+    } catch {
+      // ignore
+    }
+  }
+  if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.playbackState = 'none';
+      navigator.mediaSession.metadata = null;
+    } catch {
+      // ignore
+    }
   }
 }

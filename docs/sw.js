@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v97';
+const CACHE_NAME = 'direct-gps-v98';
 const DATA_CACHE = 'direct-gps-data-v5';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
@@ -18,6 +18,7 @@ const SHELL_ASSETS = [
   './js/config.js',
   './js/native.js',
   './js/audio.js',
+  './js/tts.js',
   './js/static-data.js',
   './js/api.js',
   './js/trajectory.js',
@@ -56,6 +57,101 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((keys) => Promise.all(keys.filter((k) => !keep.has(k)).map((k) => caches.delete(k))))
   );
   self.clients.claim();
+});
+
+self.addEventListener('message', (event) => {
+  if (event?.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
+// ── Native Android Push & Notification Action Handlers (Subir / Bajar / Detener) ──
+self.addEventListener('push', (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = { title: 'DIRECT GPS', body: event.data?.text?.() || 'Actualización de arribo' };
+  }
+  const title = String(payload.title || 'DIRECT GPS');
+  const body = String(payload.body || '');
+  const tag = String(payload.tag || 'direct-gps-live-track');
+  const silent = Boolean(payload.silent);
+  const options = {
+    body,
+    icon: './icons/icon-192.png',
+    badge: './icons/icon-192.png',
+    tag,
+    silent,
+    renotify: !silent,
+    vibrate: silent ? undefined : [140, 80, 140],
+    actions: Array.isArray(payload.actions) ? payload.actions.slice(0, 2) : undefined,
+    data: payload.data || {}
+  };
+
+  event.waitUntil(
+    Promise.all([
+      self.registration.showNotification(title, options),
+      payload.speechText
+        ? self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+            for (const c of clients) {
+              c.postMessage({
+                type: 'DIRECT_GPS_NOTIF_ACTION',
+                action: 'speak',
+                data: { text: payload.speechText }
+              });
+            }
+          })
+        : Promise.resolve()
+    ])
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  const action = String(event.action || '').trim();
+  const data = event.notification?.data || {};
+
+  // Actions from Android notification shade: Subir / Ya subí / Bajar / Detener
+  if (action === 'board' || action === 'board-now' || action === 'alight' || action === 'stop-track') {
+    if (action === 'alight' || action === 'stop-track') {
+      event.notification.close();
+    }
+    event.waitUntil(
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+        if (clients.length > 0) {
+          for (const client of clients) {
+            client.postMessage({
+              type: 'DIRECT_GPS_NOTIF_ACTION',
+              action,
+              data
+            });
+          }
+          return;
+        }
+        // If user closed the app and tapped Subir/Bajar on a lingering notification, open the app with action
+        if (action === 'board' || action === 'board-now') {
+          const url = new URL('./', self.registration.scope);
+          if (data.stopId) url.searchParams.set('idParada', data.stopId);
+          url.searchParams.set('action', action);
+          return self.clients.openWindow(url.toString());
+        }
+      })
+    );
+    return;
+  }
+
+  // Tapping notification body focuses existing PWA window or opens stop deep-link
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if ('focus' in client) return client.focus();
+      }
+      const url = new URL('./', self.registration.scope);
+      if (data.stopId) url.searchParams.set('idParada', data.stopId);
+      return self.clients.openWindow(url.toString());
+    })
+  );
 });
 
 async function trimCache(cacheName, maxEntries) {
