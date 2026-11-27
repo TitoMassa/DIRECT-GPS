@@ -20,7 +20,7 @@ const MIME_TYPES = {
 };
 
 const FLEET_STORE_FILE = path.join(__dirname, '.cache', 'fleet-memory.json');
-const ROSTER_RETENTION_DAYS = 3;
+const ROSTER_RETENTION_DAYS = 7;
 const ROSTER_RETENTION_MS = ROSTER_RETENTION_DAYS * 86400 * 1000;
 const BG_SCAN_INTERVAL_MIN = 5;
 const BG_SCAN_BATCH_SIZE = 18;

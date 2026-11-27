@@ -66,8 +66,8 @@ const CORRIENTES_HUBS = [
   { name: 'Hospital Escuela', lat: -27.47582, lng: -58.83461 }
 ];
 
-// Central Fleet & Driver Roster configuration (rolling 3-day retention + daily 03:00 ART view)
-const ROSTER_RETENTION_DAYS = 3;
+// Central Fleet & Driver Roster configuration (rolling 7-day retention + daily 03:00 ART view)
+const ROSTER_RETENTION_DAYS = 7;
 const ROSTER_RETENTION_MS = ROSTER_RETENTION_DAYS * 86400 * 1000;
 const CRON_SCAN_INTERVAL_MIN = 5;
 const CRON_BATCH_SIZE = 18; // <= 18 SOAP + 2 DO = 20 subrequests/tick (Cloudflare Free limit: 50)
@@ -1193,17 +1193,6 @@ export class FleetMemory {
       }
     } catch {
       // Non-fatal purge guard
-    }
-
-    // One-time immediate prune when migrating from 7-day to 3-day retention so stale rows are freed right away
-    try {
-      const retVer = Number(this._getMeta('retention_prune_v', 0)) || 0;
-      if (retVer < 3) {
-        this._pruneOld(Date.now());
-        this._setMeta('retention_prune_v', 3);
-      }
-    } catch {
-      // Non-fatal migration guard
     }
 
     this._ready = true;
@@ -4428,7 +4417,7 @@ export default {
       if (pathname === '/' || pathname === '/api/health') {
         return jsonResponse({
           ok: true,
-          version: '2.5.1',
+          version: '2.5.2',
           service: 'DIRECT GPS · Cloudflare SOAP Proxy',
           fleetMemory: env?.FLEET_MEMORY ? 'durable-object-sqlite' : 'memory',
           autoFleetScan: {

@@ -4129,8 +4129,10 @@ input:focus-visible,
   inset: 0;
   z-index: 980;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   place-items: center;
   padding: 18px;
+  overflow: hidden;
   background: rgba(5, 7, 10, 0.68);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
@@ -4138,6 +4140,9 @@ input:focus-visible,
 
 .modal-card {
   width: min(370px, 100%);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -4153,6 +4158,12 @@ input:focus-visible,
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+  min-width: 0;
+}
+
+.modal-head > div {
+  min-width: 0;
+  flex: 1;
 }
 
 .modal-head h2,
@@ -4376,8 +4387,20 @@ input:focus-visible,
   max-height: min(85vh, 660px);
 }
 
+.fleet-roster-card .flota-tabs {
+  min-width: 0;
+  width: 100%;
+}
+
+.fleet-roster-card .flota-tab-btn {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .fleet-roster-search-wrap {
   width: 100%;
+  min-width: 0;
 }
 
 .fleet-roster-search {
@@ -4391,7 +4414,10 @@ input:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 7px;
+  width: 100%;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   min-height: 160px;
   max-height: 55vh;
   padding-right: 2px;
@@ -4399,10 +4425,12 @@ input:focus-visible,
 
 .fleet-roster-row {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   padding: 10px 12px;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
@@ -4419,7 +4447,7 @@ input:focus-visible,
 
 .fleet-roster-main {
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -4428,7 +4456,8 @@ input:focus-visible,
 .fleet-roster-top {
   display: flex;
   align-items: center;
-  gap: 7px;
+  flex-wrap: wrap;
+  gap: 5px 7px;
   min-width: 0;
 }
 
@@ -4449,9 +4478,9 @@ input:focus-visible,
   font-size: 13px;
   font-weight: 700;
   color: var(--text-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .fleet-roster-primary.mono {
@@ -4461,17 +4490,17 @@ input:focus-visible,
 .fleet-roster-sub {
   font-size: 11.5px;
   color: var(--text-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.32;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .fleet-roster-meta {
   font-size: 10.5px;
   color: var(--text-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .fleet-roster-right {
@@ -4480,6 +4509,11 @@ input:focus-visible,
   align-items: flex-end;
   gap: 4px;
   flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.fleet-roster-right:empty {
+  display: none;
 }
 
 .fleet-roster-empty {
@@ -5179,7 +5213,8 @@ button.ev-card:hover {
 
   .modal-card {
     width: 100%;
-    max-width: 100%;
+    min-width: 0;
+    max-width: 100vw;
     border-radius: 22px 22px 0 0;
     border-bottom: none;
     padding: 16px 16px calc(18px + var(--safe-bottom));

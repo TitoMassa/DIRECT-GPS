@@ -342,6 +342,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.5.7',
+    date: '27/11/2026 · 13:15 hs',
+    items: [
+      '<strong>Historial completo de 7 días restaurado (sin perder el ahorro en Cloudflare):</strong> comprobado que la reducción del consumo en Durable Objects proviene del escáner de horarios en 2 ventanas diarias (<code>03:00–04:30</code> y <code>15:00–16:00</code>) y las guardas SQLite, se restauró la retención completa de <strong>7 días</strong> en Flota (coches, choferes, servicios y observaciones diarias), Eventos pasados y paquete offline.',
+      '<strong>Corrección de desborde en la lista "En línea ahora" (Coches y Choferes):</strong> se corrigió el desborde horizontal del modal en celulares para que el botón cerrar (<code>✕</code>), las pestañas <strong>Coches / Choferes</strong>, la etiqueta de desvío horario y todos los datos completos de recorrido, servicio, turno y cabeceras se muestren íntegros en múltiples líneas sin recortar ni sacrificar ninguna información.'
+    ]
+  },
+  {
     version: 'v2.5.6',
     date: '26/11/2026 · 17:00 hs',
     items: [
@@ -361,9 +369,8 @@ const CHANGELOG_ENTRIES = [
     version: 'v2.5.4',
     date: '25/11/2026 · 21:20 hs',
     items: [
-      '<strong>Historial optimizado a 3 días (antes 7 días):</strong> coches, choferes, servicios, observaciones diarias y eventos pasados ahora se conservan durante los últimos <strong>3 días</strong> (manteniendo los próximos <strong>7 días</strong> programados sin cambios). Esto reduce en más de un 55 % el peso de la base de datos, el paquete offline y las lecturas diarias del servidor.',
-      '<strong>Escáner de horarios en 2 ventanas diarias (03:00 y 15:00 hs):</strong> en lugar de correr las 24 h cada 5 minutos, ahora realiza la barrida completa del nuevo día laboral entre las <strong>03:00 y 04:30 hs</strong> (capturando el 100 % de las 53 paradas ancla antes del primer coche) y un repaso aditivo extra entre las <strong>15:00 y 16:00 hs</strong> sin borrar nada de lo registrado a la madrugada, permaneciendo inactivo (0 consultas al Durable Object) las restantes 21,5 horas del día.',
-      '<strong>Corrección de arribos fantasma <code>+Flota</code> y coches que finalizan servicio:</strong> el radar de corredor y la app ahora cruzan la posición real con el diagrama de horarios, servicios y turnos para descartar automáticamente tanto coches que ya salieron y se alejan en sentido contrario como coches en su <strong>última vuelta de regreso a cabecera</strong> (fin de servicio o corte, sin próxima salida programada), evitando mostrarlos como próximo arribo donde ya no cargarán pasajeros.',
+      '<strong>Escáner de horarios en 2 ventanas diarias (03:00 y 15:00 hs):</strong> en lugar de correr las 24 h cada 5 minutos, realiza la barrida completa del nuevo día laboral entre las <strong>03:00 y 04:30 hs</strong> (capturando el 100 % de las 53 paradas ancla antes del primer coche) y un repaso aditivo extra entre las <strong>15:00 y 16:00 hs</strong> sin borrar nada de lo registrado a la madrugada, permaneciendo inactivo (0 consultas al Durable Object) las restantes 21,5 horas del día.',
+      '<strong>Sin arribos fantasma en coches que ya salieron o finalizan servicio:</strong> el radar de corredor y la app ahora cruzan la posición GPS y el desvío contra el diagrama de horarios, servicios y turnos para descartar automáticamente coches que ya pasaron y se alejan en sentido contrario o que regresan a cabecera en su <strong>última vuelta</strong> solo para finalizar servicio / entrar a corte (donde ya no cargarán pasajeros).',
       '<strong>Optimización profunda de Cloudflare Durable Objects (sin perder tiempo real):</strong> se eliminaron escrituras redundantes en SQLite (throttling inteligente en <code>/live-city-ingest</code>, guardas condicionales <code>WHERE</code> que evitan escrituras innecesarias ante reinicios del servidor, consolidación de metadatos del cron y caché en memoria de borde para resúmenes y flota activa), reduciendo el consumo diario en ~85 % mientras el rastreo EN VIVO y los mapas siguen actualizándose cada <strong>8,5–10 segundos</strong>.'
     ]
   },
@@ -4484,7 +4491,7 @@ function toggleAllFleetMode(forceState = null) {
 // ============================================================================
 // Global Vertical Chronological Events Timeline (-7d History / Today / +7d)
 // ============================================================================
-const EVENTS_MAX_PAST_DAYS = 3;
+const EVENTS_MAX_PAST_DAYS = 7;
 const EVENTS_MAX_FUTURE_DAYS = 7;
 const eventsLineModelCache = new Map(); // `${codLinea}:${tipoDia}` -> LineScheduleModel | null
 
@@ -5010,7 +5017,7 @@ function renderEventsTimeline({ scrollToNow = false, preserveScroll = false } = 
           ? `Sin conexión · Caché local${clock ? ` (${clock})` : ''} · Tocá un evento para ver el chip`
           : `Actualización automática cada ${REFRESH_INTERVAL_SEC} s · Tocá un evento para ir al chip`;
     } else if (built.isPastDay) {
-      el.eventsModalSub.textContent = 'Registro histórico (últimos 3 días) · Tocá un coche registrado para verlo en mapa';
+      el.eventsModalSub.textContent = 'Registro histórico (últimos 7 días) · Tocá un coche registrado para verlo en mapa';
     } else {
       el.eventsModalSub.textContent = 'Eventos programados (próximos 7 días) · Coches y choferes se asignan al iniciar';
     }
@@ -8174,9 +8181,9 @@ function renderLineFlotaView() {
     return;
   }
 
-  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayObs: [], dayKey: getArgentinaDayKey(), retentionDays: 3, meta: {} };
+  const data = fv.data || { coches: [], choferes: [], todayTrips: [], dayObs: [], dayKey: getArgentinaDayKey(), retentionDays: 7, meta: {} };
   const todayKey = data.dayKey || getArgentinaDayKey();
-  const retentionDays = data.retentionDays || 3;
+  const retentionDays = data.retentionDays || 7;
   const meta = data.meta || {};
   const model = fv.model || null;
   const nowSec = getArgentinaSecOfDay();
@@ -9597,7 +9604,7 @@ async function computeLineScheduledFleetSummary(codLinea, tipoDiaOverride = null
 async function loadServiceHistoryDay(linea, dayOffset, { force = false } = {}) {
   const fv = state.flotaView;
   if (!linea || state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
-  const retentionDays = fv.data?.retentionDays || 3;
+  const retentionDays = fv.data?.retentionDays || 7;
   const maxOffset = Math.max(0, retentionDays - 1);
   const minOffset = -EVENTS_MAX_FUTURE_DAYS;
   const clamped = Math.max(minOffset, Math.min(maxOffset, Number(dayOffset) || 0));
@@ -9730,7 +9737,7 @@ async function openLineFlota(linea, { force = true, announceLoad = true, initial
     ]);
     const data = res?.data;
     if (state.drill.step !== 'flota' || state.drill.linea?.codigo !== linea.codigo) return;
-    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 3, meta: {} };
+    state.flotaView.data = data || { coches: [], choferes: [], todayTrips: [], dayObs: [], retentionDays: 7, meta: {} };
     state.flotaView.schedSummary = schedSummary;
     state.flotaView.model = schedSummary?._model || null;
     state.flotaView.lastSyncAt = Number(res?.savedAt) || Date.now();
@@ -10510,13 +10517,13 @@ function renderDrilldown() {
                       : '';
                   const countBadge =
                     sum && sum.cochesSemana > 0
-                      ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 3 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} (3d)`}</span>`
+                      ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} sem.`}</span>`
                       : '';
                   const flotaAria =
                     sum && sum.cochesSemana > 0
                       ? `Ver flota de coches y choferes de línea ${l.descripcion}. ${peakOrHoy} coches simultáneos hoy${
                           sum.replacementSwapsToday > 0 ? ` (${sum.cochesHoy} internos en total)` : ''
-                        }, ${sum.cochesSemana} en los últimos 3 días y ${sum.choferesSemana} choferes`
+                        }, ${sum.cochesSemana} en la semana y ${sum.choferesSemana} choferes`
                       : `Ver flota de coches y choferes de línea ${l.descripcion}`;
                   return `
                     <div class="line-tile" style="--line-color:${color}">
