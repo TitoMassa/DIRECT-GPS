@@ -13,7 +13,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="format-detection" content="telephone=no" />
   <link rel="icon" type="image/svg+xml" href="./icon.svg" />
-  <link rel="apple-touch-icon" href="./icon.svg" />
+  <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
   <link rel="manifest" href="./manifest.json" />
 
   <!-- Tactile Spatial Transit Typography: Plus Jakarta Sans + JetBrains Mono -->
@@ -151,6 +152,13 @@
               <span id="stop-pilot-tag" class="pilot-tag">Todas las líneas</span>
             </div>
             <div class="stop-hero-actions">
+              <button type="button" id="btn-opposite-stop" class="mini-action-btn" title="Ir a la parada de la mano de enfrente" aria-label="Ir a la parada de la mano de enfrente">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+                  <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                </svg>
+              </button>
+              <button type="button" id="btn-led-board" class="mini-action-btn mini-action-led" title="Abrir Modo Tablero LED" aria-label="Abrir Modo Tablero LED pantalla completa">LED</button>
               <button type="button" id="btn-toggle-fav" class="mini-action-btn" title="Guardar parada en favoritas" aria-pressed="false" aria-label="Guardar parada en favoritas">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true" focusable="false">
                   <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
@@ -199,6 +207,9 @@
 
         <!-- Line Filter Strip (Scroll-preserving in-place updates) -->
         <div id="line-filter-strip" class="line-filter-strip hidden" role="group" aria-label="Filtrar arribos por línea"></div>
+
+        <!-- Bunching / Frequency Gap Alert Strip -->
+        <div id="bunching-banner" class="bunching-banner hidden" role="status"></div>
 
         <!-- Scheduled 24h Timetables + Service Rotation Inspector -->
         <div id="horarios-panel" class="horarios-panel hidden" aria-label="Horarios programados 24 horas"></div>
@@ -328,6 +339,7 @@
       </div>
 
       <div id="insp-service-route" class="insp-service-route hidden"></div>
+      <div id="insp-telemetry-strip" class="insp-telemetry-strip hidden"></div>
 
       <div class="insp-metrics-grid">
         <div class="insp-metric">
@@ -351,9 +363,20 @@
         </div>
       </div>
 
+      <div id="insp-upcoming-wrap" class="insp-upcoming-wrap hidden">
+        <button type="button" id="btn-insp-upcoming-toggle" class="insp-upcoming-toggle" aria-expanded="false">
+          <span>Próximas paradas (en vivo)</span>
+          <span id="insp-upcoming-arrow">▾</span>
+        </button>
+        <div id="insp-upcoming-list" class="insp-upcoming-list hidden"></div>
+      </div>
+
       <div class="bus-inspector-foot">
         <span id="insp-gps" class="mono-meta">—</span>
         <div class="insp-foot-actions">
+          <button type="button" id="btn-insp-fav-car" class="seg-btn seg-btn-xs hidden" title="Seguir este coche en Favoritos">☆</button>
+          <button type="button" id="btn-insp-profile" class="seg-btn seg-btn-xs hidden" title="Ver ficha histórica de 7 días">7d</button>
+          <button type="button" id="btn-insp-car-alert" class="seg-btn seg-btn-xs hidden" title="Activar alerta para este coche">🔔</button>
           <button type="button" id="btn-insp-track" class="seg-btn seg-btn-xs hidden">Seguir</button>
           <button type="button" id="btn-insp-center" class="seg-btn seg-btn-xs">Centrar</button>
           <button type="button" id="btn-insp-route" class="seg-btn seg-btn-xs">Recorrido</button>
@@ -361,7 +384,7 @@
       </div>
     </section>
 
-    <!-- Floating Top Map Action Pills (Global Events + Citywide Fleet Mode + Desktop Expand) -->
+    <!-- Floating Top Map Action Pills (¿Cómo llego? + Global Events + Citywide Fleet Mode + Desktop Expand) -->
     <div class="map-hud-top" role="group" aria-label="Herramientas en vivo sobre el mapa">
       <button
         type="button"
@@ -376,6 +399,22 @@
           <polyline points="12.5 9.5 15 12 12.5 14.5"/>
         </svg>
         <span>Panel</span>
+      </button>
+
+      <button
+        type="button"
+        id="btn-open-planner"
+        class="map-hud-pill"
+        aria-haspopup="dialog"
+        aria-controls="trip-planner-modal"
+        title="¿Cómo llego? Planificador de viajes origen a destino"
+        aria-label="Abrir planificador de viajes Cómo llego"
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/>
+          <path d="M8.5 19H12a4 4 0 0 0 0-8h0a4 4 0 0 1 0-8h3.5"/>
+        </svg>
+        <span>Cómo llego</span>
       </button>
 
       <button
@@ -438,6 +477,11 @@
     <!-- Floating Camera & Spatial Map Controls (Bottom-Right) -->
     <div class="map-controls" role="group" aria-label="Controles de cámara del mapa">
       <div class="map-ctrl-capsule">
+        <button type="button" id="btn-map-night-toggle" class="map-ctrl-btn" aria-pressed="false" title="Activar mapa nocturno" aria-label="Alternar mapa nocturno">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
         <button type="button" id="btn-map-locate" class="map-ctrl-btn" title="Ir a mi ubicación GPS" aria-label="Buscar paradas en mi ubicación GPS">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
             <circle cx="12" cy="12" r="4"/>
@@ -514,6 +558,7 @@
           </div>
           <button type="button" id="btn-close-all-fleet-roster" class="mini-close-btn" aria-label="Cerrar lista de flota en línea">✕</button>
         </div>
+        <div id="fleet-bridge-bar" class="fleet-bridge-bar hidden"></div>
         <div class="flota-tabs-bar" role="tablist" aria-label="Elegir lista por coches o por choferes">
           <button type="button" id="btn-roster-tab-coches" class="flota-tab-btn active" data-roster-tab="coches" role="tab" aria-selected="true">Coches (0→9)</button>
           <button type="button" id="btn-roster-tab-choferes" class="flota-tab-btn" data-roster-tab="choferes" role="tab" aria-selected="false">Choferes (A–Z)</button>
@@ -521,28 +566,126 @@
         <div class="fleet-roster-search-wrap">
           <input id="all-fleet-roster-filter" type="search" class="modal-input fleet-roster-search" placeholder="Filtrar por coche, chofer o línea..." autocomplete="off" aria-label="Filtrar coches o choferes en línea" />
         </div>
+        <div id="fleet-roster-quick-filters" class="events-filter-pills" role="group" aria-label="Filtros rápidos de flota en línea">
+          <button type="button" class="events-pill active" data-roster-quick="all" aria-pressed="true">Todos</button>
+          <button type="button" class="events-pill" data-roster-quick="late" aria-pressed="false">Atrasados</button>
+          <button type="button" class="events-pill" data-roster-quick="ahead" aria-pressed="false">Adelantados</button>
+          <button type="button" class="events-pill" data-roster-quick="adapted" aria-pressed="false">♿ Adaptados</button>
+          <button type="button" class="events-pill" data-roster-quick="ending" aria-pressed="false">Última vuelta</button>
+        </div>
         <div id="all-fleet-roster-body" class="fleet-roster-body"></div>
       </div>
     </div>
 
-    <!-- Free UI Background Color Picker Modal (AMOLED + Curated Colors + Custom Color) -->
+    <!-- Settings, Appearance, Night Map, Alerts/TTS, Backup & Diagnostics Modal -->
     <div id="theme-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="theme-modal-title">
       <div class="modal-card theme-modal-card">
         <div class="modal-head">
           <div>
-            <h2 id="theme-modal-title">Apariencia y color</h2>
-            <p class="modal-sub">El contraste y las superficies se adaptan automáticamente</p>
+            <h2 id="theme-modal-title">Ajustes y apariencia</h2>
+            <p class="modal-sub">Color, mapa nocturno, alertas por voz y diagnóstico</p>
           </div>
-          <button type="button" id="btn-theme-close" class="mini-close-btn" aria-label="Cerrar selector de color">✕</button>
+          <button type="button" id="btn-theme-close" class="mini-close-btn" aria-label="Cerrar ajustes">✕</button>
         </div>
-        <div id="theme-swatches" class="theme-swatches" role="radiogroup" aria-label="Colores predefinidos de fondo"></div>
-        <div class="theme-custom-row">
-          <label for="theme-custom-color" class="theme-custom-label">
-            <span>Color libre personalizado</span>
-            <span id="theme-custom-hex" class="mono-meta">#121518</span>
-          </label>
-          <input id="theme-custom-color" type="color" class="theme-color-input" value="#121518" aria-label="Elegir cualquier color de fondo personalizado" />
+        <div class="flota-tabs-bar" role="tablist" aria-label="Secciones de ajustes">
+          <button type="button" class="flota-tab-btn active" data-settings-tab="theme" role="tab" aria-selected="true">Apariencia</button>
+          <button type="button" class="flota-tab-btn" data-settings-tab="alerts" role="tab" aria-selected="false">Alertas</button>
+          <button type="button" class="flota-tab-btn" data-settings-tab="diag" role="tab" aria-selected="false">Sistema</button>
         </div>
+
+        <div data-settings-pane="theme" class="settings-pane">
+          <div class="settings-section-label">Estilo de mapa (100 % offline, sin API)</div>
+          <div class="settings-seg-row" role="group" aria-label="Elegir estilo de mapa">
+            <button type="button" class="seg-btn seg-btn-xs active" data-map-style="osm" aria-pressed="true">☀ Claro</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-map-style="dark" aria-pressed="false">☾ Nocturno</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-map-style="auto" aria-pressed="false">Auto</button>
+          </div>
+          <div class="settings-section-label">Color de interfaz</div>
+          <div id="theme-swatches" class="theme-swatches" role="radiogroup" aria-label="Colores predefinidos de fondo"></div>
+          <div class="theme-custom-row">
+            <label for="theme-custom-color" class="theme-custom-label">
+              <span>Color libre personalizado</span>
+              <span id="theme-custom-hex" class="mono-meta">#121518</span>
+            </label>
+            <input id="theme-custom-color" type="color" class="theme-color-input" value="#121518" aria-label="Elegir cualquier color de fondo personalizado" />
+          </div>
+        </div>
+
+        <div data-settings-pane="alerts" class="settings-pane hidden">
+          <div class="settings-section-label">Anticipación de alertas de arribo</div>
+          <div class="settings-seg-row" role="group" aria-label="Minutos de anticipación para alertas">
+            <button type="button" class="seg-btn seg-btn-xs active" data-alert-lead="3" aria-pressed="true">3 min</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-alert-lead="5" aria-pressed="false">5 min</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-alert-lead="8" aria-pressed="false">8 min</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-alert-lead="10" aria-pressed="false">10 min</button>
+          </div>
+          <div class="settings-toggle-row">
+            <div>
+              <strong>Avisos hablados por voz (TTS)</strong>
+              <p class="modal-sub">Lee en voz alta el arribo y la alarma de bajada en español</p>
+            </div>
+            <input id="chk-tts-alerts" type="checkbox" class="settings-checkbox" aria-label="Activar avisos hablados por voz" />
+          </div>
+          <button type="button" id="btn-test-tts" class="secondary-action-btn seg-btn-xs">🔊 Probar voz en español</button>
+        </div>
+
+        <div data-settings-pane="diag" class="settings-pane hidden">
+          <div class="settings-section-label">Estado del servidor y caché</div>
+          <div id="diag-status-box" class="diag-status-box"></div>
+          <div class="settings-section-label">Respaldo personal (Favoritas, coches, tema y alertas)</div>
+          <div class="settings-seg-row">
+            <button type="button" id="btn-backup-export" class="secondary-action-btn seg-btn-xs">Exportar respaldo</button>
+            <button type="button" id="btn-backup-import" class="secondary-action-btn seg-btn-xs">Importar respaldo</button>
+            <input id="backup-import-file" type="file" accept="application/json" class="hidden" />
+          </div>
+          <button type="button" id="btn-force-clean-reload" class="secondary-action-btn seg-btn-xs settings-danger-btn">↻ Forzar actualización limpia de la app</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Offline-First "¿Cómo llego?" Trip Planner Modal -->
+    <div id="trip-planner-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="planner-modal-title">
+      <div class="modal-card fleet-roster-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="planner-modal-title">¿Cómo llego?</h2>
+            <p class="modal-sub">Combinaciones directas o con 1 trasbordo en las 26 líneas</p>
+          </div>
+          <button type="button" id="btn-planner-close" class="mini-close-btn" aria-label="Cerrar planificador">✕</button>
+        </div>
+        <div class="planner-form">
+          <div class="planner-input-group">
+            <input id="planner-origin-input" type="search" class="modal-input" placeholder="Origen: parada, calle o zona..." autocomplete="off" aria-label="Origen del viaje" />
+            <button type="button" id="btn-planner-origin-gps" class="mini-action-btn" title="Usar mi ubicación GPS" aria-label="Usar mi ubicación GPS">📍</button>
+            <div id="planner-origin-dropdown" class="planner-ac-dropdown hidden"></div>
+          </div>
+          <div class="planner-input-group">
+            <input id="planner-dest-input" type="search" class="modal-input" placeholder="Destino: parada, calle o zona..." autocomplete="off" aria-label="Destino del viaje" />
+            <button type="button" id="btn-planner-swap" class="mini-action-btn" title="Invertir origen y destino" aria-label="Invertir origen y destino">⇅</button>
+            <div id="planner-dest-dropdown" class="planner-ac-dropdown hidden"></div>
+          </div>
+          <button type="button" id="btn-planner-go" class="primary-action-btn">Buscar cómo llegar</button>
+        </div>
+        <div id="planner-results" class="fleet-roster-body">
+          <div class="fleet-roster-empty">Elegí un origen y un destino (ej. Puerto → Campus UNNE o tu GPS → Terminal).</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 7-Day Cross-Line Car & Driver Profile Modal -->
+    <div id="profile-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
+      <div class="modal-card fleet-roster-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="profile-modal-title">Ficha histórica (7 días)</h2>
+            <p id="profile-modal-sub" class="modal-sub">Historial cruzado en todas las líneas</p>
+          </div>
+          <div class="profile-head-actions">
+            <button type="button" id="btn-profile-fav" class="seg-btn seg-btn-xs">☆ Seguir</button>
+            <button type="button" id="btn-profile-close" class="mini-close-btn" aria-label="Cerrar ficha histórica">✕</button>
+          </div>
+        </div>
+        <div id="profile-modal-body" class="fleet-roster-body"></div>
       </div>
     </div>
 
@@ -579,6 +722,30 @@
         </div>
         <div id="changelog-list" class="changelog-list"></div>
       </div>
+    </div>
+
+    <!-- Modo Viaje (Alarma de Bajada GPS) Floating Banner -->
+    <div id="ride-mode-banner" class="ride-mode-banner hidden" role="status" aria-live="polite">
+      <div class="ride-mode-info">
+        <strong id="ride-mode-title">Modo viaje activo</strong>
+        <span id="ride-mode-sub">Obteniendo GPS del celular...</span>
+      </div>
+      <button type="button" id="btn-ride-mode-cancel" class="mini-close-btn" aria-label="Desactivar alarma de bajada">✕</button>
+    </div>
+
+    <!-- Modo Tablero LED (Pantalla de Parada Fullscreen) -->
+    <div id="led-board-overlay" class="led-board-overlay hidden" role="dialog" aria-modal="true" aria-label="Tablero LED de próximos arribos">
+      <div class="led-board-head">
+        <div>
+          <span id="led-stop-code" class="code-badge">—</span>
+          <h2 id="led-stop-name">Parada</h2>
+        </div>
+        <div class="led-head-right">
+          <span id="led-board-clock" class="led-clock mono">--:--:--</span>
+          <button type="button" id="btn-led-board-close" class="mini-close-btn" aria-label="Salir del tablero LED">✕</button>
+        </div>
+      </div>
+      <div id="led-board-list" class="led-board-list"></div>
     </div>
 
     <div id="toast-container" class="toast-container" aria-hidden="true"></div>

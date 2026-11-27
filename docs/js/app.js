@@ -3,6 +3,7 @@ import {
   api,
   warmOfflineArchive,
   refreshOfflineBundleSilent,
+  getCachedOfflineBundle,
   distanceMeters,
   formatDistance,
   formatBlocks,
@@ -57,6 +58,17 @@ import {
 import { BusSimulator, parseGpsTimestampMs } from './simulator.js';
 import { TransitMap } from './map.js';
 import { playArrivalChime, playSubtleTick } from './audio.js';
+import { getCalendarTipoDiaWithHolidays } from './holidays.js';
+import {
+  computeBridgeStatus,
+  detectBunchingAndGaps,
+  computeNetworkPunctuality,
+  classifyBusEndingBadge,
+  computeBusPhysicalTelemetry,
+  buildBusUpcomingStops,
+  findOppositeStop
+} from './telemetry.js';
+import { createUiExtras } from './ui-extras.js';
 import {
   isNative,
   initNative,
@@ -118,6 +130,7 @@ const state = {
   allFleetRosterOpen: false,
   allFleetRosterTab: 'coches', // 'coches' | 'choferes'
   allFleetRosterQuery: '',
+  allFleetRosterQuickFilter: 'all', // 'all' | 'late' | 'ahead' | 'adapted' | 'ending'
 
   // Global Chronological Events Timeline Modal (-7d History / Today Live / +7d Scheduled)
   eventsModalOpen: false,
@@ -271,6 +284,11 @@ const el = {
   inspServicePill: document.getElementById('insp-service-pill'),
   inspAccessBadge: document.getElementById('insp-access-badge'),
   inspServiceRoute: document.getElementById('insp-service-route'),
+  inspTelemetryStrip: document.getElementById('insp-telemetry-strip'),
+  inspUpcomingWrap: document.getElementById('insp-upcoming-wrap'),
+  btnInspUpcomingToggle: document.getElementById('btn-insp-upcoming-toggle'),
+  inspUpcomingArrow: document.getElementById('insp-upcoming-arrow'),
+  inspUpcomingList: document.getElementById('insp-upcoming-list'),
   inspChofer: document.getElementById('insp-chofer'),
   inspLegajo: document.getElementById('insp-legajo'),
   inspEta: document.getElementById('insp-eta'),
@@ -280,9 +298,17 @@ const el = {
   inspNextLap: document.getElementById('insp-nextlap'),
   inspGps: document.getElementById('insp-gps'),
   btnCloseInspector: document.getElementById('btn-close-inspector'),
+  btnInspFavCar: document.getElementById('btn-insp-fav-car'),
+  btnInspProfile: document.getElementById('btn-insp-profile'),
+  btnInspCarAlert: document.getElementById('btn-insp-car-alert'),
   btnInspTrack: document.getElementById('btn-insp-track'),
   btnInspCenter: document.getElementById('btn-insp-center'),
   btnInspRoute: document.getElementById('btn-insp-route'),
+
+  btnOppositeStop: document.getElementById('btn-opposite-stop'),
+  btnLedBoard: document.getElementById('btn-led-board'),
+  bunchingBanner: document.getElementById('bunching-banner'),
+  btnOpenPlanner: document.getElementById('btn-open-planner'),
 
   btnAllBuses: document.getElementById('btn-all-buses'),
   allBusesCount: document.getElementById('all-buses-count'),
@@ -309,6 +335,8 @@ const el = {
 
   allFleetRoster: document.getElementById('all-fleet-roster'),
   allFleetRosterSub: document.getElementById('all-fleet-roster-sub'),
+  fleetBridgeBar: document.getElementById('fleet-bridge-bar'),
+  fleetRosterQuickFilters: document.getElementById('fleet-roster-quick-filters'),
   btnCloseAllFleetRoster: document.getElementById('btn-close-all-fleet-roster'),
   btnRosterTabCoches: document.getElementById('btn-roster-tab-coches'),
   btnRosterTabChoferes: document.getElementById('btn-roster-tab-choferes'),
@@ -341,6 +369,20 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.6.0',
+    date: '27/11/2026 · 15:00 hs',
+    items: [
+      '<strong>Mapa Nocturno 100 % offline (sin API externa):</strong> nuevo botón de luna sobre el mapa y selector <strong>Claro / Nocturno / Auto</strong> en Ajustes que reutiliza los mismos mosaicos cacheados de OpenStreetMap mediante filtro oscuro nativo, garantizando cero errores de API y funcionamiento total sin conexión.',
+      '<strong>Planificador "¿Cómo llego?" (offline + vivo):</strong> elegí origen (tu GPS, zona o parada) y destino en Corrientes para ver combinaciones directas y con 1 trasbordo en las 26 líneas, con tiempos en vivo cuando hay conexión, trazado del viaje en el mapa y acceso directo a la parada de subida o alarma de bajada.',
+      '<strong>Modo Viaje (alarma GPS de bajada) y Próximas paradas en vivo:</strong> al tocar cualquier colectivo ahora podés desplegar sus próximas paradas con horario estimado por desvío real, ver su <strong>estela GPS reciente</strong>, velocidad en <code>km/h</code>, estado físico (<em>En marcha / Detenido / En cabecera</em>) e insignia de <strong>Última vuelta / Corta al llegar</strong>, y activar una <strong>alarma de bajada a 300 m</strong> de tu parada.',
+      '<strong>Alertas configurables (3 / 5 / 8 / 10 min), alerta por coche puntual y avisos por voz (<code>es-AR</code>):</strong> elegí con cuántos minutos avisar, activá la lectura en voz alta y marcá alertas sobre un coche específico desde el inspector.',
+      '<strong>Favoritos de Coches y Choferes + Ficha histórica de 7 días cruzada:</strong> guardá tus coches y choferes favoritos junto a tus paradas, consultá su ficha completa de 7 días en todas las líneas (días, servicios, turnos y compañeros) y saltá con 1 toque a su posición en vivo.',
+      '<strong>Monitor del Puente General Belgrano, Termómetro de puntualidad y Detector de "tren de colectivos":</strong> estado fluido/lento/congestionado del puente (904A/B/C y 902), % a horario global y por línea, filtros rápidos en <strong>En línea ahora</strong> (<em>Atrasados, Adelantados, ♿ Adaptados, Última vuelta</em>) y alertas cuando vienen coches pegados o con huecos grandes.',
+      '<strong>Atajo ⇄ Mano de enfrente, Modo Tablero LED, Feriados de Argentina/Corrientes, Exportar/Compartir y Respaldo:</strong> cambiá de vereda con un toque, abrí la parada en pantalla gigante estilo cartel LED, anticipá feriados nacionales y locales de Corrientes, compartí servicios por WhatsApp, imprimí/guardá grillas en PDF, exportá/importá tu respaldo JSON y consultá el diagnóstico en vivo del servidor.',
+      '<strong>Robustez técnica e íconos PWA nativos:</strong> fuente única de nombres de choferes (<code>docs/data/driver-overrides.json</code>), íconos PNG <code>192×192</code>, <code>512×512</code> y <code>maskable</code> para Android/iOS, suite permanente de pruebas automatizadas (<code>npm test</code>) y validación continua en GitHub Actions.'
+    ]
+  },
   {
     version: 'v2.5.7',
     date: '27/11/2026 · 13:15 hs',
@@ -623,6 +665,73 @@ const transitMap = new TransitMap('map', {
       if (cur && state.inspectorOpen) updateInspectorFields(cur);
     }
   }
+});
+
+const uiExtras = createUiExtras({
+  state,
+  api,
+  transitMap,
+  showToast: (...args) => showToast(...args),
+  announce: (...args) => announce(...args),
+  getUserGps: async () => {
+    const pos = await getCurrentPosition({ enableHighAccuracy: true, timeout: 9000 });
+    return { lat: pos.latitude, lng: pos.longitude, accuracy: pos.accuracy };
+  },
+  openStop: (st, opts) => openStopRadar(st, opts?.focusLineCode ? String(opts.focusLineCode) : '000'),
+  locateUnitOnMap: (u) => {
+    if (!u) return;
+    if (state.allFleetMode && u.key && state.allFleetBuses.some((b) => b.key === u.key)) {
+      openAllFleetBusInspector(u.key);
+      return;
+    }
+    const cod = Number(u.codigoLinea);
+    const lineName = u.descripcionLinea || state.catalogo?.lineByCode?.get(cod)?.descripcion || `L${cod}`;
+    locateFleetUnitOnMap({
+      codLinea: cod,
+      lineName,
+      coche: u.identificadorCoche || u.coche || '',
+      choferNombre: u.choferNombre || '',
+      choferLegajo: u.choferLegajo || '',
+      esAdaptado: Boolean(u.esAdaptado),
+      lat: u.rawLat ?? u.lat ?? u.lastLat,
+      lng: u.rawLng ?? u.lng ?? u.lastLng,
+      bandera: u.realBandera || u.descripcionBandera || u.lastBandera || '',
+      lastGps: u.ultimaFechaHoraGPS || u.lastGps || '',
+      lastStopId: u.lastStopId || '',
+      desvioRaw: u.desvio?.raw || u.lastDesvioRaw || '',
+      desvioSec: u.desvio?.seconds || u.lastDesvioSec || 0,
+      enLineaAhora: true
+    });
+  },
+  ensureAllRoutesLoaded: async () => {
+    if (!state.catalogo) {
+      state.catalogo = await api.catalogo().catch(() => null);
+    }
+    const codes = (state.catalogo?.lineas || state.lineas || []).map((l) => Number(l.codigo)).filter(Boolean);
+    await ensureBranchesLoaded(codes);
+  },
+  onFavoritesChanged: () => renderFavorites(),
+  getOfflineBundleData: () => getCachedOfflineBundle(),
+  getAllLiveUnits: () => {
+    const out = [];
+    const seen = new Set();
+    const push = (u) => {
+      if (!u) return;
+      const key = `${Number(u.codigoLinea) || 0}:${String(u.identificadorCoche || u.coche || '').toUpperCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(u);
+    };
+    for (const b of state.allFleetBuses || []) push(b);
+    for (const b of state.arribos || []) if (!b.isNextLap) push(b);
+    const bUnits = getCachedOfflineBundle()?.activeUnits || [];
+    for (const u of bUnits) push(u);
+    return out;
+  },
+  applyThemeColor: (hex) => applyTheme(hex),
+  getCurrentThemeHex: () => state.themeColor,
+  saveFavorites: () => saveFavorites(),
+  renderFavoritas: () => renderFavorites()
 });
 
 function getCurrentlySelectedBus() {
@@ -1062,6 +1171,7 @@ function applyTheme(colorOrLegacy) {
   if (el.themeCustomHex) el.themeCustomHex.textContent = hex.toUpperCase();
   setSystemBarsTheme(isLight ? 'light' : 'dark');
   renderThemeSwatches();
+  uiExtras?.syncAutoMapStyle();
 }
 
 function renderThemeSwatches() {
@@ -1158,52 +1268,109 @@ function toggleActiveStopFavorite() {
 }
 
 function renderFavorites() {
-  const count = state.favorites.length;
+  const favEntities = uiExtras ? uiExtras.getFavEntities() : [];
+  const totalCount = state.favorites.length + favEntities.length;
   if (el.favCountPill) {
-    el.favCountPill.textContent = String(count);
-    el.favCountPill.classList.toggle('hidden', count === 0);
+    el.favCountPill.textContent = String(totalCount);
+    el.favCountPill.classList.toggle('hidden', totalCount === 0);
   }
   if (el.tabFavDot) {
-    el.tabFavDot.classList.toggle('hidden', count === 0);
+    el.tabFavDot.classList.toggle('hidden', totalCount === 0);
   }
 
-  if (count === 0) {
+  if (totalCount === 0) {
     el.favoritasList.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon" aria-hidden="true">★</div>
-        <h3>Sin paradas favoritas</h3>
-        <p>Buscá una parada y tocá la estrella para guardarla acá con acceso directo.</p>
+        <h3>Sin favoritos guardados</h3>
+        <p>Guardá paradas con la estrella, o seguí tus coches y choferes favoritos desde el inspector o la lista en vivo.</p>
       </div>
     `;
     return;
   }
 
-  el.favoritasList.innerHTML = state.favorites
-    .map(
-      (f) => {
-        const displayLabel = f.alias ? `${f.alias}, ${f.nombre || f.id}` : f.nombre || f.id;
-        return `
-      <div class="stop-list-card is-card-clickable" data-fav-id="${escapeHtml(f.id)}">
-        <div class="stop-card-top">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-            <span class="code-badge">${escapeHtml(f.id)}</span>
-            ${f.alias ? `<span class="pilot-tag">${escapeHtml(f.alias)}</span>` : ''}
+  const stopsHtml =
+    state.favorites.length > 0
+      ? `
+        ${favEntities.length > 0 ? `<div class="fav-section-title">Paradas favoritas (${state.favorites.length})</div>` : ''}
+        ${state.favorites
+          .map((f) => {
+            const displayLabel = f.alias ? `${f.alias}, ${f.nombre || f.id}` : f.nombre || f.id;
+            return `
+          <div class="stop-list-card is-card-clickable" data-fav-id="${escapeHtml(f.id)}">
+            <div class="stop-card-top">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                <span class="code-badge">${escapeHtml(f.id)}</span>
+                ${f.alias ? `<span class="pilot-tag">${escapeHtml(f.alias)}</span>` : ''}
+              </div>
+              <div style="display:flex;gap:5px">
+                <button type="button" class="mini-action-btn btn-edit-fav" data-id="${escapeHtml(f.id)}" title="Editar etiqueta" aria-label="Editar etiqueta de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">✎</button>
+                <button type="button" class="mini-action-btn btn-del-fav" data-id="${escapeHtml(f.id)}" title="Eliminar" aria-label="Eliminar parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)} de favoritas">✕</button>
+              </div>
+            </div>
+            <div class="stop-card-name">${escapeHtml(f.nombre)}</div>
+            <div class="stop-card-foot">
+              <span class="mono-meta" aria-hidden="true">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
+              <button type="button" class="seg-btn seg-btn-xs active btn-open-fav" data-id="${escapeHtml(f.id)}" aria-label="Abrir radar de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">Abrir radar →</button>
+            </div>
           </div>
-          <div style="display:flex;gap:5px">
-            <button type="button" class="mini-action-btn btn-edit-fav" data-id="${escapeHtml(f.id)}" title="Editar etiqueta" aria-label="Editar etiqueta de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">✎</button>
-            <button type="button" class="mini-action-btn btn-del-fav" data-id="${escapeHtml(f.id)}" title="Eliminar" aria-label="Eliminar parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)} de favoritas">✕</button>
-          </div>
-        </div>
-        <div class="stop-card-name">${escapeHtml(f.nombre)}</div>
-        <div class="stop-card-foot">
-          <span class="mono-meta" aria-hidden="true">${f.lat ? `${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : 'Corrientes Capital'}</span>
-          <button type="button" class="seg-btn seg-btn-xs active btn-open-fav" data-id="${escapeHtml(f.id)}" aria-label="Abrir radar de parada ${escapeHtml(f.id)}, ${escapeHtml(displayLabel)}">Abrir radar →</button>
-        </div>
-      </div>
-    `;
+        `;
+          })
+          .join('')}
+      `
+      : '';
+
+  const livePool = [
+    ...(state.allFleetBuses || []),
+    ...(state.arribos || []).filter((b) => !b.isNextLap),
+    ...(getCachedOfflineBundle()?.activeUnits || [])
+  ];
+  const findLiveForEntity = (ent) => {
+    const idUp = String(ent.id || '').toUpperCase();
+    return livePool.find((u) => {
+      if (ent.type === 'coche') {
+        return String(u.identificadorCoche || u.coche || '').toUpperCase() === idUp;
       }
-    )
-    .join('');
+      const leg = String(u.choferLegajo || '').toUpperCase();
+      const nom = String(u.choferNombre || '').toUpperCase();
+      return (leg && leg === idUp) || nom === idUp || nom === String(ent.label || '').toUpperCase();
+    });
+  };
+
+  const entitiesHtml =
+    favEntities.length > 0
+      ? `
+        <div class="fav-section-title">Coches y choferes seguidos (${favEntities.length})</div>
+        ${favEntities
+          .map((ent, idx) => {
+            const live = findLiveForEntity(ent);
+            const liveLine = live?.descripcionLinea || ent.lineName || '';
+            const badgeColor = liveLine ? getLineColor(liveLine) : '#334155';
+            const statusTxt = live
+              ? `● En línea ahora${liveLine ? ` · L${liveLine}` : ''}${live.realBandera || live.descripcionBandera ? ` · ${live.realBandera || live.descripcionBandera}` : ''}`
+              : ent.sub || (ent.type === 'coche' ? 'Fuera de línea ahora' : 'Chofer seguido');
+            return `
+              <div class="fav-entity-card" data-fav-ent-idx="${idx}">
+                <div class="fav-entity-main">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <strong style="font-size:13px">${escapeHtml(ent.label || ent.id)}</strong>
+                    ${liveLine ? `<span class="fleet-roster-line-pill" style="background:${badgeColor}">${escapeHtml(liveLine)}</span>` : ''}
+                  </div>
+                  <span class="mono-meta" style="${live ? 'color:#34d399;font-weight:700' : ''}">${escapeHtml(statusTxt)}</span>
+                </div>
+                <div class="fav-entity-actions">
+                  ${live ? `<button type="button" class="seg-btn seg-btn-xs active btn-fav-ent-locate" data-idx="${idx}">Mapa</button>` : ''}
+                  <button type="button" class="seg-btn seg-btn-xs btn-fav-ent-profile" data-idx="${idx}" title="Ficha histórica de 7 días">7d</button>
+                  <button type="button" class="mini-action-btn btn-fav-ent-del" data-idx="${idx}" title="Quitar de favoritos" aria-label="Quitar ${escapeHtml(ent.label || ent.id)} de favoritos">✕</button>
+                </div>
+              </div>
+            `;
+          })
+          .join('')}
+      `
+      : '';
+
+  el.favoritasList.innerHTML = `${stopsHtml}${entitiesHtml}`;
 
   el.favoritasList.querySelectorAll('.stop-list-card[data-fav-id]').forEach((card) => {
     card.addEventListener('click', (e) => {
@@ -1232,6 +1399,47 @@ function renderFavorites() {
     btn.addEventListener('click', () => {
       const fav = state.favorites.find((x) => x.id === btn.dataset.id);
       if (fav) openAliasModal(fav);
+    });
+  });
+
+  el.favoritasList.querySelectorAll('.btn-fav-ent-locate').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const ent = favEntities[Number(btn.dataset.idx)];
+      if (!ent) return;
+      const live = findLiveForEntity(ent);
+      if (!live) return;
+      const cod = Number(live.codigoLinea);
+      const lineName = live.descripcionLinea || state.catalogo?.lineByCode?.get(cod)?.descripcion || `L${cod}`;
+      locateFleetUnitOnMap({
+        codLinea: cod,
+        lineName,
+        coche: live.identificadorCoche || live.coche || '',
+        choferNombre: live.choferNombre || '',
+        choferLegajo: live.choferLegajo || '',
+        esAdaptado: Boolean(live.esAdaptado),
+        lat: live.rawLat ?? live.lat ?? live.lastLat,
+        lng: live.rawLng ?? live.lng ?? live.lastLng,
+        bandera: live.realBandera || live.descripcionBandera || live.lastBandera || '',
+        lastGps: live.ultimaFechaHoraGPS || live.lastGps || '',
+        lastStopId: live.lastStopId || '',
+        desvioRaw: live.desvio?.raw || live.lastDesvioRaw || '',
+        desvioSec: live.desvio?.seconds || live.lastDesvioSec || 0,
+        enLineaAhora: true
+      });
+    });
+  });
+
+  el.favoritasList.querySelectorAll('.btn-fav-ent-profile').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const ent = favEntities[Number(btn.dataset.idx)];
+      if (ent) uiExtras?.openEntityProfileModal(ent.type, ent.id, { lineName: ent.lineName, codLinea: ent.codLinea });
+    });
+  });
+
+  el.favoritasList.querySelectorAll('.btn-fav-ent-del').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const ent = favEntities[Number(btn.dataset.idx)];
+      if (ent) uiExtras?.toggleEntityFavorite(ent);
     });
   });
 }
@@ -1556,6 +1764,7 @@ function setupMobileSheet() {
 function renderRadarWelcome() {
   el.stopHero.classList.add('hidden');
   el.lineFilterStrip.classList.add('hidden');
+  el.bunchingBanner?.classList.add('hidden');
   el.horariosPanel.classList.add('hidden');
   el.arribosList.classList.remove('hidden');
   arrivalRowCache.clear();
@@ -1658,6 +1867,22 @@ function renderRadarWelcome() {
         </button>
       </div>
 
+      <button type="button" id="btn-welcome-planner" class="welcome-free-banner">
+        <span class="welcome-free-left">
+          <span class="welcome-tile-ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/>
+              <path d="M8.5 19H12a4 4 0 0 0 0-8h0a4 4 0 0 1 0-8h3.5"/>
+            </svg>
+          </span>
+          <span class="list-row-main">
+            <span class="list-row-title">¿Cómo llego? Planificador de viajes</span>
+            <span class="list-row-sub">Directos y trasbordos en las 26 líneas (offline + vivo)</span>
+          </span>
+        </span>
+        <span class="row-chevron" aria-hidden="true">›</span>
+      </button>
+
       <button type="button" id="btn-welcome-free-fleet" class="welcome-free-banner ${state.allFleetMode ? 'is-active' : ''}">
         <span class="welcome-free-left">
           <span class="welcome-tile-ico" aria-hidden="true">
@@ -1697,6 +1922,10 @@ function renderRadarWelcome() {
 
   document.getElementById('btn-welcome-lineas')?.addEventListener('click', () => switchTab('lineas'));
   document.getElementById('btn-welcome-cercanas')?.addEventListener('click', () => switchTab('cercanas'));
+  document.getElementById('btn-welcome-planner')?.addEventListener('click', () => {
+    haptic('light');
+    uiExtras?.openTripPlannerModal();
+  });
   document.getElementById('btn-welcome-free-fleet')?.addEventListener('click', () => {
     toggleAllFleetMode(!state.allFleetMode);
     if (state.allFleetMode && isBottomSheetLayout()) {
@@ -1720,6 +1949,7 @@ function renderRadarWelcome() {
 
 function resetToWelcome() {
   state.activeStop = null;
+  transitMap.clearTripPlanRoute?.();
   state.arribos = [];
   state.selectedBusKey = null;
   state.filterLine = 'ALL';
@@ -1856,6 +2086,8 @@ async function openStopRadar(stopInfo, codLinea = '000') {
   state.horariosViewCtx = null;
   arrivalRowCache.clear();
   filterStripSig = '';
+  uiExtras?.clearTriggeredCarAlerts();
+  el.bunchingBanner?.classList.add('hidden');
   state.stopLinesList = (catStop?.lineas || [])
     .map((cod) => {
       const l = state.catalogo?.lineByCode?.get(Number(cod)) || state.lineas.find((x) => Number(x.codigo) === Number(cod));
@@ -2021,11 +2253,19 @@ function applyLiveHorariosSnapshot(snapshot, { refreshActiveViews = false } = {}
 const systemDayTipoCache = new Map(); // `${dayKey}:${sig}:${archCount}` -> { tipo, tipoLabel, isOverride }
 
 function resolveSystemDayTipo(dayKey) {
-  const calTipo = getTipoDiaForDayKey(dayKey);
-  const defaultLabel = calTipo === 'domingo' ? 'Domingo' : calTipo === 'sabado' ? 'Sábado' : 'Lun–Vie';
+  const calInfo = getCalendarTipoDiaWithHolidays(dayKey);
+  const calTipo = calInfo.tipo;
+  const holiday = calInfo.holiday;
+  const defaultLabel = holiday
+    ? `${calTipo === 'sabado' ? 'Sábado' : 'Feriado'} · ${holiday.name}`
+    : calTipo === 'domingo'
+      ? 'Domingo'
+      : calTipo === 'sabado'
+        ? 'Sábado'
+        : 'Lun–Vie';
   const dayData = state.liveHorariosDays?.[dayKey];
   if (!dayData || !dayData.lineas) {
-    return { tipo: calTipo, tipoLabel: defaultLabel, isOverride: false };
+    return { tipo: calTipo, tipoLabel: defaultLabel, isOverride: Boolean(holiday), holiday };
   }
   const cacheKey = `${dayKey}:${state.liveHorariosSig}:${state.horariosArchiveCache.size}`;
   if (systemDayTipoCache.has(cacheKey)) return systemDayTipoCache.get(cacheKey);
@@ -2046,7 +2286,7 @@ function resolveSystemDayTipo(dayKey) {
     if (res.isLiveOverride) overrideVotes++;
   }
 
-  let result = { tipo: calTipo, tipoLabel: defaultLabel, isOverride: false };
+  let result = { tipo: calTipo, tipoLabel: defaultLabel, isOverride: Boolean(holiday), holiday };
   if (evaluated > 0 && overrideVotes > 0 && (overrideVotes >= 2 || overrideVotes / evaluated >= 0.5)) {
     let bestBucket = calTipo;
     let bestCount = votes[calTipo] || 0;
@@ -2059,13 +2299,17 @@ function resolveSystemDayTipo(dayKey) {
     if (bestBucket !== calTipo) {
       const label =
         bestBucket === 'domingo'
-          ? 'Domingo / Feriado'
+          ? holiday
+            ? `Feriado · ${holiday.name}`
+            : 'Domingo / Feriado'
           : bestBucket === 'sabado'
-            ? 'Sábado / Feriado'
+            ? holiday
+              ? `Sábado · ${holiday.name}`
+              : 'Sábado / Feriado'
             : bestBucket === 'custom'
               ? 'Horario especial'
               : 'Lun–Vie';
-      result = { tipo: bestBucket, tipoLabel: label, isOverride: true };
+      result = { tipo: bestBucket, tipoLabel: label, isOverride: true, holiday };
     }
   }
   systemDayTipoCache.set(cacheKey, result);
@@ -2981,6 +3225,22 @@ function renderArribosList() {
       ? state.arribos
       : state.arribos.filter((a) => a.descripcionLinea === state.filterLine);
 
+  // Bunching ("tren de colectivos") & frequency gap detector
+  if (el.bunchingBanner) {
+    const alerts = detectBunchingAndGaps(visible);
+    if (alerts.length > 0 && !state.horariosOpen) {
+      el.bunchingBanner.innerHTML = alerts
+        .slice(0, 2)
+        .map((a) => `<div><strong>${a.kind === 'bunching' ? '⚡ Tren:' : '⏳ Hueco:'}</strong> ${escapeHtml(a.message)}</div>`)
+        .join('');
+      el.bunchingBanner.classList.remove('hidden');
+    } else {
+      el.bunchingBanner.classList.add('hidden');
+      el.bunchingBanner.innerHTML = '';
+    }
+  }
+  uiExtras?.renderLedBoard();
+
   if (visible.length === 0) {
     arrivalRowCache.clear();
     el.arribosList.innerHTML = `
@@ -3043,7 +3303,8 @@ function handleArribosListClick(e) {
       state.triggeredAlerts.delete(line);
       if (state.soundEnabled) playSubtleTick();
       haptic('medium');
-      showToast(`Aviso activado para línea ${line} cuando falten 3 minutos o menos`, 'success');
+      const leadMin = uiExtras?.getAlertLeadMinutes() || 3;
+      showToast(`Aviso activado para línea ${line} cuando falten ${leadMin} minutos o menos`, 'success');
       ensureNotificationPermission().then((ok) => {
         if (!ok && isNative) {
           showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la pantalla apagada', 'warn', 4500);
@@ -3069,11 +3330,12 @@ function syncKeepAwake() {
 
 function checkProximityAlerts() {
   if (!state.activeStop) return;
+  const leadMin = uiExtras?.getAlertLeadMinutes() || 3;
   for (const bus of state.arribos) {
     if (
       state.armedAlerts.has(bus.descripcionLinea) &&
       !state.triggeredAlerts.has(bus.descripcionLinea) &&
-      bus.eta.minutes <= 3
+      bus.eta.minutes <= leadMin
     ) {
       state.triggeredAlerts.add(bus.descripcionLinea);
       if (state.soundEnabled) playArrivalChime();
@@ -3082,6 +3344,7 @@ function checkProximityAlerts() {
       const msg = `Atención: Línea ${bus.descripcionLinea}${cocheTag}, ${etaTxt}.`;
       showToast(msg, 'success', 6000, { silent: true });
       announce(msg, { assertive: true });
+      uiExtras?.speakIfEnabled(msg);
       notifyArrival({
         title: `Línea ${bus.descripcionLinea} llegando a ${state.activeStop.id}`,
         body: `${bus.tiempoRaw || `${bus.eta.minutes} min`}${cocheTag} · ${state.activeStop.nombre || 'Tu parada'}`,
@@ -3089,6 +3352,11 @@ function checkProximityAlerts() {
       });
     }
   }
+  uiExtras?.checkCarAlerts(state.arribos, state.activeStop, {
+    soundEnabled: state.soundEnabled,
+    playArrivalChime,
+    notifyArrival
+  });
 }
 
 function updateInspectorFields(bus) {
@@ -3264,6 +3532,101 @@ function updateInspectorFields(bus) {
     el.btnInspTrack.classList.toggle('hidden', !showTrackBtn);
     el.btnInspTrack.dataset.busKey = bus.key || '';
   }
+
+  // v2.6.0: Live physical telemetry (km/h, state, recent GPS trail) + Última vuelta / Corta badge
+  const gpsHistKey = bus.identificadorCoche ? `${bus.codigoLinea}-c${bus.identificadorCoche}` : '';
+  const gpsHist = gpsHistKey ? state.lastRealGpsByUnit.get(gpsHistKey) : null;
+  const simState = busSimulator.tracks?.get(bus.key) || cityFleetSim.get(bus.key) || null;
+  const phys = computeBusPhysicalTelemetry(bus, gpsHist, simState);
+  transitMap.drawBusTrail?.(phys.trail, dirColor);
+
+  let endingBadge = classifyBusEndingBadge(bus, null);
+  if (endingBadge && bus.isCortadoBlock && !bus.resumesFromCortado) {
+    endingBadge = { kind: 'cortado', label: 'Corta al llegar', detail: endingBadge.detail || 'Entra en corte al finalizar vuelta' };
+  }
+
+  if (el.inspTelemetryStrip) {
+    const chips = [`<span class="telemetry-chip is-${escapeHtml(phys.stateKind)}">${escapeHtml(phys.stateLabel)}</span>`];
+    if (endingBadge) {
+      chips.push(
+        `<span class="ending-pill ${endingBadge.kind === 'cortado' ? 'is-cortado' : ''}" title="${escapeHtml(endingBadge.detail || '')}">${escapeHtml(endingBadge.label)}</span>`
+      );
+    }
+    el.inspTelemetryStrip.innerHTML = chips.join('');
+    el.inspTelemetryStrip.classList.remove('hidden');
+  }
+
+  // v2.6.0: Collapsible upcoming stops timeline with 1-tap Modo Viaje alighting alarm
+  if (el.inspUpcomingWrap && el.inspUpcomingList) {
+    const branches = state.routeBranchesCache.get(Number(bus.codigoLinea)) || [];
+    const upcoming = buildBusUpcomingStops(bus, null, branches, getArgentinaSecOfDay());
+    if (upcoming.length > 0) {
+      el.inspUpcomingWrap.classList.remove('hidden');
+      el.inspUpcomingList._upcomingStops = upcoming;
+      el.inspUpcomingList._lineName = bus.descripcionLinea || '';
+      el.inspUpcomingList.innerHTML = upcoming
+        .slice(0, 12)
+        .map(
+          (st, idx) => `
+          <div class="insp-upcoming-row">
+            <div class="insp-upcoming-stop">
+              <strong>${escapeHtml(st.nombre)}</strong>
+              <span class="mono">${escapeHtml(st.id)} · ${formatDistance(st.distM)}</span>
+            </div>
+            <div class="insp-upcoming-right">
+              <span class="mono" style="font-weight:700">${escapeHtml(st.clock)} · ${st.etaMin}m</span>
+              <button type="button" class="mini-pill-btn btn-insp-ride-stop" data-up-idx="${idx}" title="Activar alarma de bajada a 300 m">Bajar</button>
+            </div>
+          </div>
+        `
+        )
+        .join('');
+    } else {
+      el.inspUpcomingWrap.classList.add('hidden');
+      el.inspUpcomingList.classList.add('hidden');
+      el.btnInspUpcomingToggle?.setAttribute('aria-expanded', 'false');
+      if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = '▾';
+    }
+  }
+
+  // v2.6.0: Car Favorite, 7-day Profile & Per-Car Alert buttons
+  const carId = String(bus.identificadorCoche || '').trim();
+  const hasCar = Boolean(carId);
+  if (el.btnInspFavCar) {
+    el.btnInspFavCar.classList.toggle('hidden', !hasCar);
+    if (hasCar) {
+      const isFavCar = Boolean(uiExtras?.isEntityFavorite('coche', carId));
+      el.btnInspFavCar.textContent = isFavCar ? '★' : '☆';
+      el.btnInspFavCar.classList.toggle('active', isFavCar);
+      el.btnInspFavCar.title = isFavCar ? `Quitar coche #${carId} de favoritos` : `Seguir coche #${carId} en Favoritos`;
+      el.btnInspFavCar.dataset.carId = carId;
+      el.btnInspFavCar.dataset.codLinea = bus.codigoLinea || '';
+      el.btnInspFavCar.dataset.lineName = bus.descripcionLinea || '';
+    }
+  }
+  if (el.btnInspProfile) {
+    el.btnInspProfile.classList.toggle('hidden', !hasCar);
+    if (hasCar) {
+      el.btnInspProfile.dataset.carId = carId;
+      el.btnInspProfile.dataset.codLinea = bus.codigoLinea || '';
+      el.btnInspProfile.dataset.lineName = bus.descripcionLinea || '';
+    }
+  }
+  if (el.btnInspCarAlert) {
+    const showCarAlert = Boolean(hasCar && state.activeStop && !bus.isFreeTracked && !bus.isCityFleet);
+    el.btnInspCarAlert.classList.toggle('hidden', !showCarAlert);
+    if (showCarAlert) {
+      const armed = Boolean(uiExtras?.isCarAlertArmed(bus.codigoLinea, carId));
+      el.btnInspCarAlert.textContent = armed ? '🔔✓' : '🔔';
+      el.btnInspCarAlert.classList.toggle('active', armed);
+      el.btnInspCarAlert.title = armed
+        ? `Quitar alerta del coche #${carId}`
+        : `Avisarme cuando el coche #${carId} esté cerca`;
+      el.btnInspCarAlert.dataset.carId = carId;
+      el.btnInspCarAlert.dataset.codLinea = bus.codigoLinea || '';
+      el.btnInspCarAlert.dataset.lineName = bus.descripcionLinea || '';
+    }
+  }
 }
 
 function resolvePrimaryBusForSelection(bus) {
@@ -3374,8 +3737,12 @@ function closeBusInspector() {
   state.followSelectedBus = false;
   state.selectedBusKey = null;
   el.busInspector.classList.add('hidden');
+  el.inspUpcomingList?.classList.add('hidden');
+  el.btnInspUpcomingToggle?.setAttribute('aria-expanded', 'false');
+  if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = '▾';
   syncInspectorLayoutHeight();
   transitMap.drawFocusVector(null);
+  transitMap.clearBusTrail?.();
   transitMap.updateBuses(state.arribos, {
     filterLine: state.filterLine,
     selectedBusKey: null,
@@ -3424,6 +3791,58 @@ function renderAllFleetRoster() {
   const buses = Array.isArray(state.allFleetBuses) ? state.allFleetBuses : [];
   const q = String(state.allFleetRosterQuery || '').trim().toLowerCase();
   const tab = state.allFleetRosterTab === 'choferes' ? 'choferes' : 'coches';
+  const qf = state.allFleetRosterQuickFilter || 'all';
+
+  const getEndingBadge = (b) => {
+    let badge = classifyBusEndingBadge(b, null);
+    if (badge && b.isCortadoBlock && !b.resumesFromCortado) {
+      badge = { kind: 'cortado', label: 'Corta al llegar', detail: badge.detail || 'Entra en corte al finalizar vuelta' };
+    }
+    return badge;
+  };
+
+  const matchesQuickFilter = (b) => {
+    if (qf === 'all') return true;
+    if (qf === 'late') return b.desvio && typeof b.desvio.seconds === 'number' && b.desvio.seconds <= -4 * 60;
+    if (qf === 'ahead') return b.desvio && typeof b.desvio.seconds === 'number' && b.desvio.seconds >= 3 * 60;
+    if (qf === 'adapted') return Boolean(b.esAdaptado);
+    if (qf === 'ending') return Boolean(getEndingBadge(b));
+    return true;
+  };
+
+  // Puente General Belgrano monitor + Network punctuality thermometer
+  if (el.fleetBridgeBar) {
+    const bridge = computeBridgeStatus(buses);
+    const punct = computeNetworkPunctuality(buses);
+    const parts = [];
+    if (bridge.available) {
+      const delayTxt = bridge.avgDelayMin > 0 ? ` (~${bridge.avgDelayMin}m atraso)` : '';
+      const onBrTxt = bridge.onBridgeCount > 0 ? ` · ${bridge.onBridgeCount} en puente` : '';
+      parts.push(
+        `<span class="bridge-pill status-${escapeHtml(bridge.status)}" title="${bridge.activeCount} coches interprovinciales (904/902) activos">🌉 Puente: ${escapeHtml(bridge.label)}${escapeHtml(delayTxt)}${escapeHtml(onBrTxt)}</span>`
+      );
+    }
+    if (punct.totalWithDesvio > 0) {
+      parts.push(
+        `<span class="punctuality-pill" title="${punct.onTime} a horario · ${punct.late} atrasados · ${punct.ahead} adelantados">📊 Red: <strong>${punct.onTimePct}% a horario</strong>${punct.late > 0 ? ` · ${punct.late} atras.` : ''}</span>`
+      );
+    }
+    if (parts.length > 0) {
+      el.fleetBridgeBar.innerHTML = parts.join('');
+      el.fleetBridgeBar.classList.remove('hidden');
+    } else {
+      el.fleetBridgeBar.classList.add('hidden');
+      el.fleetBridgeBar.innerHTML = '';
+    }
+  }
+
+  if (el.fleetRosterQuickFilters) {
+    el.fleetRosterQuickFilters.querySelectorAll('[data-roster-quick]').forEach((btn) => {
+      const active = btn.dataset.rosterQuick === qf;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
 
   const busesWithDrivers = buses.filter((b) => String(b.choferNombre || '').trim().length > 0);
   const withoutDriverCount = Math.max(0, buses.length - busesWithDrivers.length);
@@ -3451,13 +3870,13 @@ function renderAllFleetRoster() {
       if (cmp !== 0) return cmp;
       return String(a.descripcionLinea || '').localeCompare(String(b.descripcionLinea || ''), 'es', { numeric: true });
     });
-    const filtered = q
-      ? sorted.filter((b) =>
-          `${b.identificadorCoche} ${b.descripcionLinea} ${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
-            .toLowerCase()
-            .includes(q)
-        )
-      : sorted;
+    const filtered = sorted.filter((b) => {
+      if (!matchesQuickFilter(b)) return false;
+      if (!q) return true;
+      return `${b.identificadorCoche} ${b.descripcionLinea} ${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
+        .toLowerCase()
+        .includes(q);
+    });
 
     if (filtered.length === 0) {
       el.allFleetRosterBody.innerHTML = `<div class="fleet-roster-empty">${
@@ -3485,12 +3904,20 @@ function renderAllFleetRoster() {
           : 'Chofer sin informar';
         const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
         const desvHtml = desv ? `<span class="desvio-pill desvio-${escapeHtml(desv.status)}">${escapeHtml(desv.label)}</span>` : '';
+        const endBadge = getEndingBadge(b);
+        const endHtml = endBadge
+          ? `<span class="ending-pill ${endBadge.kind === 'cortado' ? 'is-cortado' : ''}" title="${escapeHtml(endBadge.detail || '')}">${escapeHtml(endBadge.label)}</span>`
+          : '';
+        const carId = String(b.identificadorCoche || '').trim();
+        const isFav = carId && Boolean(uiExtras?.isEntityFavorite('coche', carId));
         return `
-          <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
+          <div role="button" tabindex="0" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
             <div class="fleet-roster-main">
               <div class="fleet-roster-top">
                 <span class="fleet-roster-primary mono">Coche ${escapeHtml(b.identificadorCoche)}</span>
                 <span class="fleet-roster-line-pill" style="background:${lineColor}">${escapeHtml(b.descripcionLinea)}</span>
+                ${b.esAdaptado ? `<span class="adapted-icon-badge" title="Unidad adaptada">♿</span>` : ''}
+                ${endHtml}
               </div>
               <div class="fleet-roster-sub">${escapeHtml(driverText)}</div>
               ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
@@ -3498,8 +3925,16 @@ function renderAllFleetRoster() {
             </div>
             <div class="fleet-roster-right">
               ${desvHtml}
+              ${
+                carId
+                  ? `<div class="fleet-roster-actions-inline">
+                      <button type="button" class="mini-pill-btn btn-roster-profile" data-ent-type="coche" data-ent-id="${escapeHtml(carId)}" data-ent-line="${escapeHtml(b.descripcionLinea || '')}" data-ent-cod="${b.codigoLinea || 0}" title="Ficha histórica 7 días">7d</button>
+                      <button type="button" class="mini-pill-btn btn-roster-fav ${isFav ? 'is-active' : ''}" data-ent-type="coche" data-ent-id="${escapeHtml(carId)}" data-ent-label="Coche #${escapeHtml(carId)}" data-ent-line="${escapeHtml(b.descripcionLinea || '')}" data-ent-cod="${b.codigoLinea || 0}" title="${isFav ? 'Quitar de favoritos' : 'Seguir en Favoritos'}">${isFav ? '★' : '☆'}</button>
+                    </div>`
+                  : ''
+              }
             </div>
-          </button>
+          </div>
         `;
       })
       .join('');
@@ -3513,13 +3948,13 @@ function renderAllFleetRoster() {
     if (cmp !== 0) return cmp;
     return compareCocheNumericAsc(a.identificadorCoche, b.identificadorCoche);
   });
-  const filteredDrivers = q
-    ? sortedDrivers.filter((b) =>
-        `${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.identificadorCoche} ${b.descripcionLinea} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
-          .toLowerCase()
-          .includes(q)
-      )
-    : sortedDrivers;
+  const filteredDrivers = sortedDrivers.filter((b) => {
+    if (!matchesQuickFilter(b)) return false;
+    if (!q) return true;
+    return `${b.choferNombre || ''} ${b.choferLegajo || ''} ${b.identificadorCoche} ${b.descripcionLinea} ${b.realBandera || b.descripcionBandera || ''} ${b.startPlace || ''} ${b.endPlace || ''}`
+      .toLowerCase()
+      .includes(q);
+  });
 
   if (filteredDrivers.length === 0) {
     el.allFleetRosterBody.innerHTML = `<div class="fleet-roster-empty">${
@@ -3538,17 +3973,25 @@ function renderAllFleetRoster() {
       const bandera = b.realBandera || b.descripcionBandera || '';
       const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
       const desvHtml = desv ? `<span class="desvio-pill desvio-${escapeHtml(desv.status)}">${escapeHtml(desv.label)}</span>` : '';
+      const endBadge = getEndingBadge(b);
+      const endHtml = endBadge
+        ? `<span class="ending-pill ${endBadge.kind === 'cortado' ? 'is-cortado' : ''}" title="${escapeHtml(endBadge.detail || '')}">${escapeHtml(endBadge.label)}</span>`
+        : '';
       const bi = b._matchedTrip?.blockInfo || null;
       const places = b.serviceNumber ? describeTurnoPlaces(bi || b, b.serviceTurnosCount || 1) : null;
       const srvMetaTxt = b.serviceNumber
         ? `Srv ${b.serviceNumber}${b.serviceTurnosCount > 1 ? ` · T${b.turnoIndex || 1}/${b.serviceTurnosCount}` : ''}${b.serviceSpan ? ` (${b.serviceSpan})` : ''}${places?.textPlain ? ` · ${places.textPlain}` : ''}`
         : '';
+      const drvId = String(b.choferLegajo || b.choferNombre || '').trim();
+      const isFav = drvId && Boolean(uiExtras?.isEntityFavorite('chofer', drvId));
       return `
-        <button type="button" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
+        <div role="button" tabindex="0" class="fleet-roster-row" data-roster-bus-key="${escapeHtml(b.key)}">
           <div class="fleet-roster-main">
             <div class="fleet-roster-top">
               <span class="fleet-roster-primary">${escapeHtml(b.choferNombre)}</span>
               <span class="fleet-roster-line-pill" style="background:${lineColor}">${escapeHtml(b.descripcionLinea)}</span>
+              ${b.esAdaptado ? `<span class="adapted-icon-badge" title="Unidad adaptada">♿</span>` : ''}
+              ${endHtml}
             </div>
             <div class="fleet-roster-sub">Coche ${escapeHtml(b.identificadorCoche)}${b.choferLegajo ? ` · Leg. ${escapeHtml(b.choferLegajo)}` : ''}</div>
             ${bandera ? `<div class="fleet-roster-meta">${escapeHtml(bandera)}</div>` : ''}
@@ -3556,14 +3999,22 @@ function renderAllFleetRoster() {
           </div>
           <div class="fleet-roster-right">
             ${desvHtml}
+            ${
+              drvId
+                ? `<div class="fleet-roster-actions-inline">
+                    <button type="button" class="mini-pill-btn btn-roster-profile" data-ent-type="chofer" data-ent-id="${escapeHtml(drvId)}" data-ent-line="${escapeHtml(b.descripcionLinea || '')}" data-ent-cod="${b.codigoLinea || 0}" title="Ficha histórica 7 días">7d</button>
+                    <button type="button" class="mini-pill-btn btn-roster-fav ${isFav ? 'is-active' : ''}" data-ent-type="chofer" data-ent-id="${escapeHtml(drvId)}" data-ent-label="${escapeHtml(b.choferNombre || drvId)}" data-ent-sub="${b.choferLegajo ? `Legajo ${escapeHtml(b.choferLegajo)}` : ''}" data-ent-line="${escapeHtml(b.descripcionLinea || '')}" data-ent-cod="${b.codigoLinea || 0}" title="${isFav ? 'Quitar de favoritos' : 'Seguir en Favoritos'}">${isFav ? '★' : '☆'}</button>
+                  </div>`
+                : ''
+            }
           </div>
-        </button>
+        </div>
       `;
     })
     .join('');
 
   const noteHtml =
-    withoutDriverCount > 0 && !q
+    withoutDriverCount > 0 && !q && qf === 'all'
       ? `<div class="fleet-roster-note">+ ${withoutDriverCount} ${withoutDriverCount === 1 ? 'unidad sin chofer informado' : 'unidades sin chofer informado'} (visibles en pestaña Coches)</div>`
       : '';
 
@@ -7639,8 +8090,7 @@ function shiftDayKey(dayKey, deltaDays) {
 function getTipoDiaForDayKey(dayKey) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || ''));
   if (!m) return getArgentinaTodayTipo();
-  const dow = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
-  return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
+  return getCalendarTipoDiaWithHolidays(dayKey).tipo;
 }
 
 function formatServiceDayNavLabel(dayKey, todayKey) {
@@ -8978,6 +9428,7 @@ function renderLineFlotaView() {
                   : 'chofer sin datos',
                 'Tocá para ver en el mapa'
               ].filter(Boolean);
+              const isCarFav = Boolean(uiExtras?.isEntityFavorite('coche', c.coche));
               return `
                 <li class="flota-row flota-row-clickable ${isLiveNow ? 'is-live' : seen.isToday ? 'is-today' : 'is-recent'}" style="--line-color:${color}">
                   <button type="button" class="flota-row-btn" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srParts.join('. '))}">
@@ -8999,6 +9450,10 @@ function renderLineFlotaView() {
                       </div>
                     </div>
                   </button>
+                  <div class="fleet-roster-actions-inline" style="padding:0 12px 8px;justify-content:flex-end">
+                    <button type="button" class="mini-pill-btn btn-flota-profile" data-ent-type="coche" data-ent-id="${escapeHtml(c.coche)}" data-ent-line="${escapeHtml(linea.descripcion)}" data-ent-cod="${linea.codigo}" title="Ver ficha histórica de 7 días en todas las líneas">Ficha 7d</button>
+                    <button type="button" class="mini-pill-btn btn-flota-fav ${isCarFav ? 'is-active' : ''}" data-ent-type="coche" data-ent-id="${escapeHtml(c.coche)}" data-ent-label="Coche #${escapeHtml(c.coche)}" data-ent-line="${escapeHtml(linea.descripcion)}" data-ent-cod="${linea.codigo}" title="${isCarFav ? 'Quitar de favoritos' : 'Seguir en Favoritos'}">${isCarFav ? '★ Favorito' : '☆ Seguir'}</button>
+                  </div>
                 </li>
               `;
             })
@@ -9097,6 +9552,8 @@ function renderLineFlotaView() {
                   : 'coche sin datos',
                 'Tocá para ver en el mapa'
               ].filter(Boolean);
+              const drvId = String(d.choferLegajo || d.choferNombre || '').trim();
+              const isDrvFav = Boolean(drvId && uiExtras?.isEntityFavorite('chofer', drvId));
               return `
                 <li class="flota-row flota-row-clickable ${isLiveNow ? 'is-live' : seen.isToday ? 'is-today' : 'is-recent'}" style="--line-color:${color}">
                   <button type="button" class="flota-row-btn" data-locate-idx="${targetIdx}" aria-label="${escapeHtml(srParts.join('. '))}">
@@ -9118,6 +9575,14 @@ function renderLineFlotaView() {
                       </div>
                     </div>
                   </button>
+                  ${
+                    drvId
+                      ? `<div class="fleet-roster-actions-inline" style="padding:0 12px 8px;justify-content:flex-end">
+                          <button type="button" class="mini-pill-btn btn-flota-profile" data-ent-type="chofer" data-ent-id="${escapeHtml(drvId)}" data-ent-line="${escapeHtml(linea.descripcion)}" data-ent-cod="${linea.codigo}" title="Ver ficha histórica de 7 días en todas las líneas">Ficha 7d</button>
+                          <button type="button" class="mini-pill-btn btn-flota-fav ${isDrvFav ? 'is-active' : ''}" data-ent-type="chofer" data-ent-id="${escapeHtml(drvId)}" data-ent-label="${escapeHtml(d.choferNombre || drvId)}" data-ent-sub="${d.choferLegajo ? `Legajo ${escapeHtml(d.choferLegajo)}` : ''}" data-ent-line="${escapeHtml(linea.descripcion)}" data-ent-cod="${linea.codigo}" title="${isDrvFav ? 'Quitar de favoritos' : 'Seguir en Favoritos'}">${isDrvFav ? '★ Favorito' : '☆ Seguir'}</button>
+                        </div>`
+                      : ''
+                  }
                 </li>
               `;
             })
@@ -9269,9 +9734,12 @@ function renderLineFlotaView() {
                 <li class="flota-row flota-srv-card" style="--line-color:${color}">
                   <div class="flota-srv-card-head">
                     <span class="flota-coche-title">Servicio ${s.serviceNumber}</span>
-                    <span class="mono-meta">${sTurnos.length} ${sTurnos.length === 1 ? 'turno' : 'turnos'}${
-                      fullDaySpan ? ` · ${escapeHtml(fullDaySpan)}` : ''
-                    }</span>
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                      <span class="mono-meta">${sTurnos.length} ${sTurnos.length === 1 ? 'turno' : 'turnos'}${
+                        fullDaySpan ? ` · ${escapeHtml(fullDaySpan)}` : ''
+                      }</span>
+                      <button type="button" class="mini-pill-btn btn-share-srv" data-share-srv="${s.serviceNumber}" title="Compartir resumen de este servicio por WhatsApp">Compartir</button>
+                    </div>
                   </div>
                   <div class="srv-turnos-stack">
                     ${turnosHtml}
@@ -9548,6 +10016,51 @@ function renderLineFlotaView() {
       const idx = Number(btn.dataset.locateIdx);
       const target = clickTargets[idx];
       if (target) locateFleetUnitOnMap(target);
+    });
+  });
+
+  el.lineasContent.querySelectorAll('.btn-flota-profile').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      uiExtras?.openEntityProfileModal(btn.dataset.entType, btn.dataset.entId, {
+        lineName: btn.dataset.entLine || linea.descripcion,
+        codLinea: Number(btn.dataset.entCod) || linea.codigo
+      });
+    });
+  });
+
+  el.lineasContent.querySelectorAll('.btn-flota-fav').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      haptic('light');
+      uiExtras?.toggleEntityFavorite({
+        type: btn.dataset.entType,
+        id: btn.dataset.entId,
+        label: btn.dataset.entLabel || btn.dataset.entId,
+        sub: btn.dataset.entSub || '',
+        lineName: btn.dataset.entLine || linea.descripcion,
+        codLinea: Number(btn.dataset.entCod) || linea.codigo
+      });
+      renderLineFlotaView();
+    });
+  });
+
+  el.lineasContent.querySelectorAll('.btn-share-srv').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const srvNum = Number(btn.dataset.shareSrv);
+      const srvObj = visibleServices.find((x) => Number(x.serviceNumber) === srvNum);
+      if (!srvObj) return;
+      const blocks =
+        (activeSrvModel?.blocks || []).filter((b) => Number(b.serviceNumber) === srvNum) ||
+        srvObj.turnos ||
+        [];
+      uiExtras?.shareServiceSummary(
+        linea.descripcion,
+        `${dayNavInfo.main} · ${dayNavInfo.tipoLabel}`,
+        srvObj,
+        blocks.length > 0 ? blocks : srvObj.turnos || []
+      );
     });
   });
 }
@@ -10218,6 +10731,7 @@ function renderLineRecorridoView() {
               ? `<button type="button" id="btn-rec-scroll-now" class="seg-btn seg-btn-xs active">Ir a ahora</button>`
               : ''
           }
+          <button type="button" id="btn-rec-print" class="seg-btn seg-btn-xs" title="Imprimir o guardar esta grilla en PDF">PDF</button>
           <button type="button" id="btn-rec-fullscreen" class="seg-btn seg-btn-xs ${rv.fullscreen ? 'active' : ''}" aria-pressed="${Boolean(rv.fullscreen)}" aria-label="${rv.fullscreen ? 'Salir de pantalla completa' : 'Ver grilla en pantalla completa'}" title="${rv.fullscreen ? 'Volver al panel normal' : 'Expandir grilla a toda la pantalla'}">
             ${fullIconSvg}
             <span>${rv.fullscreen ? 'Reducir' : 'Pantalla completa'}</span>
@@ -10419,6 +10933,14 @@ function renderLineRecorridoView() {
     haptic('light');
     scrollNowCol(true);
   });
+  document.getElementById('btn-rec-print')?.addEventListener('click', () => {
+    const tbl = el.lineasContent.querySelector('.rec-matrix-table');
+    if (!tbl) return;
+    haptic('light');
+    const tipoTxt = rv.tipoDia === 'domingo' ? 'Domingo / Feriado' : rv.tipoDia === 'sabado' ? 'Sábado' : 'Lun–Vie';
+    const subTxt = `${activeBranch.bandera || 'Recorrido'} · ${tipoTxt}${rv.serviceFilter !== 'ALL' ? ` · Servicio ${rv.serviceFilter}` : ''}`;
+    uiExtras?.printScheduleTable(`Línea ${linea.descripcion} — Horarios`, subTxt, tbl);
+  });
   document.getElementById('btn-rec-fullscreen')?.addEventListener('click', () => {
     const wrap = document.getElementById('rec-matrix-scroll');
     const prevTop = wrap?.scrollTop || 0;
@@ -10478,6 +11000,12 @@ function renderDrilldown() {
       (l) => l.descripcion.toLowerCase().includes(query) && matchesFamily(l.descripcion.toUpperCase())
     );
 
+    const punctPool =
+      state.allFleetBuses && state.allFleetBuses.length > 0
+        ? state.allFleetBuses
+        : getCachedOfflineBundle()?.activeUnits || [];
+    const netPunct = computeNetworkPunctuality(punctPool);
+
     const familyStripHtml = !query
       ? `
       <div class="line-family-strip" role="group" aria-label="Filtrar por familia de línea">
@@ -10515,6 +11043,13 @@ function renderDrilldown() {
                     activeNow > 0
                       ? `<span class="line-live-pill" aria-hidden="true">● ${activeNow} en línea</span>`
                       : '';
+                  const linePunct = netPunct.perLine.get(Number(l.codigo));
+                  const punctPillHtml =
+                    linePunct && linePunct.total > 0
+                      ? `<span class="line-punct-pill is-${linePunct.status}" title="Termómetro en vivo: ${linePunct.onTimePct}% a horario${linePunct.avgLateMin > 0 ? ` · atraso prom. -${linePunct.avgLateMin} min` : ''}">${
+                          linePunct.avgLateMin >= 5 ? `-${linePunct.avgLateMin}m` : `${linePunct.onTimePct}% ok`
+                        }</span>`
+                      : '';
                   const countBadge =
                     sum && sum.cochesSemana > 0
                       ? `<span class="line-tile-count" aria-hidden="true" title="${activeNote}Pico simultáneo hoy: ${peakOrHoy}${swapsNote} · ${sum.cochesSemana} en 7 días · ${sum.choferesSemana} choferes">${peakOrHoy > 0 ? `${peakOrHoy} hoy` : `${sum.cochesSemana} sem.`}</span>`
@@ -10534,6 +11069,7 @@ function renderDrilldown() {
                         </button>
                         <div class="line-tile-badges">
                           ${livePillHtml}
+                          ${punctPillHtml}
                           ${countBadge}
                         </div>
                       </div>
@@ -11147,6 +11683,35 @@ function bindEvents() {
     }
   });
 
+  el.btnOppositeStop?.addEventListener('click', async () => {
+    if (!state.activeStop) return;
+    haptic('light');
+    if (!state.catalogo) {
+      state.catalogo = await api.catalogo().catch(() => null);
+    }
+    const catStop = state.catalogo?.stopById?.get(String(state.activeStop.id || '').toUpperCase());
+    if (Array.isArray(catStop?.lineas) && catStop.lineas.length > 0) {
+      await ensureBranchesLoaded(catStop.lineas.slice(0, 6));
+    }
+    const opp = findOppositeStop(state.activeStop, state.catalogo, state.routeBranchesCache);
+    if (!opp) {
+      showToast('No encontramos parada de mano contraria a menos de 500 m.', 'info', 2800);
+      return;
+    }
+    showToast(`Cambiando a mano de enfrente: ${opp.nombre} (${opp.id})`, 'info', 2200);
+    openStopRadar(opp, state.codLineaQuery || '000');
+  });
+
+  el.btnLedBoard?.addEventListener('click', () => {
+    haptic('light');
+    uiExtras?.openLedBoard();
+  });
+
+  el.btnOpenPlanner?.addEventListener('click', () => {
+    haptic('light');
+    uiExtras?.openTripPlannerModal();
+  });
+
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
   el.btnShareStop.addEventListener('click', async () => {
     if (!state.activeStop) return;
@@ -11170,6 +11735,55 @@ function bindEvents() {
   });
 
   el.btnCloseInspector.addEventListener('click', closeBusInspector);
+  el.btnInspUpcomingToggle?.addEventListener('click', () => {
+    if (!el.inspUpcomingList) return;
+    const isHidden = el.inspUpcomingList.classList.toggle('hidden');
+    el.btnInspUpcomingToggle.setAttribute('aria-expanded', String(!isHidden));
+    if (el.inspUpcomingArrow) el.inspUpcomingArrow.textContent = isHidden ? '▾' : '▴';
+    syncInspectorLayoutHeight();
+  });
+  el.inspUpcomingList?.addEventListener('click', (e) => {
+    const rideBtn = e.target.closest('.btn-insp-ride-stop');
+    if (!rideBtn) return;
+    const stops = el.inspUpcomingList._upcomingStops || [];
+    const st = stops[Number(rideBtn.dataset.upIdx)];
+    if (!st) return;
+    haptic('medium');
+    uiExtras?.startRideAlarm({ ...st, lineName: el.inspUpcomingList._lineName || '' });
+  });
+  el.btnInspFavCar?.addEventListener('click', () => {
+    const carId = el.btnInspFavCar.dataset.carId;
+    if (!carId) return;
+    haptic('light');
+    const nowFav = uiExtras?.toggleEntityFavorite({
+      type: 'coche',
+      id: carId,
+      label: `Coche #${carId}`,
+      lineName: el.btnInspFavCar.dataset.lineName || '',
+      codLinea: Number(el.btnInspFavCar.dataset.codLinea) || 0
+    });
+    el.btnInspFavCar.textContent = nowFav ? '★' : '☆';
+    el.btnInspFavCar.classList.toggle('active', Boolean(nowFav));
+  });
+  el.btnInspProfile?.addEventListener('click', () => {
+    const carId = el.btnInspProfile.dataset.carId;
+    if (!carId) return;
+    haptic('light');
+    uiExtras?.openEntityProfileModal('coche', carId, {
+      lineName: el.btnInspProfile.dataset.lineName || '',
+      codLinea: Number(el.btnInspProfile.dataset.codLinea) || 0
+    });
+  });
+  el.btnInspCarAlert?.addEventListener('click', () => {
+    const carId = el.btnInspCarAlert.dataset.carId;
+    const cod = Number(el.btnInspCarAlert.dataset.codLinea);
+    if (!carId || !cod) return;
+    haptic('medium');
+    const armed = uiExtras?.toggleCarAlert(cod, carId, el.btnInspCarAlert.dataset.lineName || '');
+    el.btnInspCarAlert.textContent = armed ? '🔔✓' : '🔔';
+    el.btnInspCarAlert.classList.toggle('active', Boolean(armed));
+    if (armed) ensureNotificationPermission().catch(() => {});
+  });
   el.inspLineBadge?.addEventListener('click', () => {
     const cod = Number(el.inspLineBadge.dataset.codLinea);
     const name = el.inspLineBadge.dataset.lineName || el.inspLineBadge.textContent?.trim();
@@ -11348,9 +11962,55 @@ function bindEvents() {
     state.allFleetRosterQuery = e.target.value || '';
     renderAllFleetRoster();
   });
+  el.fleetRosterQuickFilters?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-roster-quick]');
+    if (!btn) return;
+    const next = btn.dataset.rosterQuick || 'all';
+    if (state.allFleetRosterQuickFilter === next) return;
+    state.allFleetRosterQuickFilter = next;
+    haptic('light');
+    if (el.allFleetRosterBody) el.allFleetRosterBody.scrollTop = 0;
+    renderAllFleetRoster();
+  });
   el.allFleetRosterBody?.addEventListener('click', (e) => {
+    const profBtn = e.target.closest('.btn-roster-profile');
+    if (profBtn) {
+      e.stopPropagation();
+      haptic('light');
+      uiExtras?.openEntityProfileModal(profBtn.dataset.entType, profBtn.dataset.entId, {
+        lineName: profBtn.dataset.entLine || '',
+        codLinea: Number(profBtn.dataset.entCod) || 0
+      });
+      return;
+    }
+    const favBtn = e.target.closest('.btn-roster-fav');
+    if (favBtn) {
+      e.stopPropagation();
+      haptic('light');
+      uiExtras?.toggleEntityFavorite({
+        type: favBtn.dataset.entType,
+        id: favBtn.dataset.entId,
+        label: favBtn.dataset.entLabel || favBtn.dataset.entId,
+        sub: favBtn.dataset.entSub || '',
+        lineName: favBtn.dataset.entLine || '',
+        codLinea: Number(favBtn.dataset.entCod) || 0
+      });
+      renderAllFleetRoster();
+      return;
+    }
     const row = e.target.closest('[data-roster-bus-key]');
     if (!row) return;
+    const busKey = row.dataset.rosterBusKey;
+    if (!busKey) return;
+    closeAllFleetRosterModal();
+    openAllFleetBusInspector(busKey);
+  });
+  el.allFleetRosterBody?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.target.closest('button')) return;
+    const row = e.target.closest('[data-roster-bus-key]');
+    if (!row) return;
+    e.preventDefault();
     const busKey = row.dataset.rosterBusKey;
     if (!busKey) return;
     closeAllFleetRosterModal();
@@ -11463,7 +12123,26 @@ function bindEvents() {
       return;
     }
 
-    if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
+    const ledOverlayEl = document.getElementById('led-board-overlay');
+    const plannerModalEl = document.getElementById('trip-planner-modal');
+    const profileModalEl = document.getElementById('profile-modal');
+
+    if (ledOverlayEl && !ledOverlayEl.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        uiExtras?.closeLedBoard();
+        return;
+      }
+    } else if (profileModalEl && !profileModalEl.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        uiExtras?.closeProfileModal();
+        return;
+      }
+    } else if (plannerModalEl && !plannerModalEl.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        uiExtras?.closePlannerModal();
+        return;
+      }
+    } else if (el.themeModal && !el.themeModal.classList.contains('hidden')) {
       if (e.key === 'Escape') {
         closeThemeModal();
         return;
@@ -11689,6 +12368,21 @@ function resumeRealtime() {
 
 // Layered back navigation (Escape / PWA history)
 async function handleNativeBack() {
+  const ledOverlayEl = document.getElementById('led-board-overlay');
+  if (ledOverlayEl && !ledOverlayEl.classList.contains('hidden')) {
+    uiExtras?.closeLedBoard();
+    return true;
+  }
+  const profileModalEl = document.getElementById('profile-modal');
+  if (profileModalEl && !profileModalEl.classList.contains('hidden')) {
+    uiExtras?.closeProfileModal();
+    return true;
+  }
+  const plannerModalEl = document.getElementById('trip-planner-modal');
+  if (plannerModalEl && !plannerModalEl.classList.contains('hidden')) {
+    uiExtras?.closePlannerModal();
+    return true;
+  }
   if (el.eventsModal && !el.eventsModal.classList.contains('hidden')) {
     closeEventsModal();
     return true;

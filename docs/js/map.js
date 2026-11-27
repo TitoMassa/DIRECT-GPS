@@ -52,8 +52,10 @@ export class TransitMap {
     // Layers
     this.routeLayer = L.layerGroup().addTo(this.map);
     this.routeStopsLayer = L.layerGroup().addTo(this.map);
+    this.tripPlanLayer = L.layerGroup().addTo(this.map);
     this.nearbyLayer = L.layerGroup().addTo(this.map);
     this.vectorLayer = L.layerGroup().addTo(this.map);
+    this.trailLayer = L.layerGroup().addTo(this.map);
     this.allFleetLayer = L.layerGroup().addTo(this.map);
     this.stopLayer = L.layerGroup().addTo(this.map);
     this.busLayer = L.layerGroup().addTo(this.map);
@@ -115,8 +117,8 @@ export class TransitMap {
     };
   }
 
-  setTileStyle() {
-    const cfg = MAP_TILES.osm;
+  setTileStyle(styleKey = 'osm') {
+    const cfg = styleKey === 'dark' ? MAP_TILES.dark : MAP_TILES.osm;
     const prevUrl = this.tileLayer ? this.tileLayer._url : null;
     this.tileKey = cfg.id;
 
@@ -136,7 +138,11 @@ export class TransitMap {
 
     const tilePane = this.map.getPane('tilePane');
     if (tilePane) {
-      tilePane.classList.remove('osm-dark-filter');
+      tilePane.classList.toggle('osm-dark-filter', Boolean(cfg.darkFilter));
+    }
+    const container = this.map.getContainer?.();
+    if (container) {
+      container.classList.toggle('map-night-mode', Boolean(cfg.darkFilter));
     }
     return cfg;
   }
@@ -757,5 +763,169 @@ export class TransitMap {
     })
       .bindTooltip('Tu ubicación GPS')
       .addTo(this.userLayer);
+  }
+
+  clearBusTrail() {
+    this.trailLayer?.clearLayers();
+  }
+
+  drawBusTrail(points = [], color = '#10b981') {
+    this.trailLayer?.clearLayers();
+    if (!Array.isArray(points) || points.length < 2) return;
+    L.polyline(points, {
+      renderer: this.canvasRenderer,
+      color,
+      weight: 6,
+      opacity: 0.25,
+      lineCap: 'round',
+      interactive: false
+    }).addTo(this.trailLayer);
+    L.polyline(points, {
+      renderer: this.canvasRenderer,
+      color,
+      weight: 3,
+      opacity: 0.85,
+      dashArray: '5 6',
+      lineCap: 'round',
+      interactive: false
+    }).addTo(this.trailLayer);
+    for (let i = 0; i < points.length - 1; i++) {
+      L.circleMarker(points[i], {
+        renderer: this.canvasRenderer,
+        radius: 2.8,
+        color: '#ffffff',
+        weight: 1,
+        fillColor: color,
+        fillOpacity: 0.55 + (i / points.length) * 0.4,
+        interactive: false
+      }).addTo(this.trailLayer);
+    }
+  }
+
+  clearTripPlanRoute() {
+    this.tripPlanLayer?.clearLayers();
+  }
+
+  drawTripPlanRoute(plan, origin, dest, routeBranchesByLine = null) {
+    this.tripPlanLayer?.clearLayers();
+    if (!plan || !origin || !dest) return;
+    const allPts = [];
+
+    const drawWalk = (a, b) => {
+      if (!a || !b) return;
+      const seg = [[a.lat, a.lng], [b.lat, b.lng]];
+      allPts.push(...seg);
+      L.polyline(seg, {
+        renderer: this.canvasRenderer,
+        color: '#94a3b8',
+        weight: 3.5,
+        opacity: 0.9,
+        dashArray: '4 7',
+        interactive: false
+      }).addTo(this.tripPlanLayer);
+    };
+
+    const legs = Array.isArray(plan.legs) ? plan.legs : [];
+    if (legs.length > 0) {
+      drawWalk(origin, legs[0].boardStop);
+    }
+
+    legs.forEach((leg, idx) => {
+      const color = getLineColor(leg.lineName);
+      const branches = routeBranchesByLine?.get(Number(leg.codLinea)) || [];
+      const br = branches[leg.branchIdx] || null;
+      let segPts = [];
+      if (br && Array.isArray(br.pts) && Array.isArray(br.cum)) {
+        const startAlong = Number(leg.boardStop?.along) || 0;
+        const endAlong = Number(leg.alightStop?.along) || br.totalLen;
+        for (let i = 0; i < br.pts.length; i++) {
+          if (br.cum[i] >= startAlong - 20 && br.cum[i] <= endAlong + 20) {
+            segPts.push(br.pts[i]);
+          }
+        }
+      }
+      if (segPts.length < 2) {
+        segPts = [[leg.boardStop.lat, leg.boardStop.lng], [leg.alightStop.lat, leg.alightStop.lng]];
+      }
+      allPts.push(...segPts);
+      L.polyline(segPts, {
+        renderer: this.canvasRenderer,
+        color: '#0f172a',
+        weight: 8,
+        opacity: 0.35,
+        lineCap: 'round',
+        interactive: false
+      }).addTo(this.tripPlanLayer);
+      L.polyline(segPts, {
+        renderer: this.canvasRenderer,
+        color,
+        weight: 5,
+        opacity: 0.95,
+        lineCap: 'round',
+        interactive: false
+      }).addTo(this.tripPlanLayer);
+
+      // Boarding & alighting markers
+      L.circleMarker([leg.boardStop.lat, leg.boardStop.lng], {
+        renderer: this.canvasRenderer,
+        radius: 7,
+        color: '#ffffff',
+        weight: 2.5,
+        fillColor: color,
+        fillOpacity: 1
+      })
+        .bindTooltip(`Subir ${escHtml(leg.lineName)} · ${escHtml(leg.boardStop.nombre)}`)
+        .addTo(this.tripPlanLayer);
+
+      L.circleMarker([leg.alightStop.lat, leg.alightStop.lng], {
+        renderer: this.canvasRenderer,
+        radius: 6.5,
+        color: color,
+        weight: 2.5,
+        fillColor: '#ffffff',
+        fillOpacity: 1
+      })
+        .bindTooltip(`Bajar ${escHtml(leg.lineName)} · ${escHtml(leg.alightStop.nombre)}`)
+        .addTo(this.tripPlanLayer);
+
+      if (idx + 1 < legs.length) {
+        drawWalk(leg.alightStop, legs[idx + 1].boardStop);
+      }
+    });
+
+    if (legs.length > 0) {
+      drawWalk(legs[legs.length - 1].alightStop, dest);
+    }
+
+    // Origin (A) & Destination (B) pins
+    L.circleMarker([origin.lat, origin.lng], {
+      renderer: this.canvasRenderer,
+      radius: 8,
+      color: '#ffffff',
+      weight: 3,
+      fillColor: '#10b981',
+      fillOpacity: 1
+    })
+      .bindTooltip(`Origen · ${escHtml(origin.label || 'Inicio')}`)
+      .addTo(this.tripPlanLayer);
+
+    L.circleMarker([dest.lat, dest.lng], {
+      renderer: this.canvasRenderer,
+      radius: 8,
+      color: '#ffffff',
+      weight: 3,
+      fillColor: '#ef4444',
+      fillOpacity: 1
+    })
+      .bindTooltip(`Destino · ${escHtml(dest.label || 'Llegada')}`)
+      .addTo(this.tripPlanLayer);
+
+    if (allPts.length > 0) {
+      this.map.fitBounds(L.latLngBounds(allPts), {
+        ...this._getPadding(),
+        maxZoom: 15,
+        animate: true
+      });
+    }
   }
 }

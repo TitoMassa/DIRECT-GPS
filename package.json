@@ -1,11 +1,14 @@
 {
   "name": "direct-gps",
-  "version": "2.0.0",
+  "version": "2.6.0",
   "description": "DIRECT GPS — PWA de seguimiento satelital en vivo del transporte público de Corrientes Capital",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node tests/verify.mjs",
+    "sync:drivers": "node scripts/sync-drivers.mjs",
+    "check:drivers": "node scripts/sync-drivers.mjs --check"
   },
   "engines": {
     "node": ">=20.0.0"

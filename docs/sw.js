@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v95';
+const CACHE_NAME = 'direct-gps-v96';
 const DATA_CACHE = 'direct-gps-data-v5';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
@@ -8,6 +8,10 @@ const SHELL_ASSETS = [
   './index.html',
   './manifest.json',
   './icon.svg',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  './icons/icon-maskable-512.png',
+  './icons/apple-touch-icon.png',
   './css/styles.css',
   './vendor/leaflet/leaflet.css',
   './vendor/leaflet/leaflet.js',
@@ -19,6 +23,11 @@ const SHELL_ASSETS = [
   './js/trajectory.js',
   './js/predictor.js',
   './js/simulator.js',
+  './js/holidays.js',
+  './js/trip-planner.js',
+  './js/telemetry.js',
+  './js/ride-mode.js',
+  './js/ui-extras.js',
   './js/map.js',
   './js/app.js',
   './data/catalogo.json',

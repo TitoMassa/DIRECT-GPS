@@ -581,6 +581,7 @@ export function getArgentinaTodayTipo() {
 }
 
 export const api = {
+  health: () => apiGet('/api/health', null, 5000),
   catalogo: () => loadCatalogo(),
   horariosLineArchive: (codLinea) => loadArchiveLine(codLinea),
 
@@ -1120,6 +1121,10 @@ function normalizeOfflineSearchText(str = '') {
 
 let lastBundleMemSnap = null;
 let lastBundleIdbPersistMs = 0;
+
+export function getCachedOfflineBundle() {
+  return lastBundleMemSnap?.data || null;
+}
 
 async function persistOfflineBundleSnapshot(bundleData, savedAt = Date.now()) {
   if (!bundleData || typeof bundleData !== 'object') return;

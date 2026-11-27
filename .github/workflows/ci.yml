@@ -1,0 +1,32 @@
+name: Verificación automática (CI)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verificar sintaxis JS
+        run: |
+          node --check cloudflare-worker/worker.js
+          node --check server.js
+          node --check lib/smartmove.js
+          for f in docs/js/*.js docs/sw.js scripts/*.mjs tests/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Verificar sincronización de choferes
+        run: npm run check:drivers
+
+      - name: Ejecutar suite de pruebas end-to-end
+        run: npm test
