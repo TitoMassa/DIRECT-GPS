@@ -1,0 +1,13 @@
+{
+  "version": "2.8.0",
+  "versionCode": 280,
+  "releaseDate": "2026-11-27",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v2.8.0/DIRECT-GPS-v2.8.0-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v2.8.0",
+  "notes": [
+    "Notificaciones de arribo en tiempo real que se actualizan en el lugar (sin duplicarse) con barra recta estilo Uber",
+    "La barra recta de progreso ahora es exclusiva para arribos; Modo A Bordo muestra un aviso limpio de próxima parada",
+    "Las campanitas de parada y la lectura por voz (TTS) se guardan y siguen funcionando al salir o cerrar la app",
+    "Actualizador integrado dentro de la app con aviso automático cuando sale una nueva versión"
+  ]
+}

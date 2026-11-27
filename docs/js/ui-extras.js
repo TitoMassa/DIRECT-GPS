@@ -1,5 +1,5 @@
 import { getLineColor } from './config.js';
-import { formatDistance, formatBlocks } from './api.js';
+import { formatDistance, formatBlocks, getApiBase } from './api.js';
 import { formatSecHHMM } from './predictor.js';
 import { playArrivalChime } from './audio.js';
 import {
@@ -9,6 +9,8 @@ import {
   onSwNotificationAction,
   openAndroidBatterySettings,
   speakViaNativeAndroid,
+  upsertNativeWatchAlert,
+  removeNativeWatchAlert,
   notifyArrival as sendNativeNotification
 } from './native.js';
 import {
@@ -180,6 +182,7 @@ export function createUiExtras(ctx) {
     if (armedCarAlerts.has(key)) {
       armedCarAlerts.delete(key);
       triggeredCarAlerts.delete(key);
+      if (isNative) removeNativeWatchAlert(`car::${key}`);
       showToast(`Alerta quitada para coche #${coche}`, 'info', 2200);
       return false;
     }
@@ -199,7 +202,41 @@ export function createUiExtras(ctx) {
     for (const bus of arribos || []) {
       if (!bus.identificadorCoche || !bus.eta?.valid) continue;
       const key = `${Number(bus.codigoLinea)}:${String(bus.identificadorCoche).trim()}`;
-      if (armedCarAlerts.has(key) && !triggeredCarAlerts.has(key) && bus.eta.minutes <= lead) {
+      if (!armedCarAlerts.has(key)) continue;
+
+      // Android APK: el servicio nativo mantiene UNA notificación en vivo (actualizada en el lugar),
+      // suena el timbre y lee TTS aunque la app esté cerrada.
+      if (isNative) {
+        const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
+        upsertNativeWatchAlert({
+          key: `car::${key}`,
+          apiBase: getApiBase(),
+          stopId: String(activeStop.id || '').toUpperCase(),
+          stopName: activeStop.nombre || activeStop.id,
+          stopLat: Number(activeStop.lat) || 0,
+          stopLng: Number(activeStop.lng) || 0,
+          lineName: bus.descripcionLinea,
+          codLinea: Number(bus.codigoLinea) || 0,
+          coche: String(bus.identificadorCoche).trim(),
+          lockCar: true,
+          choferNombre: bus.choferNombre || '',
+          scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
+          distM: Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : -1,
+          etaMin: Math.max(0, Math.round(bus.eta.minutes)),
+          leadMin: lead,
+          minuteByMinute: Boolean(alertPrefs.minuteByMinute),
+          ttsEnabled: Boolean(alertPrefs.tts),
+          soundEnabled: Boolean(soundEnabled)
+        });
+        if (!triggeredCarAlerts.has(key) && bus.eta.minutes <= lead) {
+          triggeredCarAlerts.add(key);
+          const etaTxt = bus.eta.minutes <= 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
+          showToast(`Tu coche #${bus.identificadorCoche} (${bus.descripcionLinea}) está ${etaTxt}.`, 'success', 6500, { silent: true });
+        }
+        continue;
+      }
+
+      if (!triggeredCarAlerts.has(key) && bus.eta.minutes <= lead) {
         triggeredCarAlerts.add(key);
         const etaTxt = bus.eta.minutes <= 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
         const toastMsg = `Tu coche #${bus.identificadorCoche} (${bus.descripcionLinea}) está ${etaTxt}.`;

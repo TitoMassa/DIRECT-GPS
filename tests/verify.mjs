@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v99') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v99 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v100') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v100 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1076,7 +1076,38 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   // 10i) Unified driver-overrides.json sync check across all 3 runtime files
   execFileSync('node', ['scripts/sync-drivers.mjs', '--check'], { cwd: ROOT, stdio: 'pipe' });
 
-  // 10j) Capacitor 7 + Native Android Foreground Service project integrity
+  // 10j) Capacitor 7 + Native Android Foreground Service + v2.8.0 Persistent Watches & In-App Updater
+  const notifOnboard = buildUberNotificationPayload({
+    phase: 'onboard',
+    lineName: '106B',
+    coche: '2976',
+    choferNombre: 'DABRIO JUAN',
+    scheduledHHMM: '13:45',
+    nextStop: { cleanName: 'Junín y Mendoza' },
+    distToNextM: 180,
+    remainingStops: 5,
+    finalStopName: 'Puerto',
+    progress01: 0.4
+  });
+  assert.ok(notifOnboard.body.includes('Junín y Mendoza'), 'Onboard notification must list next stop');
+  assert.equal(/[━◉]/.test(notifOnboard.body), false, 'Onboard notification must NOT include straight arrival progress bar');
+
+  const { compareSemver, isRemoteVersionNewer, APP_VERSION, APP_VERSION_CODE } = await importLocal('docs/js/updater.js');
+  assert.equal(compareSemver('2.8.0', '2.7.0'), 1);
+  assert.equal(compareSemver('2.8.0', '2.8.0'), 0);
+  assert.equal(compareSemver('2.7.9', '2.8.0'), -1);
+  assert.equal(isRemoteVersionNewer({ versionName: '2.7.0', versionCode: 270 }, { version: '2.8.0', versionCode: 280 }), true);
+  assert.equal(isRemoteVersionNewer({ versionName: '2.8.0', versionCode: 280 }, { version: '2.8.0', versionCode: 280 }), false);
+
+  const pkgJson = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf8'));
+  const verJson = JSON.parse(await fs.readFile(path.join(ROOT, 'docs', 'version.json'), 'utf8'));
+  const gradleSrc = await fs.readFile(path.join(ROOT, 'android', 'app', 'build.gradle'), 'utf8');
+  assert.equal(verJson.version, pkgJson.version, 'docs/version.json version must match package.json');
+  assert.equal(verJson.version, APP_VERSION, 'updater.js APP_VERSION must match docs/version.json');
+  assert.equal(verJson.versionCode, APP_VERSION_CODE, 'updater.js APP_VERSION_CODE must match docs/version.json');
+  assert.ok(gradleSrc.includes(`versionCode ${verJson.versionCode}`), 'build.gradle versionCode must match version.json');
+  assert.ok(gradleSrc.includes(`versionName "${verJson.version}"`), 'build.gradle versionName must match version.json');
+
   const capCfg = JSON.parse(await fs.readFile(path.join(ROOT, 'capacitor.config.json'), 'utf8'));
   assert.equal(capCfg.appId, 'ar.corrientes.directgps');
   assert.equal(capCfg.webDir, 'docs');
@@ -1085,14 +1116,27 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     const src = await fs.readFile(path.join(androidJavaBase, jf), 'utf8');
     assert.ok(src.includes('package ar.corrientes.directgps;'), `${jf} must belong to package ar.corrientes.directgps`);
   }
+  const tripSvcSrc = await fs.readFile(path.join(androidJavaBase, 'DirectGpsTripService.java'), 'utf8');
+  assert.ok(tripSvcSrc.includes('ACTION_UPSERT_WATCH') && tripSvcSrc.includes('CHANNEL_LIVE_SILENT'), 'DirectGpsTripService must support persistent in-place watch alerts');
+  assert.ok(tripSvcSrc.includes('playDeviceNotificationChime'), 'DirectGpsTripService must play chime before TTS');
+  const onboardMethodMatch = tripSvcSrc.match(/private Notification buildOnboardNotification\([\s\S]*?\n    \}/);
+  assert.ok(onboardMethodMatch, 'DirectGpsTripService must define buildOnboardNotification');
+  assert.equal(onboardMethodMatch[0].includes('setProgress('), false, 'Native buildOnboardNotification must NOT draw a progress bar');
+
   const manifestXml = await fs.readFile(path.join(ROOT, 'android', 'app', 'src', 'main', 'AndroidManifest.xml'), 'utf8');
   assert.ok(manifestXml.includes('FOREGROUND_SERVICE_LOCATION'), 'AndroidManifest must declare FOREGROUND_SERVICE_LOCATION');
   assert.ok(manifestXml.includes('POST_NOTIFICATIONS'), 'AndroidManifest must declare POST_NOTIFICATIONS');
+  assert.ok(manifestXml.includes('REQUEST_INSTALL_PACKAGES'), 'AndroidManifest must declare REQUEST_INSTALL_PACKAGES for in-app APK updates');
   assert.ok(manifestXml.includes('.DirectGpsTripService'), 'AndroidManifest must register DirectGpsTripService');
   const apkWorkflow = await fs.readFile(path.join(ROOT, '.github', 'workflows', 'android-apk.yml'), 'utf8');
-  assert.ok(apkWorkflow.includes('assembleDebug') && apkWorkflow.includes('upload-artifact'), 'android-apk.yml must compile and upload APK');
+  assert.ok(apkWorkflow.includes('assembleDebug') && apkWorkflow.includes('upload-artifact') && apkWorkflow.includes('gh release'), 'android-apk.yml must compile, upload artifact, and publish GitHub Release');
 
-  console.log('  ✓ Verified v2.7.0 Natural TTS pairs, Android Uber Status-Bar Notifs, Capacitor + Android Foreground Service, Subir/A Bordo/Bajar Narrator & strict exclusions');
+  const indexHtml = await fs.readFile(path.join(ROOT, 'docs', 'index.html'), 'utf8');
+  assert.ok(indexHtml.includes('id="update-modal"') && indexHtml.includes('id="btn-check-updates"'), 'index.html must include in-app update dialog and settings button');
+  const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
+  assert.ok(appJsSrc.includes("version: 'v2.8.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY'), 'app.js must include v2.8.0 changelog and persistent armed alerts');
+
+  console.log('  ✓ Verified v2.8.0 Live In-Place Notifs, Arrival-Only Uber Bar, Persistent Background Bells+TTS, In-App Updater & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

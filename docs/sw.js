@@ -1,4 +1,4 @@
-const CACHE_NAME = 'direct-gps-v99';
+const CACHE_NAME = 'direct-gps-v100';
 const DATA_CACHE = 'direct-gps-data-v5';
 const TILE_CACHE = 'direct-gps-tiles-v2';
 const MAX_TILES = 2500;
@@ -30,6 +30,7 @@ const SHELL_ASSETS = [
   './js/ride-mode.js',
   './js/ui-extras.js',
   './js/map.js',
+  './js/updater.js',
   './js/app.js',
   './data/catalogo.json',
   './data/horarios/index.json'
@@ -175,6 +176,9 @@ self.addEventListener('fetch', (event) => {
 
   // Never intercept live telemetry APIs in SW (app handles offline prediction & IndexedDB cache directly)
   if (url.pathname.includes('/api/')) return;
+
+  // Version manifest for in-app updater: always straight from network (never cached)
+  if (url.pathname.endsWith('/version.json')) return;
 
   // 1) Map tiles (OSM): cache-first with subdomain-normalized key (a/b/c share the same cached tile offline!)
   if (TILE_HOSTS.some((h) => url.hostname.endsWith(h))) {

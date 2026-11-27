@@ -617,6 +617,14 @@
         </div>
 
         <div data-settings-pane="diag" class="settings-pane hidden">
+          <div class="settings-section-label">Versión de la aplicación</div>
+          <div class="settings-toggle-row update-settings-row">
+            <div>
+              <strong>DIRECT GPS <span id="settings-app-version" class="mono-meta">v2.8.0</span></strong>
+              <p class="modal-sub">Se busca una versión nueva al abrir la app y cada 4 horas</p>
+            </div>
+            <button type="button" id="btn-check-updates" class="secondary-action-btn seg-btn-xs">🔄 Buscar actualizaciones</button>
+          </div>
           <div class="settings-section-label">Estado del servidor y caché</div>
           <div id="diag-status-box" class="diag-status-box"></div>
           <div class="settings-section-label">Respaldo personal (Favoritas, coches, tema y alertas)</div>
@@ -742,6 +750,34 @@
           <button type="button" id="btn-pwa-install" class="primary-action-btn seg-btn-xs">Instalar</button>
         </div>
         <div id="changelog-list" class="changelog-list"></div>
+      </div>
+    </div>
+
+    <!-- In-App Update Available Dialog (APK Android + PWA) -->
+    <div id="update-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="update-modal-title" aria-describedby="update-modal-sub">
+      <div class="modal-card update-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="update-modal-title">Nueva actualización disponible</h2>
+            <p id="update-modal-sub" class="modal-sub">Nueva versión de DIRECT GPS</p>
+          </div>
+          <button type="button" id="btn-update-close" class="mini-close-btn" aria-label="Cerrar aviso de actualización">✕</button>
+        </div>
+        <div class="update-hero">
+          <span class="update-hero-icon" aria-hidden="true">⬆</span>
+          <span id="update-version-badge" class="update-version-badge">v2.8.0</span>
+        </div>
+        <div class="settings-section-label">Novedades</div>
+        <ul id="update-notes-list" class="update-notes-list"></ul>
+        <div id="update-progress-wrap" class="update-progress-wrap hidden" aria-live="polite">
+          <div class="update-progress-track"><div id="update-progress-fill" class="update-progress-fill"></div></div>
+          <span id="update-progress-text" class="update-progress-text"></span>
+        </div>
+        <a id="btn-update-browser" class="update-manual-link hidden" href="#" target="_blank" rel="noopener">Descargar manualmente desde GitHub</a>
+        <div class="modal-actions">
+          <button type="button" id="btn-update-later" class="secondary-action-btn">Más tarde</button>
+          <button type="button" id="btn-update-install" class="primary-action-btn">⬇ Descargar e instalar</button>
+        </div>
       </div>
     </div>
 

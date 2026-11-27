@@ -1,6 +1,7 @@
 import { CORRIENTES_CENTER, REFRESH_INTERVAL_SEC, getLineColor } from './config.js';
 import {
   api,
+  getApiBase,
   warmOfflineArchive,
   refreshOfflineBundleSilent,
   getCachedOfflineBundle,
@@ -68,8 +69,9 @@ import {
   computeBusPhysicalTelemetry,
   findOppositeStop
 } from './telemetry.js';
-import { buildArrivalSpeechMessage } from './ride-mode.js';
+import { buildArrivalSpeechMessage, buildUberProgressLine } from './ride-mode.js';
 import { createUiExtras } from './ui-extras.js';
+import { createAppUpdater } from './updater.js';
 import {
   isNative,
   initNative,
@@ -81,6 +83,12 @@ import {
   haptic,
   ensureNotificationPermission,
   notifyArrival,
+  showSystemNotification,
+  closeSystemNotification,
+  upsertNativeWatchAlert,
+  removeNativeWatchAlert,
+  getNativeWatchedAlerts,
+  onNativeWatchedAlertsChanged,
   onPwaInstallAvailable,
   promptPwaInstall,
   isPwaInstalled,
@@ -99,6 +107,7 @@ let filterStripSig = '';
 
 const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
+const STORAGE_ARMED_ALERTS_KEY = 'directgps_armed_alerts_v1';
 
 const state = {
   activeStop: null,
@@ -366,6 +375,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.8.0',
+    date: '27/11/2026 · 19:00 hs',
+    items: [
+      '<strong>Notificaciones push en tiempo real (se actualizan en el lugar sin duplicarse):</strong> cada aviso de arribo ahora actualiza su misma tarjeta en vivo cada 10 s con la <strong>barra recta estilo Uber</strong> avanzando de izquierda a derecha, minutos reales, chofer, coche y hora programada real (nunca se congela ni manda notificaciones repetidas).',
+      '<strong>Barra recta exclusiva para arribos (Modo A Bordo limpio):</strong> la línea recta de avance en tiempo real queda reservada únicamente para los avisos de llegada; en <strong>Modo A Bordo</strong> la notificación muestra un resumen limpio de la próxima parada y paradas restantes.',
+      '<strong>Campanitas persistentes + TTS activo al salir o cerrar la app:</strong> las campanitas activadas en las paradas ya no se desactivan al salir o cerrar la aplicación y el servicio nativo Android sigue monitoreando, sonando con el timbre del celular y leyendo por voz (<code>es-AR</code>) incluso con la app cerrada.',
+      '<strong>Actualizador integrado dentro de la app:</strong> cada vez que salga una nueva versión de DIRECT GPS aparece un cuadro con las novedades y botón directo para descargar e instalar la actualización desde la misma app (o consultar manualmente en <em>Ajustes → Sistema</em>).'
+    ]
+  },
   {
     version: 'v2.7.0',
     date: '27/11/2026 · 17:50 hs',
@@ -2058,6 +2077,7 @@ async function openStopRadar(stopInfo, codLinea = '000') {
     lng: bestLng
   };
   state.codLineaQuery = isAll ? '000' : rawCode;
+  syncArmedAlertsForActiveStop();
   syncKeepAwake();
   state.focusedLineCode = isAll ? null : Number(rawCode);
   state.filterLine = lineObj ? lineObj.descripcion : 'ALL';
@@ -3293,27 +3313,181 @@ function renderArribosList() {
   }
 }
 
+// Persistent stop-scoped armed bells: Map<`${stopId}::${lineName}`, meta>
+const persistedStopAlerts = new Map();
+const webWatchProgressRef = new Map(); // key -> { initialDistM, lastSpokenEtaMin }
+
+function makeStopAlertKey(stopId, lineName) {
+  return `${String(stopId || '').trim().toUpperCase()}::${String(lineName || '').trim()}`;
+}
+
+function savePersistedStopAlerts() {
+  try {
+    localStorage.setItem(STORAGE_ARMED_ALERTS_KEY, JSON.stringify([...persistedStopAlerts.values()]));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function syncArmedAlertsForActiveStop() {
+  state.armedAlerts.clear();
+  state.triggeredAlerts.clear();
+  const sid = String(state.activeStop?.id || '').trim().toUpperCase();
+  if (!sid) return;
+  for (const item of persistedStopAlerts.values()) {
+    if (item.stopId === sid && !item.lockCar && item.lineName) {
+      state.armedAlerts.add(item.lineName);
+    }
+  }
+}
+
+async function restorePersistedArmedAlerts() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_ARMED_ALERTS_KEY) || '[]');
+    if (Array.isArray(raw)) {
+      persistedStopAlerts.clear();
+      for (const it of raw) {
+        if (!it || !it.stopId || !it.lineName) continue;
+        const key = it.key || makeStopAlertKey(it.stopId, it.lineName);
+        persistedStopAlerts.set(key, { ...it, key, stopId: String(it.stopId).toUpperCase() });
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // En Android APK, el Foreground Service nativo es la fuente de verdad (pudo quitarse desde la notificación)
+  if (isNative) {
+    const nativeAlerts = await getNativeWatchedAlerts();
+    if (Array.isArray(nativeAlerts)) {
+      persistedStopAlerts.clear();
+      for (const w of nativeAlerts) {
+        if (!w || !w.stopId || !w.lineName || w.lockCar) continue;
+        const key = w.key || makeStopAlertKey(w.stopId, w.lineName);
+        persistedStopAlerts.set(key, {
+          key,
+          stopId: String(w.stopId).toUpperCase(),
+          stopName: w.stopName || w.stopId,
+          stopLat: Number(w.stopLat) || 0,
+          stopLng: Number(w.stopLng) || 0,
+          lineName: w.lineName,
+          codLinea: Number(w.codLinea) || 0,
+          lockCar: false
+        });
+      }
+      savePersistedStopAlerts();
+    }
+    onNativeWatchedAlertsChanged((alerts) => {
+      persistedStopAlerts.clear();
+      for (const w of alerts || []) {
+        if (!w || !w.stopId || !w.lineName || w.lockCar) continue;
+        const key = w.key || makeStopAlertKey(w.stopId, w.lineName);
+        persistedStopAlerts.set(key, {
+          key,
+          stopId: String(w.stopId).toUpperCase(),
+          stopName: w.stopName || w.stopId,
+          stopLat: Number(w.stopLat) || 0,
+          stopLng: Number(w.stopLng) || 0,
+          lineName: w.lineName,
+          codLinea: Number(w.codLinea) || 0,
+          lockCar: false
+        });
+      }
+      savePersistedStopAlerts();
+      syncArmedAlertsForActiveStop();
+      syncKeepAwake();
+      if (state.activeStop) renderArribosList();
+    });
+  }
+
+  syncArmedAlertsForActiveStop();
+  syncKeepAwake();
+}
+
+function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
+  const sid = String(stop?.id || '').trim().toUpperCase();
+  const key = makeStopAlertKey(sid, lineName);
+  const rawDist = bus ? Number(bus.routeMeters ?? bus.distanceMeters) : NaN;
+  const etaMin = bus?.eta?.valid && Number.isFinite(Number(bus.eta.minutes)) ? Math.max(0, Math.round(bus.eta.minutes)) : -1;
+  return {
+    key,
+    apiBase: getApiBase(),
+    stopId: sid,
+    stopName: stop?.nombre || sid,
+    stopLat: Number.isFinite(Number(stop?.lat)) ? Number(stop.lat) : 0,
+    stopLng: Number.isFinite(Number(stop?.lng)) ? Number(stop.lng) : 0,
+    lineName: String(lineName),
+    codLinea: Number(bus?.codigoLinea) || 0,
+    coche: String(bus?.identificadorCoche || '').trim(),
+    lockCar: false,
+    choferNombre: String(bus?.choferNombre || '').trim(),
+    scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus?.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
+    distM: Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : -1,
+    etaMin,
+    leadMin: uiExtras?.getAlertLeadMinutes() || 3,
+    minuteByMinute: Boolean(uiExtras?.isMinuteByMinuteEnabled()),
+    ttsEnabled: Boolean(uiExtras?.isTtsEnabled()),
+    soundEnabled: Boolean(state.soundEnabled)
+  };
+}
+
+function findPrimaryBusForLine(lineName) {
+  return (
+    state.arribos.find((b) => !b.isNextLap && b.descripcionLinea === lineName) ||
+    state.arribos.find((b) => b.descripcionLinea === lineName) ||
+    null
+  );
+}
+
 function handleArribosListClick(e) {
   const bellBtn = e.target.closest('.alert-bell-btn');
   if (bellBtn && el.arribosList.contains(bellBtn)) {
     e.stopPropagation();
     const line = bellBtn.dataset.alertLine;
-    if (!line) return;
+    if (!line || !state.activeStop) return;
+    const stop = state.activeStop;
+    const key = makeStopAlertKey(stop.id, line);
+
     if (state.armedAlerts.has(line)) {
       state.armedAlerts.delete(line);
       state.triggeredAlerts.delete(line);
+      persistedStopAlerts.delete(key);
+      webWatchProgressRef.delete(key);
+      savePersistedStopAlerts();
+      if (isNative) {
+        removeNativeWatchAlert(key);
+      } else {
+        closeSystemNotification(`direct-gps-watch-${stop.id}-${line}`);
+      }
       showToast(`Alerta desactivada para línea ${line}`, 'info');
       haptic('light');
     } else {
       state.armedAlerts.add(line);
       state.triggeredAlerts.delete(line);
+      const matchBus = findPrimaryBusForLine(line);
+      persistedStopAlerts.set(key, {
+        key,
+        stopId: String(stop.id).toUpperCase(),
+        stopName: stop.nombre || stop.id,
+        stopLat: Number(stop.lat) || 0,
+        stopLng: Number(stop.lng) || 0,
+        lineName: line,
+        codLinea: Number(matchBus?.codigoLinea) || 0,
+        lockCar: false
+      });
+      savePersistedStopAlerts();
       if (state.soundEnabled) playSubtleTick();
       haptic('medium');
       const leadMin = uiExtras?.getAlertLeadMinutes() || 3;
-      showToast(`Aviso activado para línea ${line} cuando falten ${leadMin} minutos o menos`, 'success');
+      showToast(`Aviso en vivo activado para línea ${line} (se actualiza en tu barra de notificaciones)`, 'success');
       ensureNotificationPermission().then((ok) => {
+        if (isNative) {
+          upsertNativeWatchAlert(buildNativeWatchPayloadForLine(stop, line, matchBus));
+        } else if (ok && matchBus) {
+          checkProximityAlerts();
+        }
         if (!ok && isNative) {
-          showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la pantalla apagada', 'warn', 4500);
+          showToast('Activá las notificaciones de DIRECT GPS para recibir el aviso con la app cerrada', 'warn', 4500);
         }
       });
     }
@@ -3332,49 +3506,108 @@ function handleArribosListClick(e) {
 // Keep the screen/session awake while waiting for armed arrival alerts or an active Uber/A Bordo trip
 function syncKeepAwake() {
   setKeepAwake(
-    (Boolean(state.activeStop) && state.armedAlerts.size > 0) || Boolean(uiExtras?.hasActiveTrackingSession())
+    persistedStopAlerts.size > 0 ||
+      (Boolean(state.activeStop) && state.armedAlerts.size > 0) ||
+      Boolean(uiExtras?.hasActiveTrackingSession())
   );
 }
 
 function checkProximityAlerts() {
   if (!state.activeStop) return;
   const leadMin = uiExtras?.getAlertLeadMinutes() || 3;
-  for (const bus of state.arribos) {
-    if (
-      state.armedAlerts.has(bus.descripcionLinea) &&
-      !state.triggeredAlerts.has(bus.descripcionLinea) &&
-      bus.eta.minutes <= leadMin
-    ) {
-      state.triggeredAlerts.add(bus.descripcionLinea);
+  const minByMin = Boolean(uiExtras?.isMinuteByMinuteEnabled());
+
+  // Evaluar cada línea con campanita activa (1 sola tarjeta actualizada EN EL LUGAR, nunca duplicada)
+  for (const line of state.armedAlerts) {
+    const bus = findPrimaryBusForLine(line);
+    if (!bus || !bus.eta?.valid) continue;
+
+    // En Android APK, el Foreground Service nativo actualiza la MISMA notificación en tiempo real con barra Uber,
+    // suena el timbre real del celular y lee TTS aunque cierres la app. Solo le enviamos telemetría enriquecida!
+    if (isNative) {
+      upsertNativeWatchAlert(buildNativeWatchPayloadForLine(state.activeStop, line, bus));
+      if (!state.triggeredAlerts.has(line) && bus.eta.minutes <= leadMin) {
+        state.triggeredAlerts.add(line);
+        const cocheTag = bus.identificadorCoche ? `, coche #${bus.identificadorCoche}` : '';
+        const etaTxt = bus.eta.minutes === 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
+        showToast(`Atención: Línea ${line}${cocheTag}, ${etaTxt}.`, 'success', 5500, { silent: true });
+      }
+      continue;
+    }
+
+    // En Web/PWA: actualizar en el lugar usando el MISMO tag con barra recta Uber
+    const key = makeStopAlertKey(state.activeStop.id, line);
+    const etaMin = Math.max(0, Math.round(bus.eta.minutes));
+    const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
+    const distM = Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : null;
+    const ref = webWatchProgressRef.get(key) || { initialDistM: Math.max(1200, distM || 2600), lastSpokenEtaMin: null };
+    if (distM !== null && distM > ref.initialDistM) ref.initialDistM = Math.min(12000, distM);
+    const progress01 =
+      etaMin === 0
+        ? 1
+        : distM !== null
+          ? Math.max(0.05, Math.min(1, 1 - distM / Math.max(400, ref.initialDistM)))
+          : Math.max(0.06, Math.min(1, 1 - etaMin / Math.max(12, leadMin + 6)));
+
+    let shouldRing = false;
+    if (!state.triggeredAlerts.has(line) && etaMin <= leadMin) {
+      state.triggeredAlerts.add(line);
+      ref.lastSpokenEtaMin = etaMin;
+      shouldRing = true;
+    } else if (minByMin && etaMin <= Math.max(leadMin, 10)) {
+      const isLower = ref.lastSpokenEtaMin === null || etaMin < ref.lastSpokenEtaMin;
+      const reachedNow = etaMin === 0 && ref.lastSpokenEtaMin !== 0;
+      if (isLower || reachedNow) {
+        state.triggeredAlerts.add(line);
+        ref.lastSpokenEtaMin = etaMin;
+        shouldRing = true;
+      }
+    } else if (etaMin === 0 && ref.lastSpokenEtaMin !== 0) {
+      state.triggeredAlerts.add(line);
+      ref.lastSpokenEtaMin = 0;
+      shouldRing = true;
+    }
+    webWatchProgressRef.set(key, ref);
+
+    const cocheTxt = bus.identificadorCoche ? `#${bus.identificadorCoche}` : 's/d';
+    const driverTxt = bus.choferNombre || 'Sin datos';
+    const schedTxt = bus.turnoProgramado || 's/d';
+    const etaCompact = etaMin <= 0 ? 'ARRIBANDO' : `${etaMin} min`;
+    const bar = buildUberProgressLine(progress01, { segments: 12 });
+    const stopShort = String(state.activeStop.nombre || state.activeStop.id).slice(0, 22);
+    const distLine = distM !== null && distM > 0 ? `A ${formatDistance(distM)} (${formatBlocks(distM)} c.)` : 'En camino';
+
+    const speechMsg = buildArrivalSpeechMessage({
+      lineName: line,
+      coche: bus.identificadorCoche,
+      etaMin,
+      stopName: etaMin === 0 || !minByMin ? state.activeStop.nombre || '' : ''
+    });
+
+    if (shouldRing) {
       const cocheTag = bus.identificadorCoche ? `, coche #${bus.identificadorCoche}` : '';
-      const etaTxt = bus.eta.minutes === 0 ? 'arribando ahora' : `a ${bus.eta.minutes} ${bus.eta.minutes === 1 ? 'minuto' : 'minutos'}`;
-      const toastMsg = `Atención: Línea ${bus.descripcionLinea}${cocheTag}, ${etaTxt}.`;
-      const speechMsg = buildArrivalSpeechMessage({
-        lineName: bus.descripcionLinea,
-        coche: bus.identificadorCoche,
-        etaMin: bus.eta.minutes,
-        stopName: state.activeStop.nombre || ''
-      });
+      const etaTxt = etaMin === 0 ? 'arribando ahora' : `a ${etaMin} ${etaMin === 1 ? 'minuto' : 'minutos'}`;
+      const toastMsg = `Atención: Línea ${line}${cocheTag}, ${etaTxt}.`;
       showToast(toastMsg, 'success', 6000, { silent: true });
       announce(toastMsg, { assertive: true });
-      notifyArrival({
-        title: `🔔 Línea ${bus.descripcionLinea} llegando${bus.identificadorCoche ? ` · #${bus.identificadorCoche}` : ''}`,
-        body: `${bus.tiempoRaw || etaTxt}${bus.choferNombre ? ` · ${bus.choferNombre}` : ''}${
-          bus.turnoProgramado ? ` · Prog. real: ${bus.turnoProgramado}` : ''
-        }\n${state.activeStop.nombre || state.activeStop.id}`,
-        stopId: state.activeStop.id,
-        tag: `direct-gps-line-${bus.descripcionLinea}`,
-        speechText: speechMsg,
-        speakAfterChime: Boolean(uiExtras?.isTtsEnabled())
-      }).then((res) => {
-        if (!res?.delivered && state.soundEnabled) playArrivalChime();
-        if (!res?.handledSpeechNatively) {
-          // Hablar DESPUÉS del timbre de notificación del celular
-          uiExtras?.speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
-        }
-      });
     }
+
+    showSystemNotification({
+      title: `${etaMin === 0 ? '🔔 ' : '🚌 '}${line} · ${etaCompact} · Coche ${cocheTxt}`,
+      body: `${bar} ${stopShort}\nChofer: ${driverTxt} · Coche ${cocheTxt}\nArribo: ${etaCompact} · Prog. real: ${schedTxt}\n${distLine}`,
+      tag: `direct-gps-watch-${state.activeStop.id}-${line}`,
+      silent: !shouldRing,
+      renotify: shouldRing,
+      vibrate: shouldRing ? [160, 80, 160] : null,
+      data: { stopId: state.activeStop.id, lineName: line }
+    }).then((res) => {
+      if (shouldRing) {
+        if (!res?.delivered && state.soundEnabled) playArrivalChime();
+        uiExtras?.speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
+      }
+    });
   }
+
   uiExtras?.checkCarAlerts(state.arribos, state.activeStop, {
     soundEnabled: state.soundEnabled,
     playArrivalChime,
@@ -12980,6 +13213,8 @@ async function init() {
   });
 
   loadFavorites();
+  await restorePersistedArmedAlerts();
+  createAppUpdater({ showToast });
   bindEvents();
   updateSignalPill();
 

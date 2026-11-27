@@ -142,10 +142,10 @@ export function buildUberNotificationPayload(snap) {
       ? `🔔 ARRIBANDO · ${nextStopClean}`
       : `🚌 A bordo ${lineName}${snap.coche ? ` #${snap.coche}` : ''} → ${nextStopShort}`;
 
+    // La línea recta de progreso es exclusiva de arribos; A Bordo muestra un resumen limpio de próxima parada
     const lines = [
-      `${progressBar} ${nextStopShort}`,
-      `Próxima: ${nextStopClean}${distPart}`,
-      `Chofer: ${driverTxt} · Coche ${cocheTxt} · Prog. ${schedTxt}`,
+      `Próxima parada: ${nextStopClean}${distPart}`,
+      `Chofer: ${driverTxt} · Coche ${cocheTxt} · Prog. real: ${schedTxt}`,
       remCount > 0
         ? `${remCount} ${remCount === 1 ? 'parada restante' : 'paradas restantes'}${snap.finalStopName ? ` · Fin: ${shortStopLabel(snap.finalStopName, 18)}` : ''}`
         : 'Llegando a cabecera final'

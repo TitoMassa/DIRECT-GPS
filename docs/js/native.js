@@ -261,6 +261,65 @@ export async function speakViaNativeAndroid(text, { delayMs = 0 } = {}) {
   return true;
 }
 
+export async function upsertNativeWatchAlert(payload = {}) {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.upsertWatchAlert) return false;
+  await safe(() => plugin.upsertWatchAlert(payload));
+  return true;
+}
+
+export async function removeNativeWatchAlert(key = '') {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.removeWatchAlert || !key) return false;
+  await safe(() => plugin.removeWatchAlert({ key: String(key) }));
+  return true;
+}
+
+export async function clearNativeWatchAlerts() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.clearWatchAlerts) return false;
+  await safe(() => plugin.clearWatchAlerts());
+  return true;
+}
+
+export async function getNativeWatchedAlerts() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.getWatchedAlerts) return null;
+  const res = await safe(() => plugin.getWatchedAlerts(), null);
+  return Array.isArray(res?.alerts) ? res.alerts : [];
+}
+
+export function onNativeWatchedAlertsChanged(cb) {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.addListener || typeof cb !== 'function') return () => {};
+  let handle = null;
+  try {
+    const p = plugin.addListener('watchedAlertsChanged', (ev) => {
+      try {
+        cb(Array.isArray(ev?.alerts) ? ev.alerts : []);
+      } catch {
+        // ignore
+      }
+    });
+    if (p && typeof p.then === 'function') {
+      p.then((h) => {
+        handle = h;
+      }).catch(() => {});
+    } else {
+      handle = p;
+    }
+  } catch {
+    // ignore
+  }
+  return () => {
+    try {
+      handle?.remove?.();
+    } catch {
+      // ignore
+    }
+  };
+}
+
 async function getActiveSwRegistration() {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
   try {

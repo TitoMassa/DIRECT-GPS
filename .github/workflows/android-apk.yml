@@ -13,6 +13,9 @@ on:
       - 'package-lock.json'
       - '.github/workflows/android-apk.yml'
 
+permissions:
+  contents: write
+
 concurrency:
   group: android-apk-${{ github.ref }}
   cancel-in-progress: true
@@ -49,19 +52,38 @@ jobs:
       - name: Ensure gradlew is executable
         run: chmod +x android/gradlew
 
-      - name: Build Debug APK
+      - name: Build Debug APK (signed with consistent keystore for in-app updates)
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
 
-      - name: Rename APK for easy download
+      - name: Prepare versioned APK file
+        id: pkg
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          cp android/app/build/outputs/apk/debug/app-debug.apk "DIRECT-GPS-v${VERSION}-android.apk"
-          ls -lh "DIRECT-GPS-v${VERSION}-android.apk"
+          APK_NAME="DIRECT-GPS-v${VERSION}-android.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "${APK_NAME}"
+          ls -lh "${APK_NAME}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: DIRECT-GPS-Android-APK
-          path: DIRECT-GPS-v*-android.apk
+          path: ${{ steps.pkg.outputs.apk_name }}
           retention-days: 30
+
+      - name: Publish APK to GitHub Release (enables one-tap in-app auto-update)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.pkg.outputs.version }}"
+          APK="${{ steps.pkg.outputs.apk_name }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${APK}" --clobber
+          else
+            NOTES=$(node -e "const v=require('./docs/version.json'); console.log((v.notes||[]).map(n=>'- '+n).join('\n'));")
+            gh release create "${TAG}" "${APK}" \
+              --title "DIRECT GPS ${TAG}" \
+              --notes "${NOTES}"
+          fi

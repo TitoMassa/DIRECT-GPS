@@ -8,6 +8,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.location.Location;
@@ -16,6 +17,7 @@ import android.location.LocationManager;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.Ringtone;
 import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
@@ -23,6 +25,9 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
@@ -42,9 +47,13 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -54,23 +63,29 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Android Foreground Service nativo de DIRECT GPS (estilo Uber).
+ * Android Foreground Service nativo de DIRECT GPS (v2.8.0).
  * Funciona de forma autónoma con la app minimizada, pantalla apagada o COMPLETAMENTE CERRADA:
- *  - Notificación fija en barra de estado con barra horizontal nativa izquierda->derecha (setProgress)
- *    mostrando chofer, coche, minutos de arribo y hora programada REAL (nunca estimada).
- *  - Botones nativos Subir / Ya subí / Bajar / Detener procesados directamente por el Servicio.
- *  - Alertas minuto a minuto y avisos de parada con timbre real del celular + TextToSpeech es-AR 950 ms después.
- *  - Modo A Bordo con LocationManager nativo anunciando "Arribando, <parada>" al llegar a cada parada.
+ *  - Notificaciones en tiempo real que se ACTUALIZAN EN EL LUGAR (nunca duplican tarjetas)
+ *    con barra de progreso recta estilo Uber EXCLUSIVA para arribos (izquierda -> derecha).
+ *  - Soporta múltiples campanitas de parada simultáneas persistidas en SharedPreferences
+ *    (no se apagan ni dejan de leer TTS al salir o cerrar la app).
+ *  - Timbre real del celular + vibración + motor nativo TextToSpeech (es-AR) 950 ms después.
+ *  - Modo A Bordo (Subir/Bajar) limpio sin barra recta, con LocationManager nativo anunciando
+ *    "Arribando, <parada>." en cada próxima parada.
  */
 public class DirectGpsTripService extends Service implements TextToSpeech.OnInitListener, LocationListener {
 
     private static final String TAG = "DirectGpsTripService";
+    private static final String PREFS_NAME = "directgps_fg_prefs_v1";
+    private static final String KEY_WATCHES_JSON = "watches_json";
+    private static final String KEY_PREFS_JSON = "user_prefs_json";
 
     public static final String CHANNEL_LIVE_SILENT = "direct_gps_trip_live_v1";
     public static final String CHANNEL_ALERTS_SOUND = "direct_gps_alerts_sound_v1";
 
     public static final int NOTIF_ID_LIVE_TRIP = 4101;
     public static final int NOTIF_ID_ALERT_BASE = 4200;
+    public static final int NOTIF_ID_WATCH_BASE = 4300;
 
     public static final String ACTION_START_WAITING = "ar.corrientes.directgps.ACTION_START_WAITING";
     public static final String ACTION_UPDATE_WAITING = "ar.corrientes.directgps.ACTION_UPDATE_WAITING";
@@ -81,13 +96,18 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     public static final String ACTION_SYNC_PREFS = "ar.corrientes.directgps.ACTION_SYNC_PREFS";
     public static final String ACTION_SEND_ALERT = "ar.corrientes.directgps.ACTION_SEND_ALERT";
     public static final String ACTION_SPEAK_ONLY = "ar.corrientes.directgps.ACTION_SPEAK_ONLY";
+    public static final String ACTION_UPSERT_WATCH = "ar.corrientes.directgps.ACTION_UPSERT_WATCH";
+    public static final String ACTION_REMOVE_WATCH = "ar.corrientes.directgps.ACTION_REMOVE_WATCH";
+    public static final String ACTION_CLEAR_WATCHES = "ar.corrientes.directgps.ACTION_CLEAR_WATCHES";
 
     public static final String EXTRA_PAYLOAD = "payload";
+    public static final String EXTRA_WATCH_KEY = "watch_key";
 
     private static final Pattern ETA_MIN_PATTERN = Pattern.compile("(\\d+)");
 
     public interface StateListener {
         void onTripStateChanged(JSONObject snapshot);
+        void onWatchedAlertsChanged(JSONArray alerts);
     }
 
     private static volatile StateListener stateListener = null;
@@ -100,6 +120,20 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     @Nullable
     public static JSONObject getLastKnownSnapshot() {
         return lastKnownSnapshot;
+    }
+
+    /**
+     * Lee las campanitas activas directamente desde SharedPreferences (útil incluso si el servicio
+     * aún no recibió un intent en esta sesión).
+     */
+    public static JSONArray loadPersistedWatchesArray(Context ctx) {
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String raw = sp.getString(KEY_WATCHES_JSON, "[]");
+            return new JSONArray(raw);
+        } catch (Exception e) {
+            return new JSONArray();
+        }
     }
 
     private static final class RouteStop {
@@ -120,21 +154,105 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
+    private static final class WatchAlert {
+        String key;
+        String stopId;
+        String stopName;
+        double stopLat;
+        double stopLng;
+        String lineName;
+        int codLinea;
+        String coche;
+        boolean lockCar;
+        String choferNombre;
+        String scheduledHHMM;
+        double distM = -1;
+        double initialDistM = 2600;
+        int etaMin = -1;
+        double progress01 = 0.08;
+        int leadMin = 3;
+        boolean triggered = false;
+        Integer lastSpokenEtaMin = null;
+        boolean wasClose = false;
+        int missingPolls = 0;
+        int notifId;
+
+        JSONObject toJson() {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("key", key);
+                o.put("stopId", stopId);
+                o.put("stopName", stopName);
+                o.put("stopLat", stopLat);
+                o.put("stopLng", stopLng);
+                o.put("lineName", lineName);
+                o.put("codLinea", codLinea);
+                o.put("coche", coche);
+                o.put("lockCar", lockCar);
+                o.put("choferNombre", choferNombre);
+                o.put("scheduledHHMM", scheduledHHMM);
+                o.put("distM", distM);
+                o.put("initialDistM", initialDistM);
+                o.put("etaMin", etaMin);
+                o.put("progress01", progress01);
+                o.put("leadMin", leadMin);
+                o.put("triggered", triggered);
+                o.put("lastSpokenEtaMin", lastSpokenEtaMin != null ? lastSpokenEtaMin : JSONObject.NULL);
+                o.put("wasClose", wasClose);
+                o.put("notifId", notifId);
+            } catch (Exception ignored) {}
+            return o;
+        }
+
+        static WatchAlert fromJson(JSONObject o) {
+            WatchAlert w = new WatchAlert();
+            w.key = o.optString("key", "").trim();
+            w.stopId = o.optString("stopId", "").trim().toUpperCase(Locale.ROOT);
+            w.stopName = o.optString("stopName", w.stopId);
+            w.stopLat = o.optDouble("stopLat", 0);
+            w.stopLng = o.optDouble("stopLng", 0);
+            w.lineName = o.optString("lineName", "").trim();
+            w.codLinea = o.optInt("codLinea", 0);
+            w.coche = o.optString("coche", "").trim();
+            w.lockCar = o.optBoolean("lockCar", false);
+            w.choferNombre = o.optString("choferNombre", "").trim();
+            w.scheduledHHMM = sanitizeScheduledHHMM(o.optString("scheduledHHMM", ""));
+            w.distM = o.optDouble("distM", -1);
+            w.initialDistM = Math.max(900, o.optDouble("initialDistM", 2600));
+            w.etaMin = o.optInt("etaMin", -1);
+            w.progress01 = o.optDouble("progress01", 0.08);
+            w.leadMin = Math.max(1, o.optInt("leadMin", 3));
+            w.triggered = o.optBoolean("triggered", false);
+            if (!o.isNull("lastSpokenEtaMin") && o.has("lastSpokenEtaMin")) {
+                w.lastSpokenEtaMin = o.optInt("lastSpokenEtaMin");
+            }
+            w.wasClose = o.optBoolean("wasClose", false);
+            w.notifId = o.optInt("notifId", NOTIF_ID_WATCH_BASE + Math.abs(w.key.hashCode() % 600));
+            return w;
+        }
+    }
+
     private NotificationManager notifManager;
     private LocationManager locationManager;
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
     private TextToSpeech tts;
     private volatile boolean ttsReady = false;
-    private String pendingInitSpeech = null;
+    private final List<String> pendingInitSpeeches = new ArrayList<>();
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private Runnable pendingSpeechTask = null;
+    private final List<Runnable> scheduledSpeechTasks = new ArrayList<>();
+    private long lastChimeMs = 0;
 
     private ScheduledExecutorService pollExecutor;
     private ScheduledFuture<?> pollFuture;
 
-    // ── Trip State ────────────────────────────────────────────────────────────
+    private int activeForegroundNotifId = 0;
+
+    // ── Persisted Stop Bells (campanitas en vivo que se actualizan en el lugar) ──
+    private final Map<String, WatchAlert> watchedAlerts = java.util.Collections.synchronizedMap(new LinkedHashMap<>());
+
+    // ── Primary Trip State (selected line tracking / Subir / A Bordo) ─────────
     private String phase = "idle"; // idle | waiting | boarding_armed | onboard
     private String apiBase = "https://direct-gps-proxy.cristiantmassa.workers.dev";
     private String lineName = "";
@@ -179,7 +297,57 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         createNotificationChannels();
         pollExecutor = Executors.newSingleThreadScheduledExecutor();
+        restorePersistedState();
         initTts();
+    }
+
+    private void restorePersistedState() {
+        try {
+            SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONObject prefs = new JSONObject(sp.getString(KEY_PREFS_JSON, "{}"));
+            if (prefs.has("minuteByMinute")) minuteByMinute = prefs.optBoolean("minuteByMinute", minuteByMinute);
+            if (prefs.has("ttsEnabled")) ttsEnabled = prefs.optBoolean("ttsEnabled", ttsEnabled);
+            if (prefs.has("soundEnabled")) soundEnabled = prefs.optBoolean("soundEnabled", soundEnabled);
+            if (prefs.has("leadMin")) leadMin = Math.max(1, prefs.optInt("leadMin", leadMin));
+            String savedBase = prefs.optString("apiBase", "").trim();
+            if (!savedBase.isEmpty()) apiBase = savedBase.replaceAll("/+$", "");
+
+            JSONArray arr = new JSONArray(sp.getString(KEY_WATCHES_JSON, "[]"));
+            watchedAlerts.clear();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                WatchAlert w = WatchAlert.fromJson(o);
+                if (!w.key.isEmpty() && !w.stopId.isEmpty() && !w.lineName.isEmpty()) {
+                    watchedAlerts.put(w.key, w);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed restoring persisted watches", e);
+        }
+    }
+
+    private void persistState() {
+        try {
+            SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONObject prefs = new JSONObject();
+            prefs.put("minuteByMinute", minuteByMinute);
+            prefs.put("ttsEnabled", ttsEnabled);
+            prefs.put("soundEnabled", soundEnabled);
+            prefs.put("leadMin", leadMin);
+            prefs.put("apiBase", apiBase);
+
+            JSONArray arr = new JSONArray();
+            for (WatchAlert w : watchedAlerts.values()) {
+                arr.put(w.toJson());
+            }
+            sp.edit()
+                .putString(KEY_PREFS_JSON, prefs.toString())
+                .putString(KEY_WATCHES_JSON, arr.toString())
+                .apply();
+        } catch (Exception e) {
+            Log.w(TAG, "Failed persisting state", e);
+        }
     }
 
     private void initTts() {
@@ -217,10 +385,12 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 }
             });
             ttsReady = true;
-            if (pendingInitSpeech != null) {
-                String txt = pendingInitSpeech;
-                pendingInitSpeech = null;
-                speakNow(txt);
+            if (!pendingInitSpeeches.isEmpty()) {
+                List<String> copy = new ArrayList<>(pendingInitSpeeches);
+                pendingInitSpeeches.clear();
+                for (String txt : copy) {
+                    speakNow(txt, true);
+                }
             }
         }
     }
@@ -230,10 +400,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
         NotificationChannel liveChannel = new NotificationChannel(
             CHANNEL_LIVE_SILENT,
-            "Seguimiento en vivo (barra de progreso)",
+            "Seguimiento en vivo (actualización en tiempo real)",
             NotificationManager.IMPORTANCE_LOW
         );
-        liveChannel.setDescription("Muestra en tiempo real el avance del colectivo estilo Uber en tu barra de estado.");
+        liveChannel.setDescription("Actualiza en el lugar el avance y los minutos de tus colectivos sin duplicar notificaciones.");
         liveChannel.setSound(null, null);
         liveChannel.enableVibration(false);
         liveChannel.setShowBadge(false);
@@ -262,16 +432,44 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         return null;
     }
 
+    private boolean hasAnyActiveWork() {
+        return !"idle".equals(phase) || !watchedAlerts.isEmpty();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // Mantener el servicio activo aunque el usuario deslice la app desde recientes
+        if (hasAnyActiveWork()) {
+            persistState();
+            ensurePollingRunning();
+        }
+        super.onTaskRemoved(rootIntent);
+    }
+
     @Override
     public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
         if (intent == null) {
-            return "idle".equals(phase) ? START_NOT_STICKY : START_STICKY;
+            // Reinicio automático del SO (START_STICKY): reanudar campanitas persistidas
+            if (!watchedAlerts.isEmpty()) {
+                refreshAllNotificationsAndForeground();
+                ensurePollingRunning();
+                return START_STICKY;
+            }
+            return hasAnyActiveWork() ? START_STICKY : START_NOT_STICKY;
         }
 
         String action = intent.getAction();
         JSONObject payload = parsePayload(intent.getStringExtra(EXTRA_PAYLOAD));
 
-        if (ACTION_START_WAITING.equals(action)) {
+        if (ACTION_UPSERT_WATCH.equals(action)) {
+            handleUpsertWatch(payload);
+        } else if (ACTION_REMOVE_WATCH.equals(action)) {
+            String key = intent.getStringExtra(EXTRA_WATCH_KEY);
+            if (key == null || key.isEmpty()) key = payload.optString("key", "");
+            handleRemoveWatch(key);
+        } else if (ACTION_CLEAR_WATCHES.equals(action)) {
+            handleClearWatches();
+        } else if (ACTION_START_WAITING.equals(action)) {
             handleStartWaiting(payload);
         } else if (ACTION_UPDATE_WAITING.equals(action)) {
             handleUpdateWaitingFromJs(payload);
@@ -281,40 +479,42 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             handleRequestBoard(payload, true);
         } else if (ACTION_ALIGHT.equals(action)) {
             handleAlight(false);
-            return START_NOT_STICKY;
         } else if (ACTION_STOP.equals(action)) {
             handleAlight(payload != null && payload.optBoolean("silent", false));
-            return START_NOT_STICKY;
         } else if (ACTION_SYNC_PREFS.equals(action)) {
             applyPrefs(payload);
-            if (!"idle".equals(phase)) {
-                updateForegroundNotification();
+            persistState();
+            if (hasAnyActiveWork()) {
+                refreshAllNotificationsAndForeground();
                 broadcastSnapshot();
             }
         } else if (ACTION_SEND_ALERT.equals(action)) {
             handleStandaloneAlert(payload);
-            if ("idle".equals(phase)) {
-                // Keep service alive briefly so TTS finishes speaking, then stop cleanly
+            if (!hasAnyActiveWork()) {
                 mainHandler.postDelayed(() -> {
-                    if ("idle".equals(phase)) stopSelf();
-                }, 8000);
+                    if (!hasAnyActiveWork()) stopSelf();
+                }, 9000);
                 return START_NOT_STICKY;
             }
         } else if (ACTION_SPEAK_ONLY.equals(action)) {
             String txt = payload != null ? payload.optString("text", "") : "";
             long delayMs = payload != null ? payload.optLong("delayMs", 0) : 0;
             if (!txt.isEmpty()) {
-                scheduleSpeech(txt, delayMs);
+                scheduleSpeech(txt, delayMs, false);
             }
-            if ("idle".equals(phase)) {
+            if (!hasAnyActiveWork()) {
                 mainHandler.postDelayed(() -> {
-                    if ("idle".equals(phase)) stopSelf();
-                }, delayMs + 8000);
+                    if (!hasAnyActiveWork()) stopSelf();
+                }, delayMs + 9000);
                 return START_NOT_STICKY;
             }
         }
 
-        return "idle".equals(phase) ? START_NOT_STICKY : START_STICKY;
+        if (!hasAnyActiveWork()) {
+            stopForegroundAndIdle();
+            return START_NOT_STICKY;
+        }
+        return START_STICKY;
     }
 
     private JSONObject parsePayload(@Nullable String raw) {
@@ -331,9 +531,182 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         if (p.has("minuteByMinute")) minuteByMinute = p.optBoolean("minuteByMinute", minuteByMinute);
         if (p.has("ttsEnabled")) ttsEnabled = p.optBoolean("ttsEnabled", ttsEnabled);
         if (p.has("soundEnabled")) soundEnabled = p.optBoolean("soundEnabled", soundEnabled);
-        if (p.has("leadMin")) leadMin = p.optInt("leadMin", leadMin);
+        if (p.has("leadMin")) leadMin = Math.max(1, p.optInt("leadMin", leadMin));
+        String base = p.optString("apiBase", "").trim();
+        if (!base.isEmpty()) apiBase = base.replaceAll("/+$", "");
     }
 
+    // ── Multi-Watch Stop Bells (campanitas en vivo sin duplicados) ────────────
+    private int allocateWatchNotifId(String key) {
+        int base = NOTIF_ID_WATCH_BASE + Math.abs(key.hashCode() % 500);
+        while (true) {
+            boolean collision = (base == NOTIF_ID_LIVE_TRIP);
+            if (!collision) {
+                for (WatchAlert existing : watchedAlerts.values()) {
+                    if (!existing.key.equals(key) && existing.notifId == base) {
+                        collision = true;
+                        break;
+                    }
+                }
+            }
+            if (!collision) return base;
+            base++;
+        }
+    }
+
+    private void handleUpsertWatch(JSONObject p) {
+        if (p == null) return;
+        applyPrefs(p);
+
+        String wStopId = p.optString("stopId", "").trim().toUpperCase(Locale.ROOT);
+        String wLine = p.optString("lineName", "").trim();
+        String wCoche = p.optString("coche", "").trim();
+        boolean wLockCar = p.optBoolean("lockCar", false);
+        String key = p.optString("key", "").trim();
+        if (key.isEmpty()) {
+            key = wLockCar && !wCoche.isEmpty()
+                ? (wStopId + "::" + wLine + "::" + wCoche)
+                : (wStopId + "::" + wLine);
+        }
+        if (wStopId.isEmpty() || wLine.isEmpty()) return;
+
+        WatchAlert w = watchedAlerts.get(key);
+        boolean isNew = (w == null);
+        if (isNew) {
+            w = new WatchAlert();
+            w.key = key;
+            w.notifId = allocateWatchNotifId(key);
+            watchedAlerts.put(key, w);
+        }
+
+        w.stopId = wStopId;
+        String sn = p.optString("stopName", "").trim();
+        if (!sn.isEmpty()) w.stopName = sn;
+        else if (w.stopName == null || w.stopName.isEmpty()) w.stopName = wStopId;
+
+        double sLat = p.optDouble("stopLat", Double.NaN);
+        double sLng = p.optDouble("stopLng", Double.NaN);
+        if (Double.isFinite(sLat) && sLat != 0) w.stopLat = sLat;
+        if (Double.isFinite(sLng) && sLng != 0) w.stopLng = sLng;
+
+        w.lineName = wLine;
+        int wCod = p.optInt("codLinea", 0);
+        if (wCod > 0) w.codLinea = wCod;
+        w.lockCar = wLockCar;
+        if (!wCoche.isEmpty()) w.coche = wCoche;
+        String wDrv = p.optString("choferNombre", "").trim();
+        if (!wDrv.isEmpty()) w.choferNombre = wDrv;
+        String wSched = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
+        if (!wSched.isEmpty()) w.scheduledHHMM = wSched;
+        w.leadMin = Math.max(1, p.optInt("leadMin", leadMin));
+        w.missingPolls = 0;
+
+        double incomingDist = p.optDouble("distM", -1);
+        int incomingEta = p.optInt("etaMin", -1);
+        updateWatchMetricsAndMaybeAlert(w, incomingEta, incomingDist, isNew);
+
+        persistState();
+        refreshAllNotificationsAndForeground();
+        ensurePollingRunning();
+        broadcastWatches();
+    }
+
+    private void updateWatchMetricsAndMaybeAlert(WatchAlert w, int nextEta, double nextDist, boolean isInitial) {
+        int prevEta = w.etaMin;
+        if (nextDist >= 0) {
+            w.distM = nextDist;
+            if (isInitial || w.distM > w.initialDistM) {
+                w.initialDistM = Math.max(900, Math.min(12000, w.distM));
+            }
+            w.progress01 = Math.max(0.05, Math.min(1.0, 1.0 - w.distM / Math.max(400.0, w.initialDistM)));
+        } else if (nextEta >= 0) {
+            // Respaldo de barra cuando no vino distancia exacta
+            double estMax = Math.max(12.0, Math.max(w.leadMin + 6.0, prevEta > 0 ? prevEta : 12.0));
+            w.progress01 = Math.max(0.06, Math.min(1.0, 1.0 - (nextEta / estMax)));
+        }
+
+        if (nextEta >= 0) {
+            w.etaMin = nextEta;
+            if (w.etaMin == 0) w.progress01 = 1.0;
+            if (w.etaMin <= 1 || (w.distM >= 0 && w.distM <= 250)) {
+                w.wasClose = true;
+            }
+        }
+
+        if (w.etaMin < 0) return;
+
+        // Evaluar disparo de timbre + TTS sin crear notificación duplicada
+        boolean shouldAlert = false;
+        if (!w.triggered && w.etaMin <= w.leadMin) {
+            w.triggered = true;
+            w.lastSpokenEtaMin = w.etaMin;
+            shouldAlert = true;
+        } else if (minuteByMinute && w.etaMin <= Math.max(w.leadMin, 10)) {
+            boolean isLower = (w.lastSpokenEtaMin == null) || (w.etaMin < w.lastSpokenEtaMin);
+            boolean reachedNow = (w.etaMin == 0 && (w.lastSpokenEtaMin == null || w.lastSpokenEtaMin != 0));
+            if (isLower || reachedNow) {
+                w.triggered = true;
+                w.lastSpokenEtaMin = w.etaMin;
+                shouldAlert = true;
+            }
+        } else if (prevEta != 0 && w.etaMin == 0 && (w.lastSpokenEtaMin == null || w.lastSpokenEtaMin != 0)) {
+            w.triggered = true;
+            w.lastSpokenEtaMin = 0;
+            shouldAlert = true;
+        }
+
+        if (shouldAlert) {
+            String speechText = SpanishTtsFormatter.buildArrivalSpeech(
+                w.lineName,
+                w.coche,
+                w.etaMin,
+                (w.etaMin == 0 || !minuteByMinute) ? w.stopName : ""
+            );
+            triggerChimeAndSpeech(speechText);
+        }
+    }
+
+    private void handleRemoveWatch(String key) {
+        if (key == null || key.isEmpty()) return;
+        WatchAlert removed = watchedAlerts.remove(key);
+        if (removed != null && notifManager != null) {
+            if (removed.notifId == activeForegroundNotifId) {
+                activeForegroundNotifId = 0;
+            }
+            notifManager.cancel(removed.notifId);
+        }
+        persistState();
+        broadcastWatches();
+        if (hasAnyActiveWork()) {
+            refreshAllNotificationsAndForeground();
+        } else {
+            stopForegroundAndIdle();
+        }
+    }
+
+    private void handleClearWatches() {
+        for (WatchAlert w : watchedAlerts.values()) {
+            if (notifManager != null) notifManager.cancel(w.notifId);
+        }
+        watchedAlerts.clear();
+        if (activeForegroundNotifId >= NOTIF_ID_WATCH_BASE) {
+            activeForegroundNotifId = 0;
+        }
+        persistState();
+        broadcastWatches();
+        if (hasAnyActiveWork()) {
+            refreshAllNotificationsAndForeground();
+        } else {
+            stopForegroundAndIdle();
+        }
+    }
+
+    private boolean isDuplicateOfPrimaryWaiting(WatchAlert w) {
+        if (!"waiting".equals(phase) && !"boarding_armed".equals(phase)) return false;
+        return w.stopId.equals(stopId) && w.lineName.equalsIgnoreCase(lineName);
+    }
+
+    // ── Primary Trip Tracking (Selected Line / Subir / A Bordo) ───────────────
     private void loadOrderedStopsFromJson(@Nullable JSONArray arr) {
         if (arr == null || arr.length() == 0) return;
         orderedStops.clear();
@@ -362,8 +735,6 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             && newLine.equals(lineName);
 
         phase = sameTarget ? phase : "waiting";
-        String base = p.optString("apiBase", "").trim();
-        if (!base.isEmpty()) apiBase = base.replaceAll("/+$", "");
 
         stopId = newStopId;
         stopName = p.optString("stopName", stopId);
@@ -405,8 +776,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             if (etaMin <= 1 || (distM >= 0 && distM <= 250)) wasCloseToStop = true;
         }
 
-        startForegroundCompat(buildLiveNotification());
-        startWaitingPoller();
+        persistState();
+        refreshAllNotificationsAndForeground();
+        ensurePollingRunning();
         broadcastSnapshot();
     }
 
@@ -448,7 +820,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             return;
         }
 
-        // Alerta minuto a minuto o llegada a 0 min
+        // Alerta minuto a minuto o llegada a 0 min — ACTUALIZANDO LA MISMA NOTIFICACIÓN EN EL LUGAR
         boolean shouldAlert = false;
         String speechText = "";
         if (minuteByMinute && etaMin >= 0 && etaMin <= 20) {
@@ -468,17 +840,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             speechText = SpanishTtsFormatter.buildArrivalSpeech(lineName, coche, 0, stopName);
         }
 
-        updateForegroundNotification();
+        refreshAllNotificationsAndForeground();
         if (shouldAlert) {
-            String etaTxt = etaMin <= 0 ? "ARRIBANDO AHORA" : (etaMin + " min");
-            String title = (etaMin <= 0 ? "🔔 " : "🚌 ") + lineName + " · " + etaTxt
-                + (coche.isEmpty() ? "" : " · #" + coche);
-            String body = SpanishTtsFormatter.buildUberProgressBar(progress01, 12) + " "
-                + SpanishTtsFormatter.shortLabel(stopName, 20)
-                + "\nChofer: " + (choferNombre.isEmpty() ? "Sin datos" : choferNombre)
-                + " · Coche #" + (coche.isEmpty() ? "—" : coche)
-                + "\nArribo: " + etaTxt + " · Prog. real: " + (scheduledHHMM.isEmpty() ? "s/d" : scheduledHHMM);
-            fireSoundAlert(title, body, speechText, NOTIF_ID_ALERT_BASE + 1);
+            triggerChimeAndSpeech(speechText);
         }
         broadcastSnapshot();
     }
@@ -514,24 +878,24 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
 
         phase = "boarding_armed";
-        startForegroundCompat(buildLiveNotification());
+        refreshAllNotificationsAndForeground();
         broadcastSnapshot();
         if (ttsEnabled) {
             scheduleSpeech(
                 "Subir activado para línea " + SpanishTtsFormatter.formatLinea(lineName)
                     + ". Cuando llegue el colectivo te avisaré cada parada.",
-                200
+                200,
+                false
             );
         }
     }
 
     private void enterOnboardMode(boolean auto) {
-        stopWaitingPoller();
         phase = "onboard";
         announcedStopIds.clear();
         arrivingNow = false;
         distToNextM = -1;
-        progress01 = 0.05;
+        progress01 = 0;
 
         nextStopIdx = 0;
         if (!orderedStops.isEmpty()) {
@@ -561,8 +925,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             }
         }
 
-        startForegroundCompat(buildLiveNotification());
+        refreshAllNotificationsAndForeground();
         startGpsUpdates();
+        if (watchedAlerts.isEmpty()) stopWaitingPoller();
         broadcastSnapshot();
 
         String nextClean = nextStopIdx < orderedStops.size() ? orderedStops.get(nextStopIdx).cleanName : "";
@@ -574,22 +939,15 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 + (nextClean.isEmpty() ? "." : ". Próxima parada, " + nextClean + ".");
 
         if (auto) {
-            fireSoundAlert(
-                "🚌 A bordo · " + lineName + (coche.isEmpty() ? "" : " #" + coche),
-                "Modo viaje activado · Te avisaremos cada próxima parada",
-                speech,
-                NOTIF_ID_ALERT_BASE + 2
-            );
+            triggerChimeAndSpeech(speech);
         } else if (ttsEnabled) {
-            scheduleSpeech(speech, 250);
+            scheduleSpeech(speech, 250, false);
         }
     }
 
     private void handleAlight(boolean silent) {
         boolean wasOnboard = "onboard".equals(phase);
-        stopWaitingPoller();
         stopGpsUpdates();
-        cancelPendingSpeech();
         phase = "idle";
         arrivingNow = false;
         announcedStopIds.clear();
@@ -597,9 +955,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
         if (notifManager != null) {
             notifManager.cancel(NOTIF_ID_LIVE_TRIP);
-            notifManager.cancel(NOTIF_ID_ALERT_BASE + 1);
-            notifManager.cancel(NOTIF_ID_ALERT_BASE + 2);
-            notifManager.cancel(NOTIF_ID_ALERT_BASE + 3);
+        }
+        if (activeForegroundNotifId == NOTIF_ID_LIVE_TRIP) {
+            activeForegroundNotifId = 0;
         }
         broadcastSnapshot();
 
@@ -607,17 +965,29 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             String msg = wasOnboard
                 ? "Bajaste del colectivo. Modo viaje finalizado."
                 : "Seguimiento detenido.";
-            speakNow(msg);
+            speakNow(msg, false);
         }
 
+        if (hasAnyActiveWork()) {
+            refreshAllNotificationsAndForeground();
+            ensurePollingRunning();
+        } else {
+            stopForegroundAndIdle();
+        }
+    }
+
+    private void stopForegroundAndIdle() {
+        stopWaitingPoller();
+        stopGpsUpdates();
+        activeForegroundNotifId = 0;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE);
         } else {
             stopForeground(true);
         }
         mainHandler.postDelayed(() -> {
-            if ("idle".equals(phase)) stopSelf();
-        }, silent ? 100 : 3500);
+            if (!hasAnyActiveWork()) stopSelf();
+        }, 4500);
     }
 
     private void handleStandaloneAlert(JSONObject p) {
@@ -628,21 +998,39 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         boolean speakAfter = p.optBoolean("speakAfterChime", ttsEnabled);
         int notifId = NOTIF_ID_ALERT_BASE + 10 + Math.abs(p.optString("tag", "alert").hashCode() % 40);
 
+        if (notifManager != null) {
+            NotificationCompat.Builder b = new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
+                .setSmallIcon(R.drawable.ic_stat_bus)
+                .setContentTitle(title)
+                .setContentText(body.split("\n")[0])
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setAutoCancel(true)
+                .setSilent(true)
+                .setContentIntent(buildOpenAppIntent());
+            notifManager.notify(notifId, b.build());
+        }
         if (playSound) {
-            postHighAlertNotification(title, body, notifId);
-            if (speakAfter && !speech.isEmpty()) {
-                scheduleSpeech(speech, 950);
-            }
-        } else if (speakAfter && !speech.isEmpty()) {
-            scheduleSpeech(speech, 0);
+            playDeviceNotificationChime();
+        }
+        if (speakAfter && !speech.isEmpty()) {
+            scheduleSpeech(speech, playSound ? 950 : 0, true);
         }
     }
 
-    // ── Background Waiting Poller (works even with Activity closed!) ──────────
-    private void startWaitingPoller() {
-        stopWaitingPoller();
-        if (pollExecutor == null || pollExecutor.isShutdown() || stopId.isEmpty()) return;
-        pollFuture = pollExecutor.scheduleWithFixedDelay(this::pollArrivalsOnce, 12, 12, TimeUnit.SECONDS);
+    // ── Grouped 10-Second Background Poller (works with app closed!) ──────────
+    private void ensurePollingRunning() {
+        boolean needPolling = !watchedAlerts.isEmpty()
+            || "waiting".equals(phase)
+            || "boarding_armed".equals(phase);
+        if (!needPolling) {
+            stopWaitingPoller();
+            return;
+        }
+        if (pollFuture != null && !pollFuture.isCancelled() && !pollFuture.isDone()) return;
+        if (pollExecutor == null || pollExecutor.isShutdown()) return;
+        pollFuture = pollExecutor.scheduleWithFixedDelay(this::pollAllTargetsOnce, 10, 10, TimeUnit.SECONDS);
     }
 
     private void stopWaitingPoller() {
@@ -652,20 +1040,128 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
-    private void pollArrivalsOnce() {
-        if (!"waiting".equals(phase) && !"boarding_armed".equals(phase)) return;
-        if (stopId.isEmpty() || apiBase.isEmpty()) return;
+    private void pollAllTargetsOnce() {
+        if (apiBase == null || apiBase.isEmpty()) return;
 
+        // Recopilar todas las paradas únicas a consultar (1 sola llamada HTTP por parada)
+        final Set<String> stopsToQuery = new HashSet<>();
+        if (("waiting".equals(phase) || "boarding_armed".equals(phase)) && !stopId.isEmpty()) {
+            stopsToQuery.add(stopId);
+        }
+        final List<String> watchKeysSnapshot;
+        synchronized (watchedAlerts) {
+            watchKeysSnapshot = new ArrayList<>(watchedAlerts.keySet());
+            for (WatchAlert w : watchedAlerts.values()) {
+                if (w.stopId != null && !w.stopId.isEmpty()) {
+                    stopsToQuery.add(w.stopId);
+                }
+            }
+        }
+        if (stopsToQuery.isEmpty()) return;
+
+        final Map<String, JSONArray> arribosByStop = new HashMap<>();
+        for (String sid : stopsToQuery) {
+            JSONArray arr = fetchStopArribos(sid);
+            if (arr != null) {
+                arribosByStop.put(sid, arr);
+            }
+        }
+        if (arribosByStop.isEmpty()) return;
+
+        mainHandler.post(() -> {
+            // 1) Actualizar seguimiento principal (waiting / boarding_armed)
+            if (("waiting".equals(phase) || "boarding_armed".equals(phase)) && arribosByStop.containsKey(stopId)) {
+                JSONArray list = arribosByStop.get(stopId);
+                JSONObject matched = findMatchingBus(list, lineName, codLinea, coche, lockCar);
+                if (matched == null) {
+                    if ("boarding_armed".equals(phase) && wasCloseToStop) {
+                        enterOnboardMode(true);
+                    }
+                } else {
+                    String bc = matched.optString("identificadorCoche", "").trim();
+                    String bDrv = matched.optString("choferNombre", "").trim();
+                    double bLat = parseDoubleSafe(matched.opt("latitud"));
+                    double bLng = parseDoubleSafe(matched.opt("longitud"));
+                    double sLat = stopLat != 0 ? stopLat : parseDoubleSafe(matched.opt("latitudParada"));
+                    double sLng = stopLng != 0 ? stopLng : parseDoubleSafe(matched.opt("longitudParada"));
+                    int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
+                    double calcDist = (Double.isFinite(bLat) && Double.isFinite(bLng) && Double.isFinite(sLat) && Double.isFinite(sLng) && sLat != 0)
+                        ? haversineMeters(bLat, bLng, sLat, sLng)
+                        : -1;
+                    if (!bc.isEmpty()) coche = bc;
+                    if (!bDrv.isEmpty()) choferNombre = bDrv;
+                    processWaitingUpdate(parsedEta, calcDist);
+                }
+            }
+
+            // 2) Actualizar todas las campanitas activas en el lugar
+            boolean watchesChanged = false;
+            List<String> toRemove = new ArrayList<>();
+            for (String wk : watchKeysSnapshot) {
+                WatchAlert w = watchedAlerts.get(wk);
+                if (w == null) continue;
+                JSONArray list = arribosByStop.get(w.stopId);
+                if (list == null) continue;
+
+                JSONObject matched = findMatchingBus(list, w.lineName, w.codLinea, w.coche, w.lockCar);
+                if (matched == null) {
+                    w.missingPolls++;
+                    if (w.wasClose && w.missingPolls >= 2) {
+                        toRemove.add(wk);
+                    }
+                    continue;
+                }
+                w.missingPolls = 0;
+                String bc = matched.optString("identificadorCoche", "").trim();
+                String bDrv = matched.optString("choferNombre", "").trim();
+                if (!bc.isEmpty()) w.coche = bc;
+                if (!bDrv.isEmpty()) w.choferNombre = bDrv;
+
+                double bLat = parseDoubleSafe(matched.opt("latitud"));
+                double bLng = parseDoubleSafe(matched.opt("longitud"));
+                double sLat = w.stopLat != 0 ? w.stopLat : parseDoubleSafe(matched.opt("latitudParada"));
+                double sLng = w.stopLng != 0 ? w.stopLng : parseDoubleSafe(matched.opt("longitudParada"));
+                int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
+                double calcDist = (Double.isFinite(bLat) && Double.isFinite(bLng) && Double.isFinite(sLat) && Double.isFinite(sLng) && sLat != 0)
+                    ? haversineMeters(bLat, bLng, sLat, sLng)
+                    : -1;
+
+                updateWatchMetricsAndMaybeAlert(w, parsedEta, calcDist, false);
+                watchesChanged = true;
+            }
+
+            for (String rmKey : toRemove) {
+                WatchAlert rem = watchedAlerts.remove(rmKey);
+                if (rem != null && notifManager != null) {
+                    if (rem.notifId == activeForegroundNotifId) activeForegroundNotifId = 0;
+                    notifManager.cancel(rem.notifId);
+                    watchesChanged = true;
+                }
+            }
+
+            if (watchesChanged) {
+                persistState();
+                broadcastWatches();
+            }
+            if (hasAnyActiveWork()) {
+                refreshAllNotificationsAndForeground();
+            } else {
+                stopForegroundAndIdle();
+            }
+        });
+    }
+
+    @Nullable
+    private JSONArray fetchStopArribos(String sid) {
         HttpURLConnection conn = null;
         try {
-            String qStop = URLEncoder.encode(stopId, "UTF-8");
-            String qLine = codLinea > 0 ? String.valueOf(codLinea) : "000";
-            URL url = new URL(apiBase + "/api/arribos?idParada=" + qStop + "&codLinea=" + qLine);
+            String qStop = URLEncoder.encode(sid, "UTF-8");
+            URL url = new URL(apiBase + "/api/arribos?idParada=" + qStop + "&codLinea=000");
             conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(7000);
             conn.setReadTimeout(7000);
             conn.setRequestMethod("GET");
-            if (conn.getResponseCode() != 200) return;
+            if (conn.getResponseCode() != 200) return null;
 
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(
@@ -674,68 +1170,49 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 String line;
                 while ((line = br.readLine()) != null) sb.append(line);
             }
-
             JSONObject root = new JSONObject(sb.toString());
             JSONObject data = root.optJSONObject("data");
-            JSONArray arribos = data != null ? data.optJSONArray("arribos") : null;
-            if (arribos == null || arribos.length() == 0) {
-                if ("boarding_armed".equals(phase) && wasCloseToStop) {
-                    mainHandler.post(() -> enterOnboardMode(true));
-                }
-                return;
-            }
-
-            JSONObject matched = null;
-            if (lockCar && !coche.isEmpty()) {
-                for (int i = 0; i < arribos.length(); i++) {
-                    JSONObject b = arribos.optJSONObject(i);
-                    if (b == null) continue;
-                    String bc = b.optString("identificadorCoche", "").trim();
-                    if (coche.equals(bc)) {
-                        matched = b;
-                        break;
-                    }
-                }
-            }
-            if (matched == null) {
-                for (int i = 0; i < arribos.length(); i++) {
-                    JSONObject b = arribos.optJSONObject(i);
-                    if (b == null) continue;
-                    int bCod = b.optInt("codigoLinea", 0);
-                    String bLine = b.optString("descripcionLinea", "").trim();
-                    if ((codLinea > 0 && bCod == codLinea) || (!lineName.isEmpty() && lineName.equalsIgnoreCase(bLine))) {
-                        matched = b;
-                        break;
-                    }
-                }
-            }
-
-            if (matched == null) {
-                if ("boarding_armed".equals(phase) && wasCloseToStop) {
-                    mainHandler.post(() -> enterOnboardMode(true));
-                }
-                return;
-            }
-
-            String bc = matched.optString("identificadorCoche", "").trim();
-            String bDrv = matched.optString("choferNombre", "").trim();
-            double bLat = matched.optDouble("latitud", Double.NaN);
-            double bLng = matched.optDouble("longitud", Double.NaN);
-            int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
-            double calcDist = (Double.isFinite(bLat) && Double.isFinite(bLng) && stopLat != 0 && stopLng != 0)
-                ? haversineMeters(bLat, bLng, stopLat, stopLng)
-                : -1;
-
-            mainHandler.post(() -> {
-                if (!bc.isEmpty()) coche = bc;
-                if (!bDrv.isEmpty()) choferNombre = bDrv;
-                processWaitingUpdate(parsedEta, calcDist);
-            });
+            if (data != null && data.has("arribos")) return data.optJSONArray("arribos");
+            if (root.has("arribos")) return root.optJSONArray("arribos");
+            return new JSONArray();
         } catch (Exception e) {
-            Log.d(TAG, "Background poll skipped: " + e.getMessage());
+            Log.d(TAG, "Background poll failed for " + sid + ": " + e.getMessage());
+            return null;
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    @Nullable
+    private JSONObject findMatchingBus(JSONArray arribos, String targetLine, int targetCod, String targetCoche, boolean carLocked) {
+        if (arribos == null || arribos.length() == 0) return null;
+        if (carLocked && targetCoche != null && !targetCoche.isEmpty()) {
+            for (int i = 0; i < arribos.length(); i++) {
+                JSONObject b = arribos.optJSONObject(i);
+                if (b == null || b.optBoolean("esSiguienteVuelta", false)) continue;
+                String bc = b.optString("identificadorCoche", "").trim();
+                if (targetCoche.equals(bc)) return b;
+            }
+            return null;
+        }
+        JSONObject best = null;
+        int bestEta = Integer.MAX_VALUE;
+        for (int i = 0; i < arribos.length(); i++) {
+            JSONObject b = arribos.optJSONObject(i);
+            if (b == null || b.optBoolean("esSiguienteVuelta", false)) continue;
+            int bCod = b.optInt("codigoLinea", 0);
+            String bLine = b.optString("descripcionLinea", "").trim();
+            boolean matchLine = (targetCod > 0 && bCod == targetCod)
+                || (targetLine != null && !targetLine.isEmpty() && targetLine.equalsIgnoreCase(bLine));
+            if (!matchLine) continue;
+            int e = parseEtaMinutes(b.optString("tiempoRestanteArribo", b.optString("tiempoRaw", "")));
+            int rank = e >= 0 ? e : 999;
+            if (best == null || rank < bestEta) {
+                best = b;
+                bestEta = rank;
+            }
+        }
+        return best;
     }
 
     private int parseEtaMinutes(String raw) {
@@ -751,6 +1228,18 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             }
         }
         return -1;
+    }
+
+    private static double parseDoubleSafe(@Nullable Object raw) {
+        if (raw == null) return Double.NaN;
+        if (raw instanceof Number) return ((Number) raw).doubleValue();
+        try {
+            String s = String.valueOf(raw).trim().replace(',', '.');
+            if (s.isEmpty() || "null".equalsIgnoreCase(s)) return Double.NaN;
+            return Double.parseDouble(s);
+        } catch (Exception e) {
+            return Double.NaN;
+        }
     }
 
     // ── Native Android LocationManager for A Bordo Mode (works with app closed!) ──
@@ -793,7 +1282,6 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         double lat = location.getLatitude();
         double lng = location.getLongitude();
 
-        // Buscar si saltamos alguna parada intermedia (solo avanzar hacia adelante, nunca retroceder)
         int bestFutureIdx = nextStopIdx;
         double bestFutureDist = haversineMeters(lat, lng, orderedStops.get(nextStopIdx).lat, orderedStops.get(nextStopIdx).lng);
         int lookAheadLimit = Math.min(orderedStops.size() - 1, nextStopIdx + 4);
@@ -814,7 +1302,6 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         double dist = haversineMeters(lat, lng, target.lat, target.lng);
         distToNextM = dist;
 
-        // Si ya anunciamos esta parada y ahora nos estamos alejando (> 110 m), avanzar a la siguiente parada
         if (announcedStopIds.contains(target.id) && dist > 110 && nextStopIdx < orderedStops.size() - 1) {
             RouteStop prev = target;
             nextStopIdx += 1;
@@ -825,34 +1312,23 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             distToNextM = dist;
         }
 
-        if (dist > prevStopDistRef) prevStopDistRef = Math.min(2500, dist);
-        progress01 = Math.max(0.05, Math.min(1.0, 1.0 - dist / Math.max(120.0, prevStopDistRef)));
-
-        // Zona de arribo a parada (<= 150 m)
+        // Zona de arribo a parada (<= 150 m) — actualiza la MISMA notificación en el lugar + timbre + TTS
         if (dist <= 150.0 && !announcedStopIds.contains(target.id)) {
             announcedStopIds.add(target.id);
             arrivingNow = true;
-            progress01 = 1.0;
 
             boolean isFinal = nextStopIdx >= orderedStops.size() - 1;
             String speech = isFinal
                 ? "Arribando, " + target.cleanName + ". Fin del recorrido."
                 : "Arribando, " + target.cleanName + ".";
 
-            updateForegroundNotification();
-            fireSoundAlert(
-                "🔔 ARRIBANDO · " + target.cleanName,
-                SpanishTtsFormatter.buildUberProgressBar(1.0, 12) + " " + SpanishTtsFormatter.shortLabel(target.cleanName, 20)
-                    + "\nLínea " + lineName + (coche.isEmpty() ? "" : " · Coche #" + coche)
-                    + (choferNombre.isEmpty() ? "" : " · " + choferNombre),
-                speech,
-                NOTIF_ID_ALERT_BASE + 3
-            );
+            refreshAllNotificationsAndForeground();
+            triggerChimeAndSpeech(speech);
             broadcastSnapshot();
             return;
         }
 
-        updateForegroundNotification();
+        refreshAllNotificationsAndForeground();
         broadcastSnapshot();
     }
 
@@ -865,26 +1341,57 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     @Override
     public void onProviderDisabled(@NonNull String provider) {}
 
-    // ── Notification Builders (Uber-style native progress bar + action buttons) ──
-    private void startForegroundCompat(Notification notification) {
+    // ── In-Place Notification Rendering (ZERO Duplicates!) ────────────────────
+    private void startForegroundCompat(int notifId, Notification notification) {
+        activeForegroundNotifId = notifId;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             int fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
             if (hasLocationPermission()) {
                 fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
             }
             try {
-                startForeground(NOTIF_ID_LIVE_TRIP, notification, fgsType);
+                startForeground(notifId, notification, fgsType);
             } catch (SecurityException se) {
-                startForeground(NOTIF_ID_LIVE_TRIP, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                startForeground(notifId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
             }
         } else {
-            startForeground(NOTIF_ID_LIVE_TRIP, notification);
+            startForeground(notifId, notification);
         }
     }
 
-    private void updateForegroundNotification() {
-        if ("idle".equals(phase) || notifManager == null) return;
-        notifManager.notify(NOTIF_ID_LIVE_TRIP, buildLiveNotification());
+    private void refreshAllNotificationsAndForeground() {
+        if (notifManager == null) return;
+
+        boolean hasPrimary = !"idle".equals(phase);
+        if (hasPrimary) {
+            Notification primaryNotif = "onboard".equals(phase)
+                ? buildOnboardNotification()
+                : buildPrimaryWaitingNotification();
+            if (activeForegroundNotifId != NOTIF_ID_LIVE_TRIP) {
+                startForegroundCompat(NOTIF_ID_LIVE_TRIP, primaryNotif);
+            } else {
+                notifManager.notify(NOTIF_ID_LIVE_TRIP, primaryNotif);
+            }
+        }
+
+        boolean promotedWatchToFg = false;
+        for (WatchAlert w : watchedAlerts.values()) {
+            if (isDuplicateOfPrimaryWaiting(w)) {
+                notifManager.cancel(w.notifId);
+                continue;
+            }
+            Notification n = buildWatchNotification(w);
+            if (!hasPrimary && !promotedWatchToFg && (activeForegroundNotifId == 0 || activeForegroundNotifId == w.notifId)) {
+                if (activeForegroundNotifId != w.notifId) {
+                    startForegroundCompat(w.notifId, n);
+                } else {
+                    notifManager.notify(w.notifId, n);
+                }
+                promotedWatchToFg = true;
+            } else {
+                notifManager.notify(w.notifId, n);
+            }
+        }
     }
 
     private PendingIntent buildOpenAppIntent() {
@@ -894,9 +1401,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         return PendingIntent.getActivity(this, 100, i, flags);
     }
 
-    private PendingIntent buildServiceActionIntent(String action, int reqCode) {
+    private PendingIntent buildServiceActionIntent(String action, int reqCode, @Nullable String watchKey) {
         Intent i = new Intent(this, DirectGpsTripService.class);
         i.setAction(action);
+        if (watchKey != null) i.putExtra(EXTRA_WATCH_KEY, watchKey);
         int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             return PendingIntent.getForegroundService(this, reqCode, i, flags);
@@ -904,15 +1412,70 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         return PendingIntent.getService(this, reqCode, i, flags);
     }
 
-    private Notification buildLiveNotification() {
+    /**
+     * Notificación de ARRIBO (campanita de parada):
+     * - Se ACTUALIZA EN EL LUGAR con barra recta estilo Uber (izquierda -> derecha) + setProgress nativo.
+     * - Muestra chofer, coche, minutos reales en vivo, distancia y hora programada REAL (nunca estimada).
+     */
+    private Notification buildWatchNotification(WatchAlert w) {
+        String cocheTxt = (w.coche == null || w.coche.isEmpty()) ? "s/d" : "#" + w.coche;
+        String driverTxt = (w.choferNombre == null || w.choferNombre.isEmpty()) ? "Sin datos" : w.choferNombre;
+        String schedTxt = (w.scheduledHHMM == null || w.scheduledHHMM.isEmpty()) ? "s/d" : w.scheduledHHMM;
+        int pct = (int) Math.max(4, Math.min(100, Math.round(w.progress01 * 100.0)));
+        String bar = SpanishTtsFormatter.buildUberProgressBar(w.progress01, 12);
+        String stopShort = SpanishTtsFormatter.shortLabel(w.stopName, 20);
+        String etaTxt = w.etaMin < 0 ? "En camino" : (w.etaMin <= 0 ? "ARRIBANDO" : w.etaMin + " min");
+
+        String title = (w.etaMin == 0 ? "🔔 " : "🚌 ") + w.lineName + " · " + etaTxt + " · Coche " + cocheTxt;
+        String distLine = w.distM > 0
+            ? "A " + SpanishTtsFormatter.formatDistance(w.distM) + " (" + SpanishTtsFormatter.formatBlocks(w.distM) + " c.)"
+            : "Actualizando en tiempo real";
+        String bigBody = bar + " " + stopShort
+            + "\nChofer: " + driverTxt + " · Coche " + cocheTxt
+            + "\nArribo: " + etaTxt + " · Prog. real: " + schedTxt
+            + "\n" + distLine + (minuteByMinute ? " · Min a min" : "");
+
+        return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
+            .setSmallIcon(R.drawable.ic_stat_bus)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
+            .setContentIntent(buildOpenAppIntent())
+            .setProgress(100, pct, false)
+            .setContentTitle(title)
+            .setContentText(bar + " " + stopShort)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody))
+            .addAction(0, "✕ Quitar aviso", buildServiceActionIntent(ACTION_REMOVE_WATCH, 300 + (w.notifId % 500), w.key))
+            .build();
+    }
+
+    /**
+     * Notificación de ARRIBO (línea seleccionada):
+     * - Barra recta estilo Uber (izquierda -> derecha) + setProgress nativo.
+     */
+    private Notification buildPrimaryWaitingNotification() {
         String cocheTxt = coche.isEmpty() ? "s/d" : "#" + coche;
         String driverTxt = choferNombre.isEmpty() ? "Sin datos" : choferNombre;
         String schedTxt = scheduledHHMM.isEmpty() ? "s/d" : scheduledHHMM;
         int pct = (int) Math.max(4, Math.min(100, Math.round(progress01 * 100.0)));
         String bar = SpanishTtsFormatter.buildUberProgressBar(progress01, 12);
+        String stopShort = SpanishTtsFormatter.shortLabel(stopName.isEmpty() ? stopId : stopName, 20);
+        String etaTxt = etaMin < 0 ? "En camino" : (etaMin <= 0 ? "ARRIBANDO" : etaMin + " min");
 
-        String title;
-        String bigBody;
+        String title = (etaMin == 0 ? "🔔 " : "🚌 ") + lineName + " · " + etaTxt + " · Coche " + cocheTxt;
+        String distLine = distM > 0
+            ? "A " + SpanishTtsFormatter.formatDistance(distM) + " (" + SpanishTtsFormatter.formatBlocks(distM) + " c.)"
+            : "Acercándose a tu parada";
+        String statusLine = "boarding_armed".equals(phase)
+            ? "✅ Subir activado · pasa a A Bordo al llegar"
+            : distLine + (minuteByMinute ? " · Min a min" : "");
+
+        String bigBody = bar + " " + stopShort
+            + "\nChofer: " + driverTxt + " · Coche " + cocheTxt
+            + "\nArribo: " + etaTxt + " · Prog. real: " + schedTxt
+            + "\n" + statusLine;
 
         NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
             .setSmallIcon(R.drawable.ic_stat_bus)
@@ -922,103 +1485,141 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(buildOpenAppIntent())
-            .setProgress(100, pct, false);
+            .setProgress(100, pct, false)
+            .setContentTitle(title)
+            .setContentText(bar + " " + stopShort)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody));
 
-        if ("onboard".equals(phase)) {
-            RouteStop next = nextStopIdx < orderedStops.size() ? orderedStops.get(nextStopIdx) : null;
-            String nextClean = next != null ? next.cleanName : "Fin del recorrido";
-            String nextShort = SpanishTtsFormatter.shortLabel(nextClean, 22);
-            int rem = Math.max(0, orderedStops.size() - nextStopIdx);
-            String distPart = distToNextM >= 0 ? " · " + SpanishTtsFormatter.formatDistance(distToNextM) : "";
-
-            title = arrivingNow
-                ? "🔔 ARRIBANDO · " + nextClean
-                : "🚌 A bordo " + lineName + (coche.isEmpty() ? "" : " #" + coche) + " → " + nextShort;
-
-            bigBody = bar + " " + nextShort
-                + "\nPróxima: " + nextClean + distPart
-                + "\nChofer: " + driverTxt + " · Coche " + cocheTxt + " · Prog. real: " + schedTxt
-                + "\n" + rem + (rem == 1 ? " parada restante" : " paradas restantes");
-
-            builder.addAction(0, "🚪 Bajar", buildServiceActionIntent(ACTION_ALIGHT, 203));
+        if ("boarding_armed".equals(phase)) {
+            builder.addAction(0, "🚌 Ya subí", buildServiceActionIntent(ACTION_BOARD_NOW, 202, null));
         } else {
-            String stopShort = SpanishTtsFormatter.shortLabel(stopName.isEmpty() ? stopId : stopName, 20);
-            String etaTxt = etaMin < 0 ? "En camino" : (etaMin <= 0 ? "ARRIBANDO" : etaMin + " min");
-            title = (etaMin == 0 ? "🔔 " : "🚌 ") + lineName + " · " + etaTxt + " · Coche " + cocheTxt;
-
-            String distLine = distM > 0
-                ? "A " + SpanishTtsFormatter.formatDistance(distM) + " (" + SpanishTtsFormatter.formatBlocks(distM) + " c.)"
-                : "Acercándose a tu parada";
-            String statusLine = "boarding_armed".equals(phase)
-                ? "✅ Subir activado · pasa a A Bordo al llegar"
-                : distLine + (minuteByMinute ? " · Min a min" : "");
-
-            bigBody = bar + " " + stopShort
-                + "\nChofer: " + driverTxt + " · Coche " + cocheTxt
-                + "\nArribo: " + etaTxt + " · Prog. real: " + schedTxt
-                + "\n" + statusLine;
-
-            if ("boarding_armed".equals(phase)) {
-                builder.addAction(0, "🚌 Ya subí", buildServiceActionIntent(ACTION_BOARD_NOW, 202));
-            } else {
-                builder.addAction(0, "🚌 Subir", buildServiceActionIntent(ACTION_BOARD, 201));
-            }
-            builder.addAction(0, "✕ Detener", buildServiceActionIntent(ACTION_STOP, 204));
+            builder.addAction(0, "🚌 Subir", buildServiceActionIntent(ACTION_BOARD, 201, null));
         }
-
-        builder.setContentTitle(title);
-        builder.setContentText(bigBody.split("\n")[0]);
-        builder.setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody));
+        builder.addAction(0, "✕ Detener", buildServiceActionIntent(ACTION_STOP, 204, null));
         return builder.build();
     }
 
-    private void fireSoundAlert(String title, String body, String speechText, int notifId) {
-        postHighAlertNotification(title, body, notifId);
-        if (ttsEnabled && speechText != null && !speechText.isEmpty()) {
-            // Reproducir voz nativa Android 950 ms DESPUÉS del timbre real del celular
-            scheduleSpeech(speechText, 950);
-        }
-    }
+    /**
+     * Notificación de MODO A BORDO (accesible para no videntes):
+     * - SIN línea recta de progreso (la barra recta es exclusiva de arribos).
+     * - Se actualiza en el lugar con próxima parada, distancia, chofer, coche y botón Bajar.
+     */
+    private Notification buildOnboardNotification() {
+        String cocheTxt = coche.isEmpty() ? "s/d" : "#" + coche;
+        String driverTxt = choferNombre.isEmpty() ? "Sin datos" : choferNombre;
+        String schedTxt = scheduledHHMM.isEmpty() ? "s/d" : scheduledHHMM;
+        RouteStop next = nextStopIdx < orderedStops.size() ? orderedStops.get(nextStopIdx) : null;
+        String nextClean = next != null ? next.cleanName : "Fin del recorrido";
+        int rem = Math.max(0, orderedStops.size() - nextStopIdx);
+        String distPart = distToNextM >= 0 ? " · " + SpanishTtsFormatter.formatDistance(distToNextM) : "";
 
-    private void postHighAlertNotification(String title, String body, int notifId) {
-        if (notifManager == null) return;
-        NotificationCompat.Builder b = new NotificationCompat.Builder(this, CHANNEL_ALERTS_SOUND)
+        String title = arrivingNow
+            ? "🔔 ARRIBANDO · " + nextClean
+            : "🚌 A bordo " + lineName + (coche.isEmpty() ? "" : " #" + coche);
+
+        String bigBody = "Próxima parada: " + nextClean + distPart
+            + "\nChofer: " + driverTxt + " · Coche " + cocheTxt + " · Prog. real: " + schedTxt
+            + "\n" + rem + (rem == 1 ? " parada restante" : " paradas restantes");
+
+        return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
             .setSmallIcon(R.drawable.ic_stat_bus)
-            .setContentTitle(title)
-            .setContentText(body.split("\n")[0])
-            .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setAutoCancel(true)
-            .setContentIntent(buildOpenAppIntent());
-
-        if ("onboard".equals(phase)) {
-            b.addAction(0, "🚪 Bajar", buildServiceActionIntent(ACTION_ALIGHT, 213));
-        }
-        notifManager.notify(notifId, b.build());
+            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
+            .setContentIntent(buildOpenAppIntent())
+            .setContentTitle(title)
+            .setContentText("Próxima: " + nextClean + distPart)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody))
+            .addAction(0, "🚪 Bajar", buildServiceActionIntent(ACTION_ALIGHT, 203, null))
+            .build();
     }
 
-    // ── Native Android TextToSpeech with AudioFocus ───────────────────────────
-    private void scheduleSpeech(String text, long delayMs) {
-        cancelPendingSpeech();
+    // ── Real Phone Notification Ringtone + Vibrate + Post-Chime Native TTS ────
+    private void triggerChimeAndSpeech(String speechText) {
+        boolean playedSound = false;
+        if (soundEnabled) {
+            playedSound = playDeviceNotificationChime();
+        }
+        if (ttsEnabled && speechText != null && !speechText.isEmpty()) {
+            scheduleSpeech(speechText, playedSound ? 950 : 120, true);
+        }
+    }
+
+    private boolean playDeviceNotificationChime() {
+        long now = System.currentTimeMillis();
+        // Si 2 colectivos disparan en el mismo tick de 10 s, sonar 1 solo timbre y encolar ambas voces
+        if (now - lastChimeMs < 1400) return true;
+        lastChimeMs = now;
+
+        int ringerMode = audioManager != null ? audioManager.getRingerMode() : AudioManager.RINGER_MODE_NORMAL;
+        if (ringerMode == AudioManager.RINGER_MODE_SILENT) return false;
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                VibratorManager vm = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                if (vm != null) {
+                    vm.getDefaultVibrator().vibrate(VibrationEffect.createWaveform(new long[]{0, 150, 80, 150}, -1));
+                }
+            } else {
+                Vibrator vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                if (vib != null && vib.hasVibrator()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vib.vibrate(VibrationEffect.createWaveform(new long[]{0, 150, 80, 150}, -1));
+                    } else {
+                        vib.vibrate(new long[]{0, 150, 80, 150}, -1);
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        if (ringerMode != AudioManager.RINGER_MODE_NORMAL) return false;
+
+        try {
+            Uri uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            Ringtone ringtone = RingtoneManager.getRingtone(getApplicationContext(), uri);
+            if (ringtone != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    ringtone.setAudioAttributes(
+                        new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    );
+                }
+                ringtone.play();
+                return true;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Ringtone play failed", e);
+        }
+        return false;
+    }
+
+    // ── Native Android TextToSpeech with AudioFocus (queued so simultaneous alerts never clip) ──
+    private void scheduleSpeech(String text, long delayMs, boolean queueAdd) {
         if (text == null || text.trim().isEmpty()) return;
         if (delayMs <= 0) {
-            speakNow(text);
+            speakNow(text, queueAdd);
             return;
         }
-        pendingSpeechTask = () -> {
-            pendingSpeechTask = null;
-            speakNow(text);
+        final Runnable task = new Runnable() {
+            @Override
+            public void run() {
+                scheduledSpeechTasks.remove(this);
+                speakNow(text, queueAdd);
+            }
         };
-        mainHandler.postDelayed(pendingSpeechTask, delayMs);
+        scheduledSpeechTasks.add(task);
+        mainHandler.postDelayed(task, delayMs);
     }
 
     private void cancelPendingSpeech() {
-        if (pendingSpeechTask != null) {
-            mainHandler.removeCallbacks(pendingSpeechTask);
-            pendingSpeechTask = null;
+        for (Runnable r : scheduledSpeechTasks) {
+            mainHandler.removeCallbacks(r);
         }
+        scheduledSpeechTasks.clear();
         if (tts != null && ttsReady) {
             try {
                 tts.stop();
@@ -1026,16 +1627,21 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
-    private void speakNow(String text) {
+    private void speakNow(String text, boolean queueAdd) {
         if (!ttsReady || tts == null) {
-            pendingInitSpeech = text;
+            pendingInitSpeeches.add(text);
             return;
         }
         requestAudioFocus();
         Bundle params = new Bundle();
         params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f);
         try {
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, "dgps-" + System.currentTimeMillis());
+            tts.speak(
+                text,
+                queueAdd ? TextToSpeech.QUEUE_ADD : TextToSpeech.QUEUE_FLUSH,
+                params,
+                "dgps-" + System.currentTimeMillis()
+            );
         } catch (Exception e) {
             abandonAudioFocus();
         }
@@ -1076,6 +1682,17 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         StateListener listener = stateListener;
         if (listener != null) {
             mainHandler.post(() -> listener.onTripStateChanged(snap));
+        }
+    }
+
+    private void broadcastWatches() {
+        JSONArray arr = new JSONArray();
+        for (WatchAlert w : watchedAlerts.values()) {
+            arr.put(w.toJson());
+        }
+        StateListener listener = stateListener;
+        if (listener != null) {
+            mainHandler.post(() -> listener.onWatchedAlertsChanged(arr));
         }
     }
 
