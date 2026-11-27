@@ -3,9 +3,12 @@ import { formatDistance, formatBlocks } from './api.js';
 import { formatSecHHMM } from './predictor.js';
 import { playArrivalChime } from './audio.js';
 import {
+  isNative,
   ensureNotificationPermission,
   getNotificationPermissionState,
   onSwNotificationAction,
+  openAndroidBatterySettings,
+  speakViaNativeAndroid,
   notifyArrival as sendNativeNotification
 } from './native.js';
 import {
@@ -158,7 +161,12 @@ export function createUiExtras(ctx) {
   }
 
   function speakIfEnabled(text, { afterChime = false, delayMs = 950 } = {}) {
-    if (!alertPrefs.tts || !isSpeechSupported() || !text) return;
+    if (!alertPrefs.tts || !text) return;
+    if (isNative) {
+      speakViaNativeAndroid(text, { delayMs: afterChime ? delayMs : 0 });
+      return;
+    }
+    if (!isSpeechSupported()) return;
     if (afterChime) {
       speakAfterNotification(text, { delayMs });
     } else {
@@ -206,15 +214,19 @@ export function createUiExtras(ctx) {
         Promise.resolve(
           notifyArrival({
             title: `🔔 Coche #${bus.identificadorCoche} (${bus.descripcionLinea}) llegando`,
-            body: `${etaTxt}${bus.choferNombre ? ` · ${bus.choferNombre}` : ''}${bus.turnoProgramado ? ` · Prog. ${bus.turnoProgramado}` : ''}\n${activeStop.nombre || activeStop.id}`,
+            body: `${etaTxt}${bus.choferNombre ? ` · ${bus.choferNombre}` : ''}${bus.turnoProgramado ? ` · Prog. real: ${bus.turnoProgramado}` : ''}\n${activeStop.nombre || activeStop.id}`,
             stopId: activeStop.id,
-            tag: `direct-gps-car-${key}`
+            tag: `direct-gps-car-${key}`,
+            speechText: speechMsg,
+            speakAfterChime: Boolean(alertPrefs.tts)
           })
         ).then((res) => {
           if (!res?.delivered && soundEnabled) (playChime || playArrivalChime)();
+          if (!res?.handledSpeechNatively) {
+            // Hablar DESPUÉS del timbre de notificación
+            speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
+          }
         });
-        // Hablar DESPUÉS del timbre de notificación
-        speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
       }
     }
   }
@@ -287,10 +299,12 @@ export function createUiExtras(ctx) {
     const settingsNotifBtn = document.getElementById('btn-enable-android-notifs');
     if (settingsNotifBtn) {
       if (perm === 'granted') {
-        settingsNotifBtn.textContent = '✓ Notificaciones Android activas';
+        settingsNotifBtn.textContent = isNative
+          ? '✓ Notif. Android activas · Permitir 2° plano'
+          : '✓ Notificaciones Android activas';
         settingsNotifBtn.classList.add('active');
       } else if (perm === 'denied') {
-        settingsNotifBtn.textContent = '⚠ Notificaciones bloqueadas en navegador';
+        settingsNotifBtn.textContent = '⚠ Notificaciones bloqueadas en ajustes';
         settingsNotifBtn.classList.remove('active');
       } else {
         settingsNotifBtn.textContent = '🔔 Activar notificaciones Android';
@@ -1203,7 +1217,9 @@ export function createUiExtras(ctx) {
       saveAlertPrefs();
       liveTracker.syncPrefs({ ttsEnabled: alertPrefs.tts });
       if (alertPrefs.tts) {
-        if (isSpeechSupported()) {
+        if (isNative) {
+          speakViaNativeAndroid('Avisos por voz activados en Direct G P S.');
+        } else if (isSpeechSupported()) {
           speakText('Avisos por voz activados en Direct G P S.');
         } else {
           showToast('Tu navegador no soporta síntesis de voz.', 'warn', 3000);
@@ -1212,12 +1228,18 @@ export function createUiExtras(ctx) {
     });
 
     document.getElementById('btn-enable-android-notifs')?.addEventListener('click', async () => {
+      const wasGranted = getNotificationPermissionState() === 'granted';
       const ok = await ensureNotificationPermission();
       syncNotifPermissionButtons();
       if (ok) {
-        showToast('Notificaciones Android activadas con el timbre de tu celular', 'success', 3000);
+        if (isNative && wasGranted) {
+          await openAndroidBatterySettings();
+          showToast('Permití segundo plano sin restricciones para que funcione incluso cerrada', 'info', 4000);
+        } else {
+          showToast('Notificaciones Android activadas con el timbre de tu celular', 'success', 3000);
+        }
       } else {
-        showToast('Habilitá las notificaciones para DIRECT GPS desde los ajustes de Chrome/Android.', 'warn', 4200);
+        showToast('Habilitá las notificaciones para DIRECT GPS desde los ajustes de Android.', 'warn', 4200);
       }
     });
 
@@ -1227,15 +1249,19 @@ export function createUiExtras(ctx) {
       const res = await sendNativeNotification({
         title: '🔔 Prueba DIRECT GPS · 106B #2976',
         body: '━━━━━━🚌────◉ Av. Pedro Ferré y Brasil\nChofer: PRUEBA · Coche #2976 · Prog. real: 14:30',
-        tag: 'direct-gps-test-alert'
+        tag: 'direct-gps-test-alert',
+        speechText: demoMsg,
+        speakAfterChime: true
       });
       if (!res?.delivered) playArrivalChime();
-      if (!isSpeechSupported()) {
-        showToast('Tu navegador no soporta síntesis de voz.', 'warn', 3000);
-        return;
+      if (!res?.handledSpeechNatively) {
+        if (!isSpeechSupported()) {
+          showToast('Tu navegador no soporta síntesis de voz.', 'warn', 3000);
+          return;
+        }
+        // Reproducir voz DESPUÉS del timbre de notificación
+        speakAfterNotification(demoMsg, { delayMs: 950 });
       }
-      // Reproducir voz DESPUÉS del timbre de notificación
-      speakAfterNotification(demoMsg, { delayMs: 950 });
     });
 
     // Backup Export & Import

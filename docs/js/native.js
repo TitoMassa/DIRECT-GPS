@@ -10,13 +10,24 @@
 //    and A Bordo voice announcements keep running when minimized/screen locked.
 // ============================================================================
 
-export const isNative = false;
-export const platform = 'web';
+export const isNative = Boolean(
+  typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.()
+);
+export const platform = isNative
+  ? (typeof window !== 'undefined' && window.Capacitor?.getPlatform?.()) || 'android'
+  : 'web';
+
+export function getDirectGpsNativePlugin() {
+  if (typeof window === 'undefined') return null;
+  if (!window.Capacitor?.isNativePlatform?.()) return null;
+  return window.Capacitor?.Plugins?.DirectGpsNative || null;
+}
 
 export const PUBLIC_WEB_URL = 'https://titomassa.github.io/DIRECT-GPS/';
 
 let wakeLockSentinel = null;
 let deferredInstallPrompt = null;
+let cachedNativeNotifPerm = 'prompt';
 const installListeners = new Set();
 const swNotifActionListeners = new Set();
 
@@ -83,6 +94,7 @@ export async function promptPwaInstall() {
 }
 
 export function isPwaInstalled() {
+  if (isNative) return true;
   if (typeof window === 'undefined') return false;
   return Boolean(
     window.matchMedia?.('(display-mode: standalone)')?.matches ||
@@ -120,7 +132,10 @@ export function parseDeepLink(rawUrl) {
 
 export function buildShareUrl(stopId, codLinea = '000') {
   const base =
-    typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null'
+    !isNative &&
+    typeof window !== 'undefined' &&
+    window.location?.origin &&
+    window.location.origin !== 'null'
       ? `${window.location.origin}${window.location.pathname}`
       : PUBLIC_WEB_URL;
   const url = new URL(base);
@@ -131,7 +146,12 @@ export function buildShareUrl(stopId, codLinea = '000') {
 
 export async function initNative() {
   if (typeof document !== 'undefined') {
-    document.documentElement.classList.add('is-web', 'platform-web');
+    document.documentElement.classList.add(isNative ? 'is-native' : 'is-web', `platform-${platform}`);
+  }
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin) {
+    const status = await safe(() => plugin.getPermissionsStatus(), null);
+    if (status?.notifications) cachedNativeNotifPerm = status.notifications;
   }
   return null;
 }
@@ -204,18 +224,41 @@ export function haptic(kind = 'light') {
   }
 }
 
-// ── Android-Native Service Worker Notifications ───────────────────────────────
+// ── Android-Native (Capacitor Foreground Service / Service Worker) Notifications ──
 
 export function getNotificationPermissionState() {
+  if (getDirectGpsNativePlugin()) {
+    return cachedNativeNotifPerm === 'granted' ? 'granted' : 'default';
+  }
   if (typeof Notification === 'undefined') return 'unsupported';
   return Notification.permission || 'default';
 }
 
 export async function ensureNotificationPermission() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin) {
+    const res = await safe(() => plugin.requestAllPermissions(), null);
+    cachedNativeNotifPerm = res?.notifications || 'prompt';
+    return cachedNativeNotifPerm === 'granted';
+  }
   if (typeof Notification === 'undefined') return false;
   if (Notification.permission === 'granted') return true;
   if (Notification.permission === 'denied') return false;
   return (await safe(() => Notification.requestPermission(), 'denied')) === 'granted';
+}
+
+export async function openAndroidBatterySettings() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin) return false;
+  await safe(() => plugin.openBatteryOptimizationSettings());
+  return true;
+}
+
+export async function speakViaNativeAndroid(text, { delayMs = 0 } = {}) {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin || !text) return false;
+  await safe(() => plugin.speakNative({ text: String(text), delayMs: Number(delayMs) || 0 }));
+  return true;
 }
 
 async function getActiveSwRegistration() {
@@ -228,13 +271,6 @@ async function getActiveSwRegistration() {
   }
 }
 
-/**
- * Envía o actualiza una notificación nativa de Android vía ServiceWorkerRegistration.showNotification().
- * - Cuando `silent: false` y `renotify: true`, Android reproduce el timbre de notificación configurado
- *   en el celular del usuario (ideal antes de que hable el TTS).
- * - Cuando `silent: true` y `renotify: false`, actualiza en silencio la barra de progreso estilo Uber
- *   sin hacer sonar el teléfono cada 10 segundos.
- */
 export async function showSystemNotification({
   title,
   body,
@@ -244,10 +280,29 @@ export async function showSystemNotification({
   requireInteraction = false,
   vibrate = null,
   actions = null,
-  data = {}
+  data = {},
+  speechText = '',
+  speakAfterChime = false
 } = {}) {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin) {
+    const res = await safe(
+      () =>
+        plugin.sendAlertNotification({
+          title: String(title || 'DIRECT GPS'),
+          body: String(body || ''),
+          tag: String(tag || 'direct-gps-alert'),
+          playSound: !silent,
+          speechText: String(speechText || ''),
+          speakAfterChime: Boolean(speakAfterChime && speechText)
+        }),
+      null
+    );
+    return { delivered: Boolean(res?.delivered), usedNativeSw: true, handledSpeechNatively: Boolean(speakAfterChime && speechText) };
+  }
+
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
-    return { delivered: false, usedNativeSw: false };
+    return { delivered: false, usedNativeSw: false, handledSpeechNatively: false };
   }
 
   const options = {
@@ -273,13 +328,12 @@ export async function showSystemNotification({
   if (reg) {
     try {
       await reg.showNotification(String(title || 'DIRECT GPS'), options);
-      return { delivered: true, usedNativeSw: true };
+      return { delivered: true, usedNativeSw: true, handledSpeechNatively: false };
     } catch {
-      // Retry without actions if platform rejects actions
       try {
         const { actions: _a, ...basicOpts } = options;
         await reg.showNotification(String(title || 'DIRECT GPS'), basicOpts);
-        return { delivered: true, usedNativeSw: true };
+        return { delivered: true, usedNativeSw: true, handledSpeechNatively: false };
       } catch {
         // Fall through to desktop Notification API
       }
@@ -287,20 +341,24 @@ export async function showSystemNotification({
   }
 
   try {
-    // Desktop fallback only (Android Chrome throws on `new Notification`)
     new Notification(String(title || 'DIRECT GPS'), {
       body: options.body,
       icon: options.icon,
       tag: options.tag,
       silent: options.silent
     });
-    return { delivered: true, usedNativeSw: false };
+    return { delivered: true, usedNativeSw: false, handledSpeechNatively: false };
   } catch {
-    return { delivered: false, usedNativeSw: false };
+    return { delivered: false, usedNativeSw: false, handledSpeechNatively: false };
   }
 }
 
 export async function closeSystemNotification(tag = 'direct-gps-live-track') {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin) {
+    await safe(() => plugin.stopTrip({ silent: true }));
+    return;
+  }
   const reg = await getActiveSwRegistration();
   if (!reg || typeof reg.getNotifications !== 'function') return;
   try {
@@ -325,7 +383,9 @@ export async function notifyArrival({
   silent = false,
   renotify = true,
   actions = null,
-  data = {}
+  data = {},
+  speechText = '',
+  speakAfterChime = false
 } = {}) {
   if (!silent) haptic('success');
   return showSystemNotification({
@@ -336,7 +396,9 @@ export async function notifyArrival({
     renotify,
     vibrate: silent ? null : [140, 80, 140],
     actions,
-    data: { stopId, ...data }
+    data: { stopId, ...data },
+    speechText,
+    speakAfterChime
   });
 }
 

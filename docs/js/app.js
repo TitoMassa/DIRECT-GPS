@@ -3363,12 +3363,16 @@ function checkProximityAlerts() {
           bus.turnoProgramado ? ` · Prog. real: ${bus.turnoProgramado}` : ''
         }\n${state.activeStop.nombre || state.activeStop.id}`,
         stopId: state.activeStop.id,
-        tag: `direct-gps-line-${bus.descripcionLinea}`
+        tag: `direct-gps-line-${bus.descripcionLinea}`,
+        speechText: speechMsg,
+        speakAfterChime: Boolean(uiExtras?.isTtsEnabled())
       }).then((res) => {
         if (!res?.delivered && state.soundEnabled) playArrivalChime();
+        if (!res?.handledSpeechNatively) {
+          // Hablar DESPUÉS del timbre de notificación del celular
+          uiExtras?.speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
+        }
       });
-      // Hablar DESPUÉS del timbre de notificación del celular
-      uiExtras?.speakIfEnabled(speechMsg, { afterChime: true, delayMs: 950 });
     }
   }
   uiExtras?.checkCarAlerts(state.arribos, state.activeStop, {

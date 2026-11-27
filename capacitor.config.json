@@ -1,0 +1,16 @@
+{
+  "appId": "ar.corrientes.directgps",
+  "appName": "DIRECT GPS",
+  "webDir": "docs",
+  "server": {
+    "androidScheme": "https",
+    "hostname": "directgps.app",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#0b0d10",
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  }
+}

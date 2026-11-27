@@ -132,14 +132,19 @@ function resolveApiBase() {
   const saved = localStorage.getItem('direct_gps_api_base');
   if (saved) return saved;
 
+  const isCapNative = Boolean(typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.());
   const host = window.location.hostname;
-  if (host === 'localhost' || host === '127.0.0.1') {
+  if (!isCapNative && (host === 'localhost' || host === '127.0.0.1')) {
     return '';
   }
   return (DEFAULT_API_BASE || '').replace(/\/+$/, '');
 }
 
 const API_BASE = resolveApiBase();
+
+export function getApiBase() {
+  return API_BASE || (DEFAULT_API_BASE || '').replace(/\/+$/, '');
+}
 
 function isBrowserOffline() {
   return typeof navigator !== 'undefined' && navigator.onLine === false;

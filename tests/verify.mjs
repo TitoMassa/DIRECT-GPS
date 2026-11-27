@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v98') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v98 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v99') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v99 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1076,7 +1076,23 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   // 10i) Unified driver-overrides.json sync check across all 3 runtime files
   execFileSync('node', ['scripts/sync-drivers.mjs', '--check'], { cwd: ROOT, stdio: 'pipe' });
 
-  console.log('  ✓ Verified v2.7.0 Natural TTS pairs, Android Uber Status-Bar Notifs, Minute-by-Minute Alerts, Subir/A Bordo/Bajar Narrator, Completion Engine, PNG/JPG Exporter & strict exclusions');
+  // 10j) Capacitor 7 + Native Android Foreground Service project integrity
+  const capCfg = JSON.parse(await fs.readFile(path.join(ROOT, 'capacitor.config.json'), 'utf8'));
+  assert.equal(capCfg.appId, 'ar.corrientes.directgps');
+  assert.equal(capCfg.webDir, 'docs');
+  const androidJavaBase = path.join(ROOT, 'android', 'app', 'src', 'main', 'java', 'ar', 'corrientes', 'directgps');
+  for (const jf of ['MainActivity.java', 'DirectGpsNativePlugin.java', 'DirectGpsTripService.java', 'SpanishTtsFormatter.java']) {
+    const src = await fs.readFile(path.join(androidJavaBase, jf), 'utf8');
+    assert.ok(src.includes('package ar.corrientes.directgps;'), `${jf} must belong to package ar.corrientes.directgps`);
+  }
+  const manifestXml = await fs.readFile(path.join(ROOT, 'android', 'app', 'src', 'main', 'AndroidManifest.xml'), 'utf8');
+  assert.ok(manifestXml.includes('FOREGROUND_SERVICE_LOCATION'), 'AndroidManifest must declare FOREGROUND_SERVICE_LOCATION');
+  assert.ok(manifestXml.includes('POST_NOTIFICATIONS'), 'AndroidManifest must declare POST_NOTIFICATIONS');
+  assert.ok(manifestXml.includes('.DirectGpsTripService'), 'AndroidManifest must register DirectGpsTripService');
+  const apkWorkflow = await fs.readFile(path.join(ROOT, '.github', 'workflows', 'android-apk.yml'), 'utf8');
+  assert.ok(apkWorkflow.includes('assembleDebug') && apkWorkflow.includes('upload-artifact'), 'android-apk.yml must compile and upload APK');
+
+  console.log('  ✓ Verified v2.7.0 Natural TTS pairs, Android Uber Status-Bar Notifs, Capacitor + Android Foreground Service, Subir/A Bordo/Bajar Narrator & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

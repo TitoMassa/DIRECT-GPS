@@ -1,7 +1,8 @@
-import { distanceMeters, formatDistance, formatBlocks } from './api.js';
+import { distanceMeters, formatDistance, formatBlocks, getApiBase } from './api.js';
 import { playArrivalChime } from './audio.js';
 import { projectOnPolyline } from './trajectory.js';
 import {
+  getDirectGpsNativePlugin,
   haptic,
   notifyArrival,
   showSystemNotification,
@@ -266,6 +267,92 @@ export class LiveTripTracker {
     this.soundEnabled = true;
     this.leadMin = 3;
     this.lastNotifPushMs = 0;
+
+    // Native Android Foreground Service bridge (Capacitor APK)
+    this._nativePlugin = getDirectGpsNativePlugin();
+    this._nativeNextStop = null;
+    this._nativeRemainingStops = 0;
+    this._nativeFinalStopName = '';
+    this._nativeUsingPhoneGps = false;
+
+    if (this._nativePlugin) {
+      try {
+        this._nativePlugin.addListener?.('tripStateChanged', (nativeSnap) => {
+          this._applyNativeSnapshot(nativeSnap);
+        });
+        this._nativePlugin
+          .getTripState?.()
+          .then((nativeSnap) => {
+            if (nativeSnap && nativeSnap.phase && nativeSnap.phase !== 'idle') {
+              this._applyNativeSnapshot(nativeSnap);
+            }
+          })
+          .catch(() => {});
+      } catch {
+        // ignore plugin init errors
+      }
+    }
+  }
+
+  _serializeOrderedStops() {
+    return (this.orderedStops || []).map((st) => ({
+      id: st.id,
+      nombre: st.nombre,
+      lat: st.lat,
+      lng: st.lng,
+      along: st.along
+    }));
+  }
+
+  _applyNativeSnapshot(s) {
+    if (!s || !s.phase || s.phase === 'idle') {
+      this.phase = 'idle';
+      this.arrivingNow = false;
+      this._nativeNextStop = null;
+      this._nativeRemainingStops = 0;
+      this._nativeFinalStopName = '';
+      this._nativeUsingPhoneGps = false;
+      this._persistSession();
+      this._emitUpdate();
+      return;
+    }
+
+    this.phase = String(s.phase);
+    if (s.lineName) this.lineName = String(s.lineName);
+    if (Number.isFinite(Number(s.codLinea)) && Number(s.codLinea) > 0) {
+      this.codLinea = Number(s.codLinea);
+    }
+    this.coche = String(s.coche || '');
+    this.choferNombre = String(s.choferNombre || '');
+    this.choferLegajo = String(s.choferLegajo || '');
+    this.bandera = String(s.bandera || '');
+    this.scheduledHHMM = String(s.scheduledHHMM || '');
+    if (s.stopId) {
+      const prevLat = this.originStop?.id === s.stopId ? this.originStop.lat : NaN;
+      const prevLng = this.originStop?.id === s.stopId ? this.originStop.lng : NaN;
+      this.originStop = {
+        id: String(s.stopId).toUpperCase(),
+        nombre: String(s.stopName || s.stopId),
+        lat: prevLat,
+        lng: prevLng
+      };
+    }
+    this.distM = typeof s.distM === 'number' && Number.isFinite(s.distM) ? s.distM : null;
+    this.etaMin = typeof s.etaMin === 'number' && Number.isFinite(s.etaMin) ? s.etaMin : null;
+    if (typeof s.progress01 === 'number' && Number.isFinite(s.progress01)) {
+      this.progress01 = s.progress01;
+    }
+    if (typeof s.minuteByMinute === 'boolean') this.minuteByMinute = s.minuteByMinute;
+    if (typeof s.ttsEnabled === 'boolean') this.ttsEnabled = s.ttsEnabled;
+    this.arrivingNow = Boolean(s.arrivingNow);
+    this._nativeNextStop = s.nextStop || null;
+    this.distToNextM = typeof s.distToNextM === 'number' && Number.isFinite(s.distToNextM) ? s.distToNextM : null;
+    this._nativeRemainingStops = Number.isFinite(Number(s.remainingStops)) ? Number(s.remainingStops) : 0;
+    this._nativeFinalStopName = String(s.finalStopName || '');
+    this._nativeUsingPhoneGps = Boolean(s.usingPhoneGps);
+
+    this._persistSession();
+    this._emitUpdate();
   }
 
   isActive() {
@@ -281,14 +368,26 @@ export class LiveTripTracker {
     if (typeof ttsEnabled === 'boolean') this.ttsEnabled = ttsEnabled;
     if (typeof soundEnabled === 'boolean') this.soundEnabled = soundEnabled;
     if (Number.isFinite(Number(leadMin))) this.leadMin = Number(leadMin);
+    if (this._nativePlugin) {
+      this._nativePlugin
+        .syncPrefs?.({
+          minuteByMinute: this.minuteByMinute,
+          ttsEnabled: this.ttsEnabled,
+          soundEnabled: this.soundEnabled,
+          leadMin: this.leadMin
+        })
+        .catch(() => {});
+    }
     if (this.isActive()) {
       this._emitUpdate();
     }
   }
 
   getSnapshot() {
-    const nextStop =
-      this.phase === 'onboard' && this.orderedStops[this.nextStopIdx]
+    const useNativeOnboard = Boolean(this._nativePlugin && this.phase === 'onboard');
+    const nextStop = useNativeOnboard
+      ? this._nativeNextStop || this.orderedStops[this.nextStopIdx] || null
+      : this.phase === 'onboard' && this.orderedStops[this.nextStopIdx]
         ? this.orderedStops[this.nextStopIdx]
         : null;
     const prevStop =
@@ -315,10 +414,16 @@ export class LiveTripTracker {
       prevStop,
       distToNextM: this.distToNextM,
       remainingStops:
-        this.phase === 'onboard' ? Math.max(0, this.orderedStops.length - this.nextStopIdx) : 0,
-      finalStopName: finalStop?.cleanName || '',
+        this.phase === 'onboard'
+          ? useNativeOnboard
+            ? this._nativeRemainingStops
+            : Math.max(0, this.orderedStops.length - this.nextStopIdx)
+          : 0,
+      finalStopName: this._nativeFinalStopName || finalStop?.cleanName || '',
       arrivingNow: this.arrivingNow,
-      usingPhoneGps: this.phase === 'onboard' && Date.now() - this.lastPhoneGpsMs < 20000
+      usingPhoneGps: useNativeOnboard
+        ? this._nativeUsingPhoneGps
+        : this.phase === 'onboard' && Date.now() - this.lastPhoneGpsMs < 20000
     };
   }
 
@@ -465,6 +570,36 @@ export class LiveTripTracker {
       this.progress01 = 0.08;
     }
 
+    if (this._nativePlugin) {
+      this._nativePlugin
+        .startWaiting?.({
+          apiBase: getApiBase(),
+          stopId: this.originStop.id,
+          stopName: this.originStop.nombre,
+          stopLat: Number.isFinite(this.originStop.lat) ? this.originStop.lat : 0,
+          stopLng: Number.isFinite(this.originStop.lng) ? this.originStop.lng : 0,
+          lineName: this.lineName,
+          codLinea: this.codLinea,
+          lockCar: this.lockCar,
+          coche: this.coche,
+          choferNombre: this.choferNombre,
+          choferLegajo: this.choferLegajo,
+          bandera: this.bandera,
+          scheduledHHMM: this.scheduledHHMM,
+          distM: this.distM !== null ? this.distM : -1,
+          etaMin: this.etaMin !== null ? this.etaMin : -1,
+          minuteByMinute: this.minuteByMinute,
+          ttsEnabled: this.ttsEnabled,
+          soundEnabled: this.soundEnabled,
+          leadMin: this.leadMin,
+          orderedStops: this._serializeOrderedStops()
+        })
+        .catch(() => {});
+      this._persistSession();
+      this._emitUpdate();
+      return true;
+    }
+
     setKeepAwake(true);
     startBackgroundKeepAlive({
       title: `DIRECT GPS · ${this.lineName}`,
@@ -542,13 +677,36 @@ export class LiveTripTracker {
     // activar automáticamente Modo A Bordo!
     if (!bus) {
       if (this.phase === 'boarding_armed' && this.wasCloseToStop) {
-        this.enterOnboardMode({ auto: true, routeBranchesCache });
+        if (this._nativePlugin) {
+          this.requestBoard({ immediate: true, routeBranchesCache });
+        } else {
+          this.enterOnboardMode({ auto: true, routeBranchesCache });
+        }
       }
       return;
     }
 
     const prevEta = this.etaMin;
     this._applyWaitingBusData(bus, { isInitial: false });
+
+    if (this._nativePlugin) {
+      this._nativePlugin
+        .updateWaitingFromJs?.({
+          coche: this.coche,
+          choferNombre: this.choferNombre,
+          scheduledHHMM: this.scheduledHHMM,
+          distM: this.distM !== null ? this.distM : -1,
+          etaMin: this.etaMin !== null ? this.etaMin : -1,
+          minuteByMinute: this.minuteByMinute,
+          ttsEnabled: this.ttsEnabled,
+          soundEnabled: this.soundEnabled,
+          leadMin: this.leadMin,
+          orderedStops: this._serializeOrderedStops()
+        })
+        .catch(() => {});
+      this._emitUpdate();
+      return;
+    }
 
     // Si estamos en "Subir activado" y el colectivo llegó a la parada -> pasar a Modo A Bordo automáticamente!
     if (
@@ -616,12 +774,64 @@ export class LiveTripTracker {
       this.branch = branch;
     }
 
+    if (!this.branch && routeBranchesCache && this.codLinea) {
+      const branches = routeBranchesCache.get(Number(this.codLinea)) || [];
+      if (branches.length > 0) {
+        const normBand = String(this.bandera || '').toUpperCase();
+        this.branch =
+          branches.find((b) => normBand && String(b.bandera || '').toUpperCase().includes(normBand)) ||
+          (this.originStop?.id
+            ? branches.find((b) =>
+                (b.orderedStops || []).some((s) => String(s.id || '').toUpperCase() === this.originStop.id)
+              )
+            : null) ||
+          branches[0];
+      }
+    }
+    if (this.branch) {
+      this.orderedStops = normalizeOrderedStopsForRide(this.branch);
+    }
+
     const arrivingSoon =
       immediate ||
       this.phase === 'idle' ||
       this.phase === 'boarding_armed' ||
       (this.etaMin !== null && this.etaMin <= 1) ||
       (this.distM !== null && this.distM <= 160);
+
+    if (this._nativePlugin) {
+      if (arrivingSoon && this.orderedStops.length === 0) {
+        this.onToast('No se encontraron paradas del recorrido para activar Modo A Bordo.', 'warn', 3500);
+        return false;
+      }
+      this._nativePlugin
+        .requestBoard?.({
+          immediate: Boolean(arrivingSoon),
+          lineName: this.lineName,
+          codLinea: this.codLinea,
+          coche: this.coche,
+          choferNombre: this.choferNombre,
+          scheduledHHMM: this.scheduledHHMM,
+          stopId: this.originStop?.id || '',
+          stopName: this.originStop?.nombre || '',
+          minuteByMinute: this.minuteByMinute,
+          ttsEnabled: this.ttsEnabled,
+          soundEnabled: this.soundEnabled,
+          leadMin: this.leadMin,
+          orderedStops: this._serializeOrderedStops()
+        })
+        .catch(() => {});
+      if (arrivingSoon) {
+        this.onToast(
+          `A bordo · ${this.lineName}${this.coche ? ` #${this.coche}` : ''} · Servicio Android activo`,
+          'success',
+          4200
+        );
+      } else {
+        this.onToast('Subir activado: pasará a Modo A Bordo apenas llegue el colectivo', 'success', 3800);
+      }
+      return true;
+    }
 
     if (arrivingSoon) {
       return this.enterOnboardMode({ auto: false, bus, branch: this.branch, routeBranchesCache });
@@ -760,6 +970,7 @@ export class LiveTripTracker {
    * Respaldo en Modo A Bordo con el GPS en vivo del colectivo cuando el GPS del celular no está disponible.
    */
   updateOnboardFromBus(bus) {
+    if (this._nativePlugin) return;
     if (this.phase !== 'onboard' || !bus) return;
     const lat = Number(bus.lat ?? bus.rawLat);
     const lng = Number(bus.lng ?? bus.rawLng);
@@ -850,6 +1061,26 @@ export class LiveTripTracker {
     this.phase = 'idle';
     this.arrivingNow = false;
     this.announcedStopIds.clear();
+    this._nativeNextStop = null;
+    this._nativeRemainingStops = 0;
+    this._nativeFinalStopName = '';
+    this._nativeUsingPhoneGps = false;
+
+    if (this._nativePlugin) {
+      const fn = silent ? this._nativePlugin.stopTrip : this._nativePlugin.alight;
+      fn?.({ silent: Boolean(silent) }).catch(() => {});
+      this._persistSession();
+      this._emitUpdate();
+      if (!silent) {
+        const msg = wasOnboard
+          ? 'Bajaste del colectivo. Modo viaje finalizado.'
+          : 'Seguimiento en barra de estado detenido.';
+        this.onToast(msg, 'info', 2800);
+        this.onAnnounce(msg);
+      }
+      return;
+    }
+
     setKeepAwake(false);
     stopBackgroundKeepAlive();
     closeSystemNotification(LIVE_TRACK_NOTIFICATION_TAG);
@@ -934,11 +1165,13 @@ export class RideModeController {
           notifyArrival({
             title: `🔔 ARRIBANDO · ${cleanName}`,
             body: `A ${this.lastDistM} m de tu parada`,
-            stopId: this.target.id
+            stopId: this.target.id,
+            speechText: msg,
+            speakAfterChime: this.useTts
           }).then((res) => {
             if (!res?.delivered && this.useSound) playArrivalChime();
+            if (this.useTts && !res?.handledSpeechNatively) speakAfterNotification(msg, { delayMs: 950 });
           });
-          if (this.useTts) speakAfterNotification(msg, { delayMs: 950 });
           this.onTrigger({ target: this.target, distM: this.lastDistM, message: msg });
         }
       },
