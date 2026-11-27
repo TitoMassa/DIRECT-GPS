@@ -1,6 +1,7 @@
 package ar.corrientes.directgps;
 
 import android.Manifest;
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -25,6 +26,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
@@ -79,6 +82,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private static final String PREFS_NAME = "directgps_fg_prefs_v1";
     private static final String KEY_WATCHES_JSON = "watches_json";
     private static final String KEY_PREFS_JSON = "user_prefs_json";
+    private static final String KEY_PRIMARY_JSON = "primary_trip_json";
 
     public static final String CHANNEL_LIVE_SILENT = "direct_gps_trip_live_v1";
     public static final String CHANNEL_ALERTS_SOUND = "direct_gps_alerts_sound_v1";
@@ -99,6 +103,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     public static final String ACTION_UPSERT_WATCH = "ar.corrientes.directgps.ACTION_UPSERT_WATCH";
     public static final String ACTION_REMOVE_WATCH = "ar.corrientes.directgps.ACTION_REMOVE_WATCH";
     public static final String ACTION_CLEAR_WATCHES = "ar.corrientes.directgps.ACTION_CLEAR_WATCHES";
+    public static final String ACTION_ENSURE_ALIVE = "ar.corrientes.directgps.ACTION_ENSURE_ALIVE";
+    public static final String ACTION_RESTORE_WATCHDOG = "ar.corrientes.directgps.ACTION_RESTORE_WATCHDOG";
 
     public static final String EXTRA_PAYLOAD = "payload";
     public static final String EXTRA_WATCH_KEY = "watch_key";
@@ -133,6 +139,21 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             return new JSONArray(raw);
         } catch (Exception e) {
             return new JSONArray();
+        }
+    }
+
+    /**
+     * Indica si existen campanitas o un viaje activo persistido que deba sobrevivir al minimizar/cerrar.
+     */
+    public static boolean hasPersistedActiveWork(Context ctx) {
+        try {
+            if (loadPersistedWatchesArray(ctx).length() > 0) return true;
+            SharedPreferences sp = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONObject primary = new JSONObject(sp.getString(KEY_PRIMARY_JSON, "{}"));
+            String p = primary.optString("phase", "idle");
+            return !"idle".equals(p) && !p.isEmpty();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -235,6 +256,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private NotificationManager notifManager;
     private LocationManager locationManager;
     private AudioManager audioManager;
+    private PowerManager.WakeLock wakeLock;
     private AudioFocusRequest audioFocusRequest;
     private TextToSpeech tts;
     private volatile boolean ttsReady = false;
@@ -301,6 +323,29 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         initTts();
     }
 
+    private synchronized void ensureWakeLock() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            if (wakeLock == null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "directgps:LiveBackgroundWakeLock");
+                wakeLock.setReferenceCounted(false);
+            }
+            // Renovar 15 minutos en cada ciclo de sondeo; se libera apenas queda sin tareas activas
+            wakeLock.acquire(15 * 60 * 1000L);
+        } catch (Exception e) {
+            Log.w(TAG, "WakeLock acquire skipped", e);
+        }
+    }
+
+    private synchronized void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+        } catch (Exception ignored) {}
+    }
+
     private void restorePersistedState() {
         try {
             SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -313,17 +358,56 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             if (!savedBase.isEmpty()) apiBase = savedBase.replaceAll("/+$", "");
 
             JSONArray arr = new JSONArray(sp.getString(KEY_WATCHES_JSON, "[]"));
-            watchedAlerts.clear();
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject o = arr.optJSONObject(i);
-                if (o == null) continue;
-                WatchAlert w = WatchAlert.fromJson(o);
-                if (!w.key.isEmpty() && !w.stopId.isEmpty() && !w.lineName.isEmpty()) {
-                    watchedAlerts.put(w.key, w);
+            synchronized (watchedAlerts) {
+                watchedAlerts.clear();
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    WatchAlert w = WatchAlert.fromJson(o);
+                    if (!w.key.isEmpty() && !w.stopId.isEmpty() && !w.lineName.isEmpty()) {
+                        watchedAlerts.put(w.key, w);
+                    }
+                }
+            }
+
+            // Restaurar también el viaje principal (waiting / boarding_armed / onboard)
+            JSONObject primary = new JSONObject(sp.getString(KEY_PRIMARY_JSON, "{}"));
+            String savedPhase = primary.optString("phase", "idle");
+            if (!"idle".equals(savedPhase) && !savedPhase.isEmpty()) {
+                phase = savedPhase;
+                lineName = primary.optString("lineName", "");
+                codLinea = primary.optInt("codLinea", 0);
+                coche = primary.optString("coche", "");
+                lockCar = primary.optBoolean("lockCar", false);
+                choferNombre = primary.optString("choferNombre", "");
+                choferLegajo = primary.optString("choferLegajo", "");
+                bandera = primary.optString("bandera", "");
+                scheduledHHMM = sanitizeScheduledHHMM(primary.optString("scheduledHHMM", ""));
+                stopId = primary.optString("stopId", "");
+                stopName = primary.optString("stopName", "");
+                stopLat = primary.optDouble("stopLat", 0);
+                stopLng = primary.optDouble("stopLng", 0);
+                initialDistM = Math.max(900, primary.optDouble("initialDistM", 2600));
+                distM = primary.optDouble("distM", -1);
+                etaMin = primary.optInt("etaMin", -1);
+                progress01 = primary.optDouble("progress01", 0.08);
+                wasCloseToStop = primary.optBoolean("wasCloseToStop", false);
+                if (!primary.isNull("lastSpokenEtaMin") && primary.has("lastSpokenEtaMin")) {
+                    lastSpokenEtaMin = primary.optInt("lastSpokenEtaMin");
+                }
+                nextStopIdx = Math.max(0, primary.optInt("nextStopIdx", 0));
+                loadOrderedStopsFromJson(primary.optJSONArray("orderedStops"));
+                announcedStopIds.clear();
+                JSONArray ann = primary.optJSONArray("announcedStopIds");
+                if (ann != null) {
+                    for (int i = 0; i < ann.length(); i++) {
+                        String id = ann.optString(i, "");
+                        if (!id.isEmpty()) announcedStopIds.add(id);
+                    }
                 }
             }
         } catch (Exception e) {
-            Log.w(TAG, "Failed restoring persisted watches", e);
+            Log.w(TAG, "Failed restoring persisted state", e);
         }
     }
 
@@ -338,12 +422,54 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             prefs.put("apiBase", apiBase);
 
             JSONArray arr = new JSONArray();
-            for (WatchAlert w : watchedAlerts.values()) {
-                arr.put(w.toJson());
+            synchronized (watchedAlerts) {
+                for (WatchAlert w : watchedAlerts.values()) {
+                    arr.put(w.toJson());
+                }
             }
+
+            JSONObject primary = new JSONObject();
+            primary.put("phase", phase);
+            if (!"idle".equals(phase)) {
+                primary.put("lineName", lineName);
+                primary.put("codLinea", codLinea);
+                primary.put("coche", coche);
+                primary.put("lockCar", lockCar);
+                primary.put("choferNombre", choferNombre);
+                primary.put("choferLegajo", choferLegajo);
+                primary.put("bandera", bandera);
+                primary.put("scheduledHHMM", scheduledHHMM);
+                primary.put("stopId", stopId);
+                primary.put("stopName", stopName);
+                primary.put("stopLat", stopLat);
+                primary.put("stopLng", stopLng);
+                primary.put("initialDistM", initialDistM);
+                primary.put("distM", distM);
+                primary.put("etaMin", etaMin);
+                primary.put("progress01", progress01);
+                primary.put("wasCloseToStop", wasCloseToStop);
+                primary.put("lastSpokenEtaMin", lastSpokenEtaMin != null ? lastSpokenEtaMin : JSONObject.NULL);
+                primary.put("nextStopIdx", nextStopIdx);
+                JSONArray stopsArr = new JSONArray();
+                for (RouteStop rs : orderedStops) {
+                    JSONObject so = new JSONObject();
+                    so.put("id", rs.id);
+                    so.put("nombre", rs.nombre);
+                    so.put("lat", rs.lat);
+                    so.put("lng", rs.lng);
+                    so.put("along", rs.along);
+                    stopsArr.put(so);
+                }
+                primary.put("orderedStops", stopsArr);
+                JSONArray annArr = new JSONArray();
+                for (String aid : announcedStopIds) annArr.put(aid);
+                primary.put("announcedStopIds", annArr);
+            }
+
             sp.edit()
                 .putString(KEY_PREFS_JSON, prefs.toString())
                 .putString(KEY_WATCHES_JSON, arr.toString())
+                .putString(KEY_PRIMARY_JSON, primary.toString())
                 .apply();
         } catch (Exception e) {
             Log.w(TAG, "Failed persisting state", e);
@@ -438,30 +564,74 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        // Mantener el servicio activo aunque el usuario deslice la app desde recientes
+        // Mantener el servicio activo aunque el usuario deslice la app desde recientes (Samsung One UI, MIUI, Android)
         if (hasAnyActiveWork()) {
             persistState();
+            ensureWakeLock();
             ensurePollingRunning();
+            scheduleWatchdogRestart();
         }
         super.onTaskRemoved(rootIntent);
+    }
+
+    private void scheduleWatchdogRestart() {
+        try {
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Intent restartIntent = new Intent(getApplicationContext(), DirectGpsTripService.class);
+            restartIntent.setAction(ACTION_RESTORE_WATCHDOG);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+            PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? PendingIntent.getForegroundService(getApplicationContext(), 901, restartIntent, flags)
+                : PendingIntent.getService(getApplicationContext(), 901, restartIntent, flags);
+            long triggerAt = SystemClock.elapsedRealtime() + 1200L;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            } else {
+                am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Watchdog restart schedule skipped", e);
+        }
+    }
+
+    private void resumeActiveWorkNow() {
+        if (!hasAnyActiveWork()) return;
+        ensureWakeLock();
+        refreshAllNotificationsAndForeground();
+        if ("onboard".equals(phase)) {
+            startGpsUpdates();
+        }
+        ensurePollingRunning();
+        broadcastSnapshot();
+        broadcastWatches();
     }
 
     @Override
     public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
         if (intent == null) {
-            // Reinicio automático del SO (START_STICKY): reanudar campanitas persistidas
-            if (!watchedAlerts.isEmpty()) {
-                refreshAllNotificationsAndForeground();
-                ensurePollingRunning();
+            // Reinicio automático del SO (START_STICKY): reanudar campanitas y/o viaje activo persistidos
+            if (hasAnyActiveWork()) {
+                resumeActiveWorkNow();
                 return START_STICKY;
             }
-            return hasAnyActiveWork() ? START_STICKY : START_NOT_STICKY;
+            return START_NOT_STICKY;
         }
 
         String action = intent.getAction();
         JSONObject payload = parsePayload(intent.getStringExtra(EXTRA_PAYLOAD));
 
-        if (ACTION_UPSERT_WATCH.equals(action)) {
+        if (ACTION_ENSURE_ALIVE.equals(action) || ACTION_RESTORE_WATCHDOG.equals(action)) {
+            if (!hasAnyActiveWork()) {
+                restorePersistedState();
+            }
+            if (hasAnyActiveWork()) {
+                resumeActiveWorkNow();
+                return START_STICKY;
+            }
+            stopForegroundAndIdle();
+            return START_NOT_STICKY;
+        } else if (ACTION_UPSERT_WATCH.equals(action)) {
             handleUpsertWatch(payload);
         } else if (ACTION_REMOVE_WATCH.equals(action)) {
             String key = intent.getStringExtra(EXTRA_WATCH_KEY);
@@ -485,6 +655,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             applyPrefs(payload);
             persistState();
             if (hasAnyActiveWork()) {
+                ensureWakeLock();
                 refreshAllNotificationsAndForeground();
                 broadcastSnapshot();
             }
@@ -514,6 +685,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             stopForegroundAndIdle();
             return START_NOT_STICKY;
         }
+        ensureWakeLock();
         return START_STICKY;
     }
 
@@ -878,6 +1050,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
 
         phase = "boarding_armed";
+        persistState();
+        ensureWakeLock();
         refreshAllNotificationsAndForeground();
         broadcastSnapshot();
         if (ttsEnabled) {
@@ -925,6 +1099,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             }
         }
 
+        persistState();
+        ensureWakeLock();
         refreshAllNotificationsAndForeground();
         startGpsUpdates();
         if (watchedAlerts.isEmpty()) stopWaitingPoller();
@@ -959,6 +1135,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         if (activeForegroundNotifId == NOTIF_ID_LIVE_TRIP) {
             activeForegroundNotifId = 0;
         }
+        persistState();
         broadcastSnapshot();
 
         if (!silent && ttsEnabled) {
@@ -969,6 +1146,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
 
         if (hasAnyActiveWork()) {
+            ensureWakeLock();
             refreshAllNotificationsAndForeground();
             ensurePollingRunning();
         } else {
@@ -979,6 +1157,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private void stopForegroundAndIdle() {
         stopWaitingPoller();
         stopGpsUpdates();
+        releaseWakeLock();
         activeForegroundNotifId = 0;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE);
@@ -1019,7 +1198,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
-    // ── Grouped 10-Second Background Poller (works with app closed!) ──────────
+    // ── Grouped 10-Second Background Poller (works with app closed & screen off!) ──
     private void ensurePollingRunning() {
         boolean needPolling = !watchedAlerts.isEmpty()
             || "waiting".equals(phase)
@@ -1028,15 +1207,30 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             stopWaitingPoller();
             return;
         }
+        ensureWakeLock();
         if (pollFuture != null && !pollFuture.isCancelled() && !pollFuture.isDone()) return;
-        if (pollExecutor == null || pollExecutor.isShutdown()) return;
-        pollFuture = pollExecutor.scheduleWithFixedDelay(this::pollAllTargetsOnce, 10, 10, TimeUnit.SECONDS);
+        if (pollExecutor == null || pollExecutor.isShutdown()) {
+            pollExecutor = Executors.newSingleThreadScheduledExecutor();
+        }
+        pollFuture = pollExecutor.scheduleWithFixedDelay(this::pollAllTargetsSafe, 2, 10, TimeUnit.SECONDS);
     }
 
     private void stopWaitingPoller() {
         if (pollFuture != null) {
             pollFuture.cancel(false);
             pollFuture = null;
+        }
+    }
+
+    private void pollAllTargetsSafe() {
+        try {
+            if (hasAnyActiveWork()) {
+                ensureWakeLock();
+            }
+            pollAllTargetsOnce();
+        } catch (Throwable t) {
+            // Nunca dejar que una excepción inesperada mate el ScheduledExecutorService
+            Log.e(TAG, "Recovered from background poll error", t);
         }
     }
 
@@ -1344,18 +1538,28 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     // ── In-Place Notification Rendering (ZERO Duplicates!) ────────────────────
     private void startForegroundCompat(int notifId, Notification notification) {
         activeForegroundNotifId = notifId;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            int fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
-            if (hasLocationPermission()) {
-                fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                int fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+                if (hasLocationPermission()) {
+                    fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+                }
+                try {
+                    startForeground(notifId, notification, fgsType);
+                } catch (SecurityException se) {
+                    startForeground(notifId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                }
+            } else {
+                startForeground(notifId, notification);
             }
-            try {
-                startForeground(notifId, notification, fgsType);
-            } catch (SecurityException se) {
-                startForeground(notifId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } catch (Exception e) {
+            // Respaldo seguro en Android 12+ si el SO bloqueó startForeground desde 2° plano
+            Log.w(TAG, "startForeground fallback to notify", e);
+            if (notifManager != null) {
+                try {
+                    notifManager.notify(notifId, notification);
+                } catch (Exception ignored) {}
             }
-        } else {
-            startForeground(notifId, notification);
         }
     }
 
@@ -1374,8 +1578,13 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             }
         }
 
+        List<WatchAlert> snapshot;
+        synchronized (watchedAlerts) {
+            snapshot = new ArrayList<>(watchedAlerts.values());
+        }
+
         boolean promotedWatchToFg = false;
-        for (WatchAlert w : watchedAlerts.values()) {
+        for (WatchAlert w : snapshot) {
             if (isDuplicateOfPrimaryWaiting(w)) {
                 notifManager.cancel(w.notifId);
                 continue;
@@ -1753,10 +1962,19 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     }
 
     @Override
+    public void onTimeout(int startId, int fgsType) {
+        // Android 15+ FGS timeout guard: guardar estado y detener ordenadamente sin crashear
+        persistState();
+        releaseWakeLock();
+        stopSelf(startId);
+    }
+
+    @Override
     public void onDestroy() {
         stopWaitingPoller();
         stopGpsUpdates();
         cancelPendingSpeech();
+        releaseWakeLock();
         if (pollExecutor != null) pollExecutor.shutdownNow();
         if (tts != null) {
             try {

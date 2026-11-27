@@ -144,7 +144,7 @@ export function buildShareUrl(stopId, codLinea = '000') {
   return url.toString();
 }
 
-export async function initNative() {
+export async function initNative({ onBack, onPause, onResume } = {}) {
   if (typeof document !== 'undefined') {
     document.documentElement.classList.add(isNative ? 'is-native' : 'is-web', `platform-${platform}`);
   }
@@ -152,17 +152,70 @@ export async function initNative() {
   if (plugin) {
     const status = await safe(() => plugin.getPermissionsStatus(), null);
     if (status?.notifications) cachedNativeNotifPerm = status.notifications;
+
+    if (plugin.addListener) {
+      if (typeof onBack === 'function') {
+        safe(() =>
+          plugin.addListener('hardwareBack', async () => {
+            const handled = await safe(() => onBack(), false);
+            if (!handled) {
+              minimizeApp();
+            }
+          })
+        );
+      }
+      if (typeof onPause === 'function' || typeof onResume === 'function') {
+        safe(() =>
+          plugin.addListener('appStateChanged', (ev) => {
+            if (ev?.isActive) {
+              onResume?.();
+            } else {
+              onPause?.();
+            }
+          })
+        );
+      }
+    }
   }
   return null;
 }
 
 export function hideSplash() {}
-export function minimizeApp() {}
 
-export function setSystemBarsTheme(theme) {
-  if (typeof document === 'undefined') return;
-  const meta = document.getElementById('meta-theme-color');
-  if (meta) meta.setAttribute('content', theme === 'light' ? '#f4f5f7' : '#0b0d10');
+export function minimizeApp() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.minimizeApp) {
+    safe(() => plugin.minimizeApp());
+  }
+}
+
+export function ensureBackgroundAlive() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.ensureBackgroundAlive) {
+    safe(() => plugin.ensureBackgroundAlive());
+  }
+}
+
+export function setSystemBarsTheme(theme, hexColor = '') {
+  const resolvedColor =
+    typeof hexColor === 'string' && /^#[0-9a-f]{6}$/i.test(hexColor.trim())
+      ? hexColor.trim()
+      : theme === 'light'
+        ? '#f4f7fa'
+        : '#0b0d10';
+  if (typeof document !== 'undefined') {
+    const meta = document.getElementById('meta-theme-color');
+    if (meta) meta.setAttribute('content', resolvedColor);
+  }
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.setSystemBarsColor) {
+    safe(() =>
+      plugin.setSystemBarsColor({
+        color: resolvedColor,
+        lightIcons: theme === 'light'
+      })
+    );
+  }
 }
 
 export async function setKeepAwake(enabled) {
@@ -219,12 +272,14 @@ export async function shareStop({ id, nombre, codLinea = '000' }) {
 }
 
 export function haptic(kind = 'light') {
-  if (typeof navigator !== 'undefined' && navigator.vibrate && kind !== 'light') {
-    navigator.vibrate(kind === 'success' ? [40, 60, 40] : 25);
+  if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    if (kind === 'success') navigator.vibrate([32, 50, 32]);
+    else if (kind === 'medium') navigator.vibrate(20);
+    else if (isNative) navigator.vibrate(10);
   }
 }
 
-// ── Android-Native (Capacitor Foreground Service / Service Worker) Notifications ──
+// ── Android-Native (Capacitor Foreground Service / Service Worker) Notifications & Permissions ──
 
 export function getNotificationPermissionState() {
   if (getDirectGpsNativePlugin()) {
@@ -234,10 +289,70 @@ export function getNotificationPermissionState() {
   return Notification.permission || 'default';
 }
 
+export async function getDetailedPermissionsStatus() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.getPermissionsStatus) {
+    const status = await safe(() => plugin.getPermissionsStatus(), null);
+    if (status?.notifications) cachedNativeNotifPerm = status.notifications;
+    return status || {
+      notifications: 'prompt',
+      location: 'prompt',
+      backgroundLocation: 'prompt',
+      batteryOptimization: 'prompt',
+      installPackages: 'prompt'
+    };
+  }
+  const notif = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission || 'default';
+  let loc = 'prompt';
+  try {
+    if (navigator?.permissions?.query) {
+      const q = await navigator.permissions.query({ name: 'geolocation' });
+      loc = q?.state || 'prompt';
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    notifications: notif === 'granted' ? 'granted' : notif === 'denied' ? 'denied' : 'prompt',
+    location: loc === 'granted' ? 'granted' : loc === 'denied' ? 'denied' : 'prompt',
+    backgroundLocation: 'granted',
+    batteryOptimization: 'granted',
+    installPackages: 'granted'
+  };
+}
+
+export async function requestStartupPermissions() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.requestAllPermissions) {
+    const res = await safe(() => plugin.requestAllPermissions(), null);
+    if (res?.notifications) cachedNativeNotifPerm = res.notifications;
+    return res;
+  }
+  return getDetailedPermissionsStatus();
+}
+
+export async function requestBackgroundLocationPermission() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.requestBackgroundLocationPermission) {
+    return safe(() => plugin.requestBackgroundLocationPermission(), null);
+  }
+  return getDetailedPermissionsStatus();
+}
+
+export async function openNativeAppSettings() {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.openAppSettings) {
+    await safe(() => plugin.openAppSettings());
+    return true;
+  }
+  return false;
+}
+
 export async function ensureNotificationPermission() {
   const plugin = getDirectGpsNativePlugin();
   if (plugin) {
-    const res = await safe(() => plugin.requestAllPermissions(), null);
+    const fn = plugin.requestNotificationPermission || plugin.requestAllPermissions;
+    const res = await safe(() => fn.call(plugin), null);
     cachedNativeNotifPerm = res?.notifications || 'prompt';
     return cachedNativeNotifPerm === 'granted';
   }

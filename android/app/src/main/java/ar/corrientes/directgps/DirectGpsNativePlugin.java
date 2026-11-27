@@ -55,16 +55,37 @@ import java.util.concurrent.Executors;
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.ACCESS_COARSE_LOCATION
             }
+        ),
+        @Permission(
+            alias = "backgroundLocation",
+            strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION }
         )
     }
 )
 public class DirectGpsNativePlugin extends Plugin {
 
+    private static volatile DirectGpsNativePlugin activeInstance = null;
     private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
+
+    public static boolean dispatchHardwareBack() {
+        DirectGpsNativePlugin inst = activeInstance;
+        if (inst == null || !inst.hasListeners("hardwareBack")) return false;
+        inst.notifyListeners("hardwareBack", new JSObject(), false);
+        return true;
+    }
+
+    public static void dispatchAppState(boolean isActive) {
+        DirectGpsNativePlugin inst = activeInstance;
+        if (inst == null) return;
+        JSObject data = new JSObject();
+        data.put("isActive", isActive);
+        inst.notifyListeners("appStateChanged", data, false);
+    }
 
     @Override
     public void load() {
         super.load();
+        activeInstance = this;
         DirectGpsTripService.setStateListener(new DirectGpsTripService.StateListener() {
             @Override
             public void onTripStateChanged(JSONObject snapshot) {
@@ -87,6 +108,7 @@ public class DirectGpsNativePlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
+        if (activeInstance == this) activeInstance = null;
         DirectGpsTripService.setStateListener(null);
         downloadExecutor.shutdownNow();
         super.handleOnDestroy();
@@ -99,11 +121,40 @@ public class DirectGpsNativePlugin extends Plugin {
         if (payload != null) {
             intent.putExtra(DirectGpsTripService.EXTRA_PAYLOAD, payload.toString());
         }
-        if (asForeground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ctx.startForegroundService(intent);
-        } else {
-            ctx.startService(intent);
+        try {
+            if (asForeground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent);
+            } else {
+                ctx.startService(intent);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    @PluginMethod
+    public void setSystemBarsColor(PluginCall call) {
+        String color = call.getString("color");
+        if (color == null || !color.trim().startsWith("#")) color = "#12161a";
+        boolean lightIcons = Boolean.TRUE.equals(call.getBoolean("lightIcons", false));
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).applySystemBars(color.trim(), lightIcons);
         }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void minimizeApp(PluginCall call) {
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).minimizeWithoutClosing();
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void ensureBackgroundAlive(PluginCall call) {
+        if (DirectGpsTripService.hasPersistedActiveWork(getContext())) {
+            dispatchServiceIntent(DirectGpsTripService.ACTION_ENSURE_ALIVE, null, true);
+        }
+        call.resolve();
     }
 
     @PluginMethod
@@ -113,28 +164,61 @@ public class DirectGpsNativePlugin extends Plugin {
             Context ctx = getContext();
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
             long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
-            ret.put("versionName", pi.versionName != null ? pi.versionName : "2.8.0");
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "2.9.0");
             ret.put("versionCode", vCode);
         } catch (Exception e) {
-            ret.put("versionName", "2.8.0");
-            ret.put("versionCode", 280);
+            ret.put("versionName", "2.9.0");
+            ret.put("versionCode", 290);
         }
         call.resolve(ret);
     }
 
-    @PluginMethod
-    public void getPermissionsStatus(PluginCall call) {
+    private JSObject buildPermissionsSnapshot() {
+        Context ctx = getContext();
         JSObject ret = new JSObject();
         boolean notifGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
-            || ContextCompat.checkSelfPermission(getContext(), Manifest.permission.POST_NOTIFICATIONS)
+            || ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS)
                 == PackageManager.PERMISSION_GRANTED;
-        boolean locGranted = ContextCompat.checkSelfPermission(getContext(), Manifest.permission.ACCESS_FINE_LOCATION)
+        boolean locGranted = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION)
             == PackageManager.PERMISSION_GRANTED
-            || ContextCompat.checkSelfPermission(getContext(), Manifest.permission.ACCESS_COARSE_LOCATION)
+            || ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION)
                 == PackageManager.PERMISSION_GRANTED;
+        boolean bgLocGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+            || (locGranted && ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                == PackageManager.PERMISSION_GRANTED);
+        boolean batteryIgnoring = true;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                batteryIgnoring = pm.isIgnoringBatteryOptimizations(ctx.getPackageName());
+            }
+        }
+        boolean installAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+            || ctx.getPackageManager().canRequestPackageInstalls();
+
         ret.put("notifications", notifGranted ? "granted" : "prompt");
         ret.put("location", locGranted ? "granted" : "prompt");
-        call.resolve(ret);
+        ret.put("backgroundLocation", bgLocGranted ? "granted" : "prompt");
+        ret.put("batteryOptimization", batteryIgnoring ? "granted" : "prompt");
+        ret.put("installPackages", installAllowed ? "granted" : "prompt");
+        ret.put("sdkInt", Build.VERSION.SDK_INT);
+        return ret;
+    }
+
+    @PluginMethod
+    public void getPermissionsStatus(PluginCall call) {
+        call.resolve(buildPermissionsSnapshot());
+    }
+
+    @PluginMethod
+    public void requestNotificationPermission(PluginCall call) {
+        boolean needNotif = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            && getPermissionState("notifications") != PermissionState.GRANTED;
+        if (!needNotif) {
+            call.resolve(buildPermissionsSnapshot());
+            return;
+        }
+        requestPermissionForAlias("notifications", call, "permsCallback");
     }
 
     @PluginMethod
@@ -144,7 +228,7 @@ public class DirectGpsNativePlugin extends Plugin {
         boolean needLoc = getPermissionState("location") != PermissionState.GRANTED;
 
         if (!needNotif && !needLoc) {
-            getPermissionsStatus(call);
+            call.resolve(buildPermissionsSnapshot());
             return;
         }
         if (needNotif && needLoc) {
@@ -156,9 +240,39 @@ public class DirectGpsNativePlugin extends Plugin {
         }
     }
 
+    @PluginMethod
+    public void requestBackgroundLocationPermission(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            call.resolve(buildPermissionsSnapshot());
+            return;
+        }
+        boolean locGranted = getPermissionState("location") == PermissionState.GRANTED;
+        if (!locGranted) {
+            requestPermissionForAlias("location", call, "permsCallback");
+            return;
+        }
+        if (getPermissionState("backgroundLocation") == PermissionState.GRANTED) {
+            call.resolve(buildPermissionsSnapshot());
+            return;
+        }
+        requestPermissionForAlias("backgroundLocation", call, "permsCallback");
+    }
+
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        try {
+            Context ctx = getContext();
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            i.setData(Uri.parse("package:" + ctx.getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(i);
+        } catch (Exception ignored) {}
+        call.resolve();
+    }
+
     @PermissionCallback
     private void permsCallback(PluginCall call) {
-        getPermissionsStatus(call);
+        call.resolve(buildPermissionsSnapshot());
     }
 
     // ── Campanitas de parada persistentes (en tiempo real) ────────────────────

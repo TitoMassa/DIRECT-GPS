@@ -1,6 +1,6 @@
 {
   "name": "direct-gps",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "DIRECT GPS — PWA de seguimiento satelital en vivo del transporte público de Corrientes Capital",
   "main": "server.js",
   "scripts": {

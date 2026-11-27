@@ -5385,7 +5385,7 @@ button.ev-card:hover {
 
 /* ==========================================================================
    v2.6.0 — Night Map (Zero-API OSM Dark Filter), Telemetry, Planner, Profile,
-   Modo Viaje, LED Board, Favorite Cars/Drivers & Settings Tabs
+   Modo Viaje, Favorite Cars/Drivers & Settings Tabs
    ========================================================================== */
 .map-canvas.map-night-mode {
   background: #0d131a !important;
@@ -5398,15 +5398,6 @@ button.ev-card:hover {
 .map-ctrl-btn.is-active {
   color: var(--accent);
   background: var(--accent-soft);
-}
-
-.mini-action-led {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  width: auto;
-  padding: 0 7px;
 }
 
 .bunching-banner {
@@ -6110,121 +6101,405 @@ button.ev-card:hover {
   color: #fff !important;
 }
 
-/* Modo Tablero LED (Pantalla de Parada Fullscreen) */
-.led-board-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1050;
-  background: #05070a;
-  color: #f8fafc;
-  display: flex;
-  flex-direction: column;
-  padding: calc(16px + var(--safe-top)) 18px calc(18px + var(--safe-bottom));
-  gap: 14px;
+.ride-mode-banner.is-onboard .live-trip-track-wrap {
+  display: none !important;
 }
 
-.led-board-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
-  padding-bottom: 12px;
+.alert-bell-label {
+  display: none;
 }
 
-.led-board-head h2 {
-  font-size: clamp(18px, 3vw, 28px);
-  margin-top: 4px;
+/* ===== v2.9.0 Immersive Motion & Tactile Feedback ===== */
+@keyframes modalPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
-.led-head-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.modal-backdrop:not(.hidden) {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
-.led-clock {
-  font-size: clamp(20px, 3.5vw, 34px);
-  font-weight: 800;
-  color: #10b981;
-  font-variant-numeric: tabular-nums;
+.modal-backdrop:not(.hidden) .modal-card {
+  animation: modalPopIn 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-.led-board-list {
-  flex: 1;
+.ride-mode-banner:not(.hidden) {
+  animation: modalPopIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.arrival-row-main:active,
+.quick-stop-card:active,
+.hub-card:active,
+.fav-card:active {
+  transform: scale(0.985);
+}
+
+/* ===== Startup Permissions Checklist Modal ===== */
+.permissions-card {
+  max-width: 450px;
+  width: min(450px, calc(100vw - 26px));
+  max-height: calc(100dvh - 38px);
   overflow-y: auto;
+}
+
+.permissions-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  margin: 4px 0 8px;
 }
 
-.led-row {
+.perm-row {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 14px 16px;
-  border-radius: 16px;
-  background: #0d131a;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  gap: 11px;
+  padding: 11px 12px;
+  border-radius: 13px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
 }
 
-.led-row.led-urg-now {
-  border-color: #10b981;
-  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.35);
+.perm-row.is-granted {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: var(--accent-soft);
 }
 
-.led-line-badge {
-  min-width: 78px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  font-family: var(--font-mono);
-  font-size: clamp(18px, 2.8vw, 26px);
-  font-weight: 800;
-  text-align: center;
-  color: #ffffff;
+.perm-icon {
+  font-size: 20px;
+  line-height: 1;
   flex-shrink: 0;
 }
 
-.led-mid {
-  min-width: 0;
+.perm-copy {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
-.led-bandera {
-  font-size: clamp(15px, 2.2vw, 22px);
+.perm-copy strong {
+  font-size: 13.5px;
+  color: var(--text-1);
+}
+
+.perm-copy span {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.35;
+}
+
+.perm-badge-ok {
+  flex-shrink: 0;
+  font-size: 12px;
   font-weight: 700;
-  color: #f8fafc;
-}
-
-.led-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #94a3b8;
-}
-
-.led-eta {
-  font-size: clamp(22px, 3.8vw, 38px);
-  font-weight: 800;
-  color: #facc15;
-  font-variant-numeric: tabular-nums;
+  color: var(--ok);
   white-space: nowrap;
 }
 
-.led-row.led-urg-now .led-eta {
-  color: #34d399;
+.perm-grant-btn {
+  flex-shrink: 0;
 }
 
-.led-empty {
-  margin: auto;
-  color: #94a3b8;
+/* ===== Modo Simple (Baja Visión & Personas Mayores) ===== */
+.simple-mode-header-btn {
+  font-family: var(--font-sans, inherit);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  width: auto;
+  min-width: 34px;
+  padding: 0 8px;
+}
+
+.simple-mode-header-btn.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.simple-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  border-bottom: 2px solid var(--accent);
+  flex-shrink: 0;
+}
+
+.simple-mode-bar.hidden {
+  display: none;
+}
+
+.simple-bar-btn {
+  min-height: 44px;
+  padding: 8px 14px;
+  border-radius: 12px;
+  border: 2px solid var(--border-strong);
+  background: var(--surface-1);
+  color: var(--text-1);
+  font-size: 15px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.simple-bar-btn.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+
+.simple-bar-exit {
+  background: var(--surface-2);
+}
+
+/* Reglas globales cuando Modo Simple está activo */
+body.simple-mode {
+  --border: rgba(255, 255, 255, 0.24);
+  --border-strong: rgba(255, 255, 255, 0.42);
+}
+
+html[data-theme="light"] body.simple-mode {
+  --border: rgba(15, 23, 42, 0.24);
+  --border-strong: rgba(15, 23, 42, 0.45);
+  --text-2: #1e293b;
+  --text-3: #334155;
+}
+
+html[data-theme="dark"] body.simple-mode {
+  --text-2: #e2e8f0;
+  --text-3: #cbd5e1;
+}
+
+body.simple-mode *:focus-visible {
+  outline: 3px solid var(--accent) !important;
+  outline-offset: 2px;
+}
+
+/* Despejar elementos técnicos secundarios para reducir sobrecarga visual */
+body.simple-mode .telemetry-pill,
+body.simple-mode #btn-changelog,
+body.simple-mode #btn-desktop-collapse,
+body.simple-mode #btn-show-routes,
+body.simple-mode #btn-fit-fleet,
+body.simple-mode .stop-meta-row,
+body.simple-mode .arrival-gps-val,
+body.simple-mode .desvio-pill,
+body.simple-mode .srv-chip,
+body.simple-mode .legajo-chip,
+body.simple-mode .map-top-pills,
+body.simple-mode .search-kbd-hint {
+  display: none !important;
+}
+
+body.simple-mode .top-bar-inner {
+  gap: 10px;
+}
+
+body.simple-mode .brand-title {
   font-size: 16px;
-  text-align: center;
+}
+
+body.simple-mode .icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+body.simple-mode .quick-search-input {
+  min-height: 50px;
+  font-size: 17px;
+  font-weight: 600;
+  border-width: 2px;
+}
+
+body.simple-mode .stop-hero {
+  padding: 14px 14px 12px;
+  gap: 10px;
+}
+
+body.simple-mode .stop-title {
+  font-size: 24px;
+  line-height: 1.2;
+  font-weight: 800;
+}
+
+body.simple-mode .code-badge,
+body.simple-mode .pilot-tag {
+  font-size: 14px;
+  padding: 4px 10px;
+}
+
+body.simple-mode .mini-action-btn {
+  min-width: 46px;
+  min-height: 46px;
+  border-width: 2px;
+}
+
+body.simple-mode .seg-btn,
+body.simple-mode .primary-action-btn,
+body.simple-mode .secondary-action-btn {
+  min-height: 50px;
+  font-size: 16px;
+  font-weight: 700;
+  padding: 10px 16px;
+  border-width: 2px;
+}
+
+body.simple-mode .line-filter-strip .filter-pill {
+  min-height: 46px;
+  font-size: 16px;
+  font-weight: 800;
+  padding: 8px 14px;
+  border-width: 2px;
+}
+
+/* Tarjetas de arribos grandes, claras y de alto contraste */
+body.simple-mode .arrival-row {
+  border-width: 2px;
+  border-radius: 18px;
+  padding: 12px;
+  gap: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  background: var(--surface-1);
+}
+
+body.simple-mode .arrival-row-main {
+  padding: 4px;
+  gap: 12px;
+}
+
+body.simple-mode .line-plate {
+  min-width: 72px;
+  min-height: 52px;
+  font-size: 21px;
+  font-weight: 800;
+  border-radius: 14px;
+}
+
+body.simple-mode .arrival-bandera-txt {
+  font-size: 17px;
+  font-weight: 800;
+  white-space: normal;
+  line-height: 1.25;
+}
+
+body.simple-mode .eta-block {
+  min-width: 84px;
+  padding: 6px 10px;
+}
+
+body.simple-mode .eta-value {
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 900;
+}
+
+body.simple-mode .eta-unit {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+body.simple-mode .arrival-row-foot {
+  font-size: 15px;
+  margin-top: 4px;
+}
+
+body.simple-mode .driver-inline strong {
+  font-size: 15.5px;
+}
+
+body.simple-mode .arrival-dist-val {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+body.simple-mode .alert-bell-btn {
+  width: 100%;
+  min-height: 50px;
+  border-radius: 14px;
+  border: 2px solid var(--border-strong);
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 800;
+  justify-content: center;
+}
+
+body.simple-mode .alert-bell-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+body.simple-mode .alert-bell-label {
+  display: inline;
+}
+
+body.simple-mode .alert-bell-btn.is-armed {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+
+/* Pestañas inferiores, cercanas y favoritas de gran tamaño */
+body.simple-mode .dock-tab-bar {
+  min-height: 64px;
+}
+
+body.simple-mode .dock-tab-btn {
+  min-height: 58px;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+body.simple-mode .dock-tab-btn svg {
+  width: 22px;
+  height: 22px;
+}
+
+body.simple-mode .quick-stop-card,
+body.simple-mode .nearby-card,
+body.simple-mode .fav-card,
+body.simple-mode .hub-card {
+  min-height: 62px;
+  padding: 14px 16px;
+  border-width: 2px;
+  font-size: 17px;
+}
+
+body.simple-mode .ride-mode-banner {
+  border-width: 2px;
+  padding: 14px;
+}
+
+body.simple-mode #ride-mode-title {
+  font-size: 19px;
+}
+
+body.simple-mode #ride-mode-sub,
+body.simple-mode .live-trip-meta {
+  font-size: 15px;
+}
+
+body.simple-mode .live-trip-board-btn {
+  min-height: 52px;
+  font-size: 17px;
+  padding: 10px 20px;
+}
+
+body.simple-mode .search-result-item {
+  min-height: 58px;
+  padding: 12px 14px;
+  font-size: 17px;
 }
 
 /* Accessibility: Reduced Motion */

@@ -86,6 +86,17 @@
             </svg>
           </button>
 
+          <button
+            type="button"
+            id="btn-simple-mode"
+            class="icon-btn simple-mode-header-btn"
+            aria-pressed="false"
+            title="Modo Simple: letras grandes y botones claros para baja visión o adultos mayores"
+            aria-label="Activar Modo Simple con letras grandes y botones accesibles"
+          >
+            <span aria-hidden="true">Aa</span>
+          </button>
+
           <button type="button" id="btn-theme-toggle" class="icon-btn" title="Apariencia y color de interfaz" aria-label="Elegir apariencia y color de interfaz">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
               <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/>
@@ -143,6 +154,12 @@
         </button>
       </div>
 
+      <!-- Modo Simple Quick Bar (only visible when Modo Simple is active) -->
+      <div id="simple-mode-bar" class="simple-mode-bar hidden" role="region" aria-label="Controles de Modo Simple">
+        <button type="button" id="btn-simple-tts" class="simple-bar-btn" aria-pressed="false">🔊 Voz: NO</button>
+        <button type="button" id="btn-simple-mode-exit" class="simple-bar-btn simple-bar-exit">Salir de Modo Simple</button>
+      </div>
+
       <!-- TAB 1: RADAR EN VIVO (ARRIBOS + HORARIOS 24H) -->
       <section id="panel-radar" class="dock-panel active" role="tabpanel" aria-labelledby="tab-radar">
         <div id="stop-hero" class="stop-hero hidden">
@@ -158,7 +175,6 @@
                   <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
                 </svg>
               </button>
-              <button type="button" id="btn-led-board" class="mini-action-btn mini-action-led" title="Abrir Modo Tablero LED" aria-label="Abrir Modo Tablero LED pantalla completa">LED</button>
               <button type="button" id="btn-toggle-fav" class="mini-action-btn" title="Guardar parada en favoritas" aria-pressed="false" aria-label="Guardar parada en favoritas">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true" focusable="false">
                   <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
@@ -571,6 +587,13 @@
         </div>
 
         <div data-settings-pane="theme" class="settings-pane">
+          <div class="settings-toggle-row simple-mode-setting-row">
+            <div>
+              <strong>Modo Simple (baja visión / adultos mayores)</strong>
+              <p class="modal-sub">Letras grandes, alto contraste, botones amplios y pantalla despejada</p>
+            </div>
+            <input id="chk-simple-mode" type="checkbox" class="settings-checkbox" aria-label="Activar Modo Simple para baja visión y personas mayores" />
+          </div>
           <div class="settings-section-label">Estilo de mapa (100 % offline, sin API)</div>
           <div class="settings-seg-row" role="group" aria-label="Elegir estilo de mapa">
             <button type="button" class="seg-btn seg-btn-xs active" data-map-style="osm" aria-pressed="true">☀ Claro</button>
@@ -620,10 +643,14 @@
           <div class="settings-section-label">Versión de la aplicación</div>
           <div class="settings-toggle-row update-settings-row">
             <div>
-              <strong>DIRECT GPS <span id="settings-app-version" class="mono-meta">v2.8.0</span></strong>
+              <strong>DIRECT GPS <span id="settings-app-version" class="mono-meta">v2.9.0</span></strong>
               <p class="modal-sub">Se busca una versión nueva al abrir la app y cada 4 horas</p>
             </div>
             <button type="button" id="btn-check-updates" class="secondary-action-btn seg-btn-xs">🔄 Buscar actualizaciones</button>
+          </div>
+          <div class="settings-section-label">Permisos y funcionamiento en segundo plano</div>
+          <div class="settings-seg-row">
+            <button type="button" id="btn-review-permissions" class="secondary-action-btn seg-btn-xs">🛡️ Revisar permisos del teléfono</button>
           </div>
           <div class="settings-section-label">Estado del servidor y caché</div>
           <div id="diag-status-box" class="diag-status-box"></div>
@@ -809,19 +836,22 @@
       </div>
     </div>
 
-    <!-- Modo Tablero LED (Pantalla de Parada Fullscreen) -->
-    <div id="led-board-overlay" class="led-board-overlay hidden" role="dialog" aria-modal="true" aria-label="Tablero LED de próximos arribos">
-      <div class="led-board-head">
-        <div>
-          <span id="led-stop-code" class="code-badge">—</span>
-          <h2 id="led-stop-name">Parada</h2>
+    <!-- Startup Permissions Checklist Modal (asks any ungranted phone permissions cleanly) -->
+    <div id="permissions-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="perms-modal-title" aria-describedby="perms-modal-sub">
+      <div class="modal-card permissions-card">
+        <div class="modal-head">
+          <div>
+            <h2 id="perms-modal-title">Permisos del teléfono</h2>
+            <p id="perms-modal-sub" class="modal-sub">Activá los permisos pendientes para que las alertas, la voz y el GPS funcionen incluso con la app minimizada o cerrada</p>
+          </div>
+          <button type="button" id="btn-perms-close" class="mini-close-btn" aria-label="Cerrar ventana de permisos">✕</button>
         </div>
-        <div class="led-head-right">
-          <span id="led-board-clock" class="led-clock mono">--:--:--</span>
-          <button type="button" id="btn-led-board-close" class="mini-close-btn" aria-label="Salir del tablero LED">✕</button>
+        <div id="permissions-list" class="permissions-list"></div>
+        <div class="modal-actions">
+          <button type="button" id="btn-perms-later" class="secondary-action-btn">Más tarde</button>
+          <button type="button" id="btn-perms-grant-all" class="primary-action-btn">✓ Conceder pendientes</button>
         </div>
       </div>
-      <div id="led-board-list" class="led-board-list"></div>
     </div>
 
     <div id="toast-container" class="toast-container" aria-hidden="true"></div>

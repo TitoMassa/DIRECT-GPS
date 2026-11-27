@@ -77,6 +77,7 @@ import {
   initNative,
   hideSplash,
   setSystemBarsTheme,
+  ensureBackgroundAlive,
   setKeepAwake,
   getCurrentPosition,
   shareStop,
@@ -107,6 +108,7 @@ let filterStripSig = '';
 
 const STORAGE_FAVS_KEY = 'direct_gps_favs_v2';
 const STORAGE_THEME_KEY = 'direct_gps_theme_v1';
+const STORAGE_SOUND_KEY = 'direct_gps_sound_v1';
 const STORAGE_ARMED_ALERTS_KEY = 'directgps_armed_alerts_v1';
 
 const state = {
@@ -313,7 +315,6 @@ const el = {
   btnInspRoute: document.getElementById('btn-insp-route'),
 
   btnOppositeStop: document.getElementById('btn-opposite-stop'),
-  btnLedBoard: document.getElementById('btn-led-board'),
   bunchingBanner: document.getElementById('bunching-banner'),
 
   btnAllBuses: document.getElementById('btn-all-buses'),
@@ -375,6 +376,16 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v2.9.0',
+    date: '27/11/2026 · 20:45 hs',
+    items: [
+      '<strong>Notificaciones en segundo plano inmortales y sin suspensión al minimizar:</strong> el servicio nativo ahora mantiene un <code>WakeLock</code> parcial mientras hay alertas o viaje activo, persiste campanitas y Modo A Bordo, evita suspender la app al minimizarla y se auto-restaura si el sistema intenta cerrarla.',
+      '<strong>Nuevo Modo Simple (baja visión y adultos mayores):</strong> activalo con un toque desde el botón <strong>Aa</strong> superior o en <em>Ajustes → Apariencia</em>; ofrece letras grandes, alto contraste, botones amplios con etiquetas claras, botón directo de voz (TTS) y pantalla despejada.',
+      '<strong>Solicitud automática de permisos pendientes al abrir la app:</strong> al iniciar, solicita los permisos del teléfono que aún no fueron concedidos (Notificaciones, Ubicación GPS, GPS en segundo plano y Batería sin restricciones) y te permite revisarlos en cualquier momento desde <em>Ajustes → Sistema</em>.',
+      '<strong>Experiencia más inmersiva + correcciones:</strong> barras de estado y navegación de Android sincronizadas con cada tema de color, botón Atrás físico/gestual conectado a todos los modales, barra recta oculta también en el banner flotante de Modo A Bordo, persistencia de sonido y eliminación de la opción LED del radar de paradas.'
+    ]
+  },
   {
     version: 'v2.8.0',
     date: '27/11/2026 · 19:00 hs',
@@ -1193,7 +1204,7 @@ function applyTheme(colorOrLegacy) {
   el.btnThemeToggle?.setAttribute('aria-label', `Color de fondo actual ${hex.toUpperCase()}. Tocá para cambiar`);
   if (el.themeCustomColor) el.themeCustomColor.value = hex;
   if (el.themeCustomHex) el.themeCustomHex.textContent = hex.toUpperCase();
-  setSystemBarsTheme(isLight ? 'light' : 'dark');
+  setSystemBarsTheme(isLight ? 'light' : 'dark', hex);
   renderThemeSwatches();
   uiExtras?.syncAutoMapStyle();
 }
@@ -3126,6 +3137,7 @@ function createArrivalRow(bus) {
         <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
         <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
       </svg>
+      <span class="alert-bell-label" aria-hidden="true">Avisar</span>
     </button>
   `;
 
@@ -3141,6 +3153,7 @@ function createArrivalRow(bus) {
     etaUnit: row.querySelector('.eta-unit'),
     alertBtn: row.querySelector('.alert-bell-btn'),
     alertSvg: row.querySelector('.alert-bell-btn svg'),
+    alertLabel: row.querySelector('.alert-bell-label'),
     driverInline: row.querySelector('.driver-inline'),
     distVal: row.querySelector('.arrival-dist-val'),
     gpsVal: row.querySelector('.arrival-gps-val'),
@@ -3200,12 +3213,17 @@ function patchArrivalRow(row, bus) {
   r.alertBtn.dataset.alertLine = bus.descripcionLinea;
   r.alertBtn.classList.toggle('is-armed', isArmed);
   r.alertBtn.setAttribute('aria-pressed', String(isArmed));
+  const leadMin = uiExtras?.getAlertLeadMinutes() || 3;
   const alertDesc = isArmed
     ? `Desactivar aviso de arribo para línea ${bus.descripcionLinea}`
-    : `Activar aviso sonoro para línea ${bus.descripcionLinea} cuando falten 3 minutos o menos`;
+    : `Activar aviso sonoro para línea ${bus.descripcionLinea} cuando falten ${leadMin} minutos o menos`;
   r.alertBtn.title = alertDesc;
   r.alertBtn.setAttribute('aria-label', alertDesc);
   r.alertSvg.setAttribute('fill', isArmed ? 'currentColor' : 'none');
+  if (r.alertLabel) {
+    const lblTxt = isArmed ? 'Activo' : 'Avisar';
+    if (r.alertLabel.textContent !== lblTxt) r.alertLabel.textContent = lblTxt;
+  }
 
   const driverSig = `${bus.choferNombre || ''}|${bus.choferLegajo || ''}`;
   if (r.lastDriverSig !== driverSig) {
@@ -3265,7 +3283,6 @@ function renderArribosList() {
       el.bunchingBanner.innerHTML = '';
     }
   }
-  uiExtras?.renderLedBoard();
 
   if (visible.length === 0) {
     arrivalRowCache.clear();
@@ -12311,6 +12328,11 @@ function bindEvents() {
 
   el.btnSoundToggle.addEventListener('click', () => {
     state.soundEnabled = !state.soundEnabled;
+    try {
+      localStorage.setItem(STORAGE_SOUND_KEY, String(state.soundEnabled));
+    } catch {
+      // ignore
+    }
     el.btnSoundToggle.setAttribute('aria-pressed', String(state.soundEnabled));
     el.btnSoundToggle.setAttribute(
       'aria-label',
@@ -12318,6 +12340,7 @@ function bindEvents() {
     );
     el.iconSoundOn.classList.toggle('hidden', !state.soundEnabled);
     el.iconSoundOff.classList.toggle('hidden', state.soundEnabled);
+    uiExtras?.syncSoundPref(state.soundEnabled);
     if (state.soundEnabled) playSubtleTick();
     announce(state.soundEnabled ? 'Alertas sonoras activadas.' : 'Alertas sonoras desactivadas.');
   });
@@ -12401,11 +12424,6 @@ function bindEvents() {
     }
     showToast(`Cambiando a mano de enfrente: ${opp.nombre} (${opp.id})`, 'info', 2200);
     openStopRadar(opp, state.codLineaQuery || '000');
-  });
-
-  el.btnLedBoard?.addEventListener('click', () => {
-    haptic('light');
-    uiExtras?.openLedBoard();
   });
 
   el.btnToggleFav.addEventListener('click', toggleActiveStopFavorite);
@@ -12822,13 +12840,19 @@ function bindEvents() {
       return;
     }
 
-    const ledOverlayEl = document.getElementById('led-board-overlay');
+    const permsModalEl = document.getElementById('permissions-modal');
+    const updateModalEl = document.getElementById('update-modal');
     const schedExportModalEl = document.getElementById('schedule-export-modal');
     const profileModalEl = document.getElementById('profile-modal');
 
-    if (ledOverlayEl && !ledOverlayEl.classList.contains('hidden')) {
+    if (permsModalEl && !permsModalEl.classList.contains('hidden')) {
       if (e.key === 'Escape') {
-        uiExtras?.closeLedBoard();
+        uiExtras?.closePermissionsModal({ dismiss: true });
+        return;
+      }
+    } else if (updateModalEl && !updateModalEl.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        document.getElementById('btn-update-close')?.click();
         return;
       }
     } else if (profileModalEl && !profileModalEl.classList.contains('hidden')) {
@@ -12976,12 +13000,17 @@ function bindEvents() {
   setupMobileSheet();
 }
 
+let lastBackgroundMs = 0;
+
 function pauseRealtime() {
   cancelActiveSheetDrag();
   stopSimLoop();
-  document.body.classList.add('app-paused');
-  if (state.armedAlerts.size === 0 && !uiExtras?.hasActiveTrackingSession()) {
-    state.isAppPaused = true;
+  lastBackgroundMs = Date.now();
+  // Nunca suspender la app ni su polling en segundo plano al minimizar:
+  // solo detenemos el bucle gráfico rAF mientras la pantalla está oculta y aseguramos el servicio nativo vivo.
+  state.isAppPaused = false;
+  if (isNative && (persistedStopAlerts.size > 0 || state.armedAlerts.size > 0 || uiExtras?.hasActiveTrackingSession())) {
+    ensureBackgroundAlive();
   }
 }
 
@@ -13033,14 +13062,21 @@ function ensureServiceDayRollover() {
 }
 
 function resumeRealtime() {
-  const wasPaused = state.isAppPaused;
+  const awayMs = lastBackgroundMs > 0 ? Date.now() - lastBackgroundMs : 0;
+  const shouldRefresh = state.isAppPaused || awayMs >= 6000;
   state.isAppPaused = false;
   document.body.classList.remove('app-paused');
   scheduleViewportRecovery({ forceRepaint: true });
   ensureServiceDayRollover();
   pruneRuntimeCaches();
+  uiExtras?.refreshPermissionsModalIfOpen();
+  if (isNative) {
+    restorePersistedArmedAlerts().then(() => {
+      if (state.activeStop) renderArribosList();
+    });
+  }
   if (state.activeStop) {
-    if (wasPaused) {
+    if (shouldRefresh) {
       state.countdownSec = REFRESH_INTERVAL_SEC;
       fetchArribos(false);
     }
@@ -13056,24 +13092,29 @@ function resumeRealtime() {
     startSimLoop();
   }
   if (state.allFleetMode) {
-    if (wasPaused) refreshAllFleetBuses({ fit: false, silent: true });
+    if (shouldRefresh) refreshAllFleetBuses({ fit: false, silent: true });
     if (state.simulateMode && state.allFleetBuses.length > 0) startSimLoop();
   }
-  if (wasPaused && getActiveTab() === 'lineas') {
+  if (shouldRefresh && getActiveTab() === 'lineas') {
     state.flotaCountdownSec = REFRESH_INTERVAL_SEC;
     if (state.drill.step === 'flota') refreshActiveLineFlotaSilent();
     else if (state.drill.step === 'lineas') loadFlotaResumen(true);
   }
-  if (wasPaused && state.eventsModalOpen && state.eventsDayOffset === 0) {
+  if (shouldRefresh && state.eventsModalOpen && state.eventsDayOffset === 0) {
     loadEventsTimelineData({ forceBundle: true, silent: true });
   }
 }
 
-// Layered back navigation (Escape / PWA history)
+// Layered back navigation (Escape / Android hardware Back / PWA history)
 async function handleNativeBack() {
-  const ledOverlayEl = document.getElementById('led-board-overlay');
-  if (ledOverlayEl && !ledOverlayEl.classList.contains('hidden')) {
-    uiExtras?.closeLedBoard();
+  const permsModalEl = document.getElementById('permissions-modal');
+  if (permsModalEl && !permsModalEl.classList.contains('hidden')) {
+    uiExtras?.closePermissionsModal({ dismiss: true });
+    return true;
+  }
+  const updateModalEl = document.getElementById('update-modal');
+  if (updateModalEl && !updateModalEl.classList.contains('hidden')) {
+    document.getElementById('btn-update-close')?.click();
     return true;
   }
   const profileModalEl = document.getElementById('profile-modal');
@@ -13212,11 +13253,30 @@ async function init() {
     }
   });
 
+  try {
+    const savedSound = localStorage.getItem(STORAGE_SOUND_KEY);
+    if (savedSound === 'false') {
+      state.soundEnabled = false;
+      el.btnSoundToggle?.setAttribute('aria-pressed', 'false');
+      el.btnSoundToggle?.setAttribute('aria-label', 'Alertas sonoras desactivadas');
+      el.iconSoundOn?.classList.add('hidden');
+      el.iconSoundOff?.classList.remove('hidden');
+    }
+  } catch {
+    // ignore
+  }
+  uiExtras?.syncSoundPref(state.soundEnabled);
+
   loadFavorites();
   await restorePersistedArmedAlerts();
   createAppUpdater({ showToast });
   bindEvents();
   updateSignalPill();
+
+  // Pedir al abrir la app los permisos del teléfono que aún no fueron concedidos
+  setTimeout(() => {
+    uiExtras?.checkAndPromptMissingPermissions({ onStartup: true });
+  }, 650);
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});

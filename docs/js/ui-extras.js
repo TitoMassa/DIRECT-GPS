@@ -6,11 +6,16 @@ import {
   isNative,
   ensureNotificationPermission,
   getNotificationPermissionState,
+  getDetailedPermissionsStatus,
+  requestStartupPermissions,
+  requestBackgroundLocationPermission,
+  openNativeAppSettings,
   onSwNotificationAction,
   openAndroidBatterySettings,
   speakViaNativeAndroid,
   upsertNativeWatchAlert,
   removeNativeWatchAlert,
+  haptic,
   notifyArrival as sendNativeNotification
 } from './native.js';
 import {
@@ -35,6 +40,8 @@ import {
 const STORAGE_MAP_STYLE_KEY = 'directgps_map_style_v1'; // 'auto' | 'osm' | 'dark'
 const STORAGE_ALERT_PREFS_KEY = 'directgps_alert_prefs_v1'; // { leadMin: 3|5|8|10, tts: boolean, minuteByMinute: boolean }
 const STORAGE_FAV_ENTITIES_KEY = 'directgps_fav_entities_v1'; // [{ type:'coche'|'chofer', id, label, sub, lineName, codLinea }]
+const STORAGE_SIMPLE_MODE_KEY = 'directgps_simple_mode_v1';
+const STORAGE_PERMS_DISMISSED_KEY = 'directgps_perms_prompt_dismissed_v1';
 
 function esc(str = '') {
   return String(str)
@@ -87,6 +94,13 @@ export function createUiExtras(ctx) {
     // ignore
   }
 
+  let simpleModeEnabled = false;
+  try {
+    simpleModeEnabled = localStorage.getItem(STORAGE_SIMPLE_MODE_KEY) === 'true';
+  } catch {
+    simpleModeEnabled = false;
+  }
+
   let favEntities = [];
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_FAV_ENTITIES_KEY) || '[]');
@@ -98,9 +112,6 @@ export function createUiExtras(ctx) {
   // Per-unit specific alerts (`codLinea:coche`)
   const armedCarAlerts = new Set();
   const triggeredCarAlerts = new Set();
-
-  // LED board clock timer
-  let ledClockTimer = null;
 
   // ── 1. Night Map Mode (Zero-API OSM CSS Dark Filter) ──────────────────────
   function resolveEffectiveMapStyle() {
@@ -320,6 +331,7 @@ export function createUiExtras(ctx) {
   const liveLineBadge = document.getElementById('live-trip-line-badge');
   const rideTitle = document.getElementById('ride-mode-title');
   const rideSub = document.getElementById('ride-mode-sub');
+  const liveTrackWrap = rideBanner?.querySelector('.live-trip-track-wrap');
   const liveTrackFill = document.getElementById('live-trip-track-fill');
   const liveBusDot = document.getElementById('live-trip-bus-dot');
   const liveTripMeta = document.getElementById('live-trip-meta');
@@ -364,6 +376,7 @@ export function createUiExtras(ctx) {
       rideBanner.classList.toggle('is-onboard', isOnboard);
       rideBanner.classList.toggle('is-boarding-armed', isArmed);
       rideBanner.classList.toggle('is-arrived', Boolean(snap.arrivingNow || (!isOnboard && snap.etaMin === 0)));
+      liveTrackWrap?.classList.toggle('hidden', isOnboard);
 
       const lineCol = getLineColor(snap.lineName || '');
       rideBanner.style.setProperty('--trip-color', lineCol);
@@ -1106,82 +1119,324 @@ export function createUiExtras(ctx) {
     expModal.classList.remove('hidden');
   }
 
-  // ── 7. Modo Tablero LED (Pantalla de Parada) ──────────────────────────────
-  const ledOverlay = document.getElementById('led-board-overlay');
-  const ledStopName = document.getElementById('led-stop-name');
-  const ledStopCode = document.getElementById('led-stop-code');
-  const ledClock = document.getElementById('led-board-clock');
-  const ledList = document.getElementById('led-board-list');
-  const btnLedClose = document.getElementById('btn-led-board-close');
+  // ── 7A. Modo Simple (Interfaz accesible para baja visión y personas mayores) ──
+  const btnSimpleHeader = document.getElementById('btn-simple-mode');
+  const chkSimpleMode = document.getElementById('chk-simple-mode');
+  const simpleModeBar = document.getElementById('simple-mode-bar');
+  const btnSimpleExit = document.getElementById('btn-simple-mode-exit');
+  const btnSimpleTts = document.getElementById('btn-simple-tts');
 
-  function renderLedBoard() {
-    if (!ledOverlay || ledOverlay.classList.contains('hidden')) return;
-    if (ledStopName) ledStopName.textContent = state.activeStop?.nombre || 'Parada';
-    if (ledStopCode) ledStopCode.textContent = state.activeStop?.id || '';
+  function syncSimpleModeUi() {
+    document.documentElement.dataset.simpleMode = simpleModeEnabled ? 'true' : 'false';
+    document.body.classList.toggle('simple-mode', simpleModeEnabled);
+    if (btnSimpleHeader) {
+      btnSimpleHeader.classList.toggle('active', simpleModeEnabled);
+      btnSimpleHeader.setAttribute('aria-pressed', String(simpleModeEnabled));
+      btnSimpleHeader.setAttribute(
+        'aria-label',
+        simpleModeEnabled ? 'Desactivar Modo Simple' : 'Activar Modo Simple con letras grandes y botones accesibles'
+      );
+    }
+    if (chkSimpleMode) chkSimpleMode.checked = simpleModeEnabled;
+    if (simpleModeBar) simpleModeBar.classList.toggle('hidden', !simpleModeEnabled);
+    if (btnSimpleTts) {
+      const ttsOn = Boolean(alertPrefs.tts);
+      btnSimpleTts.textContent = ttsOn ? '🔊 Voz: ACTIVADA' : '🔇 Voz: DESACTIVADA';
+      btnSimpleTts.classList.toggle('active', ttsOn);
+      btnSimpleTts.setAttribute('aria-pressed', String(ttsOn));
+    }
+  }
 
-    const visible = (state.arribos || []).filter(
-      (b) => state.filterLine === 'ALL' || b.descripcionLinea === state.filterLine
-    );
+  function setSimpleMode(enabled, { silent = false } = {}) {
+    simpleModeEnabled = Boolean(enabled);
+    try {
+      localStorage.setItem(STORAGE_SIMPLE_MODE_KEY, String(simpleModeEnabled));
+    } catch {
+      // ignore
+    }
+    syncSimpleModeUi();
+    requestAnimationFrame(() => transitMap?.invalidateSize?.());
+    if (!silent) {
+      haptic('medium');
+      const msg = simpleModeEnabled
+        ? 'Modo Simple activado: letras grandes y botones claros'
+        : 'Modo completo restaurado';
+      showToast(msg, 'success', 2800);
+      announce?.(msg);
+      if (simpleModeEnabled && alertPrefs.tts) {
+        speakIfEnabled('Modo simple activado.');
+      }
+    }
+  }
 
-    if (!ledList) return;
-    if (visible.length === 0) {
-      ledList.innerHTML = `<div class="led-empty">Sin arribos próximos registrados en este momento.</div>`;
+  function isSimpleModeEnabled() {
+    return Boolean(simpleModeEnabled);
+  }
+
+  btnSimpleHeader?.addEventListener('click', () => setSimpleMode(!simpleModeEnabled));
+  btnSimpleExit?.addEventListener('click', () => setSimpleMode(false));
+  chkSimpleMode?.addEventListener('change', (e) => setSimpleMode(Boolean(e.target.checked)));
+  btnSimpleTts?.addEventListener('click', () => {
+    const next = !alertPrefs.tts;
+    alertPrefs.tts = next;
+    saveAlertPrefs();
+    liveTracker.syncPrefs({ ttsEnabled: next });
+    const ttsChk = document.getElementById('chk-tts-alerts');
+    if (ttsChk) ttsChk.checked = next;
+    syncSimpleModeUi();
+    haptic('light');
+    if (next) {
+      const msg = 'Avisos por voz activados.';
+      showToast(msg, 'success', 2400);
+      if (isNative) speakViaNativeAndroid(msg);
+      else if (isSpeechSupported()) speakText(msg);
+    } else {
+      showToast('Avisos por voz desactivados', 'info', 2200);
+    }
+  });
+
+  // ── 7B. Permisos al abrir la app (pide todos los permisos pendientes del teléfono) ──
+  const permsModal = document.getElementById('permissions-modal');
+  const permsListEl = document.getElementById('permissions-list');
+  const btnPermsClose = document.getElementById('btn-perms-close');
+  const btnPermsLater = document.getElementById('btn-perms-later');
+  const btnPermsGrantAll = document.getElementById('btn-perms-grant-all');
+
+  function getMissingPermItems(status) {
+    const items = [];
+    if (status?.notifications !== 'unsupported') {
+      items.push({
+        id: 'notifications',
+        icon: '🔔',
+        title: 'Notificaciones y alertas en vivo',
+        desc: 'Muestra la barra estilo Uber y avisa la llegada de tus colectivos',
+        granted: status?.notifications === 'granted'
+      });
+    }
+    items.push({
+      id: 'location',
+      icon: '📍',
+      title: 'Ubicación GPS',
+      desc: 'Encuentra tus paradas cercanas y anuncia cada parada en Modo A Bordo',
+      granted: status?.location === 'granted'
+    });
+    if (isNative) {
+      items.push({
+        id: 'backgroundLocation',
+        icon: '🧭',
+        title: 'GPS en segundo plano ("Todo el tiempo")',
+        desc: 'Permite que Modo A Bordo siga leyendo paradas con la pantalla apagada',
+        granted: status?.backgroundLocation === 'granted'
+      });
+      items.push({
+        id: 'batteryOptimization',
+        icon: '🔋',
+        title: 'Segundo plano sin restricciones',
+        desc: 'Evita que Android suspenda la app o apague las campanitas al minimizar',
+        granted: status?.batteryOptimization === 'granted'
+      });
+    }
+    return items;
+  }
+
+  async function renderPermissionsModal() {
+    if (!permsListEl) return null;
+    const status = await getDetailedPermissionsStatus();
+    const items = getMissingPermItems(status);
+    const pendingCount = items.filter((it) => !it.granted).length;
+
+    permsListEl.innerHTML = items
+      .map(
+        (it) => `
+        <div class="perm-row ${it.granted ? 'is-granted' : 'is-pending'}">
+          <span class="perm-icon" aria-hidden="true">${it.icon}</span>
+          <div class="perm-copy">
+            <strong>${esc(it.title)}</strong>
+            <span>${esc(it.desc)}</span>
+          </div>
+          ${
+            it.granted
+              ? `<span class="perm-badge-ok">✓ Activo</span>`
+              : `<button type="button" class="primary-action-btn seg-btn-xs perm-grant-btn" data-perm-action="${esc(it.id)}">Permitir</button>`
+          }
+        </div>
+      `
+      )
+      .join('');
+
+    if (btnPermsGrantAll) {
+      btnPermsGrantAll.classList.toggle('hidden', pendingCount === 0);
+      btnPermsGrantAll.textContent =
+        pendingCount === 1 ? '✓ Conceder permiso pendiente' : `✓ Conceder ${pendingCount} pendientes`;
+    }
+    if (btnPermsLater) {
+      btnPermsLater.textContent = pendingCount === 0 ? 'Listo' : 'Más tarde';
+    }
+    syncNotifPermissionButtons();
+    return { status, items, pendingCount };
+  }
+
+  async function openPermissionsModal() {
+    if (!permsModal) return;
+    await renderPermissionsModal();
+    permsModal.classList.remove('hidden');
+  }
+
+  function closePermissionsModal({ dismiss = false } = {}) {
+    permsModal?.classList.add('hidden');
+    if (dismiss) {
+      try {
+        sessionStorage.setItem(STORAGE_PERMS_DISMISSED_KEY, '1');
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  async function handleSinglePermissionGrant(permId) {
+    haptic('light');
+    if (permId === 'notifications') {
+      const ok = await ensureNotificationPermission();
+      if (!ok && isNative) {
+        await openNativeAppSettings();
+        showToast('Activá "Notificaciones" en los ajustes de DIRECT GPS y volvé a la app.', 'info', 4200);
+      }
+    } else if (permId === 'location') {
+      if (isNative) {
+        const res = await requestStartupPermissions();
+        if (res?.location !== 'granted') {
+          await openNativeAppSettings();
+          showToast('Activá "Ubicación" en los ajustes de DIRECT GPS y volvé a la app.', 'info', 4200);
+        }
+      } else if (navigator.geolocation) {
+        await new Promise((resolve) =>
+          navigator.geolocation.getCurrentPosition(() => resolve(), () => resolve(), { timeout: 8000 })
+        );
+      }
+    } else if (permId === 'backgroundLocation') {
+      const res = await requestBackgroundLocationPermission();
+      if (res?.backgroundLocation !== 'granted') {
+        await openNativeAppSettings();
+        showToast('En Ubicación elegí "Permitir todo el tiempo" para que Modo A Bordo funcione con pantalla apagada.', 'info', 4800);
+      }
+    } else if (permId === 'batteryOptimization') {
+      await openAndroidBatterySettings();
+      showToast('Elegí "Permitir" / "Sin restricciones" para que nunca se suspenda en segundo plano.', 'info', 4200);
+    }
+    const info = await renderPermissionsModal();
+    if (info && info.pendingCount === 0) {
+      showToast('¡Todos los permisos concedidos!', 'success', 2800);
+      setTimeout(() => closePermissionsModal(), 700);
+    }
+  }
+
+  permsListEl?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-perm-action]');
+    if (!btn) return;
+    handleSinglePermissionGrant(btn.dataset.permAction);
+  });
+
+  btnPermsGrantAll?.addEventListener('click', async () => {
+    const status = await getDetailedPermissionsStatus();
+    if (status.notifications !== 'granted' || status.location !== 'granted') {
+      if (isNative) {
+        await requestStartupPermissions();
+      } else {
+        if (status.notifications !== 'granted') await ensureNotificationPermission();
+        if (status.location !== 'granted' && navigator.geolocation) {
+          await new Promise((resolve) =>
+            navigator.geolocation.getCurrentPosition(() => resolve(), () => resolve(), { timeout: 8000 })
+          );
+        }
+      }
+    }
+    const after = await renderPermissionsModal();
+    if (isNative && after?.status) {
+      if (after.status.location === 'granted' && after.status.backgroundLocation !== 'granted') {
+        await handleSinglePermissionGrant('backgroundLocation');
+        return;
+      }
+      if (after.status.batteryOptimization !== 'granted') {
+        await handleSinglePermissionGrant('batteryOptimization');
+        return;
+      }
+    }
+    if (after && after.pendingCount === 0) {
+      showToast('¡Todos los permisos concedidos!', 'success', 2800);
+      closePermissionsModal();
+    }
+  });
+
+  btnPermsClose?.addEventListener('click', () => closePermissionsModal({ dismiss: true }));
+  btnPermsLater?.addEventListener('click', () => closePermissionsModal({ dismiss: true }));
+  permsModal?.addEventListener('click', (e) => {
+    if (e.target === permsModal) closePermissionsModal({ dismiss: true });
+  });
+
+  async function refreshPermissionsModalIfOpen() {
+    if (permsModal && !permsModal.classList.contains('hidden')) {
+      const info = await renderPermissionsModal();
+      if (info && info.pendingCount === 0) {
+        showToast('¡Todos los permisos quedaron activos!', 'success', 2600);
+        setTimeout(() => closePermissionsModal(), 500);
+      }
+    } else {
+      const status = await getDetailedPermissionsStatus();
+      if (status) syncNotifPermissionButtons();
+    }
+  }
+
+  async function checkAndPromptMissingPermissions({ onStartup = true } = {}) {
+    if (typeof window === 'undefined') return;
+    if (onStartup) {
+      try {
+        if (sessionStorage.getItem(STORAGE_PERMS_DISMISSED_KEY) === '1') return;
+      } catch {
+        // ignore
+      }
+    }
+
+    const status = await getDetailedPermissionsStatus();
+    if (isNative) {
+      // En Android APK pedir automáticamente los permisos del sistema que todavía no fueron concedidos
+      if (status.notifications !== 'granted' || status.location !== 'granted') {
+        await requestStartupPermissions();
+      }
+      const after = await getDetailedPermissionsStatus();
+      const missing = getMissingPermItems(after).filter((it) => !it.granted);
+      if (missing.length > 0) {
+        await openPermissionsModal();
+      }
       return;
     }
 
-    ledList.innerHTML = visible
-      .slice(0, 8)
-      .map((b) => {
-        const col = getLineColor(b.descripcionLinea);
-        const etaTxt = b.eta?.minutes <= 0 ? 'AHORA' : `${b.eta?.display || b.eta?.minutes || '—'} MIN`;
-        const urg = b.eta?.urgency || 'far';
-        const desv = b.desvio && b.desvio.status !== 'none' && b.desvio.label ? b.desvio : null;
-        return `
-          <div class="led-row led-urg-${esc(urg)}">
-            <span class="led-line-badge" style="background:${col}">${esc(b.descripcionLinea)}</span>
-            <div class="led-mid">
-              <div class="led-bandera">${esc(b.realBandera || b.descripcionBandera || '')}</div>
-              <div class="led-meta">
-                ${b.identificadorCoche ? `<span class="mono">#${esc(b.identificadorCoche)}</span>` : ''}
-                ${b.serviceNumber ? `<span>S${b.serviceNumber}${b.lapNumber ? `·V${b.lapNumber}` : ''}</span>` : ''}
-                ${desv ? `<span class="desvio-pill desvio-${esc(desv.status)}">${esc(desv.label)}</span>` : ''}
-                ${b.esAdaptado ? `<span>♿</span>` : ''}
-              </div>
-            </div>
-            <div class="led-eta mono">${esc(etaTxt)}</div>
-          </div>
-        `;
-      })
-      .join('');
+    // En Web/PWA: mostrar el asistente amigable una sola vez si falta notificaciones o ubicación
+    if (!onStartup) {
+      await openPermissionsModal();
+      return;
+    }
+    const missingWeb = getMissingPermItems(status).filter((it) => !it.granted);
+    if (missingWeb.length > 0) {
+      let seenWeb = false;
+      try {
+        seenWeb = localStorage.getItem('directgps_web_perms_seen_v1') === '1';
+      } catch {
+        // ignore
+      }
+      if (!seenWeb) {
+        try {
+          localStorage.setItem('directgps_web_perms_seen_v1', '1');
+        } catch {
+          // ignore
+        }
+        await openPermissionsModal();
+      }
+    }
   }
 
-  function openLedBoard() {
-    if (!ledOverlay || !state.activeStop) return;
-    ledOverlay.classList.remove('hidden');
-    const tickClock = () => {
-      if (!ledClock) return;
-      const now = new Date();
-      ledClock.textContent = now.toLocaleTimeString('es-AR', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-        timeZone: 'America/Argentina/Buenos_Aires'
-      });
-    };
-    tickClock();
-    clearInterval(ledClockTimer);
-    ledClockTimer = setInterval(tickClock, 1000);
-    renderLedBoard();
+  function syncSoundPref(enabled) {
+    liveTracker.syncPrefs({ soundEnabled: Boolean(enabled) });
   }
-
-  function closeLedBoard() {
-    ledOverlay?.classList.add('hidden');
-    clearInterval(ledClockTimer);
-    ledClockTimer = null;
-  }
-
-  btnLedClose?.addEventListener('click', closeLedBoard);
 
   // ── 8. Settings Tabs inside Theme Modal (Apariencia & Mapa | Alertas & Voz | Respaldo & Diagnóstico) ──
   function wireSettingsModalTabs() {
@@ -1253,6 +1508,7 @@ export function createUiExtras(ctx) {
       alertPrefs.tts = Boolean(e.target.checked);
       saveAlertPrefs();
       liveTracker.syncPrefs({ ttsEnabled: alertPrefs.tts });
+      syncSimpleModeUi();
       if (alertPrefs.tts) {
         if (isNative) {
           speakViaNativeAndroid('Avisos por voz activados en Direct G P S.');
@@ -1262,6 +1518,10 @@ export function createUiExtras(ctx) {
           showToast('Tu navegador no soporta síntesis de voz.', 'warn', 3000);
         }
       }
+    });
+
+    document.getElementById('btn-review-permissions')?.addEventListener('click', () => {
+      openPermissionsModal();
     });
 
     document.getElementById('btn-enable-android-notifs')?.addEventListener('click', async () => {
@@ -1311,6 +1571,7 @@ export function createUiExtras(ctx) {
         favEntities,
         themeHex: getCurrentThemeHex?.() || '#121518',
         mapStyle: mapStylePref,
+        simpleMode: simpleModeEnabled,
         alertPrefs
       };
       const jsonStr = JSON.stringify(payload, null, 2);
@@ -1347,6 +1608,7 @@ export function createUiExtras(ctx) {
         }
         if (parsed.themeHex) applyThemeColor?.(parsed.themeHex);
         if (parsed.mapStyle) applyMapStyle(parsed.mapStyle, { silent: true });
+        if (typeof parsed.simpleMode === 'boolean') setSimpleMode(parsed.simpleMode, { silent: true });
         if (parsed.alertPrefs) {
           alertPrefs = {
             leadMin: [3, 5, 8, 10].includes(Number(parsed.alertPrefs.leadMin)) ? Number(parsed.alertPrefs.leadMin) : 3,
@@ -1360,6 +1622,7 @@ export function createUiExtras(ctx) {
             minuteByMinute: alertPrefs.minuteByMinute
           });
           syncAlertUi();
+          syncSimpleModeUi();
         }
         renderFavoritas?.();
         showToast('Respaldo restaurado correctamente', 'success', 3200);
@@ -1442,6 +1705,7 @@ export function createUiExtras(ctx) {
   // Initialize controls on creation
   wireSettingsModalTabs();
   applyMapStyle(mapStylePref, { silent: true });
+  syncSimpleModeUi();
 
   return {
     applyMapStyle,
@@ -1452,6 +1716,13 @@ export function createUiExtras(ctx) {
     isTtsEnabled,
     isMinuteByMinuteEnabled,
     speakIfEnabled,
+    syncSoundPref,
+    setSimpleMode,
+    isSimpleModeEnabled,
+    openPermissionsModal,
+    closePermissionsModal,
+    refreshPermissionsModalIfOpen,
+    checkAndPromptMissingPermissions,
     toggleCarAlert,
     isCarAlertArmed,
     checkCarAlerts,
@@ -1472,9 +1743,6 @@ export function createUiExtras(ctx) {
     closeProfileModal,
     openScheduleExportModal,
     closeScheduleExportModal,
-    openLedBoard,
-    closeLedBoard,
-    renderLedBoard,
     shareServiceSummary
   };
 }

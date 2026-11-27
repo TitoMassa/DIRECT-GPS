@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v100') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v100 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v101') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v101 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1059,11 +1059,11 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     .catch(() => false);
   assert.equal(tripPlannerExists, false, 'docs/js/trip-planner.js must be deleted');
 
-  for (const rel of ['docs/index.html', 'docs/js/config.js', 'docs/js/map.js', 'docs/js/telemetry.js', 'docs/js/ui-extras.js']) {
+  for (const rel of ['docs/index.html', 'docs/css/styles.css', 'docs/js/config.js', 'docs/js/map.js', 'docs/js/telemetry.js', 'docs/js/ui-extras.js']) {
     const content = await fs.readFile(path.join(ROOT, rel), 'utf8');
     assert.equal(/arcgisonline|world_imagery|map-style="sat|mapa satelital/i.test(content), false, `${rel} must NOT contain satellite map`);
     assert.equal(/batterySaver|dataSaver|ahorro de bater[íi]a/i.test(content), false, `${rel} must NOT contain battery/data saver mode`);
-    assert.equal(/trip-planner|cómo llego|como llego|drawBusTrail|buildPrintableScheduleHtml|btn-rec-print|insp-upcoming|buildBusUpcomingStops/i.test(content), false, `${rel} must NOT contain removed features`);
+    assert.equal(/trip-planner|cómo llego|como llego|drawBusTrail|buildPrintableScheduleHtml|btn-rec-print|insp-upcoming|buildBusUpcomingStops|btn-led-board|led-board-overlay|openLedBoard|renderLedBoard|mini-action-led/i.test(content), false, `${rel} must NOT contain removed features`);
   }
 
   // 10h) Real PNG PWA icons exist & have valid PNG signature
@@ -1076,7 +1076,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   // 10i) Unified driver-overrides.json sync check across all 3 runtime files
   execFileSync('node', ['scripts/sync-drivers.mjs', '--check'], { cwd: ROOT, stdio: 'pipe' });
 
-  // 10j) Capacitor 7 + Native Android Foreground Service + v2.8.0 Persistent Watches & In-App Updater
+  // 10j) Capacitor 7 + Native Android Foreground Service + v2.9.0 Immortal Background, Modo Simple, Startup Permissions & Updater
   const notifOnboard = buildUberNotificationPayload({
     phase: 'onboard',
     lineName: '106B',
@@ -1093,11 +1093,11 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.equal(/[━◉]/.test(notifOnboard.body), false, 'Onboard notification must NOT include straight arrival progress bar');
 
   const { compareSemver, isRemoteVersionNewer, APP_VERSION, APP_VERSION_CODE } = await importLocal('docs/js/updater.js');
-  assert.equal(compareSemver('2.8.0', '2.7.0'), 1);
-  assert.equal(compareSemver('2.8.0', '2.8.0'), 0);
-  assert.equal(compareSemver('2.7.9', '2.8.0'), -1);
-  assert.equal(isRemoteVersionNewer({ versionName: '2.7.0', versionCode: 270 }, { version: '2.8.0', versionCode: 280 }), true);
-  assert.equal(isRemoteVersionNewer({ versionName: '2.8.0', versionCode: 280 }, { version: '2.8.0', versionCode: 280 }), false);
+  assert.equal(compareSemver('2.9.0', '2.8.0'), 1);
+  assert.equal(compareSemver('2.9.0', '2.9.0'), 0);
+  assert.equal(compareSemver('2.8.9', '2.9.0'), -1);
+  assert.equal(isRemoteVersionNewer({ versionName: '2.8.0', versionCode: 280 }, { version: '2.9.0', versionCode: 290 }), true);
+  assert.equal(isRemoteVersionNewer({ versionName: '2.9.0', versionCode: 290 }, { version: '2.9.0', versionCode: 290 }), false);
 
   const pkgJson = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf8'));
   const verJson = JSON.parse(await fs.readFile(path.join(ROOT, 'docs', 'version.json'), 'utf8'));
@@ -1118,25 +1118,36 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   }
   const tripSvcSrc = await fs.readFile(path.join(androidJavaBase, 'DirectGpsTripService.java'), 'utf8');
   assert.ok(tripSvcSrc.includes('ACTION_UPSERT_WATCH') && tripSvcSrc.includes('CHANNEL_LIVE_SILENT'), 'DirectGpsTripService must support persistent in-place watch alerts');
+  assert.ok(tripSvcSrc.includes('PARTIAL_WAKE_LOCK') && tripSvcSrc.includes('scheduleWatchdogRestart') && tripSvcSrc.includes('KEY_PRIMARY_JSON'), 'DirectGpsTripService must hold WakeLock, persist primary trip, and survive task removal');
+  assert.ok(tripSvcSrc.includes('pollAllTargetsSafe') && tripSvcSrc.includes('catch (Throwable'), 'Background polling loop must never die on uncaught throwable');
   assert.ok(tripSvcSrc.includes('playDeviceNotificationChime'), 'DirectGpsTripService must play chime before TTS');
   const onboardMethodMatch = tripSvcSrc.match(/private Notification buildOnboardNotification\([\s\S]*?\n    \}/);
   assert.ok(onboardMethodMatch, 'DirectGpsTripService must define buildOnboardNotification');
   assert.equal(onboardMethodMatch[0].includes('setProgress('), false, 'Native buildOnboardNotification must NOT draw a progress bar');
 
+  const mainActSrc = await fs.readFile(path.join(androidJavaBase, 'MainActivity.java'), 'utf8');
+  assert.ok(mainActSrc.includes('resumeTimers') && mainActSrc.includes('applySystemBars') && mainActSrc.includes('moveTaskToBack'), 'MainActivity must keep timers alive, apply dynamic system bars, and handle back cleanly');
+  const pluginSrc = await fs.readFile(path.join(androidJavaBase, 'DirectGpsNativePlugin.java'), 'utf8');
+  assert.ok(pluginSrc.includes('requestBackgroundLocationPermission') && pluginSrc.includes('setSystemBarsColor') && pluginSrc.includes('ensureBackgroundAlive'), 'DirectGpsNativePlugin must expose startup permissions, dynamic bars, and keep-alive');
+
   const manifestXml = await fs.readFile(path.join(ROOT, 'android', 'app', 'src', 'main', 'AndroidManifest.xml'), 'utf8');
   assert.ok(manifestXml.includes('FOREGROUND_SERVICE_LOCATION'), 'AndroidManifest must declare FOREGROUND_SERVICE_LOCATION');
   assert.ok(manifestXml.includes('POST_NOTIFICATIONS'), 'AndroidManifest must declare POST_NOTIFICATIONS');
   assert.ok(manifestXml.includes('REQUEST_INSTALL_PACKAGES'), 'AndroidManifest must declare REQUEST_INSTALL_PACKAGES for in-app APK updates');
-  assert.ok(manifestXml.includes('.DirectGpsTripService'), 'AndroidManifest must register DirectGpsTripService');
+  assert.ok(manifestXml.includes('android:stopWithTask="false"'), 'DirectGpsTripService must declare android:stopWithTask="false"');
   const apkWorkflow = await fs.readFile(path.join(ROOT, '.github', 'workflows', 'android-apk.yml'), 'utf8');
   assert.ok(apkWorkflow.includes('assembleDebug') && apkWorkflow.includes('upload-artifact') && apkWorkflow.includes('gh release'), 'android-apk.yml must compile, upload artifact, and publish GitHub Release');
 
   const indexHtml = await fs.readFile(path.join(ROOT, 'docs', 'index.html'), 'utf8');
   assert.ok(indexHtml.includes('id="update-modal"') && indexHtml.includes('id="btn-check-updates"'), 'index.html must include in-app update dialog and settings button');
+  assert.ok(indexHtml.includes('id="btn-simple-mode"') && indexHtml.includes('id="chk-simple-mode"') && indexHtml.includes('id="simple-mode-bar"'), 'index.html must include Modo Simple controls');
+  assert.ok(indexHtml.includes('id="permissions-modal"') && indexHtml.includes('id="btn-review-permissions"'), 'index.html must include startup permissions modal and settings trigger');
+  assert.ok(cssSrc.includes('body.simple-mode') && cssSrc.includes('.ride-mode-banner.is-onboard .live-trip-track-wrap'), 'styles.css must include Modo Simple rules and hide onboard banner track');
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v2.8.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY'), 'app.js must include v2.8.0 changelog and persistent armed alerts');
+  assert.ok(appJsSrc.includes("version: 'v2.9.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v2.9.0 changelog, persistent alerts, and startup permissions');
+  assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v2.8.0 Live In-Place Notifs, Arrival-Only Uber Bar, Persistent Background Bells+TTS, In-App Updater & strict exclusions');
+  console.log('  ✓ Verified v2.9.0 Immortal Background Service, Zero Minimize Suspension, Modo Simple, Startup Permissions, Immersive Bars, LED Removal & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');
