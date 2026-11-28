@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="nearby_gps"
+        android:enabled="true"
+        android:icon="@drawable/ic_stat_bus"
+        android:shortcutShortLabel="@string/shortcut_nearby_short"
+        android:shortcutLongLabel="@string/shortcut_nearby_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="ar.corrientes.directgps"
+            android:targetClass="ar.corrientes.directgps.MainActivity">
+            <extra android:name="dgps_action" android:value="locate" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="favorites"
+        android:enabled="true"
+        android:icon="@drawable/ic_stat_bus"
+        android:shortcutShortLabel="@string/shortcut_favs_short"
+        android:shortcutLongLabel="@string/shortcut_favs_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="ar.corrientes.directgps"
+            android:targetClass="ar.corrientes.directgps.MainActivity">
+            <extra android:name="dgps_tab" android:value="favoritas" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="live_lines"
+        android:enabled="true"
+        android:icon="@drawable/ic_stat_bus"
+        android:shortcutShortLabel="@string/shortcut_lines_short"
+        android:shortcutLongLabel="@string/shortcut_lines_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="ar.corrientes.directgps"
+            android:targetClass="ar.corrientes.directgps.MainActivity">
+            <extra android:name="dgps_tab" android:value="lineas" />
+        </intent>
+    </shortcut>
+</shortcuts>

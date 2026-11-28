@@ -363,20 +363,23 @@ export class LiveTripTracker {
     return this.phase === 'onboard';
   }
 
-  syncPrefs({ minuteByMinute, ttsEnabled, soundEnabled, leadMin } = {}) {
+  syncPrefs({ minuteByMinute, ttsEnabled, soundEnabled, leadMin, ttsSpeechRate, ttsSpeakInDnd } = {}) {
     if (typeof minuteByMinute === 'boolean') this.minuteByMinute = minuteByMinute;
     if (typeof ttsEnabled === 'boolean') this.ttsEnabled = ttsEnabled;
     if (typeof soundEnabled === 'boolean') this.soundEnabled = soundEnabled;
     if (Number.isFinite(Number(leadMin))) this.leadMin = Number(leadMin);
+    if (Number.isFinite(Number(ttsSpeechRate))) this.ttsSpeechRate = Number(ttsSpeechRate);
+    if (typeof ttsSpeakInDnd === 'boolean') this.ttsSpeakInDnd = ttsSpeakInDnd;
     if (this._nativePlugin) {
-      this._nativePlugin
-        .syncPrefs?.({
-          minuteByMinute: this.minuteByMinute,
-          ttsEnabled: this.ttsEnabled,
-          soundEnabled: this.soundEnabled,
-          leadMin: this.leadMin
-        })
-        .catch(() => {});
+      const payload = {
+        minuteByMinute: this.minuteByMinute,
+        ttsEnabled: this.ttsEnabled,
+        soundEnabled: this.soundEnabled,
+        leadMin: this.leadMin
+      };
+      if (Number.isFinite(Number(this.ttsSpeechRate))) payload.ttsSpeechRate = Number(this.ttsSpeechRate);
+      if (typeof this.ttsSpeakInDnd === 'boolean') payload.ttsSpeakInDnd = this.ttsSpeakInDnd;
+      this._nativePlugin.syncPrefs?.(payload).catch(() => {});
     }
     if (this.isActive()) {
       this._emitUpdate();

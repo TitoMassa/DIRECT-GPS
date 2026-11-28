@@ -6587,6 +6587,50 @@ body.simple-mode .search-result-item {
 .update-settings-row { gap: 10px; flex-wrap: wrap; }
 .update-settings-row #btn-check-updates { flex-shrink: 0; }
 
+/* ===== v3.0.0 Integración Nativa Android (Timbre, secciones nativas, sin barra PWA) ===== */
+.native-only-section {
+  display: none;
+}
+html.is-native .native-only-section {
+  display: block;
+}
+html.is-native .settings-toggle-row.native-only-section {
+  display: flex;
+}
+html.is-native #changelog-pwa-bar {
+  display: none !important;
+}
+.ringtone-picker-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 13px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--inset-rim);
+}
+.ringtone-picker-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.ringtone-picker-info strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+.ringtone-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

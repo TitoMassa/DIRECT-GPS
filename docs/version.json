@@ -1,11 +1,12 @@
 {
-  "version": "2.9.1",
-  "versionCode": 291,
+  "version": "3.0.0",
+  "versionCode": 300,
   "releaseDate": "2026-11-27",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v2.9.1/DIRECT-GPS-v2.9.1-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v2.9.1",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.0.0/DIRECT-GPS-v3.0.0-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.0.0",
   "notes": [
-    "Distancia real sobre el trazado del recorrido en notificaciones en vivo (corrige el error de distancia en línea recta al pasar por la parada de enfrente)",
-    "Notificación en vivo estilo Uber con UNA sola barra gráfica limpia (sin barra nativa duplicada) y tarjeta interna con línea, coche, chofer y hora programada real"
+    "Voz TTS inmortal en segundo plano: WakeLock dedicado, canal de navegación (habla incluso en No molestar), auto-reparación del motor TTS y latido Doze cada 30 s para que la voz nunca se duerma",
+    "Selector nativo de timbre del teléfono en Ajustes → Alertas (elegí cualquier tono de notificación de tu celular + velocidad de voz Pausada / Natural / Ágil)",
+    "Integración nativa Android completa: Widget en vivo en la pantalla de inicio, atajos en el ícono de la app, abrir parada al tocar notificaciones, compartir grillas PNG/JPG directo por WhatsApp y háptica nativa"
   ]
 }

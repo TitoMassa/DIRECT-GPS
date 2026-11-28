@@ -612,6 +612,20 @@
         </div>
 
         <div data-settings-pane="alerts" class="settings-pane hidden">
+          <div id="native-ringtone-section" class="native-only-section">
+            <div class="settings-section-label">Timbre de notificación del teléfono</div>
+            <div class="ringtone-picker-card">
+              <div class="ringtone-picker-info">
+                <strong>🎵 Timbre elegido para DIRECT GPS</strong>
+                <span id="ringtone-current-title" class="ringtone-title">Timbre predeterminado del teléfono</span>
+              </div>
+              <div class="settings-seg-row">
+                <button type="button" id="btn-pick-ringtone" class="primary-action-btn seg-btn-xs">🎵 Elegir timbre</button>
+                <button type="button" id="btn-reset-ringtone" class="secondary-action-btn seg-btn-xs">Predeterminado</button>
+              </div>
+            </div>
+          </div>
+
           <div class="settings-section-label">Anticipación de alertas de arribo</div>
           <div class="settings-seg-row" role="group" aria-label="Minutos de anticipación para alertas">
             <button type="button" class="seg-btn seg-btn-xs active" data-alert-lead="3" aria-pressed="true">3 min</button>
@@ -622,16 +636,29 @@
           <div class="settings-toggle-row">
             <div>
               <strong>Avisar minuto a minuto</strong>
-              <p class="modal-sub">Al seguir una línea, suena el timbre y avisa cada minuto que baja hasta llegar</p>
+              <p class="modal-sub">Suena tu timbre elegido y avisa cada minuto que baja hasta llegar</p>
             </div>
             <input id="chk-minute-alerts" type="checkbox" class="settings-checkbox" aria-label="Activar avisos minuto a minuto" />
           </div>
           <div class="settings-toggle-row">
             <div>
               <strong>Avisos hablados por voz (TTS)</strong>
-              <p class="modal-sub">Después del timbre del celular, lee arribos y cada parada en modo Subir/Bajar (ej. 2976 → «veintinueve setenta y seis»)</p>
+              <p class="modal-sub">Después del timbre elegido, lee arribos y cada parada en modo Subir/Bajar (ej. 2976 → «veintinueve setenta y seis»)</p>
             </div>
             <input id="chk-tts-alerts" type="checkbox" class="settings-checkbox" aria-label="Activar avisos hablados por voz" />
+          </div>
+          <div class="settings-section-label">Velocidad de lectura por voz</div>
+          <div class="settings-seg-row" role="group" aria-label="Velocidad de lectura TTS">
+            <button type="button" class="seg-btn seg-btn-xs" data-tts-rate="0.85" aria-pressed="false">Pausada</button>
+            <button type="button" class="seg-btn seg-btn-xs active" data-tts-rate="1.02" aria-pressed="true">Natural</button>
+            <button type="button" class="seg-btn seg-btn-xs" data-tts-rate="1.2" aria-pressed="false">Ágil</button>
+          </div>
+          <div class="settings-toggle-row native-only-section">
+            <div>
+              <strong>Hablar aunque esté en No molestar / Vibración</strong>
+              <p class="modal-sub">Usa el canal de navegación de Android para que la voz nunca quede muda al esperar tu colectivo</p>
+            </div>
+            <input id="chk-tts-dnd" type="checkbox" class="settings-checkbox" checked aria-label="Permitir avisos hablados incluso en modo No molestar o vibración" />
           </div>
           <div class="settings-seg-row">
             <button type="button" id="btn-enable-android-notifs" class="secondary-action-btn seg-btn-xs">🔔 Activar notificaciones Android</button>
@@ -643,7 +670,7 @@
           <div class="settings-section-label">Versión de la aplicación</div>
           <div class="settings-toggle-row update-settings-row">
             <div>
-              <strong>DIRECT GPS <span id="settings-app-version" class="mono-meta">v2.9.1</span></strong>
+              <strong>DIRECT GPS <span id="settings-app-version" class="mono-meta">v3.0.0</span></strong>
               <p class="modal-sub">Se busca una versión nueva al abrir la app y cada 4 horas</p>
             </div>
             <button type="button" id="btn-check-updates" class="secondary-action-btn seg-btn-xs">🔄 Buscar actualizaciones</button>
@@ -768,7 +795,7 @@
         <div class="modal-head">
           <div>
             <h2 id="changelog-modal-title">Historial de cambios</h2>
-            <p class="modal-sub">DIRECT GPS · App Web Progresiva (PWA)</p>
+            <p id="changelog-modal-sub" class="modal-sub">DIRECT GPS · Corrientes en vivo</p>
           </div>
           <button type="button" id="btn-changelog-close" class="mini-close-btn" aria-label="Cerrar historial de cambios">✕</button>
         </div>

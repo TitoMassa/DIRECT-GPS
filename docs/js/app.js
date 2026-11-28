@@ -377,6 +377,15 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.0.0',
+    date: '27/11/2026 · 23:00 hs',
+    items: [
+      '<strong>Voz TTS inmortal en segundo plano (nunca más se duerme):</strong> el servicio nativo Android ahora mantiene un <code>WakeLock</code> dedicado durante cada timbre y locución, usa el canal de audio de <strong>navegación</strong> (con opción para hablar incluso en <em>No molestar / Vibración</em>), ejecuta un <strong>watchdog auto-reparador</strong> que detecta y reconecta el motor TTS si Android lo suspende tras varios minutos, y despierta el sondeo cada 30 s en modo Doze mediante <code>AlarmManager</code>.',
+      '<strong>Selector nativo de timbre del teléfono + velocidad de voz:</strong> desde <em>Ajustes → Alertas</em> ahora podés elegir cualquier <strong>timbre de notificación de tu celular</strong> para DIRECT GPS, ajustar la velocidad de la voz (<em>Pausada · Natural · Ágil</em>) y probar timbre + voz en vivo.',
+      '<strong>Integración nativa Android completa (Widget, Atajos, Compartir y Háptica):</strong> nuevo <strong>Widget en vivo para la pantalla de inicio</strong> con tu próximo arribo, <strong>atajos rápidos</strong> manteniendo presionado el ícono de la app (<em>Paradas cercanas, Favoritas y Líneas</em>), apertura directa de la parada al tocar cualquier notificación en vivo, envío nativo de grillas PNG/JPG directo a WhatsApp, vibración háptica Android nativa y telemetría de dispositivo/servicio en <em>Ajustes → Sistema</em>.'
+    ]
+  },
+  {
     version: 'v2.9.1',
     date: '27/11/2026 · 21:45 hs',
     items: [
@@ -13289,6 +13298,13 @@ async function init() {
     // ignore
   }
   uiExtras?.syncSoundPref(state.soundEnabled);
+
+  const changelogSubEl = document.getElementById('changelog-modal-sub');
+  if (changelogSubEl) {
+    changelogSubEl.textContent = isNative
+      ? 'DIRECT GPS · App Nativa Android'
+      : 'DIRECT GPS · Corrientes en vivo';
+  }
 
   loadFavorites();
   await restorePersistedArmedAlerts();

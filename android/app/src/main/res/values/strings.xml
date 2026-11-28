@@ -4,4 +4,11 @@
     <string name="title_activity_main">DIRECT GPS</string>
     <string name="package_name">ar.corrientes.directgps</string>
     <string name="custom_url_scheme">ar.corrientes.directgps</string>
+    <string name="shortcut_nearby_short">Cercanas</string>
+    <string name="shortcut_nearby_long">Paradas cercanas (GPS)</string>
+    <string name="shortcut_favs_short">Favoritas</string>
+    <string name="shortcut_favs_long">Mis paradas favoritas</string>
+    <string name="shortcut_lines_short">Líneas</string>
+    <string name="shortcut_lines_long">Líneas y flota en vivo</string>
+    <string name="widget_description">Muestra en vivo tu próximo colectivo seguido y abre la parada al instante</string>
 </resources>

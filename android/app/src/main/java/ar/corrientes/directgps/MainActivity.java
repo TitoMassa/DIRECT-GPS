@@ -29,6 +29,8 @@ public class MainActivity extends BridgeActivity {
             wv.setBackgroundColor(Color.parseColor("#0b0d10"));
         }
 
+        handleDeepLinkIntent(getIntent());
+
         // Botón/gesto Atrás nativo: primero cierra modales/paneles en JS; en inicio minimiza sin matar el proceso
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -38,6 +40,25 @@ public class MainActivity extends BridgeActivity {
                 }
             }
         });
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleDeepLinkIntent(intent);
+    }
+
+    private void handleDeepLinkIntent(Intent intent) {
+        if (intent == null) return;
+        String stopId = intent.getStringExtra("dgps_stop_id");
+        String tab = intent.getStringExtra("dgps_tab");
+        String action = intent.getStringExtra("dgps_action");
+        if ((stopId != null && !stopId.isEmpty())
+            || (tab != null && !tab.isEmpty())
+            || (action != null && !action.isEmpty())) {
+            DirectGpsNativePlugin.dispatchDeepLink(stopId, tab, action);
+        }
     }
 
     @Override

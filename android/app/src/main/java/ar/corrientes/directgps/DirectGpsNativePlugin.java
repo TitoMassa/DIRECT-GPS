@@ -1,15 +1,23 @@
 package ar.corrientes.directgps;
 
 import android.Manifest;
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.PowerManager;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.provider.Settings;
+import android.util.Base64;
 
+import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 
@@ -19,6 +27,7 @@ import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
@@ -36,10 +45,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Plugin nativo Capacitor para DIRECT GPS Android (v2.8.0).
+ * Plugin nativo Capacitor para DIRECT GPS Android (v3.0.0 — Edición Nativa Integral).
  * Expone `window.Capacitor.Plugins.DirectGpsNative`:
- *  - Campanitas persistentes en tiempo real (actualización en el lugar + barra Uber + timbre + TTS)
+ *  - Selector nativo de timbre de notificación del teléfono (RingtoneManager.ACTION_RINGTONE_PICKER)
+ *  - Campanitas persistentes en tiempo real + TTS inmortal auto-reparable en segundo plano
  *  - Modo Subir / A Bordo / Bajar autónomo incluso con la app cerrada
+ *  - Compartir imágenes PNG/JPG por WhatsApp/Android Share Sheet (FileProvider)
+ *  - Háptica nativa flagship (VibrationEffect predefined) + Deep-links de Widget/Atajos/Notificaciones
  *  - Auto-actualizador nativo in-app (descarga APK con progreso e instala con FileProvider)
  */
 @CapacitorPlugin(
@@ -65,6 +77,7 @@ import java.util.concurrent.Executors;
 public class DirectGpsNativePlugin extends Plugin {
 
     private static volatile DirectGpsNativePlugin activeInstance = null;
+    private static volatile JSObject pendingLaunchDeepLink = null;
     private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
 
     public static boolean dispatchHardwareBack() {
@@ -80,6 +93,19 @@ public class DirectGpsNativePlugin extends Plugin {
         JSObject data = new JSObject();
         data.put("isActive", isActive);
         inst.notifyListeners("appStateChanged", data, false);
+    }
+
+    public static void dispatchDeepLink(String stopId, String tab, String action) {
+        JSObject link = new JSObject();
+        if (stopId != null && !stopId.isEmpty()) link.put("stopId", stopId);
+        if (tab != null && !tab.isEmpty()) link.put("tab", tab);
+        if (action != null && !action.isEmpty()) link.put("action", action);
+        pendingLaunchDeepLink = link;
+        DirectGpsNativePlugin inst = activeInstance;
+        if (inst != null && inst.hasListeners("deepLink")) {
+            pendingLaunchDeepLink = null;
+            inst.notifyListeners("deepLink", link, false);
+        }
     }
 
     @Override
@@ -131,6 +157,13 @@ public class DirectGpsNativePlugin extends Plugin {
     }
 
     @PluginMethod
+    public void consumeLaunchDeepLink(PluginCall call) {
+        JSObject link = pendingLaunchDeepLink;
+        pendingLaunchDeepLink = null;
+        call.resolve(link != null ? link : new JSObject());
+    }
+
+    @PluginMethod
     public void setSystemBarsColor(PluginCall call) {
         String color = call.getString("color");
         if (color == null || !color.trim().startsWith("#")) color = "#12161a";
@@ -158,17 +191,205 @@ public class DirectGpsNativePlugin extends Plugin {
     }
 
     @PluginMethod
+    public void hapticFeedback(PluginCall call) {
+        String kind = call.getString("kind", "light");
+        try {
+            Context ctx = getContext();
+            Vibrator vib = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                VibratorManager vm = (VibratorManager) ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                if (vm != null) vib = vm.getDefaultVibrator();
+            } else {
+                vib = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+            }
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    int effectId = VibrationEffect.EFFECT_TICK;
+                    if ("success".equals(kind)) effectId = VibrationEffect.EFFECT_DOUBLE_CLICK;
+                    else if ("medium".equals(kind)) effectId = VibrationEffect.EFFECT_CLICK;
+                    vib.vibrate(VibrationEffect.createPredefined(effectId));
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    long ms = "success".equals(kind) ? 35 : ("medium".equals(kind) ? 18 : 10);
+                    vib.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    vib.vibrate("medium".equals(kind) ? 18 : 10);
+                }
+            }
+        } catch (Exception ignored) {}
+        call.resolve();
+    }
+
+    // ── Selector nativo de timbre de notificación del teléfono ────────────────
+    @PluginMethod
+    public void getNotificationRingtone(PluginCall call) {
+        Context ctx = getContext();
+        JSObject ret = new JSObject();
+        ret.put("uri", DirectGpsTripService.getCustomRingtoneUri(ctx));
+        ret.put("title", DirectGpsTripService.getCustomRingtoneTitle(ctx));
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void resetNotificationRingtone(PluginCall call) {
+        Context ctx = getContext();
+        DirectGpsTripService.saveCustomRingtone(ctx, "", "");
+        JSObject ret = new JSObject();
+        ret.put("uri", "");
+        ret.put("title", DirectGpsTripService.getCustomRingtoneTitle(ctx));
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void pickNotificationRingtone(PluginCall call) {
+        try {
+            Context ctx = getContext();
+            Intent intent = new Intent(RingtoneManager.ACTION_RINGTONE_PICKER);
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION);
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "Elegí el timbre de DIRECT GPS");
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true);
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false);
+
+            String currentUriStr = DirectGpsTripService.getCustomRingtoneUri(ctx);
+            Uri existingUri = (currentUriStr != null && !currentUriStr.isEmpty())
+                ? Uri.parse(currentUriStr)
+                : RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, existingUri);
+            intent.putExtra(RingtoneManager.EXTRA_RINGTONE_DEFAULT_URI, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION));
+
+            startActivityForResult(call, intent, "ringtonePickerCallback");
+        } catch (Exception e) {
+            call.reject("No se pudo abrir el selector de timbres: " + e.getMessage());
+        }
+    }
+
+    @ActivityCallback
+    private void ringtonePickerCallback(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        Context ctx = getContext();
+        if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+            Uri pickedUri = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pickedUri = result.getData().getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri.class);
+            } else {
+                pickedUri = result.getData().getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI);
+            }
+            if (pickedUri != null) {
+                String title = "Timbre personalizado";
+                try {
+                    Ringtone r = RingtoneManager.getRingtone(ctx, pickedUri);
+                    if (r != null) {
+                        String t = r.getTitle(ctx);
+                        if (t != null && !t.trim().isEmpty()) title = t.trim();
+                    }
+                } catch (Exception ignored) {}
+                DirectGpsTripService.saveCustomRingtone(ctx, pickedUri.toString(), title);
+                JSObject ret = new JSObject();
+                ret.put("changed", true);
+                ret.put("uri", pickedUri.toString());
+                ret.put("title", title);
+                call.resolve(ret);
+                return;
+            }
+        }
+        JSObject ret = new JSObject();
+        ret.put("changed", false);
+        ret.put("uri", DirectGpsTripService.getCustomRingtoneUri(ctx));
+        ret.put("title", DirectGpsTripService.getCustomRingtoneTitle(ctx));
+        call.resolve(ret);
+    }
+
+    // ── Compartir imagen PNG/JPG nativamente por WhatsApp / Android Share Sheet ─
+    @PluginMethod
+    public void shareImageBase64(PluginCall call) {
+        String dataUrl = call.getString("dataUrl");
+        String rawName = call.getString("filename");
+        String title = call.getString("title");
+        if (dataUrl == null || !dataUrl.contains(",")) {
+            call.reject("Imagen inválida");
+            return;
+        }
+        String safeName = (rawName != null && !rawName.trim().isEmpty() ? rawName.trim() : "direct-gps-horarios.png")
+            .replaceAll("[^0-9A-Za-z._-]", "_");
+        boolean isJpg = safeName.toLowerCase().endsWith(".jpg") || safeName.toLowerCase().endsWith(".jpeg");
+        String mime = isJpg ? "image/jpeg" : "image/png";
+
+        try {
+            Context ctx = getContext();
+            String b64 = dataUrl.substring(dataUrl.indexOf(',') + 1);
+            byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+            File baseDir = ctx.getExternalCacheDir();
+            if (baseDir == null) baseDir = ctx.getCacheDir();
+            File outDir = new File(baseDir, "shares");
+            if (!outDir.exists()) outDir.mkdirs();
+            File outFile = new File(outDir, safeName);
+            try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                fos.write(bytes);
+                fos.flush();
+            }
+
+            Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", outFile);
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType(mime);
+            share.putExtra(Intent.EXTRA_STREAM, uri);
+            if (title != null && !title.isEmpty()) {
+                share.putExtra(Intent.EXTRA_SUBJECT, title);
+                share.putExtra(Intent.EXTRA_TEXT, title);
+            }
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(share, "Compartir grilla de horarios");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(chooser);
+
+            JSObject ok = new JSObject();
+            ok.put("shared", true);
+            call.resolve(ok);
+        } catch (Exception e) {
+            call.reject("No se pudo compartir la imagen: " + e.getMessage());
+        }
+    }
+
+    // ── Diagnóstico nativo Android ────────────────────────────────────────────
+    @PluginMethod
+    public void getNativeStatus(PluginCall call) {
+        Context ctx = getContext();
+        JSObject ret = new JSObject();
+        try {
+            PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+            long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.0.0");
+            ret.put("versionCode", vCode);
+        } catch (Exception e) {
+            ret.put("versionName", "3.0.0");
+            ret.put("versionCode", 300);
+        }
+        boolean batteryIgnoring = true;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) batteryIgnoring = pm.isIgnoringBatteryOptimizations(ctx.getPackageName());
+        }
+        ret.put("androidRelease", Build.VERSION.RELEASE);
+        ret.put("sdkInt", Build.VERSION.SDK_INT);
+        ret.put("deviceModel", Build.MANUFACTURER + " " + Build.MODEL);
+        ret.put("serviceRunning", DirectGpsTripService.isServiceRunning());
+        ret.put("activeWatchCount", DirectGpsTripService.loadPersistedWatchesArray(ctx).length());
+        ret.put("ringtoneTitle", DirectGpsTripService.getCustomRingtoneTitle(ctx));
+        ret.put("ringtoneUri", DirectGpsTripService.getCustomRingtoneUri(ctx));
+        ret.put("batteryUnrestricted", batteryIgnoring);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
     public void getAppVersion(PluginCall call) {
         JSObject ret = new JSObject();
         try {
             Context ctx = getContext();
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
             long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
-            ret.put("versionName", pi.versionName != null ? pi.versionName : "2.9.1");
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.0.0");
             ret.put("versionCode", vCode);
         } catch (Exception e) {
-            ret.put("versionName", "2.9.1");
-            ret.put("versionCode", 291);
+            ret.put("versionName", "3.0.0");
+            ret.put("versionCode", 300);
         }
         call.resolve(ret);
     }

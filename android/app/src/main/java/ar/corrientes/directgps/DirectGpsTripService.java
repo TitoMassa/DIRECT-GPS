@@ -85,6 +85,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private static final String KEY_WATCHES_JSON = "watches_json";
     private static final String KEY_PREFS_JSON = "user_prefs_json";
     private static final String KEY_PRIMARY_JSON = "primary_trip_json";
+    private static final String KEY_RINGTONE_URI = "custom_ringtone_uri";
+    private static final String KEY_RINGTONE_TITLE = "custom_ringtone_title";
 
     public static final String CHANNEL_LIVE_SILENT = "direct_gps_trip_live_v1";
     public static final String CHANNEL_ALERTS_SOUND = "direct_gps_alerts_sound_v1";
@@ -107,6 +109,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     public static final String ACTION_CLEAR_WATCHES = "ar.corrientes.directgps.ACTION_CLEAR_WATCHES";
     public static final String ACTION_ENSURE_ALIVE = "ar.corrientes.directgps.ACTION_ENSURE_ALIVE";
     public static final String ACTION_RESTORE_WATCHDOG = "ar.corrientes.directgps.ACTION_RESTORE_WATCHDOG";
+    public static final String ACTION_HEARTBEAT_POLL = "ar.corrientes.directgps.ACTION_HEARTBEAT_POLL";
 
     public static final String EXTRA_PAYLOAD = "payload";
     public static final String EXTRA_WATCH_KEY = "watch_key";
@@ -120,14 +123,52 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     private static volatile StateListener stateListener = null;
     private static volatile JSONObject lastKnownSnapshot = null;
+    private static volatile boolean serviceRunning = false;
 
     public static void setStateListener(@Nullable StateListener listener) {
         stateListener = listener;
     }
 
+    public static boolean isServiceRunning() {
+        return serviceRunning;
+    }
+
     @Nullable
     public static JSONObject getLastKnownSnapshot() {
         return lastKnownSnapshot;
+    }
+
+    public static void saveCustomRingtone(Context ctx, @Nullable String uriStr, @Nullable String title) {
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            sp.edit()
+                .putString(KEY_RINGTONE_URI, uriStr != null ? uriStr : "")
+                .putString(KEY_RINGTONE_TITLE, title != null ? title : "")
+                .apply();
+        } catch (Exception ignored) {}
+    }
+
+    public static String getCustomRingtoneUri(Context ctx) {
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            return sp.getString(KEY_RINGTONE_URI, "");
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    public static String getCustomRingtoneTitle(Context ctx) {
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String t = sp.getString(KEY_RINGTONE_TITLE, "");
+            if (t != null && !t.isEmpty()) return t;
+            Uri defUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            Ringtone r = defUri != null ? RingtoneManager.getRingtone(ctx, defUri) : null;
+            String sysTitle = r != null ? r.getTitle(ctx) : "";
+            return (sysTitle != null && !sysTitle.isEmpty()) ? sysTitle + " (predeterminado)" : "Timbre predeterminado del teléfono";
+        } catch (Exception e) {
+            return "Timbre predeterminado del teléfono";
+        }
     }
 
     /**
@@ -259,14 +300,21 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private LocationManager locationManager;
     private AudioManager audioManager;
     private PowerManager.WakeLock wakeLock;
+    private PowerManager.WakeLock ttsWakeLock;
     private AudioFocusRequest audioFocusRequest;
     private TextToSpeech tts;
     private volatile boolean ttsReady = false;
-    private final List<String> pendingInitSpeeches = new ArrayList<>();
+    private volatile boolean ttsInitializing = false;
+    private final List<String> pendingInitSpeeches = java.util.Collections.synchronizedList(new ArrayList<>());
+    private final Map<String, ScheduledFuture<?>> utteranceWatchdogs = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, String> activeUtteranceTexts = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<String> retriedUtterances = java.util.Collections.synchronizedSet(new HashSet<>());
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final List<Runnable> scheduledSpeechTasks = new ArrayList<>();
+    private final List<ScheduledFuture<?>> scheduledSpeechFutures = java.util.Collections.synchronizedList(new ArrayList<>());
+    private ScheduledExecutorService speechExecutor;
     private long lastChimeMs = 0;
+    private volatile long lastPollCompletedMs = 0;
 
     private ScheduledExecutorService pollExecutor;
     private ScheduledFuture<?> pollFuture;
@@ -312,15 +360,19 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private boolean ttsEnabled = false;
     private boolean soundEnabled = true;
     private int leadMin = 3;
+    private float ttsSpeechRate = 1.02f;
+    private boolean ttsSpeakInDnd = true;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        serviceRunning = true;
         notifManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         createNotificationChannels();
         pollExecutor = Executors.newSingleThreadScheduledExecutor();
+        speechExecutor = Executors.newSingleThreadScheduledExecutor();
         restorePersistedState();
         initTts();
     }
@@ -348,6 +400,26 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         } catch (Exception ignored) {}
     }
 
+    private synchronized void acquireTtsWakeLock() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            if (ttsWakeLock == null) {
+                ttsWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "directgps:TtsSpeechWakeLock");
+                ttsWakeLock.setReferenceCounted(false);
+            }
+            ttsWakeLock.acquire(25_000L);
+        } catch (Exception ignored) {}
+    }
+
+    private synchronized void releaseTtsWakeLock() {
+        try {
+            if (ttsWakeLock != null && ttsWakeLock.isHeld()) {
+                ttsWakeLock.release();
+            }
+        } catch (Exception ignored) {}
+    }
+
     private void restorePersistedState() {
         try {
             SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -356,6 +428,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             if (prefs.has("ttsEnabled")) ttsEnabled = prefs.optBoolean("ttsEnabled", ttsEnabled);
             if (prefs.has("soundEnabled")) soundEnabled = prefs.optBoolean("soundEnabled", soundEnabled);
             if (prefs.has("leadMin")) leadMin = Math.max(1, prefs.optInt("leadMin", leadMin));
+            if (prefs.has("ttsSpeechRate")) {
+                ttsSpeechRate = (float) Math.max(0.75, Math.min(1.35, prefs.optDouble("ttsSpeechRate", 1.02)));
+            }
+            if (prefs.has("ttsSpeakInDnd")) ttsSpeakInDnd = prefs.optBoolean("ttsSpeakInDnd", true);
             String savedBase = prefs.optString("apiBase", "").trim();
             if (!savedBase.isEmpty()) apiBase = savedBase.replaceAll("/+$", "");
 
@@ -421,6 +497,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             prefs.put("ttsEnabled", ttsEnabled);
             prefs.put("soundEnabled", soundEnabled);
             prefs.put("leadMin", leadMin);
+            prefs.put("ttsSpeechRate", ttsSpeechRate);
+            prefs.put("ttsSpeakInDnd", ttsSpeakInDnd);
             prefs.put("apiBase", apiBase);
 
             JSONArray arr = new JSONArray();
@@ -473,21 +551,48 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 .putString(KEY_WATCHES_JSON, arr.toString())
                 .putString(KEY_PRIMARY_JSON, primary.toString())
                 .apply();
+
+            DirectGpsWidgetProvider.updateAllWidgets(getApplicationContext());
         } catch (Exception e) {
             Log.w(TAG, "Failed persisting state", e);
         }
     }
 
-    private void initTts() {
+    private synchronized void initTts() {
+        if (ttsInitializing) return;
+        ttsInitializing = true;
+        ttsReady = false;
         try {
-            tts = new TextToSpeech(this, this);
+            tts = new TextToSpeech(getApplicationContext(), this);
         } catch (Exception e) {
+            ttsInitializing = false;
             Log.w(TAG, "TTS init failed", e);
         }
     }
 
+    private synchronized void reinitTtsEngine() {
+        ttsReady = false;
+        ttsInitializing = false;
+        if (tts != null) {
+            try {
+                tts.stop();
+                tts.shutdown();
+            } catch (Exception ignored) {}
+            tts = null;
+        }
+        initTts();
+    }
+
+    private AudioAttributes buildTtsAudioAttributes() {
+        return new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build();
+    }
+
     @Override
     public void onInit(int status) {
+        ttsInitializing = false;
         if (status == TextToSpeech.SUCCESS && tts != null) {
             int res = tts.setLanguage(new Locale("es", "AR"));
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
@@ -496,30 +601,63 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
                 tts.setLanguage(new Locale("es"));
             }
-            tts.setSpeechRate(1.02f);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                try {
+                    tts.setAudioAttributes(buildTtsAudioAttributes());
+                } catch (Exception ignored) {}
+            }
+            tts.setSpeechRate(ttsSpeechRate);
             tts.setPitch(1.0f);
             tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                 @Override
-                public void onStart(String utteranceId) {}
+                public void onStart(String utteranceId) {
+                    ScheduledFuture<?> wd = utteranceWatchdogs.remove(utteranceId);
+                    if (wd != null) wd.cancel(false);
+                }
 
                 @Override
                 public void onDone(String utteranceId) {
-                    abandonAudioFocus();
+                    ScheduledFuture<?> wd = utteranceWatchdogs.remove(utteranceId);
+                    if (wd != null) wd.cancel(false);
+                    activeUtteranceTexts.remove(utteranceId);
+                    retriedUtterances.remove(utteranceId);
+                    if (activeUtteranceTexts.isEmpty()) {
+                        abandonAudioFocus();
+                        releaseTtsWakeLock();
+                    }
                 }
 
                 @Override
                 public void onError(String utteranceId) {
-                    abandonAudioFocus();
+                    ScheduledFuture<?> wd = utteranceWatchdogs.remove(utteranceId);
+                    if (wd != null) wd.cancel(false);
+                    String failedText = activeUtteranceTexts.remove(utteranceId);
+                    if (failedText != null && retriedUtterances.add(utteranceId)) {
+                        // El motor TTS del SO se había dormido/desvinculado: reinicializar y reintentar 1 vez
+                        Log.w(TAG, "TTS utterance error -> recreating engine & retrying");
+                        pendingInitSpeeches.add(failedText);
+                        reinitTtsEngine();
+                        return;
+                    }
+                    retriedUtterances.remove(utteranceId);
+                    if (activeUtteranceTexts.isEmpty()) {
+                        abandonAudioFocus();
+                        releaseTtsWakeLock();
+                    }
                 }
             });
             ttsReady = true;
-            if (!pendingInitSpeeches.isEmpty()) {
-                List<String> copy = new ArrayList<>(pendingInitSpeeches);
+            List<String> copy;
+            synchronized (pendingInitSpeeches) {
+                copy = new ArrayList<>(pendingInitSpeeches);
                 pendingInitSpeeches.clear();
-                for (String txt : copy) {
-                    speakNow(txt, true);
-                }
             }
+            for (String txt : copy) {
+                speakNow(txt, true);
+            }
+        } else {
+            ttsReady = false;
+            releaseTtsWakeLock();
         }
     }
 
@@ -597,6 +735,45 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
+    private void scheduleDozeHeartbeat() {
+        try {
+            if (!hasAnyActiveWork()) return;
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Intent hbIntent = new Intent(getApplicationContext(), DirectGpsTripService.class);
+            hbIntent.setAction(ACTION_HEARTBEAT_POLL);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+            PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? PendingIntent.getForegroundService(getApplicationContext(), 902, hbIntent, flags)
+                : PendingIntent.getService(getApplicationContext(), 902, hbIntent, flags);
+            long triggerAt = SystemClock.elapsedRealtime() + 30_000L;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            } else {
+                am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "Doze heartbeat schedule skipped: " + e.getMessage());
+        }
+    }
+
+    private void cancelDozeHeartbeat() {
+        try {
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Intent hbIntent = new Intent(getApplicationContext(), DirectGpsTripService.class);
+            hbIntent.setAction(ACTION_HEARTBEAT_POLL);
+            int flags = PendingIntent.FLAG_NO_CREATE | PendingIntent.FLAG_IMMUTABLE;
+            PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? PendingIntent.getForegroundService(getApplicationContext(), 902, hbIntent, flags)
+                : PendingIntent.getService(getApplicationContext(), 902, hbIntent, flags);
+            if (pi != null) {
+                am.cancel(pi);
+                pi.cancel();
+            }
+        } catch (Exception ignored) {}
+    }
+
     private void resumeActiveWorkNow() {
         if (!hasAnyActiveWork()) return;
         ensureWakeLock();
@@ -605,6 +782,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             startGpsUpdates();
         }
         ensurePollingRunning();
+        scheduleDozeHeartbeat();
         broadcastSnapshot();
         broadcastWatches();
     }
@@ -623,7 +801,21 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         String action = intent.getAction();
         JSONObject payload = parsePayload(intent.getStringExtra(EXTRA_PAYLOAD));
 
-        if (ACTION_ENSURE_ALIVE.equals(action) || ACTION_RESTORE_WATCHDOG.equals(action)) {
+        if (ACTION_HEARTBEAT_POLL.equals(action)) {
+            if (!hasAnyActiveWork()) restorePersistedState();
+            if (hasAnyActiveWork()) {
+                ensureWakeLock();
+                ensurePollingRunning();
+                scheduleDozeHeartbeat();
+                // Si el SO durmió el executor por > 18s, disparar un sondeo inmediato despertado por AlarmManager
+                if (System.currentTimeMillis() - lastPollCompletedMs > 18_000L && pollExecutor != null && !pollExecutor.isShutdown()) {
+                    pollExecutor.execute(this::pollAllTargetsSafe);
+                }
+                return START_STICKY;
+            }
+            stopForegroundAndIdle();
+            return START_NOT_STICKY;
+        } else if (ACTION_ENSURE_ALIVE.equals(action) || ACTION_RESTORE_WATCHDOG.equals(action)) {
             if (!hasAnyActiveWork()) {
                 restorePersistedState();
             }
@@ -706,6 +898,15 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         if (p.has("ttsEnabled")) ttsEnabled = p.optBoolean("ttsEnabled", ttsEnabled);
         if (p.has("soundEnabled")) soundEnabled = p.optBoolean("soundEnabled", soundEnabled);
         if (p.has("leadMin")) leadMin = Math.max(1, p.optInt("leadMin", leadMin));
+        if (p.has("ttsSpeechRate")) {
+            ttsSpeechRate = (float) Math.max(0.75, Math.min(1.35, p.optDouble("ttsSpeechRate", ttsSpeechRate)));
+            if (tts != null && ttsReady) {
+                try {
+                    tts.setSpeechRate(ttsSpeechRate);
+                } catch (Exception ignored) {}
+            }
+        }
+        if (p.has("ttsSpeakInDnd")) ttsSpeakInDnd = p.optBoolean("ttsSpeakInDnd", ttsSpeakInDnd);
         String base = p.optString("apiBase", "").trim();
         if (!base.isEmpty()) apiBase = base.replaceAll("/+$", "");
     }
@@ -886,7 +1087,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             w.triggered = true;
             w.lastSpokenEtaMin = w.etaMin;
             shouldAlert = true;
-        } else if (minuteByMinute && w.etaMin <= Math.max(w.leadMin, 10)) {
+        } else if (minuteByMinute && w.etaMin <= Math.max(w.leadMin, 15)) {
             boolean isLower = (w.lastSpokenEtaMin == null) || (w.etaMin < w.lastSpokenEtaMin);
             boolean reachedNow = (w.etaMin == 0 && (w.lastSpokenEtaMin == null || w.lastSpokenEtaMin != 0));
             if (isLower || reachedNow) {
@@ -1232,7 +1433,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private void stopForegroundAndIdle() {
         stopWaitingPoller();
         stopGpsUpdates();
+        cancelDozeHeartbeat();
         releaseWakeLock();
+        releaseTtsWakeLock();
         activeForegroundNotifId = 0;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE);
@@ -1262,7 +1465,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setAutoCancel(true)
                 .setSilent(true)
-                .setContentIntent(buildOpenAppIntent());
+                .setContentIntent(buildOpenAppIntent(null));
             notifManager.notify(notifId, b.build());
         }
         if (playSound) {
@@ -1283,6 +1486,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             return;
         }
         ensureWakeLock();
+        scheduleDozeHeartbeat();
         if (pollFuture != null && !pollFuture.isCancelled() && !pollFuture.isDone()) return;
         if (pollExecutor == null || pollExecutor.isShutdown()) {
             pollExecutor = Executors.newSingleThreadScheduledExecutor();
@@ -1301,8 +1505,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         try {
             if (hasAnyActiveWork()) {
                 ensureWakeLock();
+                scheduleDozeHeartbeat();
             }
             pollAllTargetsOnce();
+            lastPollCompletedMs = System.currentTimeMillis();
         } catch (Throwable t) {
             // Nunca dejar que una excepción inesperada mate el ScheduledExecutorService
             Log.e(TAG, "Recovered from background poll error", t);
@@ -1678,11 +1884,16 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
-    private PendingIntent buildOpenAppIntent() {
+    private PendingIntent buildOpenAppIntent(@Nullable String targetStopId) {
         Intent i = new Intent(this, MainActivity.class);
         i.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int reqCode = 100;
+        if (targetStopId != null && !targetStopId.isEmpty()) {
+            i.putExtra("dgps_stop_id", targetStopId);
+            reqCode = 101 + Math.abs(targetStopId.hashCode() % 400);
+        }
         int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
-        return PendingIntent.getActivity(this, 100, i, flags);
+        return PendingIntent.getActivity(this, reqCode, i, flags);
     }
 
     private PendingIntent buildServiceActionIntent(String action, int reqCode, @Nullable String watchKey) {
@@ -1702,6 +1913,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
      * sobre el trazado del recorrido y hora programada real.
      */
     private NotificationCompat.Builder buildUberArrivalBuilder(
+        String targetStopId,
         String targetLine,
         String targetCoche,
         String targetDriver,
@@ -1760,7 +1972,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
-            .setContentIntent(buildOpenAppIntent())
+            .setContentIntent(buildOpenAppIntent(targetStopId))
             .setContentTitle(etaHeadline)
             .setContentText("Coche " + cocheTxt + " · " + distLine + " · Prog. real: " + schedTxt)
             .setStyle(new NotificationCompat.DecoratedCustomViewStyle())
@@ -1774,6 +1986,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
      */
     private Notification buildWatchNotification(WatchAlert w) {
         return buildUberArrivalBuilder(
+            w.stopId,
             w.lineName,
             w.coche,
             w.choferNombre,
@@ -1797,6 +2010,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             ? "✅ Subir activado · pasa a A Bordo al llegar"
             : null;
         NotificationCompat.Builder builder = buildUberArrivalBuilder(
+            stopId,
             lineName,
             coche,
             choferNombre,
@@ -1846,7 +2060,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
-            .setContentIntent(buildOpenAppIntent())
+            .setContentIntent(buildOpenAppIntent(stopId))
             .setContentTitle(title)
             .setContentText("Próxima: " + nextClean + distPart)
             .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody))
@@ -1854,14 +2068,22 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             .build();
     }
 
-    // ── Real Phone Notification Ringtone + Vibrate + Post-Chime Native TTS ────
+    // ── Custom Phone Notification Ringtone + Vibrate + Immortal Background TTS ──
     private void triggerChimeAndSpeech(String speechText) {
+        acquireTtsWakeLock();
         boolean playedSound = false;
         if (soundEnabled) {
             playedSound = playDeviceNotificationChime();
         }
         if (ttsEnabled && speechText != null && !speechText.isEmpty()) {
-            scheduleSpeech(speechText, playedSound ? 950 : 120, true);
+            int ringerMode = audioManager != null ? audioManager.getRingerMode() : AudioManager.RINGER_MODE_NORMAL;
+            if (ttsSpeakInDnd || ringerMode == AudioManager.RINGER_MODE_NORMAL) {
+                scheduleSpeech(speechText, playedSound ? 950 : 120, true);
+            } else {
+                releaseTtsWakeLock();
+            }
+        } else {
+            releaseTtsWakeLock();
         }
     }
 
@@ -1872,7 +2094,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         lastChimeMs = now;
 
         int ringerMode = audioManager != null ? audioManager.getRingerMode() : AudioManager.RINGER_MODE_NORMAL;
-        if (ringerMode == AudioManager.RINGER_MODE_SILENT) return false;
+        if (ringerMode == AudioManager.RINGER_MODE_SILENT && !ttsSpeakInDnd) return false;
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1892,16 +2114,25 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             }
         } catch (Exception ignored) {}
 
-        if (ringerMode != AudioManager.RINGER_MODE_NORMAL) return false;
+        if (ringerMode != AudioManager.RINGER_MODE_NORMAL && !ttsSpeakInDnd) return false;
 
         try {
-            Uri uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
-            Ringtone ringtone = RingtoneManager.getRingtone(getApplicationContext(), uri);
+            String customUriStr = getCustomRingtoneUri(getApplicationContext());
+            Uri uri = (customUriStr != null && !customUriStr.isEmpty())
+                ? Uri.parse(customUriStr)
+                : RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            Ringtone ringtone = uri != null ? RingtoneManager.getRingtone(getApplicationContext(), uri) : null;
+            if (ringtone == null) {
+                Uri fallback = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+                ringtone = fallback != null ? RingtoneManager.getRingtone(getApplicationContext(), fallback) : null;
+            }
             if (ringtone != null) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     ringtone.setAudioAttributes(
                         new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setUsage(ttsSpeakInDnd
+                                ? AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+                                : AudioAttributes.USAGE_NOTIFICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
                     );
@@ -1915,53 +2146,101 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         return false;
     }
 
-    // ── Native Android TextToSpeech with AudioFocus (queued so simultaneous alerts never clip) ──
+    // ── Self-Healing Background TTS (never sleeps after minutes in Doze / One UI!) ──
     private void scheduleSpeech(String text, long delayMs, boolean queueAdd) {
         if (text == null || text.trim().isEmpty()) return;
+        acquireTtsWakeLock();
         if (delayMs <= 0) {
             speakNow(text, queueAdd);
             return;
         }
-        final Runnable task = new Runnable() {
-            @Override
-            public void run() {
-                scheduledSpeechTasks.remove(this);
-                speakNow(text, queueAdd);
-            }
-        };
-        scheduledSpeechTasks.add(task);
-        mainHandler.postDelayed(task, delayMs);
+        if (speechExecutor == null || speechExecutor.isShutdown()) {
+            speechExecutor = Executors.newSingleThreadScheduledExecutor();
+        }
+        // Usar ScheduledExecutorService + WakeLock (a diferencia de Handler.postDelayed, no se congela en Doze)
+        ScheduledFuture<?> fut = speechExecutor.schedule(() -> {
+            speakNow(text, queueAdd);
+        }, delayMs, TimeUnit.MILLISECONDS);
+        scheduledSpeechFutures.add(fut);
     }
 
     private void cancelPendingSpeech() {
-        for (Runnable r : scheduledSpeechTasks) {
-            mainHandler.removeCallbacks(r);
+        synchronized (scheduledSpeechFutures) {
+            for (ScheduledFuture<?> f : scheduledSpeechFutures) {
+                try {
+                    f.cancel(false);
+                } catch (Exception ignored) {}
+            }
+            scheduledSpeechFutures.clear();
         }
-        scheduledSpeechTasks.clear();
+        for (ScheduledFuture<?> wd : utteranceWatchdogs.values()) {
+            try {
+                wd.cancel(false);
+            } catch (Exception ignored) {}
+        }
+        utteranceWatchdogs.clear();
+        activeUtteranceTexts.clear();
         if (tts != null && ttsReady) {
             try {
                 tts.stop();
             } catch (Exception ignored) {}
         }
+        releaseTtsWakeLock();
     }
 
     private void speakNow(String text, boolean queueAdd) {
+        if (text == null || text.trim().isEmpty()) return;
+        acquireTtsWakeLock();
+
         if (!ttsReady || tts == null) {
             pendingInitSpeeches.add(text);
+            if (!ttsInitializing) {
+                reinitTtsEngine();
+            }
             return;
         }
+
         requestAudioFocus();
         Bundle params = new Bundle();
         params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f);
+        String uttId = "dgps-" + System.nanoTime();
+        activeUtteranceTexts.put(uttId, text);
+
         try {
-            tts.speak(
+            tts.setSpeechRate(ttsSpeechRate);
+            int res = tts.speak(
                 text,
                 queueAdd ? TextToSpeech.QUEUE_ADD : TextToSpeech.QUEUE_FLUSH,
                 params,
-                "dgps-" + System.currentTimeMillis()
+                uttId
             );
+            if (res != TextToSpeech.SUCCESS) {
+                // El servicio Binder remoto de Google/Samsung TTS se durmió: recrear motor y reproducir!
+                Log.w(TAG, "tts.speak returned ERROR (" + res + ") -> reinitializing TTS engine");
+                activeUtteranceTexts.remove(uttId);
+                pendingInitSpeeches.add(text);
+                reinitTtsEngine();
+                return;
+            }
+
+            // Watchdog de 2.8 s: si onStart(uttId) no arrancó, el motor TTS remoto quedó zombi -> reiniciar y reintentar
+            if (speechExecutor != null && !speechExecutor.isShutdown()) {
+                ScheduledFuture<?> wd = speechExecutor.schedule(() -> {
+                    utteranceWatchdogs.remove(uttId);
+                    String stuckText = activeUtteranceTexts.remove(uttId);
+                    if (stuckText != null && retriedUtterances.add(uttId)) {
+                        Log.w(TAG, "TTS watchdog triggered (silent binder) -> recreating TTS engine");
+                        pendingInitSpeeches.add(stuckText);
+                        reinitTtsEngine();
+                    }
+                }, 2800L, TimeUnit.MILLISECONDS);
+                utteranceWatchdogs.put(uttId, wd);
+            }
         } catch (Exception e) {
-            abandonAudioFocus();
+            Log.w(TAG, "TTS speak exception -> recreating engine", e);
+            activeUtteranceTexts.remove(uttId);
+            pendingInitSpeeches.add(text);
+            reinitTtsEngine();
         }
     }
 
@@ -1969,12 +2248,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         if (audioManager == null) return;
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build();
                 audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                    .setAudioAttributes(attrs)
+                    .setAudioAttributes(buildTtsAudioAttributes())
                     .setAcceptsDelayedFocusGain(false)
                     .build();
                 audioManager.requestAudioFocus(audioFocusRequest);
@@ -2005,8 +2280,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     private void broadcastWatches() {
         JSONArray arr = new JSONArray();
-        for (WatchAlert w : watchedAlerts.values()) {
-            arr.put(w.toJson());
+        synchronized (watchedAlerts) {
+            for (WatchAlert w : watchedAlerts.values()) {
+                arr.put(w.toJson());
+            }
         }
         StateListener listener = stateListener;
         if (listener != null) {
@@ -2074,17 +2351,23 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     public void onTimeout(int startId, int fgsType) {
         // Android 15+ FGS timeout guard: guardar estado y detener ordenadamente sin crashear
         persistState();
+        cancelDozeHeartbeat();
         releaseWakeLock();
+        releaseTtsWakeLock();
         stopSelf(startId);
     }
 
     @Override
     public void onDestroy() {
+        serviceRunning = false;
         stopWaitingPoller();
         stopGpsUpdates();
+        cancelDozeHeartbeat();
         cancelPendingSpeech();
         releaseWakeLock();
+        releaseTtsWakeLock();
         if (pollExecutor != null) pollExecutor.shutdownNow();
+        if (speechExecutor != null) speechExecutor.shutdownNow();
         if (tts != null) {
             try {
                 tts.shutdown();

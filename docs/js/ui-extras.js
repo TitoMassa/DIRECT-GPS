@@ -15,6 +15,11 @@ import {
   speakViaNativeAndroid,
   upsertNativeWatchAlert,
   removeNativeWatchAlert,
+  getNotificationRingtone,
+  pickNotificationRingtone,
+  resetNotificationRingtone,
+  shareNativeImage,
+  getNativeAndroidStatus,
   haptic,
   notifyArrival as sendNativeNotification
 } from './native.js';
@@ -38,7 +43,7 @@ import {
 } from './ride-mode.js';
 
 const STORAGE_MAP_STYLE_KEY = 'directgps_map_style_v1'; // 'auto' | 'osm' | 'dark'
-const STORAGE_ALERT_PREFS_KEY = 'directgps_alert_prefs_v1'; // { leadMin: 3|5|8|10, tts: boolean, minuteByMinute: boolean }
+const STORAGE_ALERT_PREFS_KEY = 'directgps_alert_prefs_v1'; // { leadMin: 3|5|8|10, tts: boolean, minuteByMinute: boolean, ttsRate: number, ttsSpeakInDnd: boolean }
 const STORAGE_FAV_ENTITIES_KEY = 'directgps_fav_entities_v1'; // [{ type:'coche'|'chofer', id, label, sub, lineName, codLinea }]
 const STORAGE_SIMPLE_MODE_KEY = 'directgps_simple_mode_v1';
 const STORAGE_PERMS_DISMISSED_KEY = 'directgps_perms_prompt_dismissed_v1';
@@ -79,15 +84,19 @@ export function createUiExtras(ctx) {
     // ignore
   }
 
-  let alertPrefs = { leadMin: 3, tts: false, minuteByMinute: false };
+  let alertPrefs = { leadMin: 3, tts: false, minuteByMinute: false, ttsRate: 1.02, ttsSpeakInDnd: true };
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_ALERT_PREFS_KEY) || 'null');
     if (raw && typeof raw === 'object') {
       const lm = Number(raw.leadMin);
+      const rateRaw = Number(raw.ttsRate);
+      const validRate = [0.85, 1.02, 1.2].find((r) => Math.abs(r - rateRaw) < 0.02);
       alertPrefs = {
         leadMin: [3, 5, 8, 10].includes(lm) ? lm : 3,
         tts: Boolean(raw.tts),
-        minuteByMinute: Boolean(raw.minuteByMinute)
+        minuteByMinute: Boolean(raw.minuteByMinute),
+        ttsRate: validRate || 1.02,
+        ttsSpeakInDnd: raw.ttsSpeakInDnd !== false
       };
     }
   } catch {
@@ -181,9 +190,9 @@ export function createUiExtras(ctx) {
     }
     if (!isSpeechSupported()) return;
     if (afterChime) {
-      speakAfterNotification(text, { delayMs });
+      speakAfterNotification(text, { delayMs, rate: alertPrefs.ttsRate });
     } else {
-      speakText(text);
+      speakText(text, { rate: alertPrefs.ttsRate });
     }
   }
 
@@ -1070,6 +1079,21 @@ export function createUiExtras(ctx) {
 
   btnExpShare?.addEventListener('click', async () => {
     if (!expCtx || !expCanvas) return;
+    if (isNative) {
+      const mime = expCtx.format === 'jpg' ? 'image/jpeg' : 'image/png';
+      const ext = expCtx.format === 'jpg' ? 'jpg' : 'png';
+      const dataUrl = expCanvas.toDataURL(mime, 0.94);
+      const shared = await shareNativeImage({
+        dataUrl,
+        filename: `${buildExportFileName()}.${ext}`,
+        title: `Horarios DIRECT GPS · ${expCtx.linea?.descripcion || ''}`.trim()
+      });
+      if (shared) {
+        haptic('light');
+        showToast('Compartiendo imagen desde Android...', 'success', 2200);
+        return;
+      }
+    }
     const res = await exportCanvasAsImage(expCanvas, {
       format: expCtx.format,
       fileName: buildExportFileName(),
@@ -1466,10 +1490,41 @@ export function createUiExtras(ctx) {
       applyMapStyle(next);
     });
 
-    // Alert lead-time pills, minute-by-minute, TTS & Android notifications
+    // Alert lead-time pills, minute-by-minute, TTS, native phone ringtone & Android notifications
+    const ringtoneTitleEl = document.getElementById('ringtone-current-title');
+    if (isNative && ringtoneTitleEl) {
+      getNotificationRingtone().then((r) => {
+        if (r?.title) ringtoneTitleEl.textContent = r.title;
+      });
+    }
+
+    document.getElementById('btn-pick-ringtone')?.addEventListener('click', async () => {
+      if (!isNative) return;
+      haptic('light');
+      const res = await pickNotificationRingtone();
+      if (res && !res.canceled) {
+        if (ringtoneTitleEl) ringtoneTitleEl.textContent = res.title || 'Timbre elegido';
+        haptic('medium');
+        showToast(`Timbre actualizado: ${res.title || 'Timbre elegido'}`, 'success', 3000);
+      }
+    });
+
+    document.getElementById('btn-reset-ringtone')?.addEventListener('click', async () => {
+      if (!isNative) return;
+      haptic('light');
+      const res = await resetNotificationRingtone();
+      if (ringtoneTitleEl) ringtoneTitleEl.textContent = res?.title || 'Timbre predeterminado del teléfono';
+      showToast('Timbre restablecido al predeterminado del teléfono', 'info', 2600);
+    });
+
     const syncAlertUi = () => {
       document.querySelectorAll('[data-alert-lead]').forEach((b) => {
         const active = Number(b.dataset.alertLead) === alertPrefs.leadMin;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
+      document.querySelectorAll('[data-tts-rate]').forEach((b) => {
+        const active = Math.abs(Number(b.dataset.ttsRate) - (alertPrefs.ttsRate || 1.02)) < 0.02;
         b.classList.toggle('active', active);
         b.setAttribute('aria-pressed', String(active));
       });
@@ -1477,6 +1532,8 @@ export function createUiExtras(ctx) {
       if (minChk) minChk.checked = Boolean(alertPrefs.minuteByMinute);
       const ttsChk = document.getElementById('chk-tts-alerts');
       if (ttsChk) ttsChk.checked = Boolean(alertPrefs.tts);
+      const dndChk = document.getElementById('chk-tts-dnd');
+      if (dndChk) dndChk.checked = alertPrefs.ttsSpeakInDnd !== false;
       syncNotifPermissionButtons();
     };
     syncAlertUi();
@@ -1487,8 +1544,36 @@ export function createUiExtras(ctx) {
         saveAlertPrefs();
         liveTracker.syncPrefs({ leadMin: alertPrefs.leadMin });
         syncAlertUi();
+        haptic('light');
         showToast(`Las alertas avisarán cuando falten ≤ ${alertPrefs.leadMin} min`, 'success', 2400);
       });
+    });
+
+    document.querySelectorAll('[data-tts-rate]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const r = Number(btn.dataset.ttsRate);
+        alertPrefs.ttsRate = [0.85, 1.02, 1.2].find((v) => Math.abs(v - r) < 0.02) || 1.02;
+        saveAlertPrefs();
+        liveTracker.syncPrefs({ ttsSpeechRate: alertPrefs.ttsRate });
+        syncAlertUi();
+        haptic('light');
+        const lbl = alertPrefs.ttsRate < 0.95 ? 'Pausada' : alertPrefs.ttsRate > 1.1 ? 'Ágil' : 'Natural';
+        showToast(`Velocidad de voz: ${lbl}`, 'success', 2200);
+      });
+    });
+
+    document.getElementById('chk-tts-dnd')?.addEventListener('change', (e) => {
+      alertPrefs.ttsSpeakInDnd = Boolean(e.target.checked);
+      saveAlertPrefs();
+      liveTracker.syncPrefs({ ttsSpeakInDnd: alertPrefs.ttsSpeakInDnd });
+      haptic('light');
+      showToast(
+        alertPrefs.ttsSpeakInDnd
+          ? 'La voz hablará incluso en No molestar o vibración'
+          : 'La voz respetará el modo No molestar del teléfono',
+        'info',
+        2800
+      );
     });
 
     document.getElementById('chk-minute-alerts')?.addEventListener('change', async (e) => {
@@ -1513,7 +1598,7 @@ export function createUiExtras(ctx) {
         if (isNative) {
           speakViaNativeAndroid('Avisos por voz activados en Direct G P S.');
         } else if (isSpeechSupported()) {
-          speakText('Avisos por voz activados en Direct G P S.');
+          speakText('Avisos por voz activados en Direct G P S.', { rate: alertPrefs.ttsRate });
         } else {
           showToast('Tu navegador no soporta síntesis de voz.', 'warn', 3000);
         }
@@ -1557,7 +1642,7 @@ export function createUiExtras(ctx) {
           return;
         }
         // Reproducir voz DESPUÉS del timbre de notificación
-        speakAfterNotification(demoMsg, { delayMs: 950 });
+        speakAfterNotification(demoMsg, { delayMs: 950, rate: alertPrefs.ttsRate });
       }
     });
 
@@ -1610,16 +1695,22 @@ export function createUiExtras(ctx) {
         if (parsed.mapStyle) applyMapStyle(parsed.mapStyle, { silent: true });
         if (typeof parsed.simpleMode === 'boolean') setSimpleMode(parsed.simpleMode, { silent: true });
         if (parsed.alertPrefs) {
+          const rateRaw = Number(parsed.alertPrefs.ttsRate);
+          const validRate = [0.85, 1.02, 1.2].find((r) => Math.abs(r - rateRaw) < 0.02);
           alertPrefs = {
             leadMin: [3, 5, 8, 10].includes(Number(parsed.alertPrefs.leadMin)) ? Number(parsed.alertPrefs.leadMin) : 3,
             tts: Boolean(parsed.alertPrefs.tts),
-            minuteByMinute: Boolean(parsed.alertPrefs.minuteByMinute)
+            minuteByMinute: Boolean(parsed.alertPrefs.minuteByMinute),
+            ttsRate: validRate || 1.02,
+            ttsSpeakInDnd: parsed.alertPrefs.ttsSpeakInDnd !== false
           };
           saveAlertPrefs();
           liveTracker.syncPrefs({
             leadMin: alertPrefs.leadMin,
             ttsEnabled: alertPrefs.tts,
-            minuteByMinute: alertPrefs.minuteByMinute
+            minuteByMinute: alertPrefs.minuteByMinute,
+            ttsSpeechRate: alertPrefs.ttsRate,
+            ttsSpeakInDnd: alertPrefs.ttsSpeakInDnd
           });
           syncAlertUi();
           syncSimpleModeUi();
@@ -1655,13 +1746,11 @@ export function createUiExtras(ctx) {
   async function refreshDiagnosticsPanel() {
     const diagEl = document.getElementById('diag-status-box');
     if (!diagEl) return;
-    diagEl.innerHTML = `<div class="diag-row"><span>Consultando servidor...</span></div>`;
-    let health = null;
-    try {
-      health = await api.health();
-    } catch {
-      health = null;
-    }
+    diagEl.innerHTML = `<div class="diag-row"><span>Consultando estado...</span></div>`;
+    const [health, nativeStatus] = await Promise.all([
+      api.health().catch(() => null),
+      isNative ? getNativeAndroidStatus().catch(() => null) : Promise.resolve(null)
+    ]);
     let storageTxt = 'No disponible';
     try {
       if (navigator.storage?.estimate) {
@@ -1675,7 +1764,22 @@ export function createUiExtras(ctx) {
     const schedWin = Array.isArray(health?.autoHorariosScan?.scheduleWindows)
       ? health.autoHorariosScan.scheduleWindows.join(' · ')
       : '03:00–04:30 · 15:00–16:00';
+    let nativeRows = '';
+    if (nativeStatus) {
+      const watchCount = Number(nativeStatus.activeWatchCount) || 0;
+      const svcTxt = nativeStatus.serviceRunning
+        ? `Activo${watchCount > 0 ? ` · ${watchCount} alerta${watchCount === 1 ? '' : 's'}` : ''}`
+        : 'En espera';
+      nativeRows = `
+        <div class="diag-row"><span>App Android</span><strong class="mono">v${esc(nativeStatus.versionName || '3.0.0')} · Android ${esc(nativeStatus.androidRelease || '?')}</strong></div>
+        <div class="diag-row"><span>Dispositivo</span><strong>${esc(nativeStatus.deviceModel || 'Android')}</strong></div>
+        <div class="diag-row"><span>Servicio 2° plano</span><strong>${esc(svcTxt)}</strong></div>
+        <div class="diag-row"><span>Timbre elegido</span><strong>${esc(nativeStatus.ringtoneTitle || 'Predeterminado')}</strong></div>
+        <div class="diag-row"><span>Batería 2° plano</span><strong>${nativeStatus.batteryUnrestricted ? '✓ Sin restricciones' : '⚠ Optimizada'}</strong></div>
+      `;
+    }
     diagEl.innerHTML = `
+      ${nativeRows}
       <div class="diag-row"><span>Servidor Worker</span><strong class="mono">${health?.ok ? `v${esc(health.version || '?')} · Online` : 'Sin conexión'}</strong></div>
       <div class="diag-row"><span>Retención historial</span><strong>${health?.autoFleetScan?.retentionDays || 7} días</strong></div>
       <div class="diag-row"><span>Escáner horarios</span><strong>${esc(schedWin)}</strong></div>
@@ -1702,8 +1806,16 @@ export function createUiExtras(ctx) {
     }
   }
 
-  // Initialize controls on creation
+  // Initialize controls on creation and sync persisted TTS/alert prefs to native Android service
   wireSettingsModalTabs();
+  liveTracker.syncPrefs({
+    leadMin: alertPrefs.leadMin,
+    ttsEnabled: alertPrefs.tts,
+    minuteByMinute: alertPrefs.minuteByMinute,
+    soundEnabled: state.soundEnabled,
+    ttsSpeechRate: alertPrefs.ttsRate,
+    ttsSpeakInDnd: alertPrefs.ttsSpeakInDnd
+  });
   applyMapStyle(mapStylePref, { silent: true });
   syncSimpleModeUi();
 

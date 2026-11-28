@@ -46,14 +46,30 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
-        <!-- Foreground Service nativo estilo Uber (barra de progreso, timbre + TTS es-AR, Subir/Bajar) -->
+        <!-- Foreground Service nativo estilo Uber (barra de progreso, timbre elegido + TTS inmortal, Subir/Bajar) -->
         <service
             android:name=".DirectGpsTripService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="location|dataSync" />
+
+        <!-- Widget nativo en pantalla de inicio de Android -->
+        <receiver
+            android:name=".DirectGpsWidgetProvider"
+            android:exported="true"
+            android:label="DIRECT GPS · En vivo">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/direct_gps_widget_info" />
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

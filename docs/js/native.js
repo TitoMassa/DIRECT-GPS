@@ -144,14 +144,22 @@ export function buildShareUrl(stopId, codLinea = '000') {
   return url.toString();
 }
 
-export async function initNative({ onBack, onPause, onResume } = {}) {
+export async function initNative({ onBack, onPause, onResume, onDeepLink } = {}) {
   if (typeof document !== 'undefined') {
     document.documentElement.classList.add(isNative ? 'is-native' : 'is-web', `platform-${platform}`);
   }
   const plugin = getDirectGpsNativePlugin();
+  let initialLink = null;
   if (plugin) {
     const status = await safe(() => plugin.getPermissionsStatus(), null);
     if (status?.notifications) cachedNativeNotifPerm = status.notifications;
+
+    if (plugin.consumeLaunchDeepLink) {
+      const pending = await safe(() => plugin.consumeLaunchDeepLink(), null);
+      if (pending && (pending.stopId || pending.tab || pending.action)) {
+        initialLink = pending;
+      }
+    }
 
     if (plugin.addListener) {
       if (typeof onBack === 'function') {
@@ -175,9 +183,18 @@ export async function initNative({ onBack, onPause, onResume } = {}) {
           })
         );
       }
+      if (typeof onDeepLink === 'function') {
+        safe(() =>
+          plugin.addListener('deepLink', (link) => {
+            if (link && (link.stopId || link.tab || link.action)) {
+              onDeepLink(link);
+            }
+          })
+        );
+      }
     }
   }
-  return null;
+  return initialLink;
 }
 
 export function hideSplash() {}
@@ -272,11 +289,46 @@ export async function shareStop({ id, nombre, codLinea = '000' }) {
 }
 
 export function haptic(kind = 'light') {
+  const plugin = getDirectGpsNativePlugin();
+  if (plugin?.hapticFeedback) {
+    safe(() => plugin.hapticFeedback({ kind }));
+    return;
+  }
   if (typeof navigator !== 'undefined' && navigator.vibrate) {
     if (kind === 'success') navigator.vibrate([32, 50, 32]);
     else if (kind === 'medium') navigator.vibrate(20);
-    else if (isNative) navigator.vibrate(10);
   }
+}
+
+export async function getNotificationRingtone() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.getNotificationRingtone) return null;
+  return safe(() => plugin.getNotificationRingtone(), null);
+}
+
+export async function pickNotificationRingtone() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.pickNotificationRingtone) return null;
+  return safe(() => plugin.pickNotificationRingtone(), null);
+}
+
+export async function resetNotificationRingtone() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.resetNotificationRingtone) return null;
+  return safe(() => plugin.resetNotificationRingtone(), null);
+}
+
+export async function shareNativeImage({ dataUrl, filename = 'direct-gps-horarios.png', title = 'Horarios DIRECT GPS' } = {}) {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.shareImageBase64 || !dataUrl) return false;
+  const res = await safe(() => plugin.shareImageBase64({ dataUrl, filename, title }), null);
+  return Boolean(res?.shared);
+}
+
+export async function getNativeAndroidStatus() {
+  const plugin = getDirectGpsNativePlugin();
+  if (!plugin?.getNativeStatus) return null;
+  return safe(() => plugin.getNativeStatus(), null);
 }
 
 // ── Android-Native (Capacitor Foreground Service / Service Worker) Notifications & Permissions ──
