@@ -356,11 +356,11 @@ public class DirectGpsNativePlugin extends Plugin {
         try {
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
             long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
-            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.1.3");
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.1.4");
             ret.put("versionCode", vCode);
         } catch (Exception e) {
-            ret.put("versionName", "3.1.3");
-            ret.put("versionCode", 313);
+            ret.put("versionName", "3.1.4");
+            ret.put("versionCode", 314);
         }
         boolean batteryIgnoring = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -385,11 +385,11 @@ public class DirectGpsNativePlugin extends Plugin {
             Context ctx = getContext();
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
             long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
-            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.1.3");
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "3.1.4");
             ret.put("versionCode", vCode);
         } catch (Exception e) {
-            ret.put("versionName", "3.1.3");
-            ret.put("versionCode", 313);
+            ret.put("versionName", "3.1.4");
+            ret.put("versionCode", 314);
         }
         call.resolve(ret);
     }

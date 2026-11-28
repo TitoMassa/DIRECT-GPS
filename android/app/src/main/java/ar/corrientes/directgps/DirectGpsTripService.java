@@ -1303,10 +1303,34 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             boolean jsSimDriving = (now - w.lastJsSimMs) < 12_000L && !isInitialOrUnitChange;
             if (!jsSimDriving) {
                 boolean coherentDist = nextDist >= 0 && isDistanceCoherentWithEta(nextDist, effEta);
-                boolean sameStaleFix = (rawGpsMs > 0 && rawGpsMs == w.lastRawGpsMs && w.distM >= 0 && !isInitialOrUnitChange);
-                if (coherentDist && !sameStaleFix) {
-                    if (w.lastRawGpsMs > 0 && rawGpsMs > w.lastRawGpsMs && w.lastRawDistM > 0 && !isInitialOrUnitChange) {
-                        double dtGps = (rawGpsMs - w.lastRawGpsMs) / 1000.0;
+                long prevGpsMs = w.lastRawGpsMs;
+                long effGpsAgeMs = rawGpsMs > 0 ? Math.max(0L, now - rawGpsMs) : 0L;
+                boolean sameStaleFix = (rawGpsMs > 0 && rawGpsMs == prevGpsMs && w.distM >= 0 && !isInitialOrUnitChange);
+                boolean silentOver3Min = (rawGpsMs > 0 && effGpsAgeMs >= 180_000L && !isInitialOrUnitChange);
+                boolean gpsRecoveredFromGap = (rawGpsMs > 0 && prevGpsMs > 0 && rawGpsMs > prevGpsMs
+                    && (rawGpsMs - prevGpsMs) >= 180_000L && effGpsAgeMs < 180_000L);
+
+                if (silentOver3Min && w.scheduledHHMM != null && !w.scheduledHHMM.isEmpty()) {
+                    // 3–5 min sin GPS: usar último desvío visto; >= 5 min: estrictamente puntual 00:00 según horario programado
+                    boolean strictPunctual = effGpsAgeMs >= 300_000L;
+                    double schedRemSec = NativeScheduleLookup.computeScheduleRemainingSec(
+                        w.scheduledHHMM, w.desvioHorario, strictPunctual, now
+                    );
+                    if (schedRemSec >= 0) {
+                        w.simEtaSec = w.simEtaSec < 0 ? schedRemSec : (w.simEtaSec * 0.45 + schedRemSec * 0.55);
+                        double targetSchedDist = Math.max(effEta <= 0 ? 0.0 : 35.0, schedRemSec * Math.max(2.6, w.simSpeedMps));
+                        if (w.distM < 0) {
+                            w.distM = targetSchedDist;
+                        } else {
+                            w.distM = w.distM * 0.65 + targetSchedDist * 0.35;
+                        }
+                        if (w.initialDistM < w.distM) {
+                            w.initialDistM = computeInitialReferenceDist(w.distM, effEta);
+                        }
+                    }
+                } else if (coherentDist && !sameStaleFix) {
+                    if (prevGpsMs > 0 && rawGpsMs > prevGpsMs && w.lastRawDistM > 0 && !isInitialOrUnitChange) {
+                        double dtGps = (rawGpsMs - prevGpsMs) / 1000.0;
                         if (dtGps >= 8.0 && dtGps <= 220.0) {
                             double measuredSpd = (w.lastRawDistM - nextDist) / dtGps;
                             if (measuredSpd >= 1.2 && measuredSpd <= 15.0) {
@@ -1324,6 +1348,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
                     if (isInitialOrUnitChange || w.distM < 0 || Math.abs(liveDistNow - w.distM) > 850.0) {
                         w.distM = liveDistNow;
+                    } else if (gpsRecoveredFromGap) {
+                        // Al volver señal GPS tras ≥ 3 min: corrección suave pero rápida y precisa hacia la posición real
+                        w.distM = w.distM * 0.25 + liveDistNow * 0.75;
                     } else {
                         // Convergencia suave por velocidad (cero saltos bruscos!)
                         double errM = w.distM - liveDistNow;
@@ -1344,7 +1371,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                     }
                 }
 
-                if (nextEta >= 0) {
+                if (nextEta >= 0 && !(silentOver3Min && w.scheduledHHMM != null && !w.scheduledHHMM.isEmpty())) {
                     double targetEtaSec = nextEta == 0 ? 0.0 : Math.max(30.0, nextEta * 60.0 - 20.0);
                     if (isInitialOrUnitChange || w.simEtaSec < 0 || Math.abs(targetEtaSec - w.simEtaSec) > 180.0) {
                         w.simEtaSec = targetEtaSec;
@@ -1609,10 +1636,33 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             boolean jsSimDriving = (now - primaryLastJsSimMs) < 12_000L && !isInitialOrUnitChange;
             if (!jsSimDriving) {
                 boolean coherentDist = nextDist >= 0 && isDistanceCoherentWithEta(nextDist, effEta);
-                boolean sameStaleFix = (rawGpsMs > 0 && rawGpsMs == primaryLastRawGpsMs && distM >= 0 && !isInitialOrUnitChange);
-                if (coherentDist && !sameStaleFix) {
-                    if (primaryLastRawGpsMs > 0 && rawGpsMs > primaryLastRawGpsMs && primaryLastRawDistM > 0 && !isInitialOrUnitChange) {
-                        double dtGps = (rawGpsMs - primaryLastRawGpsMs) / 1000.0;
+                long prevGpsMs = primaryLastRawGpsMs;
+                long effGpsAgeMs = rawGpsMs > 0 ? Math.max(0L, now - rawGpsMs) : 0L;
+                boolean sameStaleFix = (rawGpsMs > 0 && rawGpsMs == prevGpsMs && distM >= 0 && !isInitialOrUnitChange);
+                boolean silentOver3Min = (rawGpsMs > 0 && effGpsAgeMs >= 180_000L && !isInitialOrUnitChange);
+                boolean gpsRecoveredFromGap = (rawGpsMs > 0 && prevGpsMs > 0 && rawGpsMs > prevGpsMs
+                    && (rawGpsMs - prevGpsMs) >= 180_000L && effGpsAgeMs < 180_000L);
+
+                if (silentOver3Min && scheduledHHMM != null && !scheduledHHMM.isEmpty()) {
+                    boolean strictPunctual = effGpsAgeMs >= 300_000L;
+                    double schedRemSec = NativeScheduleLookup.computeScheduleRemainingSec(
+                        scheduledHHMM, desvioHorario, strictPunctual, now
+                    );
+                    if (schedRemSec >= 0) {
+                        primarySimEtaSec = primarySimEtaSec < 0 ? schedRemSec : (primarySimEtaSec * 0.45 + schedRemSec * 0.55);
+                        double targetSchedDist = Math.max(effEta <= 0 ? 0.0 : 35.0, schedRemSec * Math.max(2.6, primarySimSpeedMps));
+                        if (distM < 0) {
+                            distM = targetSchedDist;
+                        } else {
+                            distM = distM * 0.65 + targetSchedDist * 0.35;
+                        }
+                        if (initialDistM < distM) {
+                            initialDistM = computeInitialReferenceDist(distM, effEta);
+                        }
+                    }
+                } else if (coherentDist && !sameStaleFix) {
+                    if (prevGpsMs > 0 && rawGpsMs > prevGpsMs && primaryLastRawDistM > 0 && !isInitialOrUnitChange) {
+                        double dtGps = (rawGpsMs - prevGpsMs) / 1000.0;
                         if (dtGps >= 8.0 && dtGps <= 220.0) {
                             double measuredSpd = (primaryLastRawDistM - nextDist) / dtGps;
                             if (measuredSpd >= 1.2 && measuredSpd <= 15.0) {
@@ -1630,6 +1680,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
                     if (isInitialOrUnitChange || distM < 0 || Math.abs(liveDistNow - distM) > 850.0) {
                         distM = liveDistNow;
+                    } else if (gpsRecoveredFromGap) {
+                        distM = distM * 0.25 + liveDistNow * 0.75;
                     } else {
                         double errM = distM - liveDistNow;
                         double steered = Math.max(1.2, Math.min(14.0, primarySimSpeedMps + errM / 18.0));
@@ -1647,7 +1699,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                     if (distM >= 0 && !isDistanceCoherentWithEta(distM, effEta)) distM = -1;
                 }
 
-                if (nextEta >= 0) {
+                if (nextEta >= 0 && !(silentOver3Min && scheduledHHMM != null && !scheduledHHMM.isEmpty())) {
                     double targetEtaSec = nextEta == 0 ? 0.0 : Math.max(30.0, nextEta * 60.0 - 20.0);
                     if (isInitialOrUnitChange || primarySimEtaSec < 0 || Math.abs(targetEtaSec - primarySimEtaSec) > 180.0) {
                         primarySimEtaSec = targetEtaSec;

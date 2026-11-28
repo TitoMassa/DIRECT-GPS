@@ -136,6 +136,30 @@ public final class NativeScheduleLookup {
     }
 
     /**
+     * Calcula los segundos restantes estimados hasta la parada según el horario programado oficial:
+     *  - `strictPunctual = true` (>= 5 min sin GPS): desvío 00:00 (100 % puntual).
+     *  - `strictPunctual = false` (3–5 min sin GPS): aplica el último desvío horario visto.
+     * Devuelve -1 si no hay horario programado válido o está fuera de ventana razonable.
+     */
+    public static double computeScheduleRemainingSec(
+        @Nullable String hhmm,
+        @Nullable String desvioRaw,
+        boolean strictPunctual,
+        long nowMs
+    ) {
+        if (hhmm == null || hhmm.trim().isEmpty()) return -1.0;
+        int slotSec = parseHHMMToServiceSec(hhmm);
+        if (slotSec < 0) return -1.0;
+        int nowSec = getCurrentArgentinaServiceSec(nowMs);
+        int effDesvio = strictPunctual ? 0 : parseDesvioSec(desvioRaw);
+        int rem = slotSec - (nowSec + effDesvio);
+        if (rem < -43200) rem += 86400;
+        if (rem > 43200) rem -= 86400;
+        if (rem < -45 || rem > 7200) return -1.0;
+        return Math.max(0.0, (double) rem);
+    }
+
+    /**
      * Resuelve el horario programado REAL (HH:MM) exacto desde `assets/public/data/horarios/{codLinea}.json`.
      * Devuelve "" si no existe coincidencia real dentro de la tolerancia (nunca devuelve hora estimada).
      */

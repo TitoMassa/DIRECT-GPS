@@ -269,7 +269,42 @@ console.log('4. Testing Cortado break termination & Relevo continuation + Spatia
     anchorLng: midPt[1]
   });
   assert.ok(Math.abs(posAtGps.along - midProj.along) < 1.0, `Expected <1m anchor accuracy`);
-  console.log(`  ✓ Verified ${cortadoChecked} cortado terminations, ${relevoChecked} relevo continuations, and <1m spatial GPS anchor`);
+
+  // Verify 3–5 min (210 s) uses last-seen desvio (-06:00), while >= 5 min (310 s) switches strictly to 00:00 punctual!
+  const midNowSec = Math.round((sampleTr.startSec + sampleTr.endSec) / 2) + 300;
+  const pos3to5 = evaluateFreeBusSchedulePos(sampleTr, m102, midNowSec, {
+    desvioSec: -360,
+    hasExplicitDesvio: true,
+    gpsAgeSec: 210,
+    lastGpsSec: midNowSec - 210,
+    anchorLat: midPt[0],
+    anchorLng: midPt[1]
+  });
+  const posOver5 = evaluateFreeBusSchedulePos(sampleTr, m102, midNowSec, {
+    desvioSec: -360,
+    hasExplicitDesvio: true,
+    gpsAgeSec: 310,
+    lastGpsSec: midNowSec - 310,
+    anchorLat: midPt[0],
+    anchorLng: midPt[1]
+  });
+  const posExactPunctual = evaluateFreeBusSchedulePos(sampleTr, m102, midNowSec, {
+    desvioSec: 0,
+    strictPunctual: true
+  });
+  assert.equal(pos3to5.isPunctualSchedule, false, '3–5 min without GPS must use last-seen desvio, not punctual override');
+  assert.equal(pos3to5.effectiveOffsetSec, -360, '3–5 min without GPS must preserve exact last-seen desvio (-360 s)');
+  assert.equal(posOver5.isPunctualSchedule, true, '>= 5 min without GPS must switch to strict punctual 00:00 mode');
+  assert.equal(posOver5.effectiveOffsetSec, 0, '>= 5 min without GPS must force effectiveOffsetSec === 0');
+  assert.ok(
+    Math.abs(posOver5.along - posExactPunctual.along) < 0.01,
+    `>= 5 min punctual position must match 00:00 timetable exactly (diff=${Math.abs(posOver5.along - posExactPunctual.along).toFixed(2)}m)`
+  );
+  assert.ok(
+    posOver5.along > pos3to5.along + 50,
+    'Late (-06:00) 3–5 min simulation must sit behind the >= 5 min punctual 00:00 position'
+  );
+  console.log(`  ✓ Verified ${cortadoChecked} cortado terminations, ${relevoChecked} relevo continuations, <1m GPS anchor, and 3-min desvio -> 5-min 00:00 punctual switch`);
 }
 
 console.log('5. Testing 103C CT32247 rawStopTimeMap & shared multi-direction stop disambiguation...');
@@ -327,7 +362,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v109') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v109 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v110') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v110 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1324,11 +1359,142 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     switchTracker.stop({ silent: true });
   }
 
+  // Verify BusSimulator 3-min desvio -> 5-min strict 00:00 punctual -> fast, smooth & precise GPS recovery glide
+  {
+    const fmtArtStamp = (ms) => {
+      const d = new Date(ms - 3 * 3600 * 1000);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+    };
+    const nowMsTest = Date.now();
+    const dArt = new Date(nowMsTest - 3 * 3600 * 1000);
+    const nowSecArt = dArt.getUTCHours() * 3600 + dArt.getUTCMinutes() * 60 + dArt.getUTCSeconds();
+    const effNowArt = nowSecArt < 3 * 3600 ? nowSecArt + 86400 : nowSecArt;
+
+    const branchPts = [
+      [-27.5000, -58.8300],
+      [-27.4900, -58.8300],
+      [-27.4800, -58.8300],
+      [-27.4700, -58.8300]
+    ];
+    const branchCum = [0, 1112, 2224, 3336];
+    const synthBranch = {
+      bandera: 'TEST IDA',
+      color: '#2563eb',
+      pts: branchPts,
+      cum: branchCum,
+      totalLen: 3336
+    };
+    const synthTrip = {
+      tripKey: 'test:1',
+      branch: synthBranch,
+      startSec: effNowArt - 600,
+      endSec: effNowArt + 600,
+      points: [
+        { along: 0, sec: effNowArt - 600 },
+        { along: 1112, sec: effNowArt - 200 },
+        { along: 2224, sec: effNowArt + 200 },
+        { along: 3336, sec: effNowArt + 600 }
+      ],
+      stopTimeMap: new Map([['TEST_STOP', effNowArt + 600]])
+    };
+    const stopProj = projectOnPolyline(synthBranch.pts, synthBranch.cum, -27.4700, -58.8300);
+    const makeTrajFromAlong = (fromAlong) => {
+      const rem = 3336 - fromAlong;
+      const frac = fromAlong / 3336;
+      const lat0 = -27.5000 + 0.03 * frac;
+      return {
+        pathPts: [
+          [lat0, -58.8300],
+          [-27.4700, -58.8300]
+        ],
+        pathCum: [0, rem],
+        totalMeters: rem,
+        leg: 'direct',
+        isAtTerminal: false,
+        speedMps: 5.5
+      };
+    };
+
+    const simStale = new BusSimulator();
+    // 1) 4 minutes without GPS (240 s) + last seen desvio -05:00 (-300 s) -> schedule mode with last-seen desvio!
+    const busTest = {
+      key: '96-c4199',
+      codigoLinea: 96,
+      identificadorCoche: '4199',
+      lat: -27.4920,
+      lng: -58.8300,
+      ultimaFechaHoraGPS: fmtArtStamp(nowMsTest - 240_000),
+      desvio: { raw: '-05:00', status: 'late', label: '-05:00', shortLabel: '-05:00', sign: '-', minutes: -5, seconds: -300 },
+      eta: { minutes: 15, valid: true, display: '15', unit: 'min', urgency: 'later' },
+      hasOfficialSoapEta: true,
+      isPredicted: false,
+      scheduledTrip: synthTrip,
+      stopProj,
+      trajectory: makeTrajFromAlong(890)
+    };
+    simStale.reconcile([busTest], { applyPositions: true, stopId: 'TEST_STOP' });
+    let st = simStale.units.get(busTest.key);
+    assert.equal(st.mode, 'schedule', '4 min without GPS must enter schedule mode');
+    assert.equal(st.schedulePunctual, false, '4 min without GPS must NOT yet force 00:00 punctual mode');
+    assert.equal(st.predDesvioSec, -300, '4 min without GPS must use last-seen desvio (-300 s)');
+    assert.equal(busTest.gpsLost, true);
+    assert.equal(busTest.gpsPunctualFallback, false);
+    const latAt4Min = busTest.lat;
+
+    // 2) 6 minutes without GPS (360 s) -> switches strictly to 00:00 punctual schedule!
+    busTest.ultimaFechaHoraGPS = fmtArtStamp(nowMsTest - 360_000);
+    busTest.trajectory = makeTrajFromAlong(890);
+    simStale.reconcile([busTest], { applyPositions: true, stopId: 'TEST_STOP' });
+    st = simStale.units.get(busTest.key);
+    assert.equal(st.mode, 'schedule');
+    assert.equal(st.schedulePunctual, true, '>= 5 min without GPS must switch to strict 00:00 punctual mode');
+    assert.equal(st.predDesvioSec, 0, '>= 5 min punctual mode must zero predDesvioSec');
+    assert.equal(st.scheduleAnchor, null, '>= 5 min punctual mode must clear old spatial anchor');
+    assert.equal(busTest.gpsPunctualFallback, true);
+    // Let glide finish (~1.6 s) and verify bus moved ahead to punctual 00:00 position (~1668 m along = -27.4850)
+    for (let k = 0; k < 40; k++) simStale.step(0.05, [busTest], { updateEta: false });
+    assert.ok(busTest.lat > latAt4Min + 0.004, 'Strict 00:00 punctual mode must advance ahead of late (-05:00) position');
+
+    // 3) GPS RETURNS fresh (3 s ago) at real position 500 m behind punctual (-27.4895, along=1168) -> smooth, brisk & precise glide!
+    const realRecoveryLat = -27.4895;
+    busTest.lat = realRecoveryLat;
+    busTest.lng = -58.8300;
+    busTest.ultimaFechaHoraGPS = fmtArtStamp(Date.now() - 3_000);
+    busTest.trajectory = makeTrajFromAlong(1168);
+    const latBeforeRecovery = busTest.lat;
+    simStale.reconcile([busTest], { applyPositions: true, stopId: 'TEST_STOP' });
+    st = simStale.units.get(busTest.key);
+    assert.equal(st.mode, 'gps', 'Returning fresh GPS must switch immediately back to gps mode');
+    assert.equal(busTest.gpsLost, false);
+    assert.equal(busTest.gpsPunctualFallback, false);
+    assert.ok(st.correctionGlide, 'GPS return must initiate a smooth correctionGlide instead of 0ms teleport or 90s freeze');
+    // Step 1 frame (50ms): must have started gliding smoothly, NOT teleported instantaneously
+    simStale.step(0.05, [busTest], { updateEta: false });
+    assert.ok(st.correctionGlide, 'Correction glide must animate smoothly across frames');
+    // Step 1.6s total: glide must complete and land accurately right near realRecoveryLat!
+    for (let k = 0; k < 35; k++) simStale.step(0.05, [busTest], { updateEta: false });
+    assert.equal(st.correctionGlide, null, 'Correction glide must finish briskly (~0.7–1.45 s)');
+    const errAfterRecoveryM = Math.abs(busTest.lat - realRecoveryLat) * 111200;
+    assert.ok(
+      errAfterRecoveryM < 45,
+      `After brisk recovery glide, bus must sit precisely on real GPS position (err=${errAfterRecoveryM.toFixed(1)}m)`
+    );
+  }
+
+  const nativeSchedSrc = await fs.readFile(path.join(androidJavaBase, 'NativeScheduleLookup.java'), 'utf8');
+  assert.ok(
+    nativeSchedSrc.includes('computeScheduleRemainingSec') &&
+      tripSvcSrc.includes('gpsRecoveredFromGap') &&
+      tripSvcSrc.includes('strictPunctual = effGpsAgeMs >= 300_000L'),
+    'Native Android service must implement 3-min desvio, 5-min strict 00:00 punctual fallback, and brisk GPS recovery'
+  );
+
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.3'") && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.3 changelog, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.4'") && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.4 changelog, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.3 NativeScheduleLookup Offline Real Schedule Resolution, Zero Inherited Previous-Bus Schedule, Exact SOAP ETA & strict exclusions');
+  console.log('  ✓ Verified v3.1.4 3-min Last-Desvio -> 5-min Strict 00:00 Punctual Schedule, Smooth-Fast-Precise GPS Recovery Glide, Exact SOAP ETA & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

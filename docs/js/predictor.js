@@ -99,6 +99,19 @@ export function parseGpsStampSecOfDay(raw = '') {
   return parseInt(m[4], 10) * 3600 + parseInt(m[5], 10) * 60 + parseInt(m[6], 10);
 }
 
+export function parseGpsStampMs(raw = '') {
+  const m = String(raw || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(
+    parseInt(m[3], 10),
+    parseInt(m[2], 10) - 1,
+    parseInt(m[1], 10),
+    parseInt(m[4], 10) + 3,
+    parseInt(m[5], 10),
+    parseInt(m[6], 10)
+  );
+}
+
 export function formatSecHHMM(sec) {
   const norm = ((Math.round(sec) % 86400) + 86400) % 86400;
   const hh = Math.floor(norm / 3600);
@@ -353,11 +366,14 @@ export function getArgentinaServiceTipo(date = new Date()) {
   return dow === 0 ? 'domingo' : dow === 6 ? 'sabado' : 'habil';
 }
 
+export const GPS_SILENT_DESVIO_SEC = 180; // 3 min sin novedad GPS -> simular con último desvío horario visto
+export const GPS_SILENT_PUNCTUAL_SEC = 300; // 5 min sin novedad GPS -> simular estrictamente puntual (00:00) según horario programado
+
 /**
  * Gradual, physically realistic deviation recovery after a bus loses GPS or goes offline:
  *  - A late bus (initialOffsetSec < 0) stays late and recovers gently (~4.8 s per real minute, i.e. 1.08x speed)
  *  - An early bus (initialOffsetSec > 0) stays ahead and eases gently (~3.6 s per real minute, i.e. 0.94x speed)
- * Never snaps magically to 00:00 on-time punctuality!
+ * Note: once >= 5 min (GPS_SILENT_PUNCTUAL_SEC) elapse without GPS, simulation switches strictly to 00:00 punctual schedule!
  */
 export function computeGradualOffsetSec(initialOffsetSec = 0, elapsedSec = 0) {
   const init = Number.isFinite(initialOffsetSec) ? initialOffsetSec : 0;
@@ -4276,11 +4292,15 @@ export function predictLineBusesForStop({
         if (targetStopSec === null) continue;
 
         const srcBus = liveBlockSrc.bus;
+        const srcGpsMs = parseGpsStampMs(srcBus.ultimaFechaHoraGPS || '');
+        const srcSilentSec = srcGpsMs ? Math.max(0, (nowMs - srcGpsMs) / 1000) : 0;
+        const srcPunctualFallback = Boolean(srcBus.gpsPunctualFallback) || srcSilentSec >= GPS_SILENT_PUNCTUAL_SEC;
+        const srcBaseDesvioSec = srcPunctualFallback ? 0 : (srcBus.desvio?.seconds || 0);
         const propagatedDesvio = propagateBlockDesvioSec(
           block,
           liveBlockSrc.srcIdx,
           targetIdx,
-          srcBus.desvio?.seconds || 0,
+          srcBaseDesvioSec,
           0
         );
         const etaSec = targetStopSec - (effNow + propagatedDesvio);
@@ -4289,10 +4309,11 @@ export function predictLineBusesForStop({
         const extraMeters = computeExtraMetersAcrossBlock(block, liveBlockSrc.srcIdx, targetIdx, stopCoords, stopProj);
         const baseRem = srcBus.routeMeters ?? srcBus.distanceMeters ?? 0;
         const totalRemMeters = Math.max(stopProj.along, baseRem + extraMeters);
-        // Display the vehicle's REAL current desvio (never an inflated/diverging next-lap desvio!)
-        const srcDesvioSec = srcBus.desvio?.seconds || 0;
-        const desvioRaw =
-          srcBus.desvio?.raw || (Math.abs(srcDesvioSec) >= 60 ? formatDesvioFromSec(srcDesvioSec) : '');
+        // Display the vehicle's REAL current desvio (or empty when >= 5 min without GPS -> punctual 00:00)
+        const srcDesvioSec = srcBaseDesvioSec;
+        const desvioRaw = srcPunctualFallback
+          ? ''
+          : (srcBus.desvio?.raw || (Math.abs(srcDesvioSec) >= 60 ? formatDesvioFromSec(srcDesvioSec) : ''));
 
         seenTripKeys.add(trip.tripKey);
         candidates.push({
@@ -4417,36 +4438,54 @@ export function predictLineBusesForStop({
 
       const memDepth = targetIdx - memIdx;
 
-      // Build spatial-temporal GPS anchor from last online fix so the bus starts from its exact last GPS spot
-      // and gradually recovers its delay/advance (~4.8 s/min late recovery, never magically on time!)
+      // 3-min / 5-min GPS silence policy:
+      //  - < 5 min without GPS: simulate using last-seen desvio / spatial anchor
+      //  - >= 5 min without GPS: strictly follow official stop-by-stop timetable as 100% punctual (00:00)
       let anchor = null;
       let desvioSec = 0;
+      let predLastGpsMs = null;
+      let predPunctualSchedule = !mem;
       if (mem) {
-        const ageMin = mem.updatedAt ? (nowMs - mem.updatedAt) / 60000 : 999;
+        const memGpsMs = parseGpsStampMs(mem.ultimaGps);
+        predLastGpsMs = memGpsMs ?? (mem.updatedAt || null);
         const memClockSec = toServiceSec(
           parseGpsStampSecOfDay(mem.ultimaGps) ??
             (mem.updatedAt ? getArgentinaSecOfDay(new Date(mem.updatedAt)) : effNow)
         );
         const elapsedSec = Math.max(0, effNow - memClockSec);
+        const memSilentSec = predLastGpsMs ? Math.max(0, (nowMs - predLastGpsMs) / 1000) : elapsedSec;
 
-        if (memDepth <= 2 && ageMin <= 90) {
-          const mLat = Number(mem.lat);
-          const mLng = Number(mem.lng);
-          if (Number.isFinite(mLat) && Number.isFinite(mLng) && mLat !== 0 && mLng !== 0) {
-            const cleanMemCoche = String(mem.coche || '').trim();
-            const unitHist =
-              cleanMemCoche && gpsHistoryByUnit ? gpsHistoryByUnit.get(`${codLinea}-c${cleanMemCoche}`) : null;
-            const prevFix = mem.prevFix || unitHist?.prevMoving || unitHist?.prev || null;
-            const preferredLeg =
-              memDepth === 0 ? mem.realLeg || null : memDepth === 1 ? 'previous_leg' : 'full_cycle';
-            anchor = buildGpsAnchorForTrip(trip, mLat, mLng, memClockSec, mem.desvioSec || 0, {
-              prevFix,
-              preferredLeg
-            });
+        if (memSilentSec >= GPS_SILENT_PUNCTUAL_SEC) {
+          // >= 5 min without GPS -> 100% punctual (00:00) official timetable
+          anchor = null;
+          desvioSec = 0;
+          predPunctualSchedule = true;
+        } else {
+          predPunctualSchedule = false;
+          const hasExplicitMemDesvio =
+            Boolean(String(mem.desvioRaw || '').trim()) || (Number.isFinite(mem.desvioSec) && mem.desvioSec !== 0);
+          if (memDepth === 0 && hasExplicitMemDesvio && memSilentSec >= GPS_SILENT_DESVIO_SEC) {
+            // 3–5 min window with known last desvio -> simulate strictly with last-seen desvio
+            desvioSec = Math.abs(mem.desvioSec || 0) <= 38 * 60 ? (mem.desvioSec || 0) : 0;
+          } else if (memDepth <= 2) {
+            const mLat = Number(mem.lat);
+            const mLng = Number(mem.lng);
+            if (Number.isFinite(mLat) && Number.isFinite(mLng) && mLat !== 0 && mLng !== 0) {
+              const cleanMemCoche = String(mem.coche || '').trim();
+              const unitHist =
+                cleanMemCoche && gpsHistoryByUnit ? gpsHistoryByUnit.get(`${codLinea}-c${cleanMemCoche}`) : null;
+              const prevFix = mem.prevFix || unitHist?.prevMoving || unitHist?.prev || null;
+              const preferredLeg =
+                memDepth === 0 ? mem.realLeg || null : memDepth === 1 ? 'previous_leg' : 'full_cycle';
+              anchor = buildGpsAnchorForTrip(trip, mLat, mLng, memClockSec, mem.desvioSec || 0, {
+                prevFix,
+                preferredLeg
+              });
+            }
           }
-        }
-        if (!anchor && Number.isFinite(mem.desvioSec)) {
-          desvioSec = propagateBlockDesvioSec(block, memIdx, targetIdx, mem.desvioSec, elapsedSec);
+          if (!anchor && desvioSec === 0 && Number.isFinite(mem.desvioSec)) {
+            desvioSec = propagateBlockDesvioSec(block, memIdx, targetIdx, mem.desvioSec, elapsedSec);
+          }
         }
       }
 
@@ -4457,9 +4496,11 @@ export function predictLineBusesForStop({
       });
       if (!ev) continue;
 
-      const curOffset = ev.effectiveOffsetSec || 0;
+      const curOffset = predPunctualSchedule ? 0 : (ev.effectiveOffsetSec || 0);
       const desvioRaw =
-        mem && (memDepth === 0 || anchor || Math.abs(curOffset) >= 60) ? formatDesvioFromSec(curOffset) : '';
+        !predPunctualSchedule && mem && (memDepth === 0 || anchor || Math.abs(curOffset) >= 60)
+          ? formatDesvioFromSec(curOffset)
+          : '';
 
       seenTripKeys.add(trip.tripKey);
       candidates.push({
@@ -4472,6 +4513,8 @@ export function predictLineBusesForStop({
         anchor,
         desvioSec: curOffset,
         desvioRaw,
+        predLastGpsMs,
+        predPunctualSchedule,
         predKey,
         liveBlockSrc: null,
         promotedLiveSrc: null
@@ -4488,7 +4531,19 @@ export function predictLineBusesForStop({
   for (const item of candidates) {
     if (predicted.length >= maxUpcoming) break;
 
-    const { trip, stopBranch, stopProj, ev, anchor, desvioSec, predKey, liveBlockSrc, promotedLiveSrc } = item;
+    const {
+      trip,
+      stopBranch,
+      stopProj,
+      ev,
+      anchor,
+      desvioSec,
+      predLastGpsMs,
+      predPunctualSchedule,
+      predKey,
+      liveBlockSrc,
+      promotedLiveSrc
+    } = item;
     let desvioRaw = item.desvioRaw;
     let mem = item.mem;
 
@@ -4680,6 +4735,9 @@ export function predictLineBusesForStop({
       stopProj,
       predAnchor: anchor,
       predDesvioSec: desvioSec,
+      predLastGpsMs: predLastGpsMs ?? null,
+      predPunctualSchedule: Boolean(predPunctualSchedule),
+      gpsPunctualFallback: Boolean(predPunctualSchedule),
       isPredicted: true,
       isNextLap,
       nextLapOfKey,
@@ -5161,9 +5219,10 @@ export function sanitizeLiveDesvio(
 
 /**
  * Evaluates a free-roaming or individually tracked bus's real-time scheduled position `(branch, along, speedMps)`
- * when its GPS signal has been absent/frozen (>= 3 min), advancing smoothly along its route polyline across
- * turnarounds and relevo continuations of the same service (`serviceNumber`), while respecting cabecera waits
- * and gradual delay recovery!
+ * when its GPS signal has been absent/frozen:
+ *  - 3–5 min without GPS (`180 <= ageSec < 300`): simulates using its last-seen schedule deviation (`desvioSec`).
+ *  - >= 5 min without GPS (`ageSec >= 300` or `strictPunctual`): strictly follows the official stop-by-stop
+ *    timetable as 100% punctual (`desvio = 00:00`).
  */
 export function evaluateFreeBusSchedulePos(
   seedTrip,
@@ -5181,55 +5240,68 @@ export function evaluateFreeBusSchedulePos(
         : {};
   const {
     desvioSec = 0,
+    hasExplicitDesvio = false,
     lastGpsSec = null,
+    gpsAgeSec = null,
     anchorLat = null,
     anchorLng = null,
-    allowShiftContinuation = true
+    allowShiftContinuation = true,
+    strictPunctual = false
   } = opts;
 
   const effNow = toServiceSec(nowSec);
   const safeDesvio = Math.abs(desvioSec || 0) <= 38 * 60 ? (desvioSec || 0) : 0;
+  const elapsedSec = Number.isFinite(gpsAgeSec)
+    ? Math.max(0, gpsAgeSec)
+    : Number.isFinite(lastGpsSec)
+      ? Math.max(0, effNow - toServiceSec(lastGpsSec))
+      : 0;
+  const isPunctualSchedule = Boolean(strictPunctual) || elapsedSec >= GPS_SILENT_PUNCTUAL_SEC;
 
-  // Spatial-temporal anchor along seedTrip at lastGpsSec: eliminates any jump when transitioning
-  // from live GPS to schedule continuation at the 180s mark!
-  let initialOffsetSec = safeDesvio;
-  if (
-    typeof anchorLat === 'number' &&
-    typeof anchorLng === 'number' &&
-    !Number.isNaN(anchorLat) &&
-    !Number.isNaN(anchorLng) &&
-    Number.isFinite(lastGpsSec)
-  ) {
-    const effLastGps = toServiceSec(lastGpsSec);
-    const proj = projectOnPolyline(seedTrip.branch.pts, seedTrip.branch.cum, anchorLat, anchorLng);
-    if (proj && proj.perp <= 180) {
-      const atOriginCabecera = isAtBranchStartTerminal(
-        seedTrip.branch,
-        proj.along,
-        anchorLat,
-        anchorLng,
-        seedTrip.prevTrip?.branch
-      );
-      const schedAtAnchor = getTripSecAtAlong(seedTrip, proj.along);
-      if (schedAtAnchor !== null) {
-        let spatialOffset = schedAtAnchor - effLastGps;
-        if (spatialOffset > 43200) spatialOffset -= 86400;
-        if (spatialOffset < -43200) spatialOffset += 86400;
-        if (
-          atOriginCabecera &&
-          (effLastGps <= Math.max(seedTrip.startSec, schedAtAnchor) + 20 || spatialOffset > 0)
-        ) {
-          initialOffsetSec = 0;
-        } else if (Math.abs(spatialOffset) <= 45 * 60) {
-          initialOffsetSec = spatialOffset;
+  let baseOffset = 0;
+  if (!isPunctualSchedule) {
+    if (elapsedSec >= GPS_SILENT_DESVIO_SEC && hasExplicitDesvio) {
+      // 3–5 min without GPS update: simulate using the bus's exact last-seen desvioHorario
+      baseOffset = safeDesvio;
+    } else {
+      // Spatial-temporal anchor along seedTrip at lastGpsSec when no explicit desvio is available (or < 3 min)
+      let initialOffsetSec = safeDesvio;
+      if (
+        typeof anchorLat === 'number' &&
+        typeof anchorLng === 'number' &&
+        !Number.isNaN(anchorLat) &&
+        !Number.isNaN(anchorLng) &&
+        Number.isFinite(lastGpsSec)
+      ) {
+        const effLastGps = toServiceSec(lastGpsSec);
+        const proj = projectOnPolyline(seedTrip.branch.pts, seedTrip.branch.cum, anchorLat, anchorLng);
+        if (proj && proj.perp <= 180) {
+          const atOriginCabecera = isAtBranchStartTerminal(
+            seedTrip.branch,
+            proj.along,
+            anchorLat,
+            anchorLng,
+            seedTrip.prevTrip?.branch
+          );
+          const schedAtAnchor = getTripSecAtAlong(seedTrip, proj.along);
+          if (schedAtAnchor !== null) {
+            let spatialOffset = schedAtAnchor - effLastGps;
+            if (spatialOffset > 43200) spatialOffset -= 86400;
+            if (spatialOffset < -43200) spatialOffset += 86400;
+            if (
+              atOriginCabecera &&
+              (effLastGps <= Math.max(seedTrip.startSec, schedAtAnchor) + 20 || spatialOffset > 0)
+            ) {
+              initialOffsetSec = 0;
+            } else if (Math.abs(spatialOffset) <= 45 * 60) {
+              initialOffsetSec = spatialOffset;
+            }
+          }
         }
       }
+      baseOffset = computeGradualOffsetSec(initialOffsetSec, elapsedSec);
     }
   }
-
-  const elapsedSec =
-    Number.isFinite(lastGpsSec) ? Math.max(0, effNow - toServiceSec(lastGpsSec)) : 0;
-  const baseOffset = computeGradualOffsetSec(initialOffsetSec, elapsedSec);
 
   // Collect ordered trips of this shift block, chaining ONLY across continuous relevo en línea blocks
   // (<= 45 min layover / relevoToNext) and NEVER across horario cortado garage breaks!
@@ -5281,24 +5353,26 @@ export function evaluateFreeBusSchedulePos(
   let seedIdx = srvTrips.findIndex((t) => t.tripKey === seedTrip.tripKey);
   if (seedIdx < 0) seedIdx = 0;
 
-  // Propagate real offset forward across cabeceras:
+  // Propagate real offset forward across cabeceras (in punctual mode >= 5 min, ALL offsets stay strictly 0):
   // early advance (>0) resets to 0 at cabecera; late delay (<0) is absorbed by layover slack
   const offsets = new Array(srvTrips.length).fill(0);
-  offsets[seedIdx] = baseOffset;
-  for (let i = seedIdx + 1; i < srvTrips.length; i++) {
-    const prevT = srvTrips[i - 1];
-    const curT = srvTrips[i];
-    const prevOff = offsets[i - 1];
-    if (prevOff >= 0) {
-      offsets[i] = 0;
-    } else {
-      const layover = Math.max(0, curT.startSec - prevT.endSec);
-      const absorbed = Math.max(0, layover - 60);
-      offsets[i] = Math.min(0, prevOff + absorbed);
+  if (!isPunctualSchedule) {
+    offsets[seedIdx] = baseOffset;
+    for (let i = seedIdx + 1; i < srvTrips.length; i++) {
+      const prevT = srvTrips[i - 1];
+      const curT = srvTrips[i];
+      const prevOff = offsets[i - 1];
+      if (prevOff >= 0) {
+        offsets[i] = 0;
+      } else {
+        const layover = Math.max(0, curT.startSec - prevT.endSec);
+        const absorbed = Math.max(0, layover - 60);
+        offsets[i] = Math.min(0, prevOff + absorbed);
+      }
     }
-  }
-  for (let i = seedIdx - 1; i >= 0; i--) {
-    offsets[i] = baseOffset;
+    for (let i = seedIdx - 1; i >= 0; i--) {
+      offsets[i] = baseOffset;
+    }
   }
 
   for (let i = 0; i < srvTrips.length; i++) {
@@ -5316,7 +5390,8 @@ export function evaluateFreeBusSchedulePos(
         speedMps: 0,
         isAtTerminal: true,
         finished: false,
-        effectiveOffsetSec: 0
+        effectiveOffsetSec: 0,
+        isPunctualSchedule
       };
     }
     if (tLeg <= tr.endSec) {
@@ -5329,7 +5404,8 @@ export function evaluateFreeBusSchedulePos(
           speedMps: ev.speedMps,
           isAtTerminal: ev.speedMps <= 0.05,
           finished: false,
-          effectiveOffsetSec: legOff
+          effectiveOffsetSec: legOff,
+          isPunctualSchedule
         };
       }
     }
@@ -5343,7 +5419,8 @@ export function evaluateFreeBusSchedulePos(
     speedMps: 0,
     isAtTerminal: true,
     finished: true,
-    effectiveOffsetSec: 0
+    effectiveOffsetSec: 0,
+    isPunctualSchedule
   };
 }
 

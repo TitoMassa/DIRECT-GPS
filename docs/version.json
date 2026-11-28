@@ -1,11 +1,11 @@
 {
-  "version": "3.1.3",
-  "versionCode": 313,
+  "version": "3.1.4",
+  "versionCode": 314,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.3/DIRECT-GPS-v3.1.3-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.3",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.4/DIRECT-GPS-v3.1.4-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.4",
   "notes": [
-    "Corregido el horario programado real (Prog. real) en notificaciones al pasar al siguiente colectivo: nunca más hereda el horario del servicio anterior que ya arribó",
-    "Nuevo buscador nativo offline de horarios oficiales en 2° plano (NativeScheduleLookup): cuando llega un colectivo y la notificación toma al siguiente (ej. 904B), busca automáticamente el horario programado real de ese nuevo servicio y reinicia las alertas para avisarte de nuevo"
+    "Simulación inteligente sin GPS en 2 etapas: de 3 a 5 min sin novedad GPS simula con el último desvío horario visto; pasados los 5 min sin GPS se guía estrictamente por los horarios programados de las paradas circulando 100 % puntual (desvío 00:00)",
+    "Al volver a recibir señal GPS, el colectivo corrige hacia su última posición real con una transición suave, rápida y precisa (sin saltos bruscos ni quedarse trabado)"
   ]
 }
