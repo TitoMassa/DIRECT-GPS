@@ -130,14 +130,124 @@ export function sampleBranchAtAlong(branch, alongMeters) {
   };
 }
 
+const MAX_TERMINAL_CONNECT_GAP_M = 430;
+
+/**
+ * Conecta los extremos de las polilíneas de cada bandera dentro de una misma línea
+ * para eliminar huecos en las puntas de línea (cabeceras) y asegurar continuidad 0 m
+ * tanto en el mapa como en el cálculo/simulación de trayectorias.
+ *
+ * Regla geométrica pura e idempotente:
+ *  - Para cada bandera `i`, busca el inicio `start_j` más cercano de otra bandera `j !== i`.
+ *  - Si `0.5 < dist(end_i, start_j) <= maxGapMeters` (todas las cabeceras de Corrientes
+ *    miden 46–419 m; las variantes de ingreso a galpón como 104A/104D > 445 m ya tocan
+ *    el tronco principal a 0 m), extiende `puntos` de `i` hasta `start_j` sin alterar
+ *    ningún punto de inicio (`pts[0]`), preservando 100 % los `stopAlongs` y `tripKey`.
+ */
+export function connectRouteEndpoints(recorridos = [], maxGapMeters = MAX_TERMINAL_CONNECT_GAP_M) {
+  if (!Array.isArray(recorridos) || recorridos.length < 2) {
+    return Array.isArray(recorridos) ? recorridos : [];
+  }
+
+  const meta = recorridos.map((r) => {
+    const rawPts = Array.isArray(r?.puntos) ? r.puntos : [];
+    const valid = [];
+    for (const p of rawPts) {
+      const la = parseFloat(p?.latitud);
+      const ln = parseFloat(p?.longitud);
+      if (Number.isFinite(la) && Number.isFinite(ln)) {
+        valid.push({ raw: p, lat: la, lng: ln });
+      }
+    }
+    if (valid.length < 2) return null;
+    return {
+      first: valid[0],
+      last: valid[valid.length - 1]
+    };
+  });
+
+  return recorridos.map((r, i) => {
+    const mi = meta[i];
+    if (!mi || !Array.isArray(r?.puntos)) return r;
+
+    let best = null;
+    for (let j = 0; j < recorridos.length; j++) {
+      if (j === i || !meta[j]) continue;
+      const d = distanceMeters(mi.last.lat, mi.last.lng, meta[j].first.lat, meta[j].first.lng);
+      if (d !== null && Number.isFinite(d) && (!best || d < best.d)) {
+        best = { j, d, target: meta[j].first };
+      }
+    }
+
+    if (!best || best.d <= 0.5 || best.d > maxGapMeters) {
+      return r;
+    }
+
+    return {
+      ...r,
+      puntos: [
+        ...r.puntos,
+        {
+          latitud: String(best.target.raw.latitud),
+          longitud: String(best.target.raw.longitud),
+          isPuntoDePaso: true,
+          isConnector: true
+        }
+      ]
+    };
+  });
+}
+
+function stitchPolylineParts(parts = []) {
+  const pathPts = [];
+  const seamIndices = [];
+
+  for (const part of parts) {
+    const valid = Array.isArray(part) ? part : [];
+    if (valid.length === 0) {
+      seamIndices.push(Math.max(0, pathPts.length - 1));
+      continue;
+    }
+    if (pathPts.length === 0) {
+      seamIndices.push(0);
+      for (const pt of valid) pathPts.push(pt);
+    } else {
+      const prev = pathPts[pathPts.length - 1];
+      const first = valid[0];
+      const gap = distanceMeters(prev[0], prev[1], first[0], first[1]) ?? Infinity;
+      if (gap <= 0.5) {
+        seamIndices.push(pathPts.length - 1);
+        for (let k = 1; k < valid.length; k++) pathPts.push(valid[k]);
+      } else {
+        seamIndices.push(pathPts.length);
+        for (const pt of valid) pathPts.push(pt);
+      }
+    }
+  }
+
+  const cum = buildCumDist(pathPts);
+  const totalMeters = cum[cum.length - 1] || 0;
+  const seamMeters = seamIndices.map((idx) => cum[idx] ?? 0);
+  return { pathPts, cum, totalMeters, seamMeters };
+}
+
 export function parseRouteBranches(recorridos = []) {
-  return (recorridos || [])
+  const connected = connectRouteEndpoints(recorridos);
+  return (connected || [])
     .map((r, idx) => {
-      const pts = (r.puntos || [])
-        .map((p) => [parseFloat(p.latitud), parseFloat(p.longitud)])
-        .filter(([la, ln]) => !Number.isNaN(la) && !Number.isNaN(ln));
+      const validRaw = (r.puntos || [])
+        .map((p) => ({
+          lat: parseFloat(p.latitud),
+          lng: parseFloat(p.longitud),
+          isConnector: Boolean(p.isConnector)
+        }))
+        .filter((p) => !Number.isNaN(p.lat) && !Number.isNaN(p.lng));
+      const pts = validRaw.map((p) => [p.lat, p.lng]);
       if (pts.length < 2) return null;
       const cum = buildCumDist(pts);
+      const totalLen = cum[cum.length - 1] || 0;
+      const hasTrailingConnector = validRaw.length >= 3 && validRaw[validRaw.length - 1].isConnector;
+      const rawTotalLen = hasTrailingConnector ? (cum[cum.length - 2] ?? totalLen) : totalLen;
       const stopIds = new Set();
       const stopAlongs = [];
       const orderedStops = [];
@@ -178,7 +288,8 @@ export function parseRouteBranches(recorridos = []) {
         git: String(r.abreviaturaGit || '').trim(),
         pts,
         cum,
-        totalLen: cum[cum.length - 1] || 0,
+        totalLen,
+        rawTotalLen,
         stopIds,
         stopAlongs,
         orderedStops
@@ -326,11 +437,9 @@ export function buildTrajectoryFromBranchAlong(
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const seg3Pts = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
 
-    const pathPts = [...seg1Pts, ...seg2Pts, ...seg3Pts];
-    const cum = buildCumDist(pathPts);
-    const totalMeters = cum[cum.length - 1] || 0;
-    const oppStartMeters = cum[seg1Pts.length] ?? (cum[Math.max(0, seg1Pts.length - 1)] || 0);
-    const turnaroundAtMeters = cum[seg1Pts.length + seg2Pts.length] ?? oppStartMeters;
+    const { pathPts, cum, totalMeters, seamMeters } = stitchPolylineParts([seg1Pts, seg2Pts, seg3Pts]);
+    const oppStartMeters = seamMeters[1] ?? 0;
+    const turnaroundAtMeters = seamMeters[2] ?? oppStartMeters;
 
     const actBandera = activeBranch.bandera || stopBandera;
     const actColor = activeBranch.color || stopColor;
@@ -401,10 +510,8 @@ export function buildTrajectoryFromBranchAlong(
   const oppRemainder = slicePolyline(activeBranch.pts, startProj, null);
   const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
   const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
-  const pathPts = [...oppRemainder, ...stopApproach];
-  const cum = buildCumDist(pathPts);
-  const totalMeters = cum[cum.length - 1] || 0;
-  const turnaroundAtMeters = cum[oppRemainder.length] ?? (cum[Math.max(0, oppRemainder.length - 1)] || 0);
+  const { pathPts, cum, totalMeters, seamMeters } = stitchPolylineParts([oppRemainder, stopApproach]);
+  const turnaroundAtMeters = seamMeters[1] ?? 0;
   const oppBandera = activeBranch.bandera || 'Sentido opuesto';
   const oppColor = activeBranch.color;
 
@@ -974,11 +1081,9 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
 
-    const pathPts = [...stopRemainder, ...retFull, ...stopApproach];
-    const cum = buildCumDist(pathPts);
-    const totalMeters = cum[cum.length - 1] || 0;
-    const oppStartMeters = cum[stopRemainder.length] ?? (cum[Math.max(0, stopRemainder.length - 1)] || 0);
-    const turnaroundAtMeters = cum[stopRemainder.length + retFull.length] ?? oppStartMeters;
+    const { pathPts, cum, totalMeters, seamMeters } = stitchPolylineParts([stopRemainder, retFull, stopApproach]);
+    const oppStartMeters = seamMeters[1] ?? 0;
+    const turnaroundAtMeters = seamMeters[2] ?? oppStartMeters;
 
     const stopAlongs = [
       ...mapStopsInRange(stopBranch, busOnStop.along, stopBranch.totalLen, 0),
@@ -1033,12 +1138,10 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
     const oppRemainder = slicePolyline(oppositeBranch.pts, busOnOpp, null);
     const stopStartProj = { segIdx: 0, t: 0, lat: stopBranch.pts[0][0], lng: stopBranch.pts[0][1] };
     const stopApproach = slicePolyline(stopBranch.pts, stopStartProj, stopProj);
-    const pathPts = [...oppRemainder, ...stopApproach];
+    const { pathPts, cum, totalMeters, seamMeters } = stitchPolylineParts([oppRemainder, stopApproach]);
     const oppBandera = oppositeBranch.bandera || 'Sentido opuesto';
     const oppColor = oppositeBranch.color;
-    const cum = buildCumDist(pathPts);
-    const totalMeters = cum[cum.length - 1] || 0;
-    const turnaroundAtMeters = cum[oppRemainder.length] ?? (cum[Math.max(0, oppRemainder.length - 1)] || 0);
+    const turnaroundAtMeters = seamMeters[1] ?? 0;
 
     const stopAlongs = [
       ...mapStopsInRange(oppositeBranch, busOnOpp.along, oppositeBranch.totalLen, 0),

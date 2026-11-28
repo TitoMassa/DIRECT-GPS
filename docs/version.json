@@ -1,10 +1,10 @@
 {
-  "version": "3.1.6",
-  "versionCode": 316,
+  "version": "3.1.7",
+  "versionCode": 317,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.6/DIRECT-GPS-v3.1.6-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.6",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.7/DIRECT-GPS-v3.1.7-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.7",
   "notes": [
-    "Corregida la ubicación exacta de la punta de línea al finalizar servicio: ahora se ubica siempre en el extremo final del trazado (polilínea) de la bandera correspondiente (ej. final del trazado amarillo en 106A Pirayuí) y no en la última parada etiquetada que solía quedar cuadras o >1 km antes"
+    "Trazados unidos sin huecos en todas las 26 líneas: los extremos de cada bandera ahora se conectan exactamente a 0 m en todas las cabeceras/puntas de línea, eliminando los saltos y desapariciones del colectivo al cruzar de un sentido al otro tanto en el mapa como en la simulación y en las notificaciones nativas"
   ]
 }

@@ -209,6 +209,41 @@ public final class RouteDistanceCalculator {
             }
 
             if (!list.isEmpty()) {
+                // Garantizar que los extremos de las banderas se toquen (0 m) incluso si un archivo externo viniera separado
+                if (list.size() >= 2) {
+                    List<RouteBranch> connected = new ArrayList<>(list.size());
+                    for (int i = 0; i < list.size(); i++) {
+                        RouteBranch a = list.get(i);
+                        int aLast = a.lats.length - 1;
+                        double bestDist = Double.MAX_VALUE;
+                        RouteBranch bestTarget = null;
+                        for (int j = 0; j < list.size(); j++) {
+                            if (j == i) continue;
+                            RouteBranch b = list.get(j);
+                            double d = haversineMeters(a.lats[aLast], a.lngs[aLast], b.lats[0], b.lngs[0]);
+                            if (d < bestDist) {
+                                bestDist = d;
+                                bestTarget = b;
+                            }
+                        }
+                        if (bestTarget != null && bestDist > 0.5 && bestDist <= 430.0) {
+                            int n = a.lats.length;
+                            double[] nLats = new double[n + 1];
+                            double[] nLngs = new double[n + 1];
+                            double[] nCum = new double[n + 1];
+                            System.arraycopy(a.lats, 0, nLats, 0, n);
+                            System.arraycopy(a.lngs, 0, nLngs, 0, n);
+                            System.arraycopy(a.cum, 0, nCum, 0, n);
+                            nLats[n] = bestTarget.lats[0];
+                            nLngs[n] = bestTarget.lngs[0];
+                            nCum[n] = nCum[n - 1] + bestDist;
+                            connected.add(new RouteBranch(a.bandera, nLats, nLngs, nCum, a.stopIds, a.orderedStops));
+                        } else {
+                            connected.add(a);
+                        }
+                    }
+                    list = connected;
+                }
                 BRANCH_CACHE.put(codLinea, list);
                 return list;
             }

@@ -857,8 +857,14 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       fullPts.unshift({ stopId: null, along: 0, sec: startSec });
     }
     if (branch.totalLen - last.along > 25) {
-      const endSec = last.sec + (branch.totalLen - last.along) / tailSpd;
-      fullPts.push({ stopId: null, along: branch.totalLen, sec: endSec });
+      const rawEndAlong = typeof branch.rawTotalLen === 'number' ? branch.rawTotalLen : branch.totalLen;
+      const schedTailMeters = Math.max(0, rawEndAlong - last.along);
+      const connectorMeters = Math.max(0, branch.totalLen - Math.max(rawEndAlong, last.along));
+      const tailDurSec =
+        schedTailMeters > 25
+          ? schedTailMeters / tailSpd
+          : Math.max(2, Math.min(10, (schedTailMeters + connectorMeters) / 12));
+      fullPts.push({ stopId: null, along: branch.totalLen, sec: last.sec + tailDurSec });
     }
 
     const startSec = fullPts[0].sec;

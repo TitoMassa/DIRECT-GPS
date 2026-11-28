@@ -1,5 +1,6 @@
 import { CORRIENTES_CENTER, MAP_TILES, getLineColor, getDirectionColor } from './config.js';
 import { formatDistance } from './api.js';
+import { connectRouteEndpoints } from './trajectory.js';
 
 function escHtml(str = '') {
   return String(str)
@@ -687,8 +688,9 @@ export class TransitMap {
 
   drawRouteCollection(recorridos, lineName, { showStops = true, fit = false } = {}) {
     const allPts = [];
+    const connectedRecs = connectRouteEndpoints(recorridos);
 
-    recorridos.forEach((rec, idx) => {
+    connectedRecs.forEach((rec, idx) => {
       const branchColor = getDirectionColor(idx);
       const pts = (rec.puntos || [])
         .map((p) => [parseFloat(p.latitud), parseFloat(p.longitud)])

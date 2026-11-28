@@ -18,6 +18,7 @@ globalThis.window = {
 globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
 
 const {
+  connectRouteEndpoints,
   parseRouteBranches,
   projectOnPolyline,
   buildTrajectoryFromBranchAlong,
@@ -362,7 +363,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v112') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v112 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v113') && sw.includes('direct-gps-data-v6'), 'sw.js should have direct-gps-v113 & direct-gps-data-v6');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -638,7 +639,8 @@ console.log('9. Testing 7-day retention, Cloudflare DO SQLite write optimization
   const hor904B = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'horarios', '1038.json'), 'utf8'));
   const m904B = buildLineScheduleModel(1038, brs904B, hor904B, 'habil');
   const vBranch904B = brs904B.find((b) => b.git === 'V-SAPU');
-  const s4Pt = vBranch904B.pts[Math.floor(vBranch904B.pts.length * 0.72)];
+  assert.ok(vBranch904B, 'Expected V-SAPU branch on 904B');
+  const s4Pt = [-27.474209, -58.855297]; // General Belgrano bridge eastbound (Corrientes approach)
   const busGalvezS4 = {
     lat: s4Pt[0],
     lng: s4Pt[1],
@@ -1635,11 +1637,114 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     'Native Android service must implement 3-min desvio, 5-min strict 00:00 punctual fallback, and brisk GPS recovery'
   );
 
+  // v3.1.7: All 26 lines / 65 branches MUST have seamlessly connected endpoints (0 m gap at every cabecera/punta de línea)
+  {
+    const catAll = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'catalogo.json'), 'utf8'));
+    let checkedBranches = 0;
+    for (const linea of catAll.lineas) {
+      const rawRec = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'recorridos', `${linea.codigo}.json`), 'utf8'));
+      // 1) Idempotency: running connectRouteEndpoints on already-connected JSON must NOT add extra points
+      const reConnected = connectRouteEndpoints(rawRec);
+      for (let i = 0; i < rawRec.length; i++) {
+        assert.equal(
+          reConnected[i].puntos.length,
+          rawRec[i].puntos.length,
+          `connectRouteEndpoints must be idempotent on ${linea.descripcion} branch ${i}`
+        );
+      }
+
+      // 2) Every branch endpoint (start & end) MUST touch another branch at <= 1 m (either exact endpoint or trunk polyline)
+      const brs = parseRouteBranches(rawRec);
+      assert.ok(brs.length >= 2, `${linea.descripcion} should have >= 2 parsed branches`);
+      for (let i = 0; i < brs.length; i++) {
+        checkedBranches++;
+        const st = brs[i].pts[0];
+        const en = brs[i].pts[brs[i].pts.length - 1];
+        let minStartTouch = Infinity;
+        let minEndTouch = Infinity;
+        for (let j = 0; j < brs.length; j++) {
+          if (j === i) continue;
+          const pSt = projectOnPolyline(brs[j].pts, brs[j].cum, st[0], st[1]);
+          const pEn = projectOnPolyline(brs[j].pts, brs[j].cum, en[0], en[1]);
+          minStartTouch = Math.min(minStartTouch, pSt.perp);
+          minEndTouch = Math.min(minEndTouch, pEn.perp);
+        }
+        assert.ok(
+          minStartTouch <= 1.0,
+          `${linea.descripcion} [${i}] ${brs[i].bandera} start must touch opposite branch (gap=${minStartTouch.toFixed(1)}m)`
+        );
+        assert.ok(
+          minEndTouch <= 1.0,
+          `${linea.descripcion} [${i}] ${brs[i].bandera} end must touch opposite branch (gap=${minEndTouch.toFixed(1)}m)`
+        );
+      }
+    }
+    assert.equal(checkedBranches, 65, 'Expected to validate endpoint connectivity on all 65 branches across 26 lines');
+
+    // 3) Synthetic separated input MUST be auto-connected to 0 m by connectRouteEndpoints & parseRouteBranches
+    const sepMock = [
+      {
+        abreviaturaBanderaSMP: 'IDA',
+        puntos: [
+          { latitud: '-27.47000', longitud: '-58.83000' },
+          { latitud: '-27.46300', longitud: '-58.83761' }
+        ],
+        paradas: []
+      },
+      {
+        abreviaturaBanderaSMP: 'VUELTA',
+        puntos: [
+          { latitud: '-27.46186', longitud: '-58.83748' },
+          { latitud: '-27.47050', longitud: '-58.83050' }
+        ],
+        paradas: []
+      }
+    ];
+    const mockBrs = parseRouteBranches(sepMock);
+    assert.ok(
+      distanceMeters(mockBrs[0].pts.at(-1)[0], mockBrs[0].pts.at(-1)[1], mockBrs[1].pts[0][0], mockBrs[1].pts[0][1]) < 0.5,
+      'Runtime parseRouteBranches must auto-connect separated branch endpoints to 0 m'
+    );
+    assert.ok(
+      distanceMeters(mockBrs[1].pts.at(-1)[0], mockBrs[1].pts.at(-1)[1], mockBrs[0].pts[0][0], mockBrs[0].pts[0][1]) < 0.5,
+      'Runtime parseRouteBranches must auto-connect return endpoint to 0 m'
+    );
+
+    // 4) Stitched multi-leg trajectory (106A previous_leg & full_cycle) must have 0 m seam gap and zero duplicate vertices
+    const brs106A = routeBranchesCache.get(350);
+    const stop106Proj = projectOnPolyline(brs106A[1].pts, brs106A[1].cum, brs106A[1].orderedStops[5].lat, brs106A[1].orderedStops[5].lng);
+    const prevLeg106 = buildTrajectoryFromBranchAlong(brs106A[0], brs106A[0].totalLen * 0.5, brs106A[1], stop106Proj, { etaSec: 900 });
+    assert.equal(prevLeg106.leg, 'previous_leg');
+    assert.ok(
+      distanceMeters(
+        prevLeg106.segments[0].pts.at(-1)[0],
+        prevLeg106.segments[0].pts.at(-1)[1],
+        prevLeg106.segments[1].pts[0][0],
+        prevLeg106.segments[1].pts[0][1]
+      ) < 0.5,
+      '106A previous_leg segments must touch at exact 0 m turnaround seam'
+    );
+    for (let k = 1; k < prevLeg106.pathPts.length; k++) {
+      const segD = distanceMeters(
+        prevLeg106.pathPts[k - 1][0],
+        prevLeg106.pathPts[k - 1][1],
+        prevLeg106.pathPts[k][0],
+        prevLeg106.pathPts[k][1]
+      );
+      assert.ok(segD > 0.05 || k === 1 || k === prevLeg106.pathPts.length - 1, 'Stitched pathPts should not contain duplicate seam vertex');
+    }
+
+    const mapJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'map.js'), 'utf8');
+    assert.ok(mapJsSrc.includes('connectRouteEndpoints'), 'map.js must connect route endpoints in drawRouteCollection');
+    const routeDistSrc = await fs.readFile(path.join(androidJavaBase, 'RouteDistanceCalculator.java'), 'utf8');
+    assert.ok(routeDistSrc.includes('bestDist <= 430.0'), 'Android RouteDistanceCalculator must defensively connect branch endpoints');
+  }
+
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.6'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.6 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.7'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.7 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.6 Exact Polyline-Tip Punta de Línea Terminal Snap (106A/106B/904B), 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
+  console.log('  ✓ Verified v3.1.7 Seamless 0m Connected Route Polylines (all 26 lines / 65 branches), Exact Polyline-Tip Terminal Snap, 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

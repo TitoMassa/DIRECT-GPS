@@ -1457,7 +1457,7 @@ async function readOfflineFlotaActiva() {
 }
 
 // ── Automatic Full-Offline Startup Sync (Routes, Schedules, 7-day Fleet Bundle & Corrientes OSM Map Tiles) ──
-const SW_DATA_CACHE_NAME = 'direct-gps-data-v4';
+const SW_DATA_CACHE_NAME = 'direct-gps-data-v6';
 const SW_TILE_CACHE_NAME = 'direct-gps-tiles-v2';
 const OFFLINE_BUNDLE_REFRESH_MIN_MS = 5 * 60 * 1000;
 

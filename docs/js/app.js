@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.7',
+    date: '28/11/2026 · 03:55 hs',
+    items: [
+      '<strong>Trazados de banderas conectados sin huecos en todas las 26 líneas:</strong> se unieron los extremos de las polilíneas de ida y vuelta en todas las cabeceras/puntas de línea (0 m de separación en los 65 ramales), eliminando los saltos o desapariciones del colectivo al girar de una bandera a la otra tanto en el mapa como en la simulación en vivo y en el cálculo nativo de distancias.'
+    ]
+  },
+  {
     version: 'v3.1.6',
     date: '28/11/2026 · 02:25 hs',
     items: [
