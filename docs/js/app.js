@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.1',
+    date: '28/11/2026 · 00:15 hs',
+    items: [
+      '<strong>Orden fijo y estable por distancia (m/km) en las notificaciones push (cero saltos de posición):</strong> las notificaciones ahora se agrupan con <code>setGroup</code> + resumen de grupo en primer plano, timestamps fijos por posición (<code>setWhen</code> + <code>setSortKey</code>) e histéresis de <strong>120 m</strong> para que los colectivos más cercanos queden siempre arriba y los más lejanos abajo sin reordenarse ni saltar en cada actualización.'
+    ]
+  },
+  {
     version: 'v3.1.0',
     date: '28/11/2026 · 00:05 hs',
     items: [

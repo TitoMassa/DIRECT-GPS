@@ -94,9 +94,13 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     public static final String CHANNEL_LIVE_SILENT = "direct_gps_trip_live_v1";
     public static final String CHANNEL_ALERTS_SOUND = "direct_gps_alerts_sound_v1";
 
+    public static final int NOTIF_ID_GROUP_SUMMARY = 4100;
     public static final int NOTIF_ID_LIVE_TRIP = 4101;
     public static final int NOTIF_ID_ALERT_BASE = 4200;
     public static final int NOTIF_ID_WATCH_BASE = 4300;
+    private static final String GROUP_LIVE_ARRIVALS = "ar.corrientes.directgps.LIVE_ARRIVALS";
+    private static final String PRIMARY_ORDER_KEY = "__PRIMARY__";
+    private static final double ORDER_HYSTERESIS_METERS = 120.0;
 
     public static final String ACTION_START_WAITING = "ar.corrientes.directgps.ACTION_START_WAITING";
     public static final String ACTION_UPDATE_WAITING = "ar.corrientes.directgps.ACTION_UPDATE_WAITING";
@@ -343,6 +347,9 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private ScheduledFuture<?> simTickerFuture;
 
     private int activeForegroundNotifId = 0;
+    private final long sortBaseEpochMs = System.currentTimeMillis();
+    private final List<String> stableArrivalOrder = new ArrayList<>();
+    private final Map<String, Integer> stableRankByKey = new HashMap<>();
 
     // ── Persisted Stop Bells (campanitas en vivo que se actualizan en el lugar) ──
     private final Map<String, WatchAlert> watchedAlerts = java.util.Collections.synchronizedMap(new LinkedHashMap<>());
@@ -1777,6 +1784,11 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         releaseWakeLock();
         releaseTtsWakeLock();
         activeForegroundNotifId = 0;
+        stableArrivalOrder.clear();
+        stableRankByKey.clear();
+        if (notifManager != null) {
+            notifManager.cancel(NOTIF_ID_GROUP_SUMMARY);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE);
         } else {
@@ -1866,15 +1878,17 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     /**
      * Avance continuo cada 1,5 s en modo Simulación EN VIVO:
      * integra la velocidad sobre el trazado del recorrido, actualiza la cuenta regresiva en vivo
-     * y desliza suavemente la cápsula del colectivo sin esperar los saltos del último GPS.
+     * y desliza suavemente la cápsula del colectivo manteniendo el orden fijo por distancia (sin saltos).
      */
     private void runLiveSimTickOnMain() {
         try {
             if (notifManager == null) return;
             long now = System.currentTimeMillis();
 
-            // 1) Seguimiento principal (waiting / boarding_armed)
-            if ("waiting".equals(phase) || "boarding_armed".equals(phase)) {
+            // 1) Integrar simulación EN VIVO del seguimiento principal (waiting / boarding_armed)
+            boolean primaryActive = "waiting".equals(phase) || "boarding_armed".equals(phase);
+            int primaryLiveEta = etaMin;
+            if (primaryActive) {
                 if (primarySimLastTickMs <= 0) primarySimLastTickMs = now;
                 double dt = Math.max(0.2, Math.min(4.0, (now - primarySimLastTickMs) / 1000.0));
                 primarySimLastTickMs = now;
@@ -1885,28 +1899,12 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 if (primarySimEtaSec > 0 && etaMin != 0) {
                     primarySimEtaSec = Math.max(25.0, primarySimEtaSec - dt);
                 }
-                int liveEta = resolveLiveDisplayEtaMin(primarySimEtaSec, etaMin);
-                double targetP = computeSmoothLiveProgress01(distM, primarySimEtaSec, liveEta);
+                primaryLiveEta = resolveLiveDisplayEtaMin(primarySimEtaSec, etaMin);
+                double targetP = computeSmoothLiveProgress01(distM, primarySimEtaSec, primaryLiveEta);
                 progress01 = easeProgress01(progress01, targetP, false);
-
-                if (shouldRepaintNotification(
-                    progress01, primaryLastRenderedProgress01,
-                    distM, primaryLastRenderedDistM,
-                    liveEta, primaryLastRenderedEtaMin
-                )) {
-                    Notification primaryNotif = buildPrimaryWaitingNotification();
-                    if (activeForegroundNotifId != NOTIF_ID_LIVE_TRIP) {
-                        startForegroundCompat(NOTIF_ID_LIVE_TRIP, primaryNotif);
-                    } else {
-                        notifManager.notify(NOTIF_ID_LIVE_TRIP, primaryNotif);
-                    }
-                    primaryLastRenderedProgress01 = progress01;
-                    primaryLastRenderedDistM = distM;
-                    primaryLastRenderedEtaMin = liveEta;
-                }
             }
 
-            // 2) Campanitas activas (watchedAlerts)
+            // 2) Integrar simulación EN VIVO de todas las campanitas activas
             List<WatchAlert> snapshot;
             synchronized (watchedAlerts) {
                 snapshot = new ArrayList<>(watchedAlerts.values());
@@ -1926,14 +1924,35 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 int liveEta = resolveLiveDisplayEtaMin(w.simEtaSec, w.etaMin);
                 double targetP = computeSmoothLiveProgress01(w.distM, w.simEtaSec, liveEta);
                 w.progress01 = easeProgress01(w.progress01, targetP, false);
+            }
 
+            // 3) Si cambió el orden real por distancia (> 120 m de histéresis), actualizar en bloque
+            if (recomputeStableArrivalRanks()) {
+                refreshAllNotificationsAndForeground();
+                return;
+            }
+
+            // 4) Si el orden NO cambió, repintar suavemente en el lugar con rank/when fijos (CERO saltos)
+            if (primaryActive && shouldRepaintNotification(
+                progress01, primaryLastRenderedProgress01,
+                distM, primaryLastRenderedDistM,
+                primaryLiveEta, primaryLastRenderedEtaMin
+            )) {
+                notifManager.notify(NOTIF_ID_LIVE_TRIP, buildPrimaryWaitingNotification());
+                primaryLastRenderedProgress01 = progress01;
+                primaryLastRenderedDistM = distM;
+                primaryLastRenderedEtaMin = primaryLiveEta;
+            }
+
+            for (WatchAlert w : snapshot) {
+                if (isDuplicateOfPrimaryWaiting(w)) continue;
+                int liveEta = resolveLiveDisplayEtaMin(w.simEtaSec, w.etaMin);
                 if (shouldRepaintNotification(
                     w.progress01, w.lastRenderedProgress01,
                     w.distM, w.lastRenderedDistM,
                     liveEta, w.lastRenderedEtaMin
                 )) {
-                    Notification n = buildWatchNotification(w);
-                    notifManager.notify(w.notifId, n);
+                    notifManager.notify(w.notifId, buildWatchNotification(w));
                     w.lastRenderedProgress01 = w.progress01;
                     w.lastRenderedDistM = w.distM;
                     w.lastRenderedEtaMin = liveEta;
@@ -2307,49 +2326,190 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
-    private void refreshAllNotificationsAndForeground() {
-        if (notifManager == null) return;
+    private static double computeEffectiveSortDistanceM(double distMeters, double simEtaSec, int etaMinutes) {
+        if (distMeters >= 0 && isDistanceCoherentWithEta(distMeters, etaMinutes)) {
+            return distMeters;
+        }
+        if (simEtaSec >= 0) {
+            return simEtaSec * 5.2;
+        }
+        if (etaMinutes >= 0) {
+            return etaMinutes * 310.0;
+        }
+        return 999_999.0;
+    }
 
-        boolean hasPrimary = !"idle".equals(phase);
-        if (hasPrimary) {
-            Notification primaryNotif = "onboard".equals(phase)
-                ? buildOnboardNotification()
-                : buildPrimaryWaitingNotification();
-            if (activeForegroundNotifId != NOTIF_ID_LIVE_TRIP) {
-                startForegroundCompat(NOTIF_ID_LIVE_TRIP, primaryNotif);
-            } else {
-                notifManager.notify(NOTIF_ID_LIVE_TRIP, primaryNotif);
-            }
-            primaryLastRenderedProgress01 = progress01;
-            primaryLastRenderedDistM = distM;
-            primaryLastRenderedEtaMin = etaMin;
+    /**
+     * Ordena los arribos estrictamente por distancia en m/km (más cercano arriba -> más lejano abajo)
+     * con histéresis de 120 m para eliminar cualquier salto o intercambio molesto al actualizar.
+     * Devuelve true únicamente si cambió alguna posición real.
+     */
+    private boolean recomputeStableArrivalRanks() {
+        Map<String, Double> activeDistances = new LinkedHashMap<>();
+
+        if ("waiting".equals(phase) || "boarding_armed".equals(phase)) {
+            int liveEta = resolveLiveDisplayEtaMin(primarySimEtaSec, etaMin);
+            activeDistances.put(PRIMARY_ORDER_KEY, computeEffectiveSortDistanceM(distM, primarySimEtaSec, liveEta));
         }
 
         List<WatchAlert> snapshot;
         synchronized (watchedAlerts) {
             snapshot = new ArrayList<>(watchedAlerts.values());
         }
+        for (WatchAlert w : snapshot) {
+            if (isDuplicateOfPrimaryWaiting(w)) continue;
+            int liveEta = resolveLiveDisplayEtaMin(w.simEtaSec, w.etaMin);
+            activeDistances.put(w.key, computeEffectiveSortDistanceM(w.distM, w.simEtaSec, liveEta));
+        }
 
-        boolean promotedWatchToFg = false;
+        List<String> prevOrder = new ArrayList<>(stableArrivalOrder);
+
+        // 1) Quitar los que ya no están activos
+        Iterator<String> it = stableArrivalOrder.iterator();
+        while (it.hasNext()) {
+            if (!activeDistances.containsKey(it.next())) {
+                it.remove();
+            }
+        }
+
+        // 2) Insertar los nuevos en su posición exacta por distancia (menor distancia arriba)
+        for (Map.Entry<String, Double> e : activeDistances.entrySet()) {
+            String k = e.getKey();
+            if (stableArrivalOrder.contains(k)) continue;
+            double d = e.getValue();
+            int insertIdx = stableArrivalOrder.size();
+            for (int i = 0; i < stableArrivalOrder.size(); i++) {
+                Double existingDist = activeDistances.get(stableArrivalOrder.get(i));
+                if (existingDist == null || d < existingDist) {
+                    insertIdx = i;
+                    break;
+                }
+            }
+            stableArrivalOrder.add(insertIdx, k);
+        }
+
+        // 3) Reordenar solo si un colectivo supera realmente a otro por más de 120 m (histéresis anti-salto)
+        boolean swapped = true;
+        int guard = 0;
+        while (swapped && guard < 32) {
+            swapped = false;
+            guard++;
+            for (int i = 0; i < stableArrivalOrder.size() - 1; i++) {
+                String kAbove = stableArrivalOrder.get(i);
+                String kBelow = stableArrivalOrder.get(i + 1);
+                Double dAbove = activeDistances.get(kAbove);
+                Double dBelow = activeDistances.get(kBelow);
+                if (dAbove != null && dBelow != null && (dBelow + ORDER_HYSTERESIS_METERS) < dAbove) {
+                    stableArrivalOrder.set(i, kBelow);
+                    stableArrivalOrder.set(i + 1, kAbove);
+                    swapped = true;
+                }
+            }
+        }
+
+        stableRankByKey.clear();
+        for (int i = 0; i < stableArrivalOrder.size(); i++) {
+            stableRankByKey.put(stableArrivalOrder.get(i), i);
+        }
+
+        return !prevOrder.equals(stableArrivalOrder);
+    }
+
+    private int getStableRank(String key) {
+        Integer r = stableRankByKey.get(key);
+        return r != null ? r : Math.max(0, stableArrivalOrder.size());
+    }
+
+    private Notification buildGroupSummaryNotification(int count) {
+        return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
+            .setSmallIcon(R.drawable.ic_stat_bus)
+            .setGroup(GROUP_LIVE_ARRIVALS)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setWhen(sortBaseEpochMs + 120_000L)
+            .setShowWhen(false)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
+            .setContentTitle("DIRECT GPS · " + count + " colectivos en vivo")
+            .setContentText("Ordenados por cercanía (m/km)")
+            .setContentIntent(buildOpenAppIntent(null))
+            .build();
+    }
+
+    private void refreshAllNotificationsAndForeground() {
+        if (notifManager == null) return;
+
+        recomputeStableArrivalRanks();
+
+        boolean hasPrimary = !"idle".equals(phase);
+        boolean isOnboard = "onboard".equals(phase);
+
+        List<WatchAlert> snapshot;
+        synchronized (watchedAlerts) {
+            snapshot = new ArrayList<>(watchedAlerts.values());
+        }
+        List<WatchAlert> visibleWatches = new ArrayList<>();
         for (WatchAlert w : snapshot) {
             if (isDuplicateOfPrimaryWaiting(w)) {
                 notifManager.cancel(w.notifId);
-                continue;
+            } else {
+                visibleWatches.add(w);
             }
+        }
+
+        int totalVisible = (hasPrimary ? 1 : 0) + visibleWatches.size();
+        if (totalVisible == 0) {
+            notifManager.cancel(NOTIF_ID_GROUP_SUMMARY);
+            return;
+        }
+
+        // Con 2+ notificaciones activas, anclamos el Foreground Service en el resumen de grupo
+        // para que One UI / Android nunca "pegue" arriba una notificación lejana solo por ser foreground.
+        boolean useGroupSummaryAnchor = totalVisible >= 2;
+        if (useGroupSummaryAnchor) {
+            Notification summary = buildGroupSummaryNotification(totalVisible);
+            if (activeForegroundNotifId != NOTIF_ID_GROUP_SUMMARY) {
+                startForegroundCompat(NOTIF_ID_GROUP_SUMMARY, summary);
+            } else {
+                notifManager.notify(NOTIF_ID_GROUP_SUMMARY, summary);
+            }
+        } else {
+            if (activeForegroundNotifId == NOTIF_ID_GROUP_SUMMARY) {
+                activeForegroundNotifId = 0;
+            }
+            notifManager.cancel(NOTIF_ID_GROUP_SUMMARY);
+        }
+
+        if (hasPrimary) {
+            Notification primaryNotif = isOnboard
+                ? buildOnboardNotification()
+                : buildPrimaryWaitingNotification();
+            if (!useGroupSummaryAnchor && activeForegroundNotifId != NOTIF_ID_LIVE_TRIP) {
+                startForegroundCompat(NOTIF_ID_LIVE_TRIP, primaryNotif);
+            } else {
+                notifManager.notify(NOTIF_ID_LIVE_TRIP, primaryNotif);
+            }
+            primaryLastRenderedProgress01 = progress01;
+            primaryLastRenderedDistM = distM;
+            primaryLastRenderedEtaMin = resolveLiveDisplayEtaMin(primarySimEtaSec, etaMin);
+        }
+
+        // Ordenar las campanitas por su rank estable (0 = más cercano arriba -> N = más lejano abajo)
+        visibleWatches.sort((a, b) -> Integer.compare(getStableRank(a.key), getStableRank(b.key)));
+
+        for (WatchAlert w : visibleWatches) {
             Notification n = buildWatchNotification(w);
-            if (!hasPrimary && !promotedWatchToFg && (activeForegroundNotifId == 0 || activeForegroundNotifId == w.notifId)) {
-                if (activeForegroundNotifId != w.notifId) {
-                    startForegroundCompat(w.notifId, n);
-                } else {
-                    notifManager.notify(w.notifId, n);
-                }
-                promotedWatchToFg = true;
+            if (!useGroupSummaryAnchor && !hasPrimary && activeForegroundNotifId != w.notifId) {
+                startForegroundCompat(w.notifId, n);
             } else {
                 notifManager.notify(w.notifId, n);
             }
             w.lastRenderedProgress01 = w.progress01;
             w.lastRenderedDistM = w.distM;
-            w.lastRenderedEtaMin = w.etaMin;
+            w.lastRenderedEtaMin = resolveLiveDisplayEtaMin(w.simEtaSec, w.etaMin);
         }
     }
 
@@ -2377,9 +2537,10 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     }
 
     /**
-     * Construye la notificación push en tiempo real estilo Uber (v3.1.0):
+     * Construye la notificación push en tiempo real estilo Uber (v3.1.1):
      *  - UNA sola barra gráfica con gradiente del color real de la línea, micro-hitos y faro esmeralda
-     *  - Orden automático por menor tiempo de llegada (setSortKey) y acento del color de la línea (setColor)
+     *  - Orden fijo y estable por distancia en m/km (más cercano arriba, más lejano abajo) usando
+     *    setGroup + setSortKey + setWhen fijo por posición (CERO saltos al actualizar en One UI/Android)
      *  - Vista compacta enriquecida con distancia real y vista expandida sin textos redundantes:
      *      #4150            Prog. real: 23:03
      *      GARCIA J.
@@ -2395,6 +2556,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         int targetEtaMin,
         double targetDistM,
         double targetProgress01,
+        int stableRank,
         @Nullable String extraStatusLine
     ) {
         String cocheTxt = (targetCoche == null || targetCoche.isEmpty()) ? "s/d" : "#" + targetCoche;
@@ -2453,17 +2615,23 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         expandedView.setTextViewText(R.id.notif_driver_line, driverTxt);
         expandedView.setTextViewText(R.id.notif_dist_line, distLine);
 
-        int sortEta = targetEtaMin < 0 ? 999 : Math.max(0, Math.min(998, targetEtaMin));
-        String sortKey = String.format(Locale.US, "%04d_%s", sortEta, targetLine);
+        int safeRank = Math.max(0, Math.min(999, stableRank));
+        String sortKey = String.format(Locale.US, "%03d_%s", safeRank, targetLine);
+        // Timestamp fijo por posición: el colectivo más cercano (rank 0) siempre tiene el timestamp
+        // más alto y nunca cambia al repintar la barra -> One UI / Android nunca salta notificaciones.
+        long fixedWhenMs = sortBaseEpochMs - (safeRank * 60_000L);
 
         return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
             .setSmallIcon(R.drawable.ic_stat_bus)
             .setColor(lineColor)
+            .setGroup(GROUP_LIVE_ARRIVALS)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
             .setSortKey(sortKey)
+            .setWhen(fixedWhenMs)
+            .setShowWhen(false)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
-            .setShowWhen(false)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(buildOpenAppIntent(targetStopId))
@@ -2476,11 +2644,12 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     /**
      * Notificación push en vivo de ARRIBO (campanita de parada):
-     * - Se ACTUALIZA EN EL LUGAR con avance EN VIVO continuo + acciones rápidas Subir / Min a min / Quitar.
+     * - Se ACTUALIZA EN EL LUGAR con avance EN VIVO continuo + orden estable por distancia + acciones rápidas.
      */
     private Notification buildWatchNotification(WatchAlert w) {
         int liveEta = resolveLiveDisplayEtaMin(w.simEtaSec, w.etaMin);
         int reqSlot = Math.abs(w.notifId % 500);
+        int rank = getStableRank(w.key);
         return buildUberArrivalBuilder(
             w.stopId,
             w.lineName,
@@ -2491,6 +2660,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             liveEta,
             w.distM,
             w.progress01,
+            rank,
             null
         )
             .addAction(0, "🚌 Subir", buildServiceActionIntent(ACTION_BOARD_FROM_WATCH, 900 + reqSlot, w.key))
@@ -2505,10 +2675,11 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     /**
      * Notificación push en vivo de ARRIBO (línea seleccionada):
-     * - Avance EN VIVO continuo + acciones Subir / Min a min / Detener.
+     * - Avance EN VIVO continuo + orden estable por distancia + acciones Subir / Min a min / Detener.
      */
     private Notification buildPrimaryWaitingNotification() {
         int liveEta = resolveLiveDisplayEtaMin(primarySimEtaSec, etaMin);
+        int rank = getStableRank(PRIMARY_ORDER_KEY);
         String extraStatus = "boarding_armed".equals(phase)
             ? "✅ Subir activado · pasa a A Bordo al llegar"
             : null;
@@ -2522,6 +2693,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             liveEta,
             distM,
             progress01,
+            rank,
             extraStatus
         );
 
@@ -2585,11 +2757,14 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
             .setSmallIcon(R.drawable.ic_stat_bus)
             .setColor(lineColor)
-            .setSortKey("0000_ONBOARD")
+            .setGroup(GROUP_LIVE_ARRIVALS)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            .setSortKey("000_ONBOARD")
+            .setWhen(sortBaseEpochMs + 60_000L)
+            .setShowWhen(false)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
-            .setShowWhen(false)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(buildOpenAppIntent(stopId))

@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v106') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v106 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v107') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v107 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1217,16 +1217,20 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
       tripSvcSrc.includes('ACTION_BOARD_FROM_WATCH') &&
       tripSvcSrc.includes('resolveLiveDisplayEtaMin') &&
       tripSvcSrc.includes('setSortKey') &&
+      tripSvcSrc.includes('recomputeStableArrivalRanks') &&
+      tripSvcSrc.includes('ORDER_HYSTERESIS_METERS') &&
+      tripSvcSrc.includes('setWhen(fixedWhenMs)') &&
+      tripSvcSrc.includes('GROUP_LIVE_ARRIVALS') &&
       tripSvcSrc.includes('notif_onboard_expanded'),
-    'DirectGpsTripService must expose v3.1.0 interactive push notification actions, ETA sorting, live countdown, and custom onboard card'
+    'DirectGpsTripService must expose v3.1.1 stable distance-ranked ordering, fixed setWhen, group summary anchor, interactive actions, and custom onboard card'
   );
   assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_car_primary, "Coche "'), false, 'Expanded notification must show #coche directly without redundant Coche label');
   assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_driver_line, "Chofer: "'), false, 'Expanded notification must show driver name directly without redundant Chofer label');
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.0 changelog, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.1'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.1 changelog, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.0 Removed Floating Card, Upgraded Real-Time Android Push Notifications (Gradient Track, ETA Sort, 1-Tap Subir/Min-a-Min, Custom Onboard Card) & strict exclusions');
+  console.log('  ✓ Verified v3.1.1 Stable Distance-Ranked Notification Ordering (Zero Position Jumping), Upgraded Real-Time Push Notifications & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');
