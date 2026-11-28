@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.5',
+    date: '28/11/2026 · 01:45 hs',
+    items: [
+      '<strong>Última ubicación en punta de línea final al terminar servicio/turno (NO relevo):</strong> llegada la hora programada de finalización y pasados <strong>3 minutos sin novedad GPS</strong>, el colectivo se muestra siempre ubicado en la <strong>punta de línea exacta donde finaliza su turno</strong> (ej. Puerto en 904B/C, o la cabecera opuesta en turnos de vueltas y media), sin importar en qué parte del recorrido haya sido visto por última vez, tanto en Mapa/Inspector como en Flota, Coches, Choferes, Servicios y Buscador.'
+    ]
+  },
+  {
     version: 'v3.1.4',
     date: '28/11/2026 · 01:25 hs',
     items: [
@@ -4738,21 +4745,17 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
   const seenKeys = new Set();
 
   for (const bus of buses) {
-    // Offline or finished-service units MUST stay stationary at their last/terminal position — NEVER simulated moving!
-    if (bus.serviceFinished || bus.enLineaAhora === false) {
+    if (bus.serviceFinished) {
       cityFleetSim.delete(bus.key);
       bus.gpsLost = false;
       bus.gpsPunctualFallback = false;
       continue;
     }
 
-    const rawLat = typeof bus.rawLat === 'number' ? bus.rawLat : bus.lat;
-    const rawLng = typeof bus.rawLng === 'number' ? bus.rawLng : bus.lng;
-    if (typeof rawLat !== 'number' || typeof rawLng !== 'number') continue;
-
-    // Cross-check schedule/GPS coherence: if this unit already finished its service/turno, freeze it at terminal!
+    // Cross-check schedule/GPS coherence FIRST (even for offline units):
+    // once end of service/turno (not relevo) arrives + >= 3 min no GPS, snap to ending punta de línea!
     const completion = evaluateServiceCompletionStatus(bus, bus._scheduleModel || null, nowSec, {
-      entityType: 'coche',
+      entityType: bus._trackedEntityType || 'coche',
       nowMs
     });
     if (completion.finished) {
@@ -4767,10 +4770,25 @@ function reconcileCityFleetSim(buses = [], { keepOtherKeys = false } = {}) {
       if (completion.snapToTerminal && Number.isFinite(completion.terminalLat) && Number.isFinite(completion.terminalLng)) {
         bus.lat = completion.terminalLat;
         bus.lng = completion.terminalLng;
+        bus.rawLat = completion.terminalLat;
+        bus.rawLng = completion.terminalLng;
+        bus.terminalSnapped = true;
       }
       cityFleetSim.delete(bus.key);
       continue;
     }
+
+    // Offline units stay stationary at their last known position — NEVER simulated moving!
+    if (bus.enLineaAhora === false) {
+      cityFleetSim.delete(bus.key);
+      bus.gpsLost = false;
+      bus.gpsPunctualFallback = false;
+      continue;
+    }
+
+    const rawLat = typeof bus.rawLat === 'number' ? bus.rawLat : bus.lat;
+    const rawLng = typeof bus.rawLng === 'number' ? bus.rawLng : bus.lng;
+    if (typeof rawLat !== 'number' || typeof rawLng !== 'number') continue;
 
     seenKeys.add(bus.key);
 
@@ -5382,6 +5400,9 @@ function filterActiveCityFleetBuses(buses, nowSec = getArgentinaSecOfDay(), nowM
       if (comp.snapToTerminal && Number.isFinite(comp.terminalLat) && Number.isFinite(comp.terminalLng)) {
         bus.lat = comp.terminalLat;
         bus.lng = comp.terminalLng;
+        bus.rawLat = comp.terminalLat;
+        bus.rawLng = comp.terminalLng;
+        bus.terminalSnapped = true;
       }
       cityFleetSim.delete(bus.key);
       continue;
@@ -5394,7 +5415,8 @@ function filterActiveCityFleetBuses(buses, nowSec = getArgentinaSecOfDay(), nowM
 /**
  * Reconciles stale Worker "enLineaAhora" flags against the real schedule + GPS + terminal
  * coherence engine (`evaluateServiceCompletionStatus`), returning shallow copies where cars
- * or drivers whose service/turno already finished are immediately marked offline (`Finalizó`).
+ * or drivers whose service/turno already finished are immediately marked offline (`Finalizó`)
+ * and snapped to their ending punta de línea when applicable.
  */
 function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec) {
   const rawCars = Array.isArray(allCoches) ? allCoches : [];
@@ -5418,6 +5440,16 @@ function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
     const nb = normDrv(nameB);
     return Boolean(na && nb && na === nb);
   };
+  const applyTerminalCoords = (comp) =>
+    comp?.snapToTerminal && Number.isFinite(comp.terminalLat) && Number.isFinite(comp.terminalLng)
+      ? {
+          lat: comp.terminalLat,
+          lng: comp.terminalLng,
+          lastLat: comp.terminalLat,
+          lastLng: comp.terminalLng,
+          terminalSnapped: true
+        }
+      : {};
 
   const liveCarById = new Map();
   const finishedCarIds = new Set();
@@ -5437,6 +5469,7 @@ function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
         finishedCarIds.add(c.coche);
         return {
           ...c,
+          ...applyTerminalCoords(comp),
           enLineaAhora: false,
           serviceFinished: true,
           finishedReason: comp.reason,
@@ -5451,6 +5484,7 @@ function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
     if (comp?.finished) {
       return {
         ...c,
+        ...applyTerminalCoords(comp),
         serviceFinished: true,
         finishedReason: comp.reason,
         finishedLabel: comp.label,
@@ -5488,6 +5522,7 @@ function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
       if (comp?.finished || carTakenByOtherDriver || (d.lastCoche && finishedCarIds.has(d.lastCoche))) {
         return {
           ...d,
+          ...applyTerminalCoords(comp),
           enLineaAhora: false,
           serviceFinished: true,
           finishedReason: comp?.reason || (carTakenByOtherDriver ? 'turno_ended' : 'service_ended'),
@@ -5501,6 +5536,7 @@ function sanitizeLiveFleetAgainstSchedule(allCoches, allChoferes, model, nowSec)
     if (comp?.finished) {
       return {
         ...d,
+        ...applyTerminalCoords(comp),
         serviceFinished: true,
         finishedReason: comp.reason,
         finishedLabel: comp.label,
@@ -6688,6 +6724,7 @@ async function locateFleetUnitOnMap({
       serviceSpan,
       enLineaAhora: Boolean(isLiveNow),
       serviceFinished: false,
+      _trackedEntityType: evalEntityType,
       isFreeTracked: true,
       isPredicted: false
     };
@@ -6709,6 +6746,8 @@ async function locateFleetUnitOnMap({
       if (completion.snapToTerminal && Number.isFinite(completion.terminalLat) && Number.isFinite(completion.terminalLng)) {
         obj.lat = completion.terminalLat;
         obj.lng = completion.terminalLng;
+        obj.rawLat = completion.terminalLat;
+        obj.rawLng = completion.terminalLng;
         obj.terminalSnapped = true;
       }
       const lastBiTrip = Array.isArray(resolvedBi?.trips) && resolvedBi.trips.length > 0
@@ -6737,8 +6776,27 @@ async function locateFleetUnitOnMap({
   };
 
   // Resolve initial metadata & render immediately if coordinates exist
+  // Preserve explicit serviceMeta blockInfo (from Servicios / Coches / Choferes / Buscador) so finished
+  // units always snap to their exact ending punta de línea even if their last GPS was old or mid-route!
+  const explicitServiceMeta = (() => {
+    if (!serviceMeta) return null;
+    if (serviceMeta.trip || serviceMeta.blockInfo) return serviceMeta;
+    if (serviceMeta.blockId && model?.blockInfoById?.has(serviceMeta.blockId)) {
+      return { ...serviceMeta, blockInfo: model.blockInfoById.get(serviceMeta.blockId) };
+    }
+    if (serviceMeta.serviceNumber > 0 && Array.isArray(model?.blocks)) {
+      const blk =
+        model.blocks.find(
+          (b) =>
+            b.serviceNumber === Number(serviceMeta.serviceNumber) &&
+            b.turnoIndex === Number(serviceMeta.turnoIndex || 1)
+        ) || model.blocks.find((b) => b.serviceNumber === Number(serviceMeta.serviceNumber));
+      if (blk) return { ...serviceMeta, blockInfo: blk };
+    }
+    return null;
+  })();
   const initialMeta =
-    (serviceMeta?.trip ? serviceMeta : null) ||
+    explicitServiceMeta ||
     resolveUnitScheduleMeta(
       model,
       {
@@ -6859,6 +6917,8 @@ async function locateFleetUnitOnMap({
             if (drvComp.snapToTerminal && Number.isFinite(drvComp.terminalLat) && Number.isFinite(drvComp.terminalLng)) {
               found.lat = drvComp.terminalLat;
               found.lng = drvComp.terminalLng;
+              found.rawLat = drvComp.terminalLat;
+              found.rawLng = drvComp.terminalLng;
               found.terminalSnapped = true;
             }
           }
@@ -6962,6 +7022,8 @@ async function locateFleetUnitOnMap({
             if (reComp.snapToTerminal && Number.isFinite(reComp.terminalLat) && Number.isFinite(reComp.terminalLng)) {
               keptBus.lat = reComp.terminalLat;
               keptBus.lng = reComp.terminalLng;
+              keptBus.rawLat = reComp.terminalLat;
+              keptBus.rawLng = reComp.terminalLng;
               keptBus.terminalSnapped = true;
             }
           }
@@ -10625,6 +10687,14 @@ function renderLineFlotaView() {
                       `;
                     } else {
                       const targetIdx = clickTargets.length;
+                      const snappedLat =
+                        turnoComp?.finished && turnoComp.snapToTerminal && Number.isFinite(turnoComp.terminalLat)
+                          ? turnoComp.terminalLat
+                          : assign.lat;
+                      const snappedLng =
+                        turnoComp?.finished && turnoComp.snapToTerminal && Number.isFinite(turnoComp.terminalLng)
+                          ? turnoComp.terminalLng
+                          : assign.lng;
                       clickTargets.push({
                         codLinea: linea.codigo,
                         lineName: linea.descripcion,
@@ -10632,8 +10702,8 @@ function renderLineFlotaView() {
                         choferNombre: assign.choferNombre,
                         choferLegajo: assign.choferLegajo,
                         esAdaptado: assign.esAdaptado,
-                        lat: assign.lat,
-                        lng: assign.lng,
+                        lat: snappedLat,
+                        lng: snappedLng,
                         bandera: assign.bandera,
                         lastGps: assign.lastGps,
                         lastStopId: assign.lastStopId,
@@ -10643,6 +10713,8 @@ function renderLineFlotaView() {
                         lastSeenLabel: isLiveNow ? 'En línea' : isTurnoFinished ? 'Finalizó' : 'Hoy',
                         entityType: t.relevoToNext && assign.choferNombre ? 'chofer' : 'coche',
                         serviceMeta: {
+                          blockId: t.blockId,
+                          blockInfo: turnoBlockInfo,
                           serviceNumber: s.serviceNumber,
                           turnoIndex: t.turnoIndex,
                           serviceTurnosCount: sTurnos.length,
@@ -12562,8 +12634,14 @@ function renderGlobalSearchResults(rawQuery) {
                 choferNombre: h.choferNombre,
                 choferLegajo: h.choferLegajo,
                 esAdaptado: h.esAdaptado,
-                lat: h.lastLat,
-                lng: h.lastLng,
+                lat:
+                  hitComp?.finished && hitComp.snapToTerminal && Number.isFinite(hitComp.terminalLat)
+                    ? hitComp.terminalLat
+                    : h.lastLat,
+                lng:
+                  hitComp?.finished && hitComp.snapToTerminal && Number.isFinite(hitComp.terminalLng)
+                    ? hitComp.terminalLng
+                    : h.lastLng,
                 bandera: h.lastBandera,
                 lastGps: h.lastGps,
                 lastStopId: h.lastStopId,

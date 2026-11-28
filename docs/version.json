@@ -1,11 +1,11 @@
 {
-  "version": "3.1.4",
-  "versionCode": 314,
+  "version": "3.1.5",
+  "versionCode": 315,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.4/DIRECT-GPS-v3.1.4-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.4",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.5/DIRECT-GPS-v3.1.5-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.5",
   "notes": [
-    "Simulación inteligente sin GPS en 2 etapas: de 3 a 5 min sin novedad GPS simula con el último desvío horario visto; pasados los 5 min sin GPS se guía estrictamente por los horarios programados de las paradas circulando 100 % puntual (desvío 00:00)",
-    "Al volver a recibir señal GPS, el colectivo corrige hacia su última posición real con una transición suave, rápida y precisa (sin saltos bruscos ni quedarse trabado)"
+    "Fin de servicio/turno (no relevo) + 3 min sin GPS: ahora siempre muestra como última ubicación la punta de línea exacta donde finaliza el colectivo (ej. Puerto en 904B/C, o la cabecera opuesta en servicios de x vueltas y media), sin importar en qué parte del recorrido haya sido su último reporte GPS",
+    "Aplicado en Flota, Coches, Choferes, Servicios, Buscador y seguimiento en mapa, incluyendo coches con turnos encadenados por relevo al llegar al fin real de su jornada"
   ]
 }

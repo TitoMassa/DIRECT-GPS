@@ -362,7 +362,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v110') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v110 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v111') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v111 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -827,6 +827,84 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   });
   assert.equal(relDrvComp.finished, true, 'Driver on relevoToNext block MUST be marked finished after relevo');
   assert.equal(relDrvComp.reason, 'turno_ended');
+
+  // v3.1.5: Once scheduled end of service/turno (NOT relevo) arrives + >= 3 min without GPS,
+  // ALWAYS snap to the exact ending punta de línea regardless of where last GPS was seen (even 15+ km away!)
+  {
+    const unneStartPt = s4LastTrip.branch.pts[0]; // ~15+ km away from Puerto (UNNE Resistencia)
+    assert.ok(distanceMeters(unneStartPt[0], unneStartPt[1], s4PuertoStop.lat, s4PuertoStop.lng) > 12000);
+    const fmtHM = (sec) => {
+      const s = ((Math.round(sec) % 86400) + 86400) % 86400;
+      return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`;
+    };
+    const gpsBeforeEnd = fmtHM(s4Block904B.endSec - 240);
+    const far904Unit = {
+      identificadorCoche: '4131',
+      choferNombre: 'PUCHETA',
+      lat: unneStartPt[0],
+      lng: unneStartPt[1],
+      rawLat: unneStartPt[0],
+      rawLng: unneStartPt[1],
+      ultimaFechaHoraGPS: `27/11/2026 ${gpsBeforeEnd}:00`,
+      desvio: { status: 'late', seconds: -900, raw: '-15:00' },
+      serviceNumber: s4Block904B.serviceNumber,
+      turnoIndex: s4Block904B.turnoIndex,
+      _matchedTrip: s4LastTrip
+    };
+    // Exactly at scheduled end time + 4 min no GPS (>= 3 min) -> MUST finish and snap straight to Puerto!
+    const far904Done = evaluateServiceCompletionStatus(far904Unit, m904B, s4Block904B.endSec + 5, {
+      entityType: 'coche',
+      blockInfo: s4Block904B
+    });
+    assert.equal(far904Done.finished, true, '904B past scheduled end with >= 3 min no GPS must finish even if last GPS was in Resistencia');
+    assert.equal(far904Done.snapToTerminal, true, '904B finished non-relevo service MUST snap to Puerto even from 15+ km away');
+    assert.ok(
+      distanceMeters(far904Done.terminalLat, far904Done.terminalLng, s4PuertoStop.lat, s4PuertoStop.lng) < 5,
+      '904B terminal snap must land at Puerto'
+    );
+
+    // Half-lap ("x vueltas y media") shift: 106B S1T1 (2.5 vueltas, starts at Barrio Nuevo, ends at Puerto!)
+    const halfLapBlk = m106B.blocks.find((b) => !b.relevoToNext && b.shiftLaps && b.shiftLaps % 1 !== 0);
+    assert.ok(halfLapBlk, 'Expected a non-relevo half-lap block on 106B');
+    const hlLastTrip = halfLapBlk.trips[halfLapBlk.trips.length - 1];
+    const hlStartPt = hlLastTrip.branch.pts[0]; // opposite end of the line
+    const hlEndStops = hlLastTrip.branch.orderedStops || [];
+    const hlExpectedEnd = hlEndStops.length > 0 ? hlEndStops[hlEndStops.length - 1] : { lat: hlLastTrip.branch.pts.at(-1)[0], lng: hlLastTrip.branch.pts.at(-1)[1] };
+    const hlGpsHM = fmtHM(halfLapBlk.endSec - 300);
+    const hlRes = evaluateServiceCompletionStatus(
+      {
+        identificadorCoche: '2950',
+        lat: hlStartPt[0],
+        lng: hlStartPt[1],
+        rawLat: hlStartPt[0],
+        rawLng: hlStartPt[1],
+        ultimaFechaHoraGPS: `27/11/2026 ${hlGpsHM}:00`,
+        desvio: { status: 'ok', seconds: 0 }
+      },
+      m106B,
+      halfLapBlk.endSec + 10,
+      { entityType: 'coche', blockInfo: halfLapBlk }
+    );
+    assert.equal(hlRes.finished, true, 'Half-lap shift at endSec + >= 3 min no GPS must finish');
+    assert.equal(hlRes.snapToTerminal, true, 'Half-lap shift must snap to its exact opposite ending terminal');
+    assert.ok(
+      distanceMeters(hlRes.terminalLat, hlRes.terminalLng, hlExpectedEnd.lat, hlExpectedEnd.lng) < 5,
+      'Half-lap shift must snap to the exact ending terminal of that shift (not starting terminal)'
+    );
+
+    // Chained relevo car: while still in T2 -> NOT finished; once T2 ends + >= 3 min no GPS -> finished & snapped to T2 ending terminal!
+    const chainedT2 = relModel.blocks.find(
+      (b) => b.serviceNumber === relevoBlock.serviceNumber && b.startSec >= relevoBlock.endSec && !b.relevoToNext
+    );
+    if (chainedT2) {
+      const carAfterT2 = evaluateServiceCompletionStatus(relUnit, relModel, chainedT2.endSec + 180, {
+        entityType: 'coche',
+        blockInfo: relevoBlock
+      });
+      assert.equal(carAfterT2.finished, true, 'Car on chained relevo service must finish once final chained turno ends + 3 min no GPS');
+      assert.equal(carAfterT2.snapToTerminal, true, 'Car finishing chained relevo service must snap to final ending terminal');
+    }
+  }
 
   // 10d) Telemetry module (Bridge monitor, Bunching, Punctuality, Ending badge, Physical telemetry without trail, Upcoming stops, Opposite stop, 7-day profile, Share)
   const bridgeHeavy = computeBridgeStatus([
@@ -1491,10 +1569,10 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   );
 
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.4'") && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.4 changelog, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.5'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.5 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.4 3-min Last-Desvio -> 5-min Strict 00:00 Punctual Schedule, Smooth-Fast-Precise GPS Recovery Glide, Exact SOAP ETA & strict exclusions');
+  console.log('  ✓ Verified v3.1.5 Unconditional End-of-Service Terminal Snap (≥3 min no GPS, non-relevo), 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

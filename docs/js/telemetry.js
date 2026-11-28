@@ -290,6 +290,38 @@ export function evaluateServiceCompletionStatus(
     }
   }
 
+  let isRelevoToNext = Boolean(bi?.relevoToNext ?? srvMeta?.relevoToNext ?? unit.relevoToNext);
+
+  // On a relevo-en-linea block, the CAR continues with the relieving driver into the next chained turno.
+  // Follow the continuous relevo chain to find where the CAR itself finishes its service/cortado!
+  if (entityType === 'coche' && isRelevoToNext) {
+    let chainedEndBi = null;
+    if (bi && Array.isArray(model?.blocks) && bi.serviceNumber) {
+      const sameSrv = model.blocks
+        .filter((b) => b.serviceNumber === bi.serviceNumber && b.startSec >= bi.startSec)
+        .sort((a, b) => a.startSec - b.startSec);
+      const startIdx = sameSrv.findIndex((b) => b.blockId === bi.blockId || b.turnoIndex === bi.turnoIndex);
+      if (startIdx >= 0) {
+        let cur = sameSrv[startIdx];
+        for (let i = startIdx + 1; i < sameSrv.length; i++) {
+          const nxt = sameSrv[i];
+          const gapSec = nxt.startSec - cur.endSec;
+          if (!cur.relevoToNext || gapSec > 55 * 60) break;
+          cur = nxt;
+          if (!cur.relevoToNext) {
+            chainedEndBi = cur;
+            break;
+          }
+        }
+      }
+    }
+    if (!chainedEndBi) {
+      return NOT_FINISHED;
+    }
+    bi = chainedEndBi;
+    isRelevoToNext = false;
+  }
+
   const schedEndSec =
     typeof bi?.endSec === 'number'
       ? bi.endSec
@@ -300,12 +332,6 @@ export function evaluateServiceCompletionStatus(
           : null;
 
   if (schedEndSec === null || !Number.isFinite(schedEndSec)) return NOT_FINISHED;
-
-  const isRelevoToNext = Boolean(bi?.relevoToNext ?? srvMeta?.relevoToNext ?? unit.relevoToNext);
-  // On a relevo-en-linea block, the CAR continues with the relieving driver, whereas the DRIVER finishes their turno!
-  if (entityType === 'coche' && isRelevoToNext) {
-    return NOT_FINISHED;
-  }
 
   const isCortadoBreak = Boolean(
     !isRelevoToNext &&
@@ -409,7 +435,16 @@ export function evaluateServiceCompletionStatus(
   const wellPastExpectedEnd =
     effNow >= expectedEndSec + 20 * 60 && (gpsAgeSec === null || gpsAgeSec >= 180);
 
-  if (!atTerminalAroundEnd && !pastExpectedAndReachable && !wellPastExpectedEnd) {
+  // Condition D (strict 3-min no-GPS end-of-service/turno rule, NOT relevo):
+  // Once the scheduled finish time has arrived (`effNow >= schedEndSec`) and GPS has been silent >= 3 min
+  // (`gpsAgeSec === null || gpsAgeSec >= 180`), treat the unit as finished at its ending punta de línea
+  // regardless of where along the route its last GPS fix was seen!
+  const pastScheduledEndNoGps3Min =
+    !isRelevoToNext &&
+    effNow >= schedEndSec &&
+    (gpsAgeSec === null || gpsAgeSec >= 180);
+
+  if (!atTerminalAroundEnd && !pastExpectedAndReachable && !wellPastExpectedEnd && !pastScheduledEndNoGps3Min) {
     return NOT_FINISHED;
   }
 
@@ -420,11 +455,15 @@ export function evaluateServiceCompletionStatus(
       ? 'En corte'
       : 'Servicio finalizado';
 
+  // Para fin de servicio o corte (NO relevo): siempre mostrar como última ubicación la punta de línea
+  // donde finaliza el colectivo, sin importar en qué punto del recorrido fue su último reporte GPS.
   const snapToTerminal = Boolean(
     Number.isFinite(terminalLat) &&
       Number.isFinite(terminalLng) &&
-      (remDistM === null || remDistM <= 4500)
+      (!isRelevoToNext || remDistM === null || remDistM <= 1500)
   );
+
+  const displayEndSec = pastScheduledEndNoGps3Min && effNow < expectedEndSec ? schedEndSec : expectedEndSec;
 
   return {
     finished: true,
@@ -432,7 +471,7 @@ export function evaluateServiceCompletionStatus(
     label,
     endPlace,
     scheduledEndHHMM: formatSecHHMM(schedEndSec),
-    expectedEndHHMM: formatSecHHMM(expectedEndSec),
+    expectedEndHHMM: formatSecHHMM(displayEndSec),
     snapToTerminal,
     terminalLat,
     terminalLng
