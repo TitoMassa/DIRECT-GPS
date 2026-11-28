@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="notif_title">#0F172A</color>
+    <color name="notif_subtitle">#475569</color>
+    <color name="notif_card_bg">#120F172A</color>
+    <color name="notif_card_stroke">#200F172A</color>
+    <color name="notif_accent">#059669</color>
+</resources>

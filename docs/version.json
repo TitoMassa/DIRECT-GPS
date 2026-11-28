@@ -1,13 +1,11 @@
 {
-  "version": "2.9.0",
-  "versionCode": 290,
+  "version": "2.9.1",
+  "versionCode": 291,
   "releaseDate": "2026-11-27",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v2.9.0/DIRECT-GPS-v2.9.0-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v2.9.0",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v2.9.1/DIRECT-GPS-v2.9.1-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v2.9.1",
   "notes": [
-    "Notificaciones en segundo plano inmortales (WakeLock parcial, auto-restauración y persistencia de viaje) y cero suspensión al minimizar la app",
-    "Nuevo Modo Simple para personas con baja visión y adultos mayores (letras grandes, alto contraste, botones claros y botón directo de voz)",
-    "Solicitud automática de permisos pendientes al abrir la app (Notificaciones, GPS, GPS en segundo plano y Batería sin restricciones)",
-    "Experiencia más inmersiva (barras Android sincronizadas con cada tema, botón Atrás nativo) y eliminación de la opción LED del radar de paradas"
+    "Distancia real sobre el trazado del recorrido en notificaciones en vivo (corrige el error de distancia en línea recta al pasar por la parada de enfrente)",
+    "Notificación en vivo estilo Uber con UNA sola barra gráfica limpia (sin barra nativa duplicada) y tarjeta interna con línea, coche, chofer y hora programada real"
   ]
 }

@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -34,6 +35,7 @@ import android.os.VibratorManager;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
+import android.widget.RemoteViews;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -783,27 +785,98 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         broadcastWatches();
     }
 
+    private static boolean isDistanceCoherentWithEta(double distMeters, int etaMinutes) {
+        if (distMeters < 0) return false;
+        if (etaMinutes < 5) return true;
+        // Velocidad implícita < 1.3 m/s (< 4.7 km/h) delata un cálculo erróneo en línea recta (parada de enfrente)
+        double impliedSpeed = distMeters / (etaMinutes * 60.0);
+        return impliedSpeed >= 1.3;
+    }
+
+    private static double computeInitialReferenceDist(double currentDist, int etaMinutes) {
+        double etaRef = etaMinutes > 0 ? Math.max(1200.0, etaMinutes * 260.0) : 2600.0;
+        double base = currentDist > 0 ? Math.max(currentDist * 1.12, etaRef) : etaRef;
+        return Math.max(1000.0, Math.min(25000.0, base));
+    }
+
+    private static double computeCoherentProgress01(double distMeters, double initialRefM, int etaMinutes) {
+        if (etaMinutes == 0) return 1.0;
+        double raw;
+        if (distMeters >= 0 && isDistanceCoherentWithEta(distMeters, etaMinutes)) {
+            double ref = Math.max(450.0, Math.max(initialRefM, distMeters * 1.08));
+            raw = 1.0 - (distMeters / ref);
+        } else if (etaMinutes > 0) {
+            double maxEta = Math.max(18.0, etaMinutes * 1.25);
+            raw = 1.0 - (etaMinutes / maxEta);
+        } else {
+            raw = 0.08;
+        }
+        // Nunca mostrar la barra casi llena cuando todavía faltan muchos minutos de recorrido
+        double cap = 0.98;
+        if (etaMinutes >= 20) cap = 0.42;
+        else if (etaMinutes >= 12) cap = 0.62;
+        else if (etaMinutes >= 6) cap = 0.80;
+        else if (etaMinutes >= 2) cap = 0.92;
+        return Math.max(0.05, Math.min(cap, raw));
+    }
+
+    private double resolveRouteDistanceMeters(
+        int lineCod,
+        String lineLabel,
+        String targetStopId,
+        double sLat,
+        double sLng,
+        double bLat,
+        double bLng,
+        int parsedEta
+    ) {
+        RouteDistanceCalculator.RouteResult rr = RouteDistanceCalculator.computeRouteDistance(
+            this,
+            lineCod,
+            lineLabel,
+            targetStopId,
+            sLat,
+            sLng,
+            bLat,
+            bLng,
+            parsedEta
+        );
+        if (rr != null && Double.isFinite(rr.routeMeters) && rr.routeMeters >= 0) {
+            return Math.round(rr.routeMeters);
+        }
+        if (Double.isFinite(bLat) && Double.isFinite(bLng) && Double.isFinite(sLat) && Double.isFinite(sLng) && sLat != 0) {
+            double straight = haversineMeters(bLat, bLng, sLat, sLng);
+            if (isDistanceCoherentWithEta(straight, parsedEta)) {
+                return Math.round(straight);
+            }
+        }
+        return -1;
+    }
+
     private void updateWatchMetricsAndMaybeAlert(WatchAlert w, int nextEta, double nextDist, boolean isInitial) {
         int prevEta = w.etaMin;
-        if (nextDist >= 0) {
+        int effEta = nextEta >= 0 ? nextEta : w.etaMin;
+
+        if (nextDist >= 0 && isDistanceCoherentWithEta(nextDist, effEta)) {
             w.distM = nextDist;
-            if (isInitial || w.distM > w.initialDistM) {
-                w.initialDistM = Math.max(900, Math.min(12000, w.distM));
+            if (isInitial || w.initialDistM < w.distM) {
+                w.initialDistM = computeInitialReferenceDist(w.distM, effEta);
             }
-            w.progress01 = Math.max(0.05, Math.min(1.0, 1.0 - w.distM / Math.max(400.0, w.initialDistM)));
-        } else if (nextEta >= 0) {
-            // Respaldo de barra cuando no vino distancia exacta
-            double estMax = Math.max(12.0, Math.max(w.leadMin + 6.0, prevEta > 0 ? prevEta : 12.0));
-            w.progress01 = Math.max(0.06, Math.min(1.0, 1.0 - (nextEta / estMax)));
+        } else if (nextDist >= 0 && !isDistanceCoherentWithEta(nextDist, effEta)) {
+            // Descartar distancia recta incoherente (ej. 320 m para un colectivo a 30 min en la mano de enfrente)
+            if (w.distM >= 0 && !isDistanceCoherentWithEta(w.distM, effEta)) {
+                w.distM = -1;
+            }
         }
 
         if (nextEta >= 0) {
             w.etaMin = nextEta;
-            if (w.etaMin == 0) w.progress01 = 1.0;
-            if (w.etaMin <= 1 || (w.distM >= 0 && w.distM <= 250)) {
+            if (w.etaMin <= 1 || (w.distM >= 0 && w.distM <= 250 && w.etaMin <= 3)) {
                 w.wasClose = true;
             }
         }
+
+        w.progress01 = computeCoherentProgress01(w.distM, w.initialDistM, w.etaMin);
 
         if (w.etaMin < 0) return;
 
@@ -935,18 +1008,18 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
         double incomingDist = p.optDouble("distM", -1);
         int incomingEta = p.optInt("etaMin", -1);
-        if (incomingDist >= 0) {
+        int effEta = incomingEta >= 0 ? incomingEta : etaMin;
+        if (incomingDist >= 0 && isDistanceCoherentWithEta(incomingDist, effEta)) {
             distM = incomingDist;
             if (!sameTarget || distM > initialDistM) {
-                initialDistM = Math.max(900, Math.min(12000, distM));
+                initialDistM = computeInitialReferenceDist(distM, effEta);
             }
-            progress01 = Math.max(0.05, Math.min(1.0, 1.0 - distM / Math.max(400.0, initialDistM)));
         }
         if (incomingEta >= 0) {
             etaMin = incomingEta;
-            if (etaMin == 0) progress01 = 1.0;
-            if (etaMin <= 1 || (distM >= 0 && distM <= 250)) wasCloseToStop = true;
+            if (etaMin <= 1 || (distM >= 0 && distM <= 250 && etaMin <= 3)) wasCloseToStop = true;
         }
+        progress01 = computeCoherentProgress01(distM, initialDistM, etaMin);
 
         persistState();
         refreshAllNotificationsAndForeground();
@@ -972,22 +1045,24 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     private void processWaitingUpdate(int nextEta, double nextDist) {
         int prevEta = etaMin;
-        if (nextDist >= 0) {
+        int effEta = nextEta >= 0 ? nextEta : etaMin;
+        if (nextDist >= 0 && isDistanceCoherentWithEta(nextDist, effEta)) {
             distM = nextDist;
             if (distM > initialDistM) {
-                initialDistM = Math.max(900, Math.min(12000, distM));
+                initialDistM = computeInitialReferenceDist(distM, effEta);
             }
-            progress01 = Math.max(0.05, Math.min(1.0, 1.0 - distM / Math.max(400.0, initialDistM)));
+        } else if (nextDist >= 0 && !isDistanceCoherentWithEta(nextDist, effEta)) {
+            if (distM >= 0 && !isDistanceCoherentWithEta(distM, effEta)) distM = -1;
         }
         if (nextEta >= 0) {
             etaMin = nextEta;
-            if (etaMin == 0) progress01 = 1.0;
-            if (etaMin <= 1 || (distM >= 0 && distM <= 250)) wasCloseToStop = true;
+            if (etaMin <= 1 || (distM >= 0 && distM <= 250 && etaMin <= 3)) wasCloseToStop = true;
         }
+        progress01 = computeCoherentProgress01(distM, initialDistM, etaMin);
 
-        // Auto-Subir al llegar el colectivo a la parada
+        // Auto-Subir al llegar el colectivo a la parada (nunca por un coche de la mano de enfrente)
         if ("boarding_armed".equals(phase)
-            && ((etaMin >= 0 && etaMin <= 0) || (distM >= 0 && distM <= 95))) {
+            && ((etaMin >= 0 && etaMin <= 0) || (distM >= 0 && distM <= 95 && (etaMin < 0 || etaMin <= 2)))) {
             enterOnboardMode(true);
             return;
         }
@@ -1274,14 +1349,14 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 } else {
                     String bc = matched.optString("identificadorCoche", "").trim();
                     String bDrv = matched.optString("choferNombre", "").trim();
+                    int bCod = matched.optInt("codigoLinea", codLinea);
+                    if (bCod > 0) codLinea = bCod;
                     double bLat = parseDoubleSafe(matched.opt("latitud"));
                     double bLng = parseDoubleSafe(matched.opt("longitud"));
                     double sLat = stopLat != 0 ? stopLat : parseDoubleSafe(matched.opt("latitudParada"));
                     double sLng = stopLng != 0 ? stopLng : parseDoubleSafe(matched.opt("longitudParada"));
                     int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
-                    double calcDist = (Double.isFinite(bLat) && Double.isFinite(bLng) && Double.isFinite(sLat) && Double.isFinite(sLng) && sLat != 0)
-                        ? haversineMeters(bLat, bLng, sLat, sLng)
-                        : -1;
+                    double calcDist = resolveRouteDistanceMeters(codLinea, lineName, stopId, sLat, sLng, bLat, bLng, parsedEta);
                     if (!bc.isEmpty()) coche = bc;
                     if (!bDrv.isEmpty()) choferNombre = bDrv;
                     processWaitingUpdate(parsedEta, calcDist);
@@ -1308,6 +1383,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 w.missingPolls = 0;
                 String bc = matched.optString("identificadorCoche", "").trim();
                 String bDrv = matched.optString("choferNombre", "").trim();
+                int bCod = matched.optInt("codigoLinea", w.codLinea);
+                if (bCod > 0) w.codLinea = bCod;
                 if (!bc.isEmpty()) w.coche = bc;
                 if (!bDrv.isEmpty()) w.choferNombre = bDrv;
 
@@ -1316,9 +1393,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 double sLat = w.stopLat != 0 ? w.stopLat : parseDoubleSafe(matched.opt("latitudParada"));
                 double sLng = w.stopLng != 0 ? w.stopLng : parseDoubleSafe(matched.opt("longitudParada"));
                 int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
-                double calcDist = (Double.isFinite(bLat) && Double.isFinite(bLng) && Double.isFinite(sLat) && Double.isFinite(sLng) && sLat != 0)
-                    ? haversineMeters(bLat, bLng, sLat, sLng)
-                    : -1;
+                double calcDist = resolveRouteDistanceMeters(w.codLinea, w.lineName, w.stopId, sLat, sLng, bLat, bLng, parsedEta);
 
                 updateWatchMetricsAndMaybeAlert(w, parsedEta, calcDist, false);
                 watchesChanged = true;
@@ -1622,27 +1697,61 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     }
 
     /**
-     * Notificación de ARRIBO (campanita de parada):
-     * - Se ACTUALIZA EN EL LUGAR con barra recta estilo Uber (izquierda -> derecha) + setProgress nativo.
-     * - Muestra chofer, coche, minutos reales en vivo, distancia y hora programada REAL (nunca estimada).
+     * Construye la notificación en vivo estilo Uber con UNA SOLA barra gráfica limpia
+     * (sin setProgress redundante) y tarjeta interna con línea, coche, chofer, distancia real
+     * sobre el trazado del recorrido y hora programada real.
      */
-    private Notification buildWatchNotification(WatchAlert w) {
-        String cocheTxt = (w.coche == null || w.coche.isEmpty()) ? "s/d" : "#" + w.coche;
-        String driverTxt = (w.choferNombre == null || w.choferNombre.isEmpty()) ? "Sin datos" : w.choferNombre;
-        String schedTxt = (w.scheduledHHMM == null || w.scheduledHHMM.isEmpty()) ? "s/d" : w.scheduledHHMM;
-        int pct = (int) Math.max(4, Math.min(100, Math.round(w.progress01 * 100.0)));
-        String bar = SpanishTtsFormatter.buildUberProgressBar(w.progress01, 12);
-        String stopShort = SpanishTtsFormatter.shortLabel(w.stopName, 20);
-        String etaTxt = w.etaMin < 0 ? "En camino" : (w.etaMin <= 0 ? "ARRIBANDO" : w.etaMin + " min");
+    private NotificationCompat.Builder buildUberArrivalBuilder(
+        String targetLine,
+        String targetCoche,
+        String targetDriver,
+        String targetSched,
+        String targetStopName,
+        int targetEtaMin,
+        double targetDistM,
+        double targetProgress01,
+        @Nullable String extraStatusLine
+    ) {
+        String cocheTxt = (targetCoche == null || targetCoche.isEmpty()) ? "s/d" : "#" + targetCoche;
+        String driverTxt = (targetDriver == null || targetDriver.isEmpty()) ? "Sin datos" : targetDriver;
+        String schedTxt = (targetSched == null || targetSched.isEmpty()) ? "s/d" : targetSched;
+        String stopClean = SpanishTtsFormatter.shortLabel(targetStopName, 34);
+        String etaHeadline = targetEtaMin < 0
+            ? targetLine + " · En camino"
+            : (targetEtaMin <= 0 ? targetLine + " · Arribando ahora" : targetLine + " · Llega en " + targetEtaMin + " min");
+        String schedPill = "s/d".equals(schedTxt) ? "" : "Prog. " + schedTxt;
 
-        String title = (w.etaMin == 0 ? "🔔 " : "🚌 ") + w.lineName + " · " + etaTxt + " · Coche " + cocheTxt;
-        String distLine = w.distM > 0
-            ? "A " + SpanishTtsFormatter.formatDistance(w.distM) + " (" + SpanishTtsFormatter.formatBlocks(w.distM) + " c.)"
-            : "Actualizando en tiempo real";
-        String bigBody = bar + " " + stopShort
-            + "\nChofer: " + driverTxt + " · Coche " + cocheTxt
-            + "\nArribo: " + etaTxt + " · Prog. real: " + schedTxt
-            + "\n" + distLine + (minuteByMinute ? " · Min a min" : "");
+        String distLine;
+        if (extraStatusLine != null && !extraStatusLine.isEmpty()) {
+            distLine = extraStatusLine;
+        } else if (targetDistM > 0 && isDistanceCoherentWithEta(targetDistM, targetEtaMin)) {
+            distLine = "A " + SpanishTtsFormatter.formatDistance(targetDistM)
+                + " (" + SpanishTtsFormatter.formatBlocks(targetDistM) + " c.)"
+                + (minuteByMinute ? " · Min a min" : "");
+        } else {
+            distLine = "En recorrido hacia tu parada" + (minuteByMinute ? " · Min a min" : "");
+        }
+
+        int lineColor = UberProgressBitmapRenderer.resolveLineColor(targetLine);
+        Bitmap compactTrack = UberProgressBitmapRenderer.renderTrack(this, targetProgress01, lineColor, true);
+        Bitmap expandedTrack = UberProgressBitmapRenderer.renderTrack(this, targetProgress01, lineColor, false);
+        Bitmap badgeBmp = UberProgressBitmapRenderer.renderLineBadge(this, targetLine, lineColor);
+
+        RemoteViews compactView = new RemoteViews(getPackageName(), R.layout.notif_uber_compact);
+        compactView.setTextViewText(R.id.notif_title, etaHeadline);
+        compactView.setTextViewText(R.id.notif_sched_pill, schedPill);
+        compactView.setTextViewText(R.id.notif_subtitle, stopClean + " · Coche " + cocheTxt);
+        compactView.setImageViewBitmap(R.id.notif_progress_track, compactTrack);
+
+        RemoteViews expandedView = new RemoteViews(getPackageName(), R.layout.notif_uber_expanded);
+        expandedView.setTextViewText(R.id.notif_title, etaHeadline);
+        expandedView.setTextViewText(R.id.notif_subtitle, "Parada: " + stopClean);
+        expandedView.setImageViewBitmap(R.id.notif_progress_track, expandedTrack);
+        expandedView.setImageViewBitmap(R.id.notif_line_badge, badgeBmp);
+        expandedView.setTextViewText(R.id.notif_car_primary, "Coche " + cocheTxt);
+        expandedView.setTextViewText(R.id.notif_sched_pill, "Prog. real: " + schedTxt);
+        expandedView.setTextViewText(R.id.notif_driver_line, "Chofer: " + driverTxt);
+        expandedView.setTextViewText(R.id.notif_dist_line, distLine);
 
         return new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
             .setSmallIcon(R.drawable.ic_stat_bus)
@@ -1652,52 +1761,52 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(buildOpenAppIntent())
-            .setProgress(100, pct, false)
-            .setContentTitle(title)
-            .setContentText(bar + " " + stopShort)
-            .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody))
+            .setContentTitle(etaHeadline)
+            .setContentText("Coche " + cocheTxt + " · " + distLine + " · Prog. real: " + schedTxt)
+            .setStyle(new NotificationCompat.DecoratedCustomViewStyle())
+            .setCustomContentView(compactView)
+            .setCustomBigContentView(expandedView);
+    }
+
+    /**
+     * Notificación en vivo de ARRIBO (campanita de parada):
+     * - Se ACTUALIZA EN EL LUGAR con UNA sola barra estilo Uber (sin barra nativa duplicada).
+     */
+    private Notification buildWatchNotification(WatchAlert w) {
+        return buildUberArrivalBuilder(
+            w.lineName,
+            w.coche,
+            w.choferNombre,
+            w.scheduledHHMM,
+            w.stopName,
+            w.etaMin,
+            w.distM,
+            w.progress01,
+            null
+        )
             .addAction(0, "✕ Quitar aviso", buildServiceActionIntent(ACTION_REMOVE_WATCH, 300 + (w.notifId % 500), w.key))
             .build();
     }
 
     /**
-     * Notificación de ARRIBO (línea seleccionada):
-     * - Barra recta estilo Uber (izquierda -> derecha) + setProgress nativo.
+     * Notificación en vivo de ARRIBO (línea seleccionada):
+     * - UNA sola barra recta estilo Uber (izquierda -> derecha) + acciones Subir / Detener.
      */
     private Notification buildPrimaryWaitingNotification() {
-        String cocheTxt = coche.isEmpty() ? "s/d" : "#" + coche;
-        String driverTxt = choferNombre.isEmpty() ? "Sin datos" : choferNombre;
-        String schedTxt = scheduledHHMM.isEmpty() ? "s/d" : scheduledHHMM;
-        int pct = (int) Math.max(4, Math.min(100, Math.round(progress01 * 100.0)));
-        String bar = SpanishTtsFormatter.buildUberProgressBar(progress01, 12);
-        String stopShort = SpanishTtsFormatter.shortLabel(stopName.isEmpty() ? stopId : stopName, 20);
-        String etaTxt = etaMin < 0 ? "En camino" : (etaMin <= 0 ? "ARRIBANDO" : etaMin + " min");
-
-        String title = (etaMin == 0 ? "🔔 " : "🚌 ") + lineName + " · " + etaTxt + " · Coche " + cocheTxt;
-        String distLine = distM > 0
-            ? "A " + SpanishTtsFormatter.formatDistance(distM) + " (" + SpanishTtsFormatter.formatBlocks(distM) + " c.)"
-            : "Acercándose a tu parada";
-        String statusLine = "boarding_armed".equals(phase)
+        String extraStatus = "boarding_armed".equals(phase)
             ? "✅ Subir activado · pasa a A Bordo al llegar"
-            : distLine + (minuteByMinute ? " · Min a min" : "");
-
-        String bigBody = bar + " " + stopShort
-            + "\nChofer: " + driverTxt + " · Coche " + cocheTxt
-            + "\nArribo: " + etaTxt + " · Prog. real: " + schedTxt
-            + "\n" + statusLine;
-
-        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_LIVE_SILENT)
-            .setSmallIcon(R.drawable.ic_stat_bus)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
-            .setContentIntent(buildOpenAppIntent())
-            .setProgress(100, pct, false)
-            .setContentTitle(title)
-            .setContentText(bar + " " + stopShort)
-            .setStyle(new NotificationCompat.BigTextStyle().bigText(bigBody));
+            : null;
+        NotificationCompat.Builder builder = buildUberArrivalBuilder(
+            lineName,
+            coche,
+            choferNombre,
+            scheduledHHMM,
+            stopName.isEmpty() ? stopId : stopName,
+            etaMin,
+            distM,
+            progress01,
+            extraStatus
+        );
 
         if ("boarding_armed".equals(phase)) {
             builder.addAction(0, "🚌 Ya subí", buildServiceActionIntent(ACTION_BOARD_NOW, 202, null));

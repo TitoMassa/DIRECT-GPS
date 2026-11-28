@@ -1112,7 +1112,14 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.equal(capCfg.appId, 'ar.corrientes.directgps');
   assert.equal(capCfg.webDir, 'docs');
   const androidJavaBase = path.join(ROOT, 'android', 'app', 'src', 'main', 'java', 'ar', 'corrientes', 'directgps');
-  for (const jf of ['MainActivity.java', 'DirectGpsNativePlugin.java', 'DirectGpsTripService.java', 'SpanishTtsFormatter.java']) {
+  for (const jf of [
+    'MainActivity.java',
+    'DirectGpsNativePlugin.java',
+    'DirectGpsTripService.java',
+    'SpanishTtsFormatter.java',
+    'RouteDistanceCalculator.java',
+    'UberProgressBitmapRenderer.java'
+  ]) {
     const src = await fs.readFile(path.join(androidJavaBase, jf), 'utf8');
     assert.ok(src.includes('package ar.corrientes.directgps;'), `${jf} must belong to package ar.corrientes.directgps`);
   }
@@ -1120,10 +1127,40 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.ok(tripSvcSrc.includes('ACTION_UPSERT_WATCH') && tripSvcSrc.includes('CHANNEL_LIVE_SILENT'), 'DirectGpsTripService must support persistent in-place watch alerts');
   assert.ok(tripSvcSrc.includes('PARTIAL_WAKE_LOCK') && tripSvcSrc.includes('scheduleWatchdogRestart') && tripSvcSrc.includes('KEY_PRIMARY_JSON'), 'DirectGpsTripService must hold WakeLock, persist primary trip, and survive task removal');
   assert.ok(tripSvcSrc.includes('pollAllTargetsSafe') && tripSvcSrc.includes('catch (Throwable'), 'Background polling loop must never die on uncaught throwable');
+  assert.ok(tripSvcSrc.includes('RouteDistanceCalculator.computeRouteDistance'), 'DirectGpsTripService must compute route-traced distance (not straight-line haversine)');
+  assert.ok(tripSvcSrc.includes('DecoratedCustomViewStyle') && tripSvcSrc.includes('UberProgressBitmapRenderer.renderTrack'), 'DirectGpsTripService must render single-track Uber-style custom live notification');
+  assert.equal(tripSvcSrc.includes('.setProgress('), false, 'DirectGpsTripService must NOT call .setProgress() (zero redundant progress bars)');
   assert.ok(tripSvcSrc.includes('playDeviceNotificationChime'), 'DirectGpsTripService must play chime before TTS');
   const onboardMethodMatch = tripSvcSrc.match(/private Notification buildOnboardNotification\([\s\S]*?\n    \}/);
   assert.ok(onboardMethodMatch, 'DirectGpsTripService must define buildOnboardNotification');
-  assert.equal(onboardMethodMatch[0].includes('setProgress('), false, 'Native buildOnboardNotification must NOT draw a progress bar');
+  assert.equal(onboardMethodMatch[0].includes('notif_uber_'), false, 'Native buildOnboardNotification must NOT use Uber arrival progress track');
+
+  for (const xmlRel of ['layout/notif_uber_compact.xml', 'layout/notif_uber_expanded.xml', 'drawable/notif_uber_card_bg.xml']) {
+    const xmlSrc = await fs.readFile(path.join(ROOT, 'android', 'app', 'src', 'main', 'res', xmlRel), 'utf8');
+    assert.ok(xmlSrc.length > 50, `${xmlRel} must exist`);
+  }
+
+  // Verify JS LiveTripTracker rejects implausible 320m straight-line distance for a 30-min bus
+  const coherenceTracker = new LiveTripTracker();
+  coherenceTracker.startWaiting({
+    stop: { id: 'CT31942', nombre: 'AV. PEDRO FERRÉ - BRASIL VTA', lat: -27.477427, lng: -58.824951 },
+    lineName: '102C',
+    codLinea: 96,
+    bus: {
+      codigoLinea: 96,
+      descripcionLinea: '102C',
+      identificadorCoche: '4102',
+      choferNombre: 'GALARZA A.',
+      turnoProgramado: '22:03',
+      eta: { minutes: 30, valid: true },
+      routeMeters: 320
+    },
+    ttsEnabled: false,
+    soundEnabled: false
+  });
+  assert.equal(coherenceTracker.distM, null, '320m straight-line distance for 30-min ETA must be rejected as incoherent');
+  assert.ok(coherenceTracker.progress01 <= 0.42, `30-min bus must not show near-full progress bar (got ${coherenceTracker.progress01})`);
+  coherenceTracker.stop({ silent: true });
 
   const mainActSrc = await fs.readFile(path.join(androidJavaBase, 'MainActivity.java'), 'utf8');
   assert.ok(mainActSrc.includes('resumeTimers') && mainActSrc.includes('applySystemBars') && mainActSrc.includes('moveTaskToBack'), 'MainActivity must keep timers alive, apply dynamic system bars, and handle back cleanly');
@@ -1144,10 +1181,10 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.ok(indexHtml.includes('id="permissions-modal"') && indexHtml.includes('id="btn-review-permissions"'), 'index.html must include startup permissions modal and settings trigger');
   assert.ok(cssSrc.includes('body.simple-mode') && cssSrc.includes('.ride-mode-banner.is-onboard .live-trip-track-wrap'), 'styles.css must include Modo Simple rules and hide onboard banner track');
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v2.9.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v2.9.0 changelog, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v2.9.1'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v2.9.1 changelog, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v2.9.0 Immortal Background Service, Zero Minimize Suspension, Modo Simple, Startup Permissions, Immersive Bars, LED Removal & strict exclusions');
+  console.log('  ✓ Verified v2.9.1 Route-Traced Distance, Single-Track Uber Live Notification, Immortal Background Service, Modo Simple, Startup Permissions & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

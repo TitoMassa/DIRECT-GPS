@@ -164,11 +164,11 @@ public class DirectGpsNativePlugin extends Plugin {
             Context ctx = getContext();
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
             long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
-            ret.put("versionName", pi.versionName != null ? pi.versionName : "2.9.0");
+            ret.put("versionName", pi.versionName != null ? pi.versionName : "2.9.1");
             ret.put("versionCode", vCode);
         } catch (Exception e) {
-            ret.put("versionName", "2.9.0");
-            ret.put("versionCode", 290);
+            ret.put("versionName", "2.9.1");
+            ret.put("versionCode", 291);
         }
         call.resolve(ret);
     }

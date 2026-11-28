@@ -625,24 +625,45 @@ export class LiveTripTracker {
       this.orderedStops = normalizeOrderedStopsForRide(this.branch);
     }
 
+    const parsedEta =
+      bus.eta && typeof bus.eta.minutes === 'number' && Number.isFinite(bus.eta.minutes)
+        ? Math.max(0, Math.round(bus.eta.minutes))
+        : this.etaMin;
     const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
-    if (Number.isFinite(rawDist) && rawDist >= 0) {
+    const distCoherent =
+      Number.isFinite(rawDist) &&
+      rawDist >= 0 &&
+      (parsedEta === null || parsedEta < 5 || rawDist / (parsedEta * 60) >= 1.3);
+
+    if (distCoherent) {
       this.distM = Math.round(rawDist);
+      const etaRef = parsedEta > 0 ? Math.max(1200, parsedEta * 260) : 2600;
       if (isInitial || this.distM > this.initialDistM) {
-        this.initialDistM = Math.max(900, Math.min(12000, this.distM));
+        this.initialDistM = Math.max(1000, Math.min(25000, Math.max(this.distM * 1.12, etaRef)));
       }
-      const ratio = 1 - this.distM / Math.max(400, this.initialDistM);
-      this.progress01 = Math.max(0.05, Math.min(1, ratio));
+    } else if (parsedEta !== null && parsedEta >= 5 && this.distM !== null && this.distM / (parsedEta * 60) < 1.3) {
+      this.distM = null;
     }
 
     if (bus.eta && typeof bus.eta.minutes === 'number' && Number.isFinite(bus.eta.minutes)) {
       this.etaMin = Math.max(0, Math.round(bus.eta.minutes));
-      if (this.etaMin <= 1 || (this.distM !== null && this.distM <= 250)) {
+      if (this.etaMin <= 1 || (this.distM !== null && this.distM <= 250 && this.etaMin <= 3)) {
         this.wasCloseToStop = true;
       }
-      if (this.etaMin === 0) {
-        this.progress01 = 1;
-      }
+    }
+
+    if (this.etaMin === 0) {
+      this.progress01 = 1;
+    } else {
+      const rawRatio =
+        this.distM !== null
+          ? 1 - this.distM / Math.max(450, Math.max(this.initialDistM, this.distM * 1.08))
+          : this.etaMin > 0
+            ? 1 - this.etaMin / Math.max(18, this.etaMin * 1.25)
+            : 0.08;
+      const cap =
+        this.etaMin >= 20 ? 0.42 : this.etaMin >= 12 ? 0.62 : this.etaMin >= 6 ? 0.8 : this.etaMin >= 2 ? 0.92 : 0.98;
+      this.progress01 = Math.max(0.05, Math.min(cap, rawRatio));
     }
   }
 

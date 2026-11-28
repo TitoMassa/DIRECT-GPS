@@ -377,6 +377,14 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v2.9.1',
+    date: '27/11/2026 · 21:45 hs',
+    items: [
+      '<strong>Distancia real sobre el trazado del recorrido en notificaciones en vivo:</strong> el servicio nativo ahora lee los recorridos oficiales empaquetados y calcula los metros/cuadras siguiendo las calles (incluyendo tramos en sentido contrario y giro en cabecera), corrigiendo el caso donde un colectivo a 26–30 min pasando por la parada de enfrente figuraba «a 320 m» con la barra casi llena.',
+      '<strong>Notificación en vivo estilo Uber con UNA sola barra gráfica limpia:</strong> se eliminó la barra nativa duplicada y la barra de texto; ahora cada aviso en vivo muestra un único diseño estilo Uber con línea izquierda → derecha, cápsula del colectivo deslizándose en tiempo real y tarjeta interna con placa de línea, coche, chofer, distancia real y hora programada real.'
+    ]
+  },
+  {
     version: 'v2.9.0',
     date: '27/11/2026 · 20:45 hs',
     items: [
@@ -3421,11 +3429,22 @@ async function restorePersistedArmedAlerts() {
   syncKeepAwake();
 }
 
+function isCoherentRouteDist(distM, etaMin) {
+  if (!Number.isFinite(distM) || distM < 0) return false;
+  if (!Number.isFinite(etaMin) || etaMin < 5) return true;
+  return distM / (etaMin * 60) >= 1.3;
+}
+
 function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
   const sid = String(stop?.id || '').trim().toUpperCase();
   const key = makeStopAlertKey(sid, lineName);
-  const rawDist = bus ? Number(bus.routeMeters ?? bus.distanceMeters) : NaN;
   const etaMin = bus?.eta?.valid && Number.isFinite(Number(bus.eta.minutes)) ? Math.max(0, Math.round(bus.eta.minutes)) : -1;
+  const rawDist = bus ? Number(bus.routeMeters ?? bus.distanceMeters) : NaN;
+  const distM = isCoherentRouteDist(rawDist, etaMin) ? Math.round(rawDist) : -1;
+  const codLinea =
+    Number(bus?.codigoLinea) ||
+    Number(state.lineas?.find((l) => String(l.descripcion).toUpperCase() === String(lineName).toUpperCase())?.codigo) ||
+    0;
   return {
     key,
     apiBase: getApiBase(),
@@ -3434,12 +3453,12 @@ function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
     stopLat: Number.isFinite(Number(stop?.lat)) ? Number(stop.lat) : 0,
     stopLng: Number.isFinite(Number(stop?.lng)) ? Number(stop.lng) : 0,
     lineName: String(lineName),
-    codLinea: Number(bus?.codigoLinea) || 0,
+    codLinea,
     coche: String(bus?.identificadorCoche || '').trim(),
     lockCar: false,
     choferNombre: String(bus?.choferNombre || '').trim(),
     scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus?.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
-    distM: Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : -1,
+    distM,
     etaMin,
     leadMin: uiExtras?.getAlertLeadMinutes() || 3,
     minuteByMinute: Boolean(uiExtras?.isMinuteByMinuteEnabled()),
@@ -3556,15 +3575,19 @@ function checkProximityAlerts() {
     const key = makeStopAlertKey(state.activeStop.id, line);
     const etaMin = Math.max(0, Math.round(bus.eta.minutes));
     const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
-    const distM = Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : null;
-    const ref = webWatchProgressRef.get(key) || { initialDistM: Math.max(1200, distM || 2600), lastSpokenEtaMin: null };
-    if (distM !== null && distM > ref.initialDistM) ref.initialDistM = Math.min(12000, distM);
-    const progress01 =
-      etaMin === 0
-        ? 1
-        : distM !== null
-          ? Math.max(0.05, Math.min(1, 1 - distM / Math.max(400, ref.initialDistM)))
-          : Math.max(0.06, Math.min(1, 1 - etaMin / Math.max(12, leadMin + 6)));
+    const distM = isCoherentRouteDist(rawDist, etaMin) ? Math.round(rawDist) : null;
+    const etaRefDist = etaMin > 0 ? Math.max(1200, etaMin * 260) : 2600;
+    const ref = webWatchProgressRef.get(key) || {
+      initialDistM: Math.min(25000, Math.max(distM ? distM * 1.12 : etaRefDist, etaRefDist)),
+      lastSpokenEtaMin: null
+    };
+    if (distM !== null && distM > ref.initialDistM) ref.initialDistM = Math.min(25000, distM * 1.12);
+    const progCap = etaMin >= 20 ? 0.42 : etaMin >= 12 ? 0.62 : etaMin >= 6 ? 0.8 : etaMin >= 2 ? 0.92 : 0.98;
+    const rawProg =
+      distM !== null
+        ? 1 - distM / Math.max(450, Math.max(ref.initialDistM, distM * 1.08))
+        : 1 - etaMin / Math.max(18, etaMin * 1.25);
+    const progress01 = etaMin === 0 ? 1 : Math.max(0.05, Math.min(progCap, rawProg));
 
     let shouldRing = false;
     if (!state.triggeredAlerts.has(line) && etaMin <= leadMin) {
