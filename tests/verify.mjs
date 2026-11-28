@@ -362,7 +362,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v111') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v111 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v112') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v112 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -715,7 +715,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.ok(s5Block106B, '106B Lun–Vie must have Servicio 5 Turno 1');
   const s5LastTrip = s5Block106B.trips[s5Block106B.trips.length - 1];
   const s5EndStops = s5LastTrip.branch.orderedStops;
-  const s5TerminalStop = s5EndStops[s5EndStops.length - 1];
+  const s5TerminalTip = s5LastTrip.branch.pts[s5LastTrip.branch.pts.length - 1];
   const s5ApproachStop = s5EndStops[Math.max(0, s5EndStops.length - 5)]; // ~1 km before Cabecera Barrio Nuevo
 
   const dabrioUnit = {
@@ -739,8 +739,8 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.equal(dabrio1524.finished, true, 'Dabrio 106B Srv 5 at 15:24 must be marked finished');
   assert.equal(dabrio1524.snapToTerminal, true, 'Dabrio 106B Srv 5 must snap to finishing terminal');
   assert.ok(
-    distanceMeters(dabrio1524.terminalLat, dabrio1524.terminalLng, s5TerminalStop.lat, s5TerminalStop.lng) < 5,
-    'Dabrio terminal snap coordinates must match final stop of Srv 5'
+    distanceMeters(dabrio1524.terminalLat, dabrio1524.terminalLng, s5TerminalTip[0], s5TerminalTip[1]) < 1,
+    'Dabrio terminal snap coordinates must match exact end of Srv 5 branch polyline (punta de línea)'
   );
   // At 13:53 (just 4 min after 13:49 scheduled end, 2.5 min after delay-adjusted 13:50:30): MUST already be finished (no 15-min lingering "En línea")!
   const dabrio1353 = evaluateServiceCompletionStatus(dabrioUnit, m106B, 13 * 3600 + 53 * 60, {
@@ -828,11 +828,13 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   assert.equal(relDrvComp.finished, true, 'Driver on relevoToNext block MUST be marked finished after relevo');
   assert.equal(relDrvComp.reason, 'turno_ended');
 
-  // v3.1.5: Once scheduled end of service/turno (NOT relevo) arrives + >= 3 min without GPS,
-  // ALWAYS snap to the exact ending punta de línea regardless of where last GPS was seen (even 15+ km away!)
+  // v3.1.5 / v3.1.6: Once scheduled end of service/turno (NOT relevo) arrives + >= 3 min without GPS,
+  // ALWAYS snap to the exact ending polyline endpoint (punta de línea of that bandera), NOT the last tagged stop,
+  // regardless of where last GPS was seen (even 15+ km away!)
   {
     const unneStartPt = s4LastTrip.branch.pts[0]; // ~15+ km away from Puerto (UNNE Resistencia)
-    assert.ok(distanceMeters(unneStartPt[0], unneStartPt[1], s4PuertoStop.lat, s4PuertoStop.lng) > 12000);
+    const s4PuertoTip = s4LastTrip.branch.pts[s4LastTrip.branch.pts.length - 1];
+    assert.ok(distanceMeters(unneStartPt[0], unneStartPt[1], s4PuertoTip[0], s4PuertoTip[1]) > 12000);
     const fmtHM = (sec) => {
       const s = ((Math.round(sec) % 86400) + 86400) % 86400;
       return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`;
@@ -851,7 +853,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
       turnoIndex: s4Block904B.turnoIndex,
       _matchedTrip: s4LastTrip
     };
-    // Exactly at scheduled end time + 4 min no GPS (>= 3 min) -> MUST finish and snap straight to Puerto!
+    // Exactly at scheduled end time + 4 min no GPS (>= 3 min) -> MUST finish and snap straight to Puerto polyline tip!
     const far904Done = evaluateServiceCompletionStatus(far904Unit, m904B, s4Block904B.endSec + 5, {
       entityType: 'coche',
       blockInfo: s4Block904B
@@ -859,8 +861,8 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     assert.equal(far904Done.finished, true, '904B past scheduled end with >= 3 min no GPS must finish even if last GPS was in Resistencia');
     assert.equal(far904Done.snapToTerminal, true, '904B finished non-relevo service MUST snap to Puerto even from 15+ km away');
     assert.ok(
-      distanceMeters(far904Done.terminalLat, far904Done.terminalLng, s4PuertoStop.lat, s4PuertoStop.lng) < 5,
-      '904B terminal snap must land at Puerto'
+      distanceMeters(far904Done.terminalLat, far904Done.terminalLng, s4PuertoTip[0], s4PuertoTip[1]) < 1,
+      '904B terminal snap must land at the exact Puerto polyline tip'
     );
 
     // Half-lap ("x vueltas y media") shift: 106B S1T1 (2.5 vueltas, starts at Barrio Nuevo, ends at Puerto!)
@@ -868,8 +870,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     assert.ok(halfLapBlk, 'Expected a non-relevo half-lap block on 106B');
     const hlLastTrip = halfLapBlk.trips[halfLapBlk.trips.length - 1];
     const hlStartPt = hlLastTrip.branch.pts[0]; // opposite end of the line
-    const hlEndStops = hlLastTrip.branch.orderedStops || [];
-    const hlExpectedEnd = hlEndStops.length > 0 ? hlEndStops[hlEndStops.length - 1] : { lat: hlLastTrip.branch.pts.at(-1)[0], lng: hlLastTrip.branch.pts.at(-1)[1] };
+    const hlExpectedTip = hlLastTrip.branch.pts[hlLastTrip.branch.pts.length - 1];
     const hlGpsHM = fmtHM(halfLapBlk.endSec - 300);
     const hlRes = evaluateServiceCompletionStatus(
       {
@@ -888,8 +889,74 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     assert.equal(hlRes.finished, true, 'Half-lap shift at endSec + >= 3 min no GPS must finish');
     assert.equal(hlRes.snapToTerminal, true, 'Half-lap shift must snap to its exact opposite ending terminal');
     assert.ok(
-      distanceMeters(hlRes.terminalLat, hlRes.terminalLng, hlExpectedEnd.lat, hlExpectedEnd.lng) < 5,
-      'Half-lap shift must snap to the exact ending terminal of that shift (not starting terminal)'
+      distanceMeters(hlRes.terminalLat, hlRes.terminalLng, hlExpectedTip[0], hlExpectedTip[1]) < 1,
+      'Half-lap shift must snap to the exact polyline endpoint of that shift (not last tagged stop or starting terminal)'
+    );
+
+    // v3.1.6 regression (user screenshot 106A #3093 FIN):
+    // Punta de línea MUST be the exact tip of the ending branch polyline (yellow PUERTO - PIRAYUI tip at -27.504192, -58.787558),
+    // NEVER the last tagged stop (RUTA 12 - TUPAC AMATU VUELTA, which sits >1.2 km earlier!).
+    const brs106A = routeBranchesCache.get(350);
+    const hor106A = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'horarios', '350.json'), 'utf8'));
+    const m106A = buildLineScheduleModel(350, brs106A, hor106A, 'habil');
+    const pirayuiBlk = m106A.blocks.find(
+      (b) => !b.relevoToNext && /PUERTO\s*-\s*PIRAYUI/i.test(b.trips.at(-1)?.branch?.bandera || '')
+    );
+    assert.ok(pirayuiBlk, '106A must have a non-relevo block ending on PUERTO - PIRAYUI (yellow trace)');
+    const pLastTrip = pirayuiBlk.trips[pirayuiBlk.trips.length - 1];
+    const pYellowTip = pLastTrip.branch.pts[pLastTrip.branch.pts.length - 1];
+    const pLastTaggedStop = pLastTrip.branch.orderedStops[pLastTrip.branch.orderedStops.length - 1];
+    const pGpsHM = fmtHM(pirayuiBlk.endSec - 300);
+    const pRes = evaluateServiceCompletionStatus(
+      {
+        identificadorCoche: '3093',
+        lat: pLastTaggedStop.lat,
+        lng: pLastTaggedStop.lng,
+        rawLat: pLastTaggedStop.lat,
+        rawLng: pLastTaggedStop.lng,
+        ultimaFechaHoraGPS: `27/11/2026 ${pGpsHM}:00`,
+        desvio: { status: 'ok', seconds: 0 }
+      },
+      m106A,
+      pirayuiBlk.endSec + 10,
+      { entityType: 'coche', blockInfo: pirayuiBlk }
+    );
+    assert.equal(pRes.finished, true, '106A #3093 after endSec + >= 3 min no GPS must finish');
+    assert.equal(pRes.snapToTerminal, true, '106A #3093 must snap to Pirayuí yellow trace endpoint');
+    assert.ok(
+      distanceMeters(pRes.terminalLat, pRes.terminalLng, pYellowTip[0], pYellowTip[1]) < 1,
+      '106A #3093 must snap to exact tip of PUERTO - PIRAYUI yellow polyline (-27.504192, -58.787558)'
+    );
+    assert.ok(
+      distanceMeters(pRes.terminalLat, pRes.terminalLng, pLastTaggedStop.lat, pLastTaggedStop.lng) > 1000,
+      '106A #3093 terminal snap must be >1 km beyond last tagged stop (RUTA 12 - TUPAC AMATU VUELTA)'
+    );
+
+    const puerto106ABlk = m106A.blocks.find(
+      (b) => !b.relevoToNext && /PIRAYUI\s*-\s*PUERTO/i.test(b.trips.at(-1)?.branch?.bandera || '')
+    );
+    assert.ok(puerto106ABlk, '106A must also have a non-relevo block ending on PIRAYUI - PUERTO (blue trace)');
+    const bLastTrip = puerto106ABlk.trips[puerto106ABlk.trips.length - 1];
+    const bBlueTip = bLastTrip.branch.pts[bLastTrip.branch.pts.length - 1];
+    const bRes = evaluateServiceCompletionStatus(
+      {
+        identificadorCoche: '3094',
+        lat: bLastTrip.branch.pts[0][0],
+        lng: bLastTrip.branch.pts[0][1],
+        rawLat: bLastTrip.branch.pts[0][0],
+        rawLng: bLastTrip.branch.pts[0][1],
+        ultimaFechaHoraGPS: `27/11/2026 ${fmtHM(puerto106ABlk.endSec - 300)}:00`,
+        desvio: { status: 'ok', seconds: 0 }
+      },
+      m106A,
+      puerto106ABlk.endSec + 10,
+      { entityType: 'coche', blockInfo: puerto106ABlk }
+    );
+    assert.equal(bRes.finished, true);
+    assert.equal(bRes.snapToTerminal, true);
+    assert.ok(
+      distanceMeters(bRes.terminalLat, bRes.terminalLng, bBlueTip[0], bBlueTip[1]) < 1,
+      '106A blue-trace ending block must snap to exact tip of PIRAYUI - PUERTO polyline'
     );
 
     // Chained relevo car: while still in T2 -> NOT finished; once T2 ends + >= 3 min no GPS -> finished & snapped to T2 ending terminal!
@@ -1569,10 +1636,10 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
   );
 
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.5'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.5 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.6'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.6 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.5 Unconditional End-of-Service Terminal Snap (≥3 min no GPS, non-relevo), 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
+  console.log('  ✓ Verified v3.1.6 Exact Polyline-Tip Punta de Línea Terminal Snap (106A/106B/904B), 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

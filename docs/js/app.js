@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.6',
+    date: '28/11/2026 · 02:25 hs',
+    items: [
+      '<strong>Punta de línea exacta en el extremo final del trazado:</strong> al finalizar un servicio/turno, el pin ahora se ubica siempre en la <strong>punta real del trazado (último punto de la polilínea de la bandera)</strong> —por ejemplo, al final del trazado amarillo en 106A Pirayuí— en lugar de la última parada etiquetada que podía quedar cuadras o más de 1 km antes.'
+    ]
+  },
+  {
     version: 'v3.1.5',
     date: '28/11/2026 · 01:45 hs',
     items: [

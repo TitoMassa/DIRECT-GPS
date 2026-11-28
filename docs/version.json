@@ -1,11 +1,10 @@
 {
-  "version": "3.1.5",
-  "versionCode": 315,
+  "version": "3.1.6",
+  "versionCode": 316,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.5/DIRECT-GPS-v3.1.5-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.5",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.6/DIRECT-GPS-v3.1.6-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.6",
   "notes": [
-    "Fin de servicio/turno (no relevo) + 3 min sin GPS: ahora siempre muestra como última ubicación la punta de línea exacta donde finaliza el colectivo (ej. Puerto en 904B/C, o la cabecera opuesta en servicios de x vueltas y media), sin importar en qué parte del recorrido haya sido su último reporte GPS",
-    "Aplicado en Flota, Coches, Choferes, Servicios, Buscador y seguimiento en mapa, incluyendo coches con turnos encadenados por relevo al llegar al fin real de su jornada"
+    "Corregida la ubicación exacta de la punta de línea al finalizar servicio: ahora se ubica siempre en el extremo final del trazado (polilínea) de la bandera correspondiente (ej. final del trazado amarillo en 106A Pirayuí) y no en la última parada etiquetada que solía quedar cuadras o >1 km antes"
   ]
 }

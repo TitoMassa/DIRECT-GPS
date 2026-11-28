@@ -353,14 +353,26 @@ export function evaluateServiceCompletionStatus(
   if (endBranch) {
     const stops = Array.isArray(endBranch.orderedStops) ? endBranch.orderedStops : [];
     const lastStop = stops.length > 0 ? stops[stops.length - 1] : null;
-    if (lastStop && Number.isFinite(Number(lastStop.lat)) && Number.isFinite(Number(lastStop.lng))) {
+    if (lastStop) {
+      lastStopName = lastStop.nombre || lastStop.descripcion || '';
+    }
+    // La punta de línea es SIEMPRE el extremo final del trazado (polilínea) de la bandera donde finaliza el turno,
+    // NO la última parada etiquetada (que en muchas líneas queda varios cientos de metros o >1 km antes de la cabecera real).
+    if (Array.isArray(endBranch.pts) && endBranch.pts.length > 0) {
+      const pt = endBranch.pts[endBranch.pts.length - 1];
+      if (Number.isFinite(Number(pt?.[0])) && Number.isFinite(Number(pt?.[1]))) {
+        terminalLat = Number(pt[0]);
+        terminalLng = Number(pt[1]);
+      }
+    }
+    if (
+      (terminalLat === null || terminalLng === null) &&
+      lastStop &&
+      Number.isFinite(Number(lastStop.lat)) &&
+      Number.isFinite(Number(lastStop.lng))
+    ) {
       terminalLat = Number(lastStop.lat);
       terminalLng = Number(lastStop.lng);
-      lastStopName = lastStop.nombre || lastStop.descripcion || '';
-    } else if (Array.isArray(endBranch.pts) && endBranch.pts.length > 0) {
-      const pt = endBranch.pts[endBranch.pts.length - 1];
-      terminalLat = pt[0];
-      terminalLng = pt[1];
     }
   }
   const endPlace = bi?.endPlace || srvMeta?.endPlace || unit.endPlace || lastStopName || '';
