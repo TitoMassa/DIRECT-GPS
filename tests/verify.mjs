@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v102') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v102 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v103') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v103 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
