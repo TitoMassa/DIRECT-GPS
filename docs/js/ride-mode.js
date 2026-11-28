@@ -591,6 +591,9 @@ export class LiveTripTracker {
           scheduledHHMM: this.scheduledHHMM,
           distM: this.distM !== null ? this.distM : -1,
           etaMin: this.etaMin !== null ? this.etaMin : -1,
+          etaSec: Number.isFinite(this.etaSec) ? Math.round(this.etaSec) : -1,
+          simSpeedMps: Number.isFinite(this.simSpeedMps) ? Number(this.simSpeedMps.toFixed(2)) : -1,
+          fromLiveSim: Boolean(this._fromLiveSim),
           minuteByMinute: this.minuteByMinute,
           ttsEnabled: this.ttsEnabled,
           soundEnabled: this.soundEnabled,
@@ -615,8 +618,29 @@ export class LiveTripTracker {
     return true;
   }
 
+  _computeSmoothLiveProgress(distM, etaSec, etaMin, { isInitial = false } = {}) {
+    const hasEtaSec = Number.isFinite(etaSec) && etaSec >= 0;
+    const effEtaSec = hasEtaSec ? etaSec : etaMin !== null && etaMin >= 0 ? etaMin * 60 : -1;
+    if ((effEtaSec >= 0 && effEtaSec <= 20) || (distM !== null && distM <= 35 && (effEtaSec < 0 || effEtaSec <= 90))) {
+      return 1;
+    }
+    const etaProg =
+      effEtaSec >= 0 ? 1 / (1 + Math.pow(Math.max(0, effEtaSec / 60) / 14.0, 1.1)) : 0.08;
+    const distProg =
+      distM !== null && distM >= 0 ? 1 / (1 + Math.pow(Math.max(0, distM) / 3800.0, 1.05)) : null;
+    const target = distProg !== null ? 0.65 * distProg + 0.35 * etaProg : etaProg;
+    const clamped = Math.max(0.05, Math.min(0.99, target));
+    if (isInitial || !Number.isFinite(this.progress01)) return clamped;
+    const delta = clamped - this.progress01;
+    if (Math.abs(delta) > 0.28) return clamped; // Cambio de unidad/colectivo
+    if (delta >= 0) return Math.min(clamped, this.progress01 + 0.02);
+    return Math.max(clamped, this.progress01 - 0.005);
+  }
+
   _applyWaitingBusData(bus, { isInitial = false } = {}) {
+    const prevCoche = this.coche;
     this.coche = String(bus.identificadorCoche || this.coche || '').trim();
+    const cocheChanged = Boolean(!isInitial && prevCoche && this.coche && prevCoche !== this.coche);
     this.choferNombre = String(bus.choferNombre || this.choferNombre || '').trim();
     this.choferLegajo = String(bus.choferLegajo || this.choferLegajo || '').trim();
     this.bandera = String(bus.realBandera || bus.descripcionBandera || this.bandera || '').trim();
@@ -628,10 +652,22 @@ export class LiveTripTracker {
       this.orderedStops = normalizeOrderedStopsForRide(this.branch);
     }
 
+    this._fromLiveSim = Boolean(bus.simActive);
+    if (Number.isFinite(Number(bus.simSpeedMps)) && Number(bus.simSpeedMps) > 0.3) {
+      this.simSpeedMps = Number(bus.simSpeedMps);
+    }
+
     const parsedEta =
       bus.eta && typeof bus.eta.minutes === 'number' && Number.isFinite(bus.eta.minutes)
         ? Math.max(0, Math.round(bus.eta.minutes))
         : this.etaMin;
+    const rawEtaSec = Number(bus.etaSecondsRemaining);
+    if (Number.isFinite(rawEtaSec) && rawEtaSec >= 0) {
+      this.etaSec = rawEtaSec;
+    } else if (parsedEta !== null) {
+      this.etaSec = parsedEta * 60;
+    }
+
     const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
     const distCoherent =
       Number.isFinite(rawDist) &&
@@ -641,7 +677,7 @@ export class LiveTripTracker {
     if (distCoherent) {
       this.distM = Math.round(rawDist);
       const etaRef = parsedEta > 0 ? Math.max(1200, parsedEta * 260) : 2600;
-      if (isInitial || this.distM > this.initialDistM) {
+      if (isInitial || cocheChanged || this.distM > this.initialDistM) {
         this.initialDistM = Math.max(1000, Math.min(25000, Math.max(this.distM * 1.12, etaRef)));
       }
     } else if (parsedEta !== null && parsedEta >= 5 && this.distM !== null && this.distM / (parsedEta * 60) < 1.3) {
@@ -655,25 +691,15 @@ export class LiveTripTracker {
       }
     }
 
-    if (this.etaMin === 0) {
-      this.progress01 = 1;
-    } else {
-      const rawRatio =
-        this.distM !== null
-          ? 1 - this.distM / Math.max(450, Math.max(this.initialDistM, this.distM * 1.08))
-          : this.etaMin > 0
-            ? 1 - this.etaMin / Math.max(18, this.etaMin * 1.25)
-            : 0.08;
-      const cap =
-        this.etaMin >= 20 ? 0.42 : this.etaMin >= 12 ? 0.62 : this.etaMin >= 6 ? 0.8 : this.etaMin >= 2 ? 0.92 : 0.98;
-      this.progress01 = Math.max(0.05, Math.min(cap, rawRatio));
-    }
+    this.progress01 = this._computeSmoothLiveProgress(this.distM, this.etaSec, this.etaMin, {
+      isInitial: isInitial || cocheChanged
+    });
   }
 
   /**
-   * Actualiza la barra Uber y dispara avisos minuto a minuto + auto-Subir desde cada poll de arribos.
+   * Actualiza la barra Uber y dispara avisos minuto a minuto + auto-Subir desde cada poll o tick EN VIVO.
    */
-  updateFromArrivals(arribos = [], activeStop = null, routeBranchesCache = null) {
+  updateFromArrivals(arribos = [], activeStop = null, routeBranchesCache = null, { fromSimTick = false } = {}) {
     if (this.phase !== 'waiting' && this.phase !== 'boarding_armed') return;
     if (activeStop && this.originStop && activeStop.id !== this.originStop.id) return;
 
@@ -700,7 +726,7 @@ export class LiveTripTracker {
     // Si el usuario activó "Subir" y el colectivo que estaba a <=1 min desapareció porque ya pasó la parada:
     // activar automáticamente Modo A Bordo!
     if (!bus) {
-      if (this.phase === 'boarding_armed' && this.wasCloseToStop) {
+      if (!fromSimTick && this.phase === 'boarding_armed' && this.wasCloseToStop) {
         if (this._nativePlugin) {
           this.requestBoard({ immediate: true, routeBranchesCache });
         } else {
@@ -714,20 +740,28 @@ export class LiveTripTracker {
     this._applyWaitingBusData(bus, { isInitial: false });
 
     if (this._nativePlugin) {
-      this._nativePlugin
-        .updateWaitingFromJs?.({
-          coche: this.coche,
-          choferNombre: this.choferNombre,
-          scheduledHHMM: this.scheduledHHMM,
-          distM: this.distM !== null ? this.distM : -1,
-          etaMin: this.etaMin !== null ? this.etaMin : -1,
-          minuteByMinute: this.minuteByMinute,
-          ttsEnabled: this.ttsEnabled,
-          soundEnabled: this.soundEnabled,
-          leadMin: this.leadMin,
-          orderedStops: this._serializeOrderedStops()
-        })
-        .catch(() => {});
+      const nowMs = Date.now();
+      const shouldPushNative = !fromSimTick || nowMs - (this._lastNativeSimPushMs || 0) >= 2400;
+      if (shouldPushNative) {
+        this._lastNativeSimPushMs = nowMs;
+        this._nativePlugin
+          .updateWaitingFromJs?.({
+            coche: this.coche,
+            choferNombre: this.choferNombre,
+            scheduledHHMM: this.scheduledHHMM,
+            distM: this.distM !== null ? this.distM : -1,
+            etaMin: this.etaMin !== null ? this.etaMin : -1,
+            etaSec: Number.isFinite(this.etaSec) ? Math.round(this.etaSec) : -1,
+            simSpeedMps: Number.isFinite(this.simSpeedMps) ? Number(this.simSpeedMps.toFixed(2)) : -1,
+            fromLiveSim: Boolean(this._fromLiveSim),
+            minuteByMinute: this.minuteByMinute,
+            ttsEnabled: this.ttsEnabled,
+            soundEnabled: this.soundEnabled,
+            leadMin: this.leadMin,
+            orderedStops: this._serializeOrderedStops()
+          })
+          .catch(() => {});
+      }
       this._emitUpdate();
       return;
     }

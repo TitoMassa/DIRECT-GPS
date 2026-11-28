@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v104') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v104 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v105') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v105 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1197,16 +1197,21 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
 
   const indexHtml = await fs.readFile(path.join(ROOT, 'docs', 'index.html'), 'utf8');
   assert.ok(indexHtml.includes('id="update-modal"') && indexHtml.includes('id="btn-check-updates"'), 'index.html must include in-app update dialog and settings button');
-  assert.ok(indexHtml.includes('id="btn-simple-mode"') && indexHtml.includes('id="chk-simple-mode"') && indexHtml.includes('id="simple-mode-bar"'), 'index.html must include Modo Simple controls');
+  assert.equal(indexHtml.includes('id="btn-simple-mode"'), false, 'index.html must NOT include top header Aa button (Modo Simple only in Ajustes -> Apariencia)');
+  assert.ok(indexHtml.includes('id="chk-simple-mode"') && indexHtml.includes('id="simple-mode-bar"'), 'index.html must include Modo Simple toggle in Ajustes -> Apariencia');
   assert.ok(indexHtml.includes('id="permissions-modal"') && indexHtml.includes('id="btn-review-permissions"'), 'index.html must include startup permissions modal and settings trigger');
   assert.ok(indexHtml.includes('id="btn-pick-ringtone"') && indexHtml.includes('id="chk-tts-dnd"') && indexHtml.includes('data-tts-rate'), 'index.html must include v3.0.0 ringtone picker, TTS rate, and DND controls');
   assert.ok(cssSrc.includes('body.simple-mode') && cssSrc.includes('.ride-mode-banner.is-onboard .live-trip-track-wrap'), 'styles.css must include Modo Simple rules and hide onboard banner track');
   assert.ok(cssSrc.includes('.native-only-section') && cssSrc.includes('.ringtone-picker-card'), 'styles.css must include v3.0.0 native Android styles');
+  assert.ok(/\.settings-pane\s*\{[\s\S]{0,260}overflow-y:\s*auto/.test(cssSrc), 'styles.css .settings-pane must be vertically scrollable');
+  assert.ok(tripSvcSrc.includes('runLiveSimTickOnMain') && tripSvcSrc.includes('computeSmoothLiveProgress01') && tripSvcSrc.includes('parseGpsTimestampMs'), 'DirectGpsTripService must run continuous EN VIVO simulation');
+  assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_car_primary, "Coche "'), false, 'Expanded notification must show #coche directly without redundant Coche label');
+  assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_driver_line, "Chofer: "'), false, 'Expanded notification must show driver name directly without redundant Chofer label');
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.0.0'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.0.0 changelog, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.0.1'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.0.1 changelog, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.0.0 Immortal Background TTS, Custom Phone Ringtone Picker, Android Home Widget, Launcher Shortcuts, Native Image Share & strict exclusions');
+  console.log('  ✓ Verified v3.0.1 Smooth EN VIVO Live-Sim Progress, Clean Non-Redundant Expanded Card, Scrollable Settings Panes, Removed Aa Header Button & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

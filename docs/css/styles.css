@@ -4284,14 +4284,29 @@ input:focus-visible,
 /* Theme Swatch Modal */
 .theme-modal-card {
   width: min(430px, calc(100vw - 24px));
-  max-height: min(84vh, 590px);
+  max-height: min(88dvh, 700px);
+}
+
+.theme-modal-card > .modal-head,
+.theme-modal-card > .flota-tabs-bar {
+  flex-shrink: 0;
+}
+
+.theme-modal-card > .flota-tabs-bar {
+  flex-wrap: nowrap;
+}
+
+.theme-modal-card > .flota-tabs-bar .flota-tab-btn {
+  padding: 7px 6px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .theme-swatches {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
-  overflow-y: auto;
+  overflow-y: visible;
   padding-right: 2px;
 }
 
@@ -5581,6 +5596,17 @@ button.ev-card:hover {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding-right: 3px;
+  padding-bottom: 12px;
+}
+
+.settings-pane > * {
+  flex-shrink: 0;
 }
 
 .settings-section-label {
@@ -6058,7 +6084,7 @@ button.ev-card:hover {
   height: 100%;
   border-radius: 999px;
   background: linear-gradient(90deg, var(--trip-color, var(--accent)), #10b981);
-  transition: width 0.5s ease;
+  transition: width 0.95s linear;
 }
 
 .live-trip-bus-dot {
@@ -6068,7 +6094,7 @@ button.ev-card:hover {
   font-size: 15px;
   line-height: 1;
   filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.45));
-  transition: left 0.5s ease;
+  transition: left 0.95s linear;
   pointer-events: none;
 }
 
@@ -6209,23 +6235,6 @@ button.ev-card:hover {
 }
 
 /* ===== Modo Simple (Baja Visión & Personas Mayores) ===== */
-.simple-mode-header-btn {
-  font-family: var(--font-sans, inherit);
-  font-size: 13px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
-  width: auto;
-  min-width: 34px;
-  padding: 0 8px;
-}
-
-.simple-mode-header-btn.active {
-  background: var(--accent);
-  color: var(--accent-ink);
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-soft);
-}
-
 .simple-mode-bar {
   display: flex;
   align-items: center;

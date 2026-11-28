@@ -1178,6 +1178,8 @@ export class BusSimulator {
       bus.lng = sample.lng;
     }
     bus.routeMeters = sample.remainingMeters;
+    bus.simSpeedMps = Number.isFinite(st.speedMps) ? st.speedMps : 5.5;
+    bus.simActive = true;
     bus.isOppositeLeg = sample.inOppositeLeg;
     bus.isNextCycle = Boolean(sample.inNextCycle);
     if (sample.currentBandera) bus.realBandera = sample.currentBandera;

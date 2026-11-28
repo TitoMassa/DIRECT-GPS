@@ -377,6 +377,15 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.0.1',
+    date: '27/11/2026 · 23:45 hs',
+    items: [
+      '<strong>Barra de avance ultra suave basada en Simulación EN VIVO (sin saltos):</strong> el progreso ahora avanza de forma continua cada 2 s siguiendo la velocidad y extrapolación en vivo del recorrido (en lugar de esperar saltos del último GPS), con curva matemática continua y sincronización directa con <code>BusSimulator</code> cuando la app está abierta.',
+      '<strong>Notificación expandida más limpia y sin recortes:</strong> se quitaron las etiquetas redundantes («Coche», «Chofer:», «A ») en la tarjeta interna para mostrar directo <code>#4150</code>, el nombre completo del chofer y la distancia (<code>2,5 km (25 c.)</code>) sin desbordes.',
+      '<strong>Ajustes totalmente desplazables y barra superior más despejada:</strong> corregido el desplazamiento vertical en <em>Ajustes → Alertas</em> para acceder a todas las opciones (velocidad de voz, No molestar, prueba de timbre y voz), pestañas en una sola fila y eliminación del botón superior «Aa» (el <strong>Modo Simple</strong> ahora se controla únicamente desde <em>Ajustes y apariencia → Apariencia</em>).'
+    ]
+  },
+  {
     version: 'v3.0.0',
     date: '27/11/2026 · 23:00 hs',
     items: [
@@ -2728,6 +2737,23 @@ function syncSimCardsDom() {
     const focused = getCurrentlySelectedBus();
     if (focused) updateInspectorFields(focused);
   }
+
+  // Sincronizar barra Uber y notificaciones Android desde Simulación EN VIVO (avance suave y continuo)
+  if (state.activeStop && state.arribos.length > 0) {
+    uiExtras?.updateLiveTripFromArrivals(state.arribos, state.activeStop, { fromSimTick: true });
+    if (isNative && state.simulateMode && state.armedAlerts.size > 0) {
+      const nowMs = Date.now();
+      if (!syncSimCardsDom._lastWatchSimPushMs || nowMs - syncSimCardsDom._lastWatchSimPushMs >= 2600) {
+        syncSimCardsDom._lastWatchSimPushMs = nowMs;
+        for (const line of state.armedAlerts) {
+          const bus = findPrimaryBusForLine(line);
+          if (bus && bus.eta?.valid) {
+            upsertNativeWatchAlert(buildNativeWatchPayloadForLine(state.activeStop, line, bus));
+          }
+        }
+      }
+    }
+  }
 }
 
 function startSimLoop() {
@@ -3448,8 +3474,14 @@ function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
   const sid = String(stop?.id || '').trim().toUpperCase();
   const key = makeStopAlertKey(sid, lineName);
   const etaMin = bus?.eta?.valid && Number.isFinite(Number(bus.eta.minutes)) ? Math.max(0, Math.round(bus.eta.minutes)) : -1;
+  const rawEtaSec = Number(bus?.etaSecondsRemaining);
+  const etaSec = Number.isFinite(rawEtaSec) && rawEtaSec >= 0 ? Math.round(rawEtaSec) : etaMin >= 0 ? etaMin * 60 : -1;
   const rawDist = bus ? Number(bus.routeMeters ?? bus.distanceMeters) : NaN;
   const distM = isCoherentRouteDist(rawDist, etaMin) ? Math.round(rawDist) : -1;
+  const simSpeedMps =
+    Number.isFinite(Number(bus?.simSpeedMps)) && Number(bus.simSpeedMps) > 0.3
+      ? Number(Number(bus.simSpeedMps).toFixed(2))
+      : -1;
   const codLinea =
     Number(bus?.codigoLinea) ||
     Number(state.lineas?.find((l) => String(l.descripcion).toUpperCase() === String(lineName).toUpperCase())?.codigo) ||
@@ -3469,6 +3501,9 @@ function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
     scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus?.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
     distM,
     etaMin,
+    etaSec,
+    simSpeedMps,
+    fromLiveSim: Boolean(state.simulateMode && bus?.simActive),
     leadMin: uiExtras?.getAlertLeadMinutes() || 3,
     minuteByMinute: Boolean(uiExtras?.isMinuteByMinuteEnabled()),
     ttsEnabled: Boolean(uiExtras?.isTtsEnabled()),

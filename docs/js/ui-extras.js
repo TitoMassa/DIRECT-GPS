@@ -228,6 +228,8 @@ export function createUiExtras(ctx) {
       // suena el timbre y lee TTS aunque la app esté cerrada.
       if (isNative) {
         const rawDist = Number(bus.routeMeters ?? bus.distanceMeters);
+        const rawEtaSec = Number(bus.etaSecondsRemaining);
+        const etaMinVal = Math.max(0, Math.round(bus.eta.minutes));
         upsertNativeWatchAlert({
           key: `car::${key}`,
           apiBase: getApiBase(),
@@ -242,7 +244,10 @@ export function createUiExtras(ctx) {
           choferNombre: bus.choferNombre || '',
           scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
           distM: Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : -1,
-          etaMin: Math.max(0, Math.round(bus.eta.minutes)),
+          etaMin: etaMinVal,
+          etaSec: Number.isFinite(rawEtaSec) && rawEtaSec >= 0 ? Math.round(rawEtaSec) : etaMinVal * 60,
+          simSpeedMps: Number.isFinite(Number(bus.simSpeedMps)) && Number(bus.simSpeedMps) > 0.3 ? Number(Number(bus.simSpeedMps).toFixed(2)) : -1,
+          fromLiveSim: Boolean(state.simulateMode && bus.simActive),
           leadMin: lead,
           minuteByMinute: Boolean(alertPrefs.minuteByMinute),
           ttsEnabled: Boolean(alertPrefs.tts),
@@ -577,13 +582,17 @@ export function createUiExtras(ctx) {
     return ok;
   }
 
-  function updateLiveTripFromArrivals(arribos, activeStop) {
-    liveTracker.syncPrefs({
-      minuteByMinute: alertPrefs.minuteByMinute,
-      ttsEnabled: alertPrefs.tts,
-      soundEnabled: state.soundEnabled,
-      leadMin: alertPrefs.leadMin
-    });
+  function updateLiveTripFromArrivals(arribos, activeStop, { fromSimTick = false } = {}) {
+    if (!fromSimTick) {
+      liveTracker.syncPrefs({
+        minuteByMinute: alertPrefs.minuteByMinute,
+        ttsEnabled: alertPrefs.tts,
+        soundEnabled: state.soundEnabled,
+        leadMin: alertPrefs.leadMin,
+        ttsSpeechRate: alertPrefs.ttsRate,
+        ttsSpeakInDnd: alertPrefs.ttsSpeakInDnd
+      });
+    }
     if (liveTracker.isOnboard()) {
       const snap = liveTracker.getSnapshot();
       const matched = (arribos || []).find(
@@ -594,7 +603,7 @@ export function createUiExtras(ctx) {
       if (matched) liveTracker.updateOnboardFromBus(matched);
       return;
     }
-    liveTracker.updateFromArrivals(arribos, activeStop, state.routeBranchesCache);
+    liveTracker.updateFromArrivals(arribos, activeStop, state.routeBranchesCache, { fromSimTick });
   }
 
   function updateLiveTripFromBus(bus) {
@@ -1144,7 +1153,6 @@ export function createUiExtras(ctx) {
   }
 
   // ── 7A. Modo Simple (Interfaz accesible para baja visión y personas mayores) ──
-  const btnSimpleHeader = document.getElementById('btn-simple-mode');
   const chkSimpleMode = document.getElementById('chk-simple-mode');
   const simpleModeBar = document.getElementById('simple-mode-bar');
   const btnSimpleExit = document.getElementById('btn-simple-mode-exit');
@@ -1153,14 +1161,6 @@ export function createUiExtras(ctx) {
   function syncSimpleModeUi() {
     document.documentElement.dataset.simpleMode = simpleModeEnabled ? 'true' : 'false';
     document.body.classList.toggle('simple-mode', simpleModeEnabled);
-    if (btnSimpleHeader) {
-      btnSimpleHeader.classList.toggle('active', simpleModeEnabled);
-      btnSimpleHeader.setAttribute('aria-pressed', String(simpleModeEnabled));
-      btnSimpleHeader.setAttribute(
-        'aria-label',
-        simpleModeEnabled ? 'Desactivar Modo Simple' : 'Activar Modo Simple con letras grandes y botones accesibles'
-      );
-    }
     if (chkSimpleMode) chkSimpleMode.checked = simpleModeEnabled;
     if (simpleModeBar) simpleModeBar.classList.toggle('hidden', !simpleModeEnabled);
     if (btnSimpleTts) {
@@ -1197,7 +1197,6 @@ export function createUiExtras(ctx) {
     return Boolean(simpleModeEnabled);
   }
 
-  btnSimpleHeader?.addEventListener('click', () => setSimpleMode(!simpleModeEnabled));
   btnSimpleExit?.addEventListener('click', () => setSimpleMode(false));
   chkSimpleMode?.addEventListener('change', (e) => setSimpleMode(Boolean(e.target.checked)));
   btnSimpleTts?.addEventListener('click', () => {
