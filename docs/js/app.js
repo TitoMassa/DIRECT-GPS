@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.8',
+    date: '28/11/2026 · 04:25 hs',
+    items: [
+      '<strong>Unión de banderas en el sentido correcto en todas las 26 líneas:</strong> se restauró el final exacto de cada bandera en su <strong>punta de línea original</strong> (65/65 ramales intactos, ej. Plaza Barrio Pirayuí en 106A/B), y ahora es siempre el <strong>inicio de la bandera siguiente</strong> (por ejemplo, el trazado azul) el que completa el hueco desde ese extremo a 0 m.'
+    ]
+  },
+  {
     version: 'v3.1.7',
     date: '28/11/2026 · 03:55 hs',
     items: [

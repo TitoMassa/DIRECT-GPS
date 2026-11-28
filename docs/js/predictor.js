@@ -851,20 +851,25 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
     const headSpd = Math.max(avgSpeed, 6.5);
     const tailSpd = Math.max(avgSpeed, 7.0);
 
+    const headOffset = typeof branch.connectorHeadLen === 'number' ? branch.connectorHeadLen : 0;
+    const rawFirstAlong = Math.max(0, first.along - headOffset);
+    const rawStartSec = rawFirstAlong > 25 ? first.sec - rawFirstAlong / headSpd : first.sec;
+
     const fullPts = pts.map((p) => ({ stopId: p.stopId, along: p.along, sec: p.sec }));
     if (first.along > 25) {
-      const startSec = first.sec - first.along / headSpd;
-      fullPts.unshift({ stopId: null, along: 0, sec: startSec });
+      if (rawFirstAlong > 25) {
+        fullPts.unshift({ stopId: null, along: 0, sec: first.sec - rawFirstAlong / headSpd });
+      } else {
+        const nextStopSec = fullPts.length >= 2 ? fullPts[1].sec : first.sec + 600;
+        const maxRoll = Math.max(1, (nextStopSec - first.sec) * 0.25);
+        const rollSec = Math.min(Math.max(2, first.along / 12), maxRoll);
+        fullPts[0] = { ...fullPts[0], sec: first.sec + rollSec };
+        fullPts.unshift({ stopId: null, along: 0, sec: first.sec });
+      }
     }
     if (branch.totalLen - last.along > 25) {
-      const rawEndAlong = typeof branch.rawTotalLen === 'number' ? branch.rawTotalLen : branch.totalLen;
-      const schedTailMeters = Math.max(0, rawEndAlong - last.along);
-      const connectorMeters = Math.max(0, branch.totalLen - Math.max(rawEndAlong, last.along));
-      const tailDurSec =
-        schedTailMeters > 25
-          ? schedTailMeters / tailSpd
-          : Math.max(2, Math.min(10, (schedTailMeters + connectorMeters) / 12));
-      fullPts.push({ stopId: null, along: branch.totalLen, sec: last.sec + tailDurSec });
+      const endSec = last.sec + (branch.totalLen - last.along) / tailSpd;
+      fullPts.push({ stopId: null, along: branch.totalLen, sec: endSec });
     }
 
     const startSec = fullPts[0].sec;
@@ -878,10 +883,10 @@ function reconstructBranchTrips(branch, horariosFile, tipoDia) {
       }
     }
 
-    let suffix = `@${formatSecHHMM(startSec)}`;
+    let suffix = `@${formatSecHHMM(rawStartSec)}`;
     let tripKey = `${normBranchBandera}${suffix}`;
     if (usedKeys.has(tripKey)) {
-      suffix = `@${formatSecHHMM(startSec)}:${Math.round(startSec % 60)}`;
+      suffix = `@${formatSecHHMM(rawStartSec)}:${Math.round(rawStartSec % 60)}`;
       tripKey = `${normBranchBandera}${suffix}`;
     }
     usedKeys.add(tripKey);
@@ -2331,8 +2336,9 @@ export function measureTripPaceFactor(trip, prevAlong, curAlong, dtSec) {
 
 function isAtBranchStartTerminal(branch, projAlong, lat, lng, incomingBranch = null) {
   if (!branch?.pts?.length) return false;
+  const headLen = branch.connectorHeadLen || 0;
   const firstStopAlong = branch.orderedStops?.[0]?.along ?? 0;
-  const maxStartAlong = Math.min(360, Math.max(240, firstStopAlong + 145));
+  const maxStartAlong = Math.min(360 + headLen, Math.max(240 + headLen, firstStopAlong + 145));
   if (projAlong <= maxStartAlong) return true;
   const startPt = branch.pts[0];
   if ((distanceMeters(lat, lng, startPt[0], startPt[1]) ?? Infinity) <= 250) return true;

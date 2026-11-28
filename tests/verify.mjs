@@ -363,7 +363,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v113') && sw.includes('direct-gps-data-v6'), 'sw.js should have direct-gps-v113 & direct-gps-data-v6');
+    assert.ok(sw.includes('direct-gps-v114') && sw.includes('direct-gps-data-v7'), 'sw.js should have direct-gps-v114 & direct-gps-data-v7');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1681,7 +1681,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     }
     assert.equal(checkedBranches, 65, 'Expected to validate endpoint connectivity on all 65 branches across 26 lines');
 
-    // 3) Synthetic separated input MUST be auto-connected to 0 m by connectRouteEndpoints & parseRouteBranches
+    // 3) Synthetic separated input MUST preserve each branch's original END and fill the gap from the NEXT branch's START!
     const sepMock = [
       {
         abreviaturaBanderaSMP: 'IDA',
@@ -1701,13 +1701,32 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
       }
     ];
     const mockBrs = parseRouteBranches(sepMock);
+    assert.deepEqual(mockBrs[0].pts.at(-1), [-27.463, -58.83761], 'IDA original end must remain untouched');
+    assert.deepEqual(mockBrs[1].pts.at(-1), [-27.4705, -58.8305], 'VUELTA original end must remain untouched');
+    assert.deepEqual(mockBrs[1].pts[0], [-27.463, -58.83761], 'VUELTA start must prepend IDA end to fill the gap');
+    assert.deepEqual(mockBrs[0].pts[0], [-27.4705, -58.8305], 'IDA start must prepend VUELTA end to fill the gap');
+    assert.ok(mockBrs[1].connectorHeadLen > 100 && mockBrs[0].connectorHeadLen > 50, 'connectorHeadLen must reflect leading gap');
+
+    // 3b) v3.1.8 user screenshot regression (106B Plaza Barrio Pirayuí):
+    // YELLOW (PUERTO-BARRIO NUEVO) MUST keep its original end at Plaza Barrio Pirayuí (-27.504192, -58.787558),
+    // and BLUE (BARRIO NUEVO-PUERTO) MUST start there and fill the 105 m gap down Milán to Cuba (-27.50514, -58.787585)!
+    const brs106B = routeBranchesCache.get(351);
     assert.ok(
-      distanceMeters(mockBrs[0].pts.at(-1)[0], mockBrs[0].pts.at(-1)[1], mockBrs[1].pts[0][0], mockBrs[1].pts[0][1]) < 0.5,
-      'Runtime parseRouteBranches must auto-connect separated branch endpoints to 0 m'
+      distanceMeters(brs106B[1].pts.at(-1)[0], brs106B[1].pts.at(-1)[1], -27.504192, -58.787558) < 0.5,
+      '106B YELLOW must still end at exact original Plaza Barrio Pirayuí punta de línea'
     );
     assert.ok(
-      distanceMeters(mockBrs[1].pts.at(-1)[0], mockBrs[1].pts.at(-1)[1], mockBrs[0].pts[0][0], mockBrs[0].pts[0][1]) < 0.5,
-      'Runtime parseRouteBranches must auto-connect return endpoint to 0 m'
+      distanceMeters(brs106B[0].pts[0][0], brs106B[0].pts[0][1], -27.504192, -58.787558) < 0.5,
+      '106B BLUE must start at YELLOW end (Plaza Barrio Pirayuí) to cover the gap'
+    );
+    assert.ok(
+      distanceMeters(brs106B[0].pts[1][0], brs106B[0].pts[1][1], -27.50514, -58.787585) < 0.5,
+      '106B BLUE second vertex must continue seamlessly to Milán y Cuba'
+    );
+    assert.ok(
+      distanceMeters(brs106B[0].pts.at(-1)[0], brs106B[0].pts.at(-1)[1], -27.461776, -58.83702) < 0.5 &&
+        distanceMeters(brs106B[1].pts[0][0], brs106B[1].pts[0][1], -27.461776, -58.83702) < 0.5,
+      '106B at Puerto: BLUE end untouched and YELLOW start fills the 46 m gap'
     );
 
     // 4) Stitched multi-leg trajectory (106A previous_leg & full_cycle) must have 0 m seam gap and zero duplicate vertices
@@ -1737,14 +1756,14 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     const mapJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'map.js'), 'utf8');
     assert.ok(mapJsSrc.includes('connectRouteEndpoints'), 'map.js must connect route endpoints in drawRouteCollection');
     const routeDistSrc = await fs.readFile(path.join(androidJavaBase, 'RouteDistanceCalculator.java'), 'utf8');
-    assert.ok(routeDistSrc.includes('bestDist <= 430.0'), 'Android RouteDistanceCalculator must defensively connect branch endpoints');
+    assert.ok(routeDistSrc.includes('bestPrev != null && bestDist > 0.5 && bestDist <= 430.0'), 'Android RouteDistanceCalculator must defensively prepend prev branch end onto next branch start');
   }
 
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.7'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.7 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.8'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.8 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.7 Seamless 0m Connected Route Polylines (all 26 lines / 65 branches), Exact Polyline-Tip Terminal Snap, 3-min/5-min Schedule Rules, Smooth GPS Recovery & strict exclusions');
+  console.log('  ✓ Verified v3.1.8 Next-Bandera-Fills-Gap 0m Connected Polylines (all 26 lines / 65 untouched original ends), Exact Polyline-Tip Terminal Snap, 3-min/5-min Schedule Rules & Smooth GPS Recovery');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

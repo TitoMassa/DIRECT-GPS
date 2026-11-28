@@ -1,10 +1,10 @@
 {
-  "version": "3.1.7",
-  "versionCode": 317,
+  "version": "3.1.8",
+  "versionCode": 318,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.7/DIRECT-GPS-v3.1.7-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.7",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.8/DIRECT-GPS-v3.1.8-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.8",
   "notes": [
-    "Trazados unidos sin huecos en todas las 26 líneas: los extremos de cada bandera ahora se conectan exactamente a 0 m en todas las cabeceras/puntas de línea, eliminando los saltos y desapariciones del colectivo al cruzar de un sentido al otro tanto en el mapa como en la simulación y en las notificaciones nativas"
+    "Corregida la dirección de unión de trazados en las 26 líneas: el final de cada bandera vuelve exactamente a su punta de línea original intacta (ej. Plaza Barrio Pirayuí en 106A/B), y ahora es el inicio de la bandera siguiente (ej. el trazado azul) el que completa el hueco desde ese punto sin mover las cabeceras"
   ]
 }

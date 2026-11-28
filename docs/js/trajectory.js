@@ -137,12 +137,12 @@ const MAX_TERMINAL_CONNECT_GAP_M = 430;
  * para eliminar huecos en las puntas de línea (cabeceras) y asegurar continuidad 0 m
  * tanto en el mapa como en el cálculo/simulación de trayectorias.
  *
- * Regla geométrica pura e idempotente:
- *  - Para cada bandera `i`, busca el inicio `start_j` más cercano de otra bandera `j !== i`.
+ * Regla geométrica pura e idempotente (v3.1.8):
+ *  - El FINAL (`pts[last]`) de cada bandera permanece INTACTO en su punta de línea real.
+ *  - Para cada bandera siguiente `j`, busca el final `end_i` más cercano de otra bandera `i !== j`.
  *  - Si `0.5 < dist(end_i, start_j) <= maxGapMeters` (todas las cabeceras de Corrientes
- *    miden 46–419 m; las variantes de ingreso a galpón como 104A/104D > 445 m ya tocan
- *    el tronco principal a 0 m), extiende `puntos` de `i` hasta `start_j` sin alterar
- *    ningún punto de inicio (`pts[0]`), preservando 100 % los `stopAlongs` y `tripKey`.
+ *    miden 46–419 m), el INICIO de la bandera siguiente `j` antepone `end_i` (`isConnector: true`),
+ *    completando el hueco con el color y trazo de la bandera saliente sin alterar jamás la punta de línea real.
  */
 export function connectRouteEndpoints(recorridos = [], maxGapMeters = MAX_TERMINAL_CONNECT_GAP_M) {
   if (!Array.isArray(recorridos) || recorridos.length < 2) {
@@ -166,16 +166,16 @@ export function connectRouteEndpoints(recorridos = [], maxGapMeters = MAX_TERMIN
     };
   });
 
-  return recorridos.map((r, i) => {
-    const mi = meta[i];
-    if (!mi || !Array.isArray(r?.puntos)) return r;
+  return recorridos.map((r, j) => {
+    const mj = meta[j];
+    if (!mj || !Array.isArray(r?.puntos)) return r;
 
     let best = null;
-    for (let j = 0; j < recorridos.length; j++) {
-      if (j === i || !meta[j]) continue;
-      const d = distanceMeters(mi.last.lat, mi.last.lng, meta[j].first.lat, meta[j].first.lng);
+    for (let i = 0; i < recorridos.length; i++) {
+      if (i === j || !meta[i]) continue;
+      const d = distanceMeters(meta[i].last.lat, meta[i].last.lng, mj.first.lat, mj.first.lng);
       if (d !== null && Number.isFinite(d) && (!best || d < best.d)) {
-        best = { j, d, target: meta[j].first };
+        best = { i, d, sourceEnd: meta[i].last };
       }
     }
 
@@ -186,13 +186,13 @@ export function connectRouteEndpoints(recorridos = [], maxGapMeters = MAX_TERMIN
     return {
       ...r,
       puntos: [
-        ...r.puntos,
         {
-          latitud: String(best.target.raw.latitud),
-          longitud: String(best.target.raw.longitud),
+          latitud: String(best.sourceEnd.raw.latitud),
+          longitud: String(best.sourceEnd.raw.longitud),
           isPuntoDePaso: true,
           isConnector: true
-        }
+        },
+        ...r.puntos
       ]
     };
   });
@@ -246,8 +246,8 @@ export function parseRouteBranches(recorridos = []) {
       if (pts.length < 2) return null;
       const cum = buildCumDist(pts);
       const totalLen = cum[cum.length - 1] || 0;
-      const hasTrailingConnector = validRaw.length >= 3 && validRaw[validRaw.length - 1].isConnector;
-      const rawTotalLen = hasTrailingConnector ? (cum[cum.length - 2] ?? totalLen) : totalLen;
+      const hasLeadingConnector = validRaw.length >= 3 && validRaw[0].isConnector;
+      const connectorHeadLen = hasLeadingConnector ? (cum[1] ?? 0) : 0;
       const stopIds = new Set();
       const stopAlongs = [];
       const orderedStops = [];
@@ -289,7 +289,7 @@ export function parseRouteBranches(recorridos = []) {
         pts,
         cum,
         totalLen,
-        rawTotalLen,
+        connectorHeadLen,
         stopIds,
         stopAlongs,
         orderedStops
@@ -1051,18 +1051,20 @@ export function resolveBusTrajectory(bus, stopId, stopCoords, branches = [], pre
   const nearTerminalPt = terminalPts.some(
     (pt) => (distanceMeters(bus.lat, bus.lng, pt[0], pt[1]) ?? Infinity) <= 240
   );
+  const stopHeadLen = stopBranch.connectorHeadLen || 0;
+  const oppHeadLen = oppositeBranch?.connectorHeadLen || 0;
   const firstStopAlong = stopBranch.orderedStops?.[0]?.along ?? 0;
   const nearStopBranchOrigin =
     leg === 'direct' &&
     busOnStop &&
     busOnStop.perp <= 140 &&
-    busOnStop.along <= Math.min(340, Math.max(220, firstStopAlong + 130));
+    busOnStop.along <= Math.min(340 + stopHeadLen, Math.max(220 + stopHeadLen, firstStopAlong + 130));
   const nearOppBranchTerminal =
     leg === 'previous_leg' &&
     oppositeBranch &&
     busOnOpp &&
     busOnOpp.perp <= 140 &&
-    (oppositeBranch.totalLen - busOnOpp.along <= 360 || busOnOpp.along <= 220);
+    (oppositeBranch.totalLen - busOnOpp.along <= 360 || busOnOpp.along <= 220 + oppHeadLen);
   const isAtTerminal = nearTerminalPt || nearStopBranchOrigin || nearOppBranchTerminal;
 
   const mapStopsInRange = (branch, fromAlong, toAlong, offsetMeters) => {

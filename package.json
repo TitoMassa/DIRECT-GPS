@@ -1,6 +1,6 @@
 {
   "name": "direct-gps",
-  "version": "3.1.7",
+  "version": "3.1.8",
   "description": "DIRECT GPS — App nativa Android y web de seguimiento satelital en vivo del transporte público de Corrientes Capital",
   "main": "server.js",
   "scripts": {

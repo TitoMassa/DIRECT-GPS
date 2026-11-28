@@ -209,37 +209,44 @@ public final class RouteDistanceCalculator {
             }
 
             if (!list.isEmpty()) {
-                // Garantizar que los extremos de las banderas se toquen (0 m) incluso si un archivo externo viniera separado
+                // Garantizar que el inicio de la bandera siguiente complete el hueco desde el final de la bandera anterior (0 m)
                 if (list.size() >= 2) {
                     List<RouteBranch> connected = new ArrayList<>(list.size());
-                    for (int i = 0; i < list.size(); i++) {
-                        RouteBranch a = list.get(i);
-                        int aLast = a.lats.length - 1;
+                    for (int j = 0; j < list.size(); j++) {
+                        RouteBranch b = list.get(j);
                         double bestDist = Double.MAX_VALUE;
-                        RouteBranch bestTarget = null;
-                        for (int j = 0; j < list.size(); j++) {
-                            if (j == i) continue;
-                            RouteBranch b = list.get(j);
+                        RouteBranch bestPrev = null;
+                        for (int i = 0; i < list.size(); i++) {
+                            if (i == j) continue;
+                            RouteBranch a = list.get(i);
+                            int aLast = a.lats.length - 1;
                             double d = haversineMeters(a.lats[aLast], a.lngs[aLast], b.lats[0], b.lngs[0]);
                             if (d < bestDist) {
                                 bestDist = d;
-                                bestTarget = b;
+                                bestPrev = a;
                             }
                         }
-                        if (bestTarget != null && bestDist > 0.5 && bestDist <= 430.0) {
-                            int n = a.lats.length;
+                        if (bestPrev != null && bestDist > 0.5 && bestDist <= 430.0) {
+                            int pLast = bestPrev.lats.length - 1;
+                            int n = b.lats.length;
                             double[] nLats = new double[n + 1];
                             double[] nLngs = new double[n + 1];
                             double[] nCum = new double[n + 1];
-                            System.arraycopy(a.lats, 0, nLats, 0, n);
-                            System.arraycopy(a.lngs, 0, nLngs, 0, n);
-                            System.arraycopy(a.cum, 0, nCum, 0, n);
-                            nLats[n] = bestTarget.lats[0];
-                            nLngs[n] = bestTarget.lngs[0];
-                            nCum[n] = nCum[n - 1] + bestDist;
-                            connected.add(new RouteBranch(a.bandera, nLats, nLngs, nCum, a.stopIds, a.orderedStops));
+                            nLats[0] = bestPrev.lats[pLast];
+                            nLngs[0] = bestPrev.lngs[pLast];
+                            nCum[0] = 0.0;
+                            System.arraycopy(b.lats, 0, nLats, 1, n);
+                            System.arraycopy(b.lngs, 0, nLngs, 1, n);
+                            for (int k = 0; k < n; k++) {
+                                nCum[k + 1] = b.cum[k] + bestDist;
+                            }
+                            List<StopItem> shiftedStops = new ArrayList<>(b.orderedStops.size());
+                            for (StopItem s : b.orderedStops) {
+                                shiftedStops.add(new StopItem(s.id, s.nombre, s.lat, s.lng, s.along + bestDist));
+                            }
+                            connected.add(new RouteBranch(b.bandera, nLats, nLngs, nCum, b.stopIds, shiftedStops));
                         } else {
-                            connected.add(a);
+                            connected.add(b);
                         }
                     }
                     list = connected;
