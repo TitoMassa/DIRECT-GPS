@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v108') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v108 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v109') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v109 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1119,6 +1119,7 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     'DirectGpsWidgetProvider.java',
     'SpanishTtsFormatter.java',
     'RouteDistanceCalculator.java',
+    'NativeScheduleLookup.java',
     'UberProgressBitmapRenderer.java'
   ]) {
     const src = await fs.readFile(path.join(androidJavaBase, jf), 'utf8');
@@ -1271,11 +1272,63 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     assert.ok(soapBus.routeMeters < 508, 'BusSimulator must still advance simulated map/bar position smoothly');
   }
 
+  assert.ok(
+    tripSvcSrc.includes('NativeScheduleLookup.resolveRealScheduledHHMM') &&
+      tripSvcSrc.includes('NativeScheduleLookup.isScheduledHHMMPlausible') &&
+      tripSvcSrc.includes('lapRolledOver') &&
+      tripSvcSrc.includes('driverChanged'),
+    'DirectGpsTripService must clear stale previous-bus scheduledHHMM and resolve real official timetable offline via NativeScheduleLookup'
+  );
+  const rideModeSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'ride-mode.js'), 'utf8');
+  assert.ok(rideModeSrc.includes('driverChanged') && rideModeSrc.includes("this.scheduledHHMM = ''"), 'ride-mode.js must clear scheduledHHMM when bus/driver changes');
+  {
+    const switchTracker = new LiveTripTracker();
+    switchTracker.startWaiting({
+      stop: { id: 'CT31571', nombre: 'AV. 3 DE ABRIL - ALBERDI', lat: -27.474, lng: -58.831 },
+      lineName: '904B',
+      codLinea: 1038,
+      bus: {
+        codigoLinea: 1038,
+        descripcionLinea: '904B',
+        identificadorCoche: '4120',
+        choferNombre: 'ACEVEDO',
+        turnoProgramado: '00:43',
+        eta: { minutes: 1, valid: true },
+        routeMeters: 250
+      },
+      ttsEnabled: false,
+      soundEnabled: false
+    });
+    assert.equal(switchTracker.scheduledHHMM, '00:43');
+    // Next poll: Acevedo arrived and Pucheta #4131 is now next bus (initially without turnoProgramado)
+    switchTracker._applyWaitingBusData({
+      codigoLinea: 1038,
+      descripcionLinea: '904B',
+      identificadorCoche: '4131',
+      choferNombre: 'PUCHETA NELSON HERNAN',
+      turnoProgramado: null,
+      eta: { minutes: 33, valid: true },
+      routeMeters: 19900
+    });
+    assert.equal(switchTracker.scheduledHHMM, '', 'Changing from Acevedo to Pucheta must NEVER inherit 00:43');
+    switchTracker._applyWaitingBusData({
+      codigoLinea: 1038,
+      descripcionLinea: '904B',
+      identificadorCoche: '4131',
+      choferNombre: 'PUCHETA NELSON HERNAN',
+      turnoProgramado: '01:17',
+      eta: { minutes: 33, valid: true },
+      routeMeters: 19900
+    });
+    assert.equal(switchTracker.scheduledHHMM, '01:17', 'Pucheta must receive its own real official schedule 01:17');
+    switchTracker.stop({ silent: true });
+  }
+
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.2'") && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.2 changelog, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.3'") && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.3 changelog, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.2 Exact Official SOAP ETA Preservation (Zero Arribando Flicker), Stable Distance-Ranked Notifications & strict exclusions');
+  console.log('  ✓ Verified v3.1.3 NativeScheduleLookup Offline Real Schedule Resolution, Zero Inherited Previous-Bus Schedule, Exact SOAP ETA & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

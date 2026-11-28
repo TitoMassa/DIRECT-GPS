@@ -1,11 +1,11 @@
 {
-  "version": "3.1.2",
-  "versionCode": 312,
-  "releaseDate": "2026-11-27",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.2/DIRECT-GPS-v3.1.2-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.2",
+  "version": "3.1.3",
+  "versionCode": 313,
+  "releaseDate": "2026-11-28",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.3/DIRECT-GPS-v3.1.3-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.3",
   "notes": [
-    "Eliminado el parpadeo entre «Arribando» y «1/2 min»: ahora los minutos de arribo y el estado «Arribando» muestran exactamente lo que devuelve Cuando Llega / SOAP oficial (sin inventar minutos ni adelantar «Arribando»), reservando el cálculo estimado únicamente para coches sin GPS guiados por horario programado",
-    "La barra de avance y el movimiento en el mapa siguen deslizándose suavemente en modo EN VIVO, pero respetando siempre el tiempo oficial exacto de Cuando Llega"
+    "Corregido el horario programado real (Prog. real) en notificaciones al pasar al siguiente colectivo: nunca más hereda el horario del servicio anterior que ya arribó",
+    "Nuevo buscador nativo offline de horarios oficiales en 2° plano (NativeScheduleLookup): cuando llega un colectivo y la notificación toma al siguiente (ej. 904B), busca automáticamente el horario programado real de ese nuevo servicio y reinicia las alertas para avisarte de nuevo"
   ]
 }

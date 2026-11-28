@@ -242,6 +242,8 @@ export function createUiExtras(ctx) {
           coche: String(bus.identificadorCoche).trim(),
           lockCar: true,
           choferNombre: bus.choferNombre || '',
+          bandera: String(bus.realBandera || bus.descripcionBandera || '').trim(),
+          desvioHorario: String(bus.desvioHorario || bus.desvio?.raw || '').trim(),
           scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
           distM: Number.isFinite(rawDist) && rawDist >= 0 ? Math.round(rawDist) : -1,
           etaMin: etaMinVal,

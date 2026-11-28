@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.3',
+    date: '28/11/2026 · 00:50 hs',
+    items: [
+      '<strong>Horario programado real siempre correspondiente al colectivo actual (adiós horario heredado del coche anterior):</strong> al arribar una unidad y pasar la notificación al siguiente servicio de la línea, se limpia el horario vencido, se reinician las alertas para el nuevo coche y el nuevo buscador nativo offline (<code>NativeScheduleLookup</code>) consulta el diagrama oficial empaquetado (respetando el día de servicio 00:00–02:59 y el desvío real) para mostrar únicamente el horario programado real del coche actual.'
+    ]
+  },
+  {
     version: 'v3.1.2',
     date: '28/11/2026 · 00:25 hs',
     items: [
@@ -3522,6 +3529,8 @@ function buildNativeWatchPayloadForLine(stop, lineName, bus = null) {
     coche: String(bus?.identificadorCoche || '').trim(),
     lockCar: false,
     choferNombre: String(bus?.choferNombre || '').trim(),
+    bandera: String(bus?.realBandera || bus?.descripcionBandera || '').trim(),
+    desvioHorario: String(bus?.desvioHorario || bus?.desvio?.raw || '').trim(),
     scheduledHHMM: /^\d{1,2}:\d{2}/.test(String(bus?.turnoProgramado || '')) ? String(bus.turnoProgramado).slice(0, 5) : '',
     distM,
     etaMin,

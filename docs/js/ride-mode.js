@@ -639,11 +639,23 @@ export class LiveTripTracker {
 
   _applyWaitingBusData(bus, { isInitial = false } = {}) {
     const prevCoche = this.coche;
-    this.coche = String(bus.identificadorCoche || this.coche || '').trim();
-    const cocheChanged = Boolean(!isInitial && prevCoche && this.coche && prevCoche !== this.coche);
-    this.choferNombre = String(bus.choferNombre || this.choferNombre || '').trim();
+    const prevDriver = this.choferNombre;
+    const incomingCoche = String(bus.identificadorCoche || '').trim();
+    const incomingDriver = String(bus.choferNombre || '').trim();
+    if (incomingCoche) this.coche = incomingCoche;
+    if (incomingDriver) this.choferNombre = incomingDriver;
+    const cocheChanged = Boolean(!isInitial && prevCoche && incomingCoche && prevCoche !== incomingCoche);
+    const driverChanged = Boolean(
+      !isInitial && prevDriver && incomingDriver && prevDriver.toUpperCase() !== incomingDriver.toUpperCase()
+    );
+    const unitChanged = cocheChanged || driverChanged;
     this.choferLegajo = String(bus.choferLegajo || this.choferLegajo || '').trim();
     this.bandera = String(bus.realBandera || bus.descripcionBandera || this.bandera || '').trim();
+    if (unitChanged) {
+      this.scheduledHHMM = '';
+      this.lastSpokenEtaMin = null;
+      this.wasCloseToStop = false;
+    }
     const realSched = resolveRealScheduledHHMM(bus);
     if (realSched) this.scheduledHHMM = realSched;
 

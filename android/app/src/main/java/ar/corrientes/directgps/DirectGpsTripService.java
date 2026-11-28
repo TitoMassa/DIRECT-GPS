@@ -241,6 +241,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         String coche;
         boolean lockCar;
         String choferNombre;
+        String bandera = "";
+        String desvioHorario = "";
         String scheduledHHMM;
         double distM = -1;
         double initialDistM = 2600;
@@ -364,6 +366,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private String choferNombre = "";
     private String choferLegajo = "";
     private String bandera = "";
+    private String desvioHorario = "";
     private String scheduledHHMM = ""; // Hora programada REAL (nunca estimada)
 
     private String stopId = "";
@@ -969,6 +972,8 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         coche = w.coche != null ? w.coche : "";
         lockCar = w.lockCar;
         choferNombre = w.choferNombre != null ? w.choferNombre : "";
+        bandera = w.bandera != null ? w.bandera : "";
+        desvioHorario = w.desvioHorario != null ? w.desvioHorario : "";
         scheduledHHMM = w.scheduledHHMM != null ? w.scheduledHHMM : "";
         distM = w.distM;
         initialDistM = w.initialDistM;
@@ -1087,21 +1092,47 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         int wCod = p.optInt("codLinea", 0);
         if (wCod > 0) w.codLinea = wCod;
         w.lockCar = wLockCar;
-        String prevCoche = w.coche != null ? w.coche : "";
-        boolean cocheChanged = (!isNew && !prevCoche.isEmpty() && !wCoche.isEmpty() && !prevCoche.equals(wCoche));
-        if (!wCoche.isEmpty()) w.coche = wCoche;
-        String wDrv = p.optString("choferNombre", "").trim();
-        if (!wDrv.isEmpty()) w.choferNombre = wDrv;
-        String wSched = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
-        if (!wSched.isEmpty()) w.scheduledHHMM = wSched;
-        w.leadMin = Math.max(1, p.optInt("leadMin", leadMin));
-        w.missingPolls = 0;
 
         double incomingDist = p.optDouble("distM", -1);
         int incomingEta = p.optInt("etaMin", -1);
         double incomingEtaSec = p.optDouble("etaSec", -1);
         double incomingSpeed = p.optDouble("simSpeedMps", -1);
         boolean fromLiveSim = p.optBoolean("fromLiveSim", false);
+
+        String prevCoche = w.coche != null ? w.coche : "";
+        String prevDrv = w.choferNombre != null ? w.choferNombre : "";
+        String wDrv = p.optString("choferNombre", "").trim();
+        boolean cocheChanged = (!isNew && !prevCoche.isEmpty() && !wCoche.isEmpty() && !prevCoche.equals(wCoche));
+        boolean driverChanged = (!isNew && !prevDrv.isEmpty() && !wDrv.isEmpty() && !prevDrv.equalsIgnoreCase(wDrv));
+        boolean lapRolledOver = (!isNew && w.etaMin >= 0 && w.etaMin <= 3 && incomingEta >= 12);
+        boolean unitChanged = cocheChanged || driverChanged || lapRolledOver;
+
+        if (!wCoche.isEmpty()) w.coche = wCoche;
+        if (!wDrv.isEmpty()) w.choferNombre = wDrv;
+        String wBandera = p.optString("bandera", "").trim();
+        String wDesvio = p.optString("desvioHorario", "").trim();
+        if (unitChanged) {
+            w.scheduledHHMM = "";
+            w.desvioHorario = "";
+            w.bandera = "";
+            w.triggered = false;
+            w.lastSpokenEtaMin = null;
+            w.wasClose = false;
+        }
+        if (!wBandera.isEmpty()) w.bandera = wBandera;
+        if (!wDesvio.isEmpty()) w.desvioHorario = wDesvio;
+        String wSched = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
+        if (!wSched.isEmpty()) {
+            w.scheduledHHMM = wSched;
+        } else if (w.scheduledHHMM == null || w.scheduledHHMM.isEmpty()
+            || !NativeScheduleLookup.isScheduledHHMMPlausible(w.scheduledHHMM, incomingEta, w.desvioHorario)) {
+            w.scheduledHHMM = NativeScheduleLookup.resolveRealScheduledHHMM(
+                this, w.codLinea, w.lineName, w.stopId, w.bandera, incomingEta, w.desvioHorario
+            );
+        }
+        w.leadMin = Math.max(1, p.optInt("leadMin", leadMin));
+        w.missingPolls = 0;
+
         updateWatchMetricsAndMaybeAlert(
             w,
             incomingEta,
@@ -1110,15 +1141,15 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             incomingSpeed,
             0L,
             fromLiveSim,
-            isNew || cocheChanged
+            isNew || unitChanged
         );
 
-        if (isNew || cocheChanged || !fromLiveSim) {
+        if (isNew || unitChanged || !fromLiveSim) {
             persistState();
         }
         refreshAllNotificationsAndForeground();
         ensurePollingRunning();
-        if (isNew || cocheChanged) {
+        if (isNew || unitChanged) {
             broadcastWatches();
         }
     }
@@ -1452,6 +1483,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         choferNombre = p.optString("choferNombre", "").trim();
         choferLegajo = p.optString("choferLegajo", "").trim();
         bandera = p.optString("bandera", "").trim();
+        desvioHorario = p.optString("desvioHorario", "").trim();
         scheduledHHMM = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
 
         loadOrderedStopsFromJson(p.optJSONArray("orderedStops"));
@@ -1475,6 +1507,11 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         double incomingEtaSec = p.optDouble("etaSec", -1);
         double incomingSpeed = p.optDouble("simSpeedMps", -1);
         boolean fromLiveSim = p.optBoolean("fromLiveSim", false);
+        if (scheduledHHMM.isEmpty() && incomingEta >= 0) {
+            scheduledHHMM = NativeScheduleLookup.resolveRealScheduledHHMM(
+                this, codLinea, lineName, stopId, bandera, incomingEta, desvioHorario
+            );
+        }
         processWaitingUpdate(incomingEta, incomingDist, incomingEtaSec, incomingSpeed, 0L, fromLiveSim, !sameTarget || cocheChanged);
 
         persistState();
@@ -1484,22 +1521,46 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
     private void handleUpdateWaitingFromJs(JSONObject p) {
         if (!"waiting".equals(phase) && !"boarding_armed".equals(phase)) return;
         applyPrefs(p);
-        String prevCoche = coche;
-        String newCoche = p.optString("coche", "").trim();
-        boolean cocheChanged = !prevCoche.isEmpty() && !newCoche.isEmpty() && !prevCoche.equals(newCoche);
-        if (!newCoche.isEmpty()) coche = newCoche;
-        String newChofer = p.optString("choferNombre", "").trim();
-        if (!newChofer.isEmpty()) choferNombre = newChofer;
-        String newSched = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
-        if (!newSched.isEmpty()) scheduledHHMM = newSched;
-        loadOrderedStopsFromJson(p.optJSONArray("orderedStops"));
 
         double incomingDist = p.optDouble("distM", -1);
         int incomingEta = p.optInt("etaMin", -1);
         double incomingEtaSec = p.optDouble("etaSec", -1);
         double incomingSpeed = p.optDouble("simSpeedMps", -1);
         boolean fromLiveSim = p.optBoolean("fromLiveSim", false);
-        processWaitingUpdate(incomingEta, incomingDist, incomingEtaSec, incomingSpeed, 0L, fromLiveSim, cocheChanged);
+
+        String prevCoche = coche != null ? coche : "";
+        String prevDrv = choferNombre != null ? choferNombre : "";
+        String newCoche = p.optString("coche", "").trim();
+        String newChofer = p.optString("choferNombre", "").trim();
+        String newBandera = p.optString("bandera", "").trim();
+        String newDesvio = p.optString("desvioHorario", "").trim();
+        boolean cocheChanged = !prevCoche.isEmpty() && !newCoche.isEmpty() && !prevCoche.equals(newCoche);
+        boolean driverChanged = !prevDrv.isEmpty() && !newChofer.isEmpty() && !prevDrv.equalsIgnoreCase(newChofer);
+        boolean lapRolledOver = (etaMin >= 0 && etaMin <= 3 && incomingEta >= 12);
+        boolean unitChanged = cocheChanged || driverChanged || lapRolledOver;
+
+        if (!newCoche.isEmpty()) coche = newCoche;
+        if (!newChofer.isEmpty()) choferNombre = newChofer;
+        if (unitChanged) {
+            scheduledHHMM = "";
+            desvioHorario = "";
+            lastSpokenEtaMin = null;
+            wasCloseToStop = false;
+        }
+        if (!newBandera.isEmpty()) bandera = newBandera;
+        if (!newDesvio.isEmpty()) desvioHorario = newDesvio;
+        String newSched = sanitizeScheduledHHMM(p.optString("scheduledHHMM", ""));
+        if (!newSched.isEmpty()) {
+            scheduledHHMM = newSched;
+        } else if (scheduledHHMM == null || scheduledHHMM.isEmpty()
+            || !NativeScheduleLookup.isScheduledHHMMPlausible(scheduledHHMM, incomingEta, desvioHorario)) {
+            scheduledHHMM = NativeScheduleLookup.resolveRealScheduledHHMM(
+                this, codLinea, lineName, stopId, bandera, incomingEta, desvioHorario
+            );
+        }
+        loadOrderedStopsFromJson(p.optJSONArray("orderedStops"));
+
+        processWaitingUpdate(incomingEta, incomingDist, incomingEtaSec, incomingSpeed, 0L, fromLiveSim, unitChanged);
     }
 
     private void processWaitingUpdate(
@@ -2026,22 +2087,44 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                         enterOnboardMode(true);
                     }
                 } else {
-                    String prevCoche = coche;
+                    String prevCoche = coche != null ? coche : "";
+                    String prevDrv = choferNombre != null ? choferNombre : "";
                     String bc = matched.optString("identificadorCoche", "").trim();
-                    boolean cocheChanged = !prevCoche.isEmpty() && !bc.isEmpty() && !prevCoche.equals(bc);
                     String bDrv = matched.optString("choferNombre", "").trim();
+                    int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
+                    boolean cocheChanged = !prevCoche.isEmpty() && !bc.isEmpty() && !prevCoche.equals(bc);
+                    boolean driverChanged = !prevDrv.isEmpty() && !bDrv.isEmpty() && !prevDrv.equalsIgnoreCase(bDrv);
+                    boolean lapRolledOver = (etaMin >= 0 && etaMin <= 3 && parsedEta >= 12);
+                    boolean unitChanged = cocheChanged || driverChanged || lapRolledOver;
+
                     int bCod = matched.optInt("codigoLinea", codLinea);
                     if (bCod > 0) codLinea = bCod;
                     double bLat = parseDoubleSafe(matched.opt("latitud"));
                     double bLng = parseDoubleSafe(matched.opt("longitud"));
                     double sLat = stopLat != 0 ? stopLat : parseDoubleSafe(matched.opt("latitudParada"));
                     double sLng = stopLng != 0 ? stopLng : parseDoubleSafe(matched.opt("longitudParada"));
-                    int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
                     long gpsMs = parseGpsTimestampMs(matched.optString("fechaHoraGps", matched.optString("ultimaActualizacion", "")));
+                    String desvioRaw = matched.optString("desvioHorario", "").trim();
+                    String bBandera = matched.optString("descripcionBandera", matched.optString("descripcionCortaBandera", "")).trim();
                     double calcDist = resolveRouteDistanceMeters(codLinea, lineName, stopId, sLat, sLng, bLat, bLng, parsedEta);
+
                     if (!bc.isEmpty()) coche = bc;
                     if (!bDrv.isEmpty()) choferNombre = bDrv;
-                    processWaitingUpdate(parsedEta, calcDist, -1, -1, gpsMs, false, cocheChanged);
+                    if (unitChanged) {
+                        scheduledHHMM = "";
+                        desvioHorario = "";
+                        lastSpokenEtaMin = null;
+                        wasCloseToStop = false;
+                    }
+                    if (!bBandera.isEmpty()) bandera = bBandera;
+                    if (!desvioRaw.isEmpty()) desvioHorario = desvioRaw;
+                    if (unitChanged || scheduledHHMM == null || scheduledHHMM.isEmpty()
+                        || !NativeScheduleLookup.isScheduledHHMMPlausible(scheduledHHMM, parsedEta, desvioHorario)) {
+                        scheduledHHMM = NativeScheduleLookup.resolveRealScheduledHHMM(
+                            this, codLinea, lineName, stopId, bandera, parsedEta, desvioHorario
+                        );
+                    }
+                    processWaitingUpdate(parsedEta, calcDist, -1, -1, gpsMs, false, unitChanged);
                 }
             }
 
@@ -2064,9 +2147,15 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 }
                 w.missingPolls = 0;
                 String prevCoche = w.coche != null ? w.coche : "";
+                String prevDrv = w.choferNombre != null ? w.choferNombre : "";
                 String bc = matched.optString("identificadorCoche", "").trim();
-                boolean cocheChanged = !prevCoche.isEmpty() && !bc.isEmpty() && !prevCoche.equals(bc);
                 String bDrv = matched.optString("choferNombre", "").trim();
+                int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
+                boolean cocheChanged = !prevCoche.isEmpty() && !bc.isEmpty() && !prevCoche.equals(bc);
+                boolean driverChanged = !prevDrv.isEmpty() && !bDrv.isEmpty() && !prevDrv.equalsIgnoreCase(bDrv);
+                boolean lapRolledOver = (w.etaMin >= 0 && w.etaMin <= 3 && parsedEta >= 12);
+                boolean unitChanged = cocheChanged || driverChanged || lapRolledOver;
+
                 int bCod = matched.optInt("codigoLinea", w.codLinea);
                 if (bCod > 0) w.codLinea = bCod;
                 if (!bc.isEmpty()) w.coche = bc;
@@ -2076,11 +2165,29 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
                 double bLng = parseDoubleSafe(matched.opt("longitud"));
                 double sLat = w.stopLat != 0 ? w.stopLat : parseDoubleSafe(matched.opt("latitudParada"));
                 double sLng = w.stopLng != 0 ? w.stopLng : parseDoubleSafe(matched.opt("longitudParada"));
-                int parsedEta = parseEtaMinutes(matched.optString("tiempoRestanteArribo", matched.optString("tiempoRaw", "")));
                 long gpsMs = parseGpsTimestampMs(matched.optString("fechaHoraGps", matched.optString("ultimaActualizacion", "")));
+                String desvioRaw = matched.optString("desvioHorario", "").trim();
+                String bBandera = matched.optString("descripcionBandera", matched.optString("descripcionCortaBandera", "")).trim();
                 double calcDist = resolveRouteDistanceMeters(w.codLinea, w.lineName, w.stopId, sLat, sLng, bLat, bLng, parsedEta);
 
-                updateWatchMetricsAndMaybeAlert(w, parsedEta, calcDist, -1, -1, gpsMs, false, cocheChanged);
+                if (unitChanged) {
+                    w.scheduledHHMM = "";
+                    w.desvioHorario = "";
+                    w.bandera = "";
+                    w.triggered = false;
+                    w.lastSpokenEtaMin = null;
+                    w.wasClose = false;
+                }
+                if (!bBandera.isEmpty()) w.bandera = bBandera;
+                if (!desvioRaw.isEmpty()) w.desvioHorario = desvioRaw;
+                if (unitChanged || w.scheduledHHMM == null || w.scheduledHHMM.isEmpty()
+                    || !NativeScheduleLookup.isScheduledHHMMPlausible(w.scheduledHHMM, parsedEta, w.desvioHorario)) {
+                    w.scheduledHHMM = NativeScheduleLookup.resolveRealScheduledHHMM(
+                        this, w.codLinea, w.lineName, w.stopId, w.bandera, parsedEta, w.desvioHorario
+                    );
+                }
+
+                updateWatchMetricsAndMaybeAlert(w, parsedEta, calcDist, -1, -1, gpsMs, false, unitChanged);
                 watchesChanged = true;
             }
 

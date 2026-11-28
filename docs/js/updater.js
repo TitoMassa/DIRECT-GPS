@@ -1,7 +1,7 @@
 import { isNative, getDirectGpsNativePlugin } from './native.js';
 
-export const APP_VERSION = '3.1.2';
-export const APP_VERSION_CODE = 312;
+export const APP_VERSION = '3.1.3';
+export const APP_VERSION_CODE = 313;
 export const VERSION_MANIFEST_URL = 'https://titomassa.github.io/DIRECT-GPS/version.json';
 
 const STORAGE_DISMISSED_KEY = 'directgps_update_dismissed_v1';
