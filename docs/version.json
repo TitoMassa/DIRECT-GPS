@@ -1,11 +1,11 @@
 {
-  "version": "3.1.1",
-  "versionCode": 311,
+  "version": "3.1.2",
+  "versionCode": 312,
   "releaseDate": "2026-11-27",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.1/DIRECT-GPS-v3.1.1-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.1",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.2/DIRECT-GPS-v3.1.2-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.2",
   "notes": [
-    "Orden estable y fijo por distancia en m/km en las notificaciones push (los colectivos más cercanos siempre arriba y los más lejanos abajo, sin saltar ni reordenarse en cada actualización)",
-    "Grupo nativo con timestamps fijos por posición e histéresis de 120 m para evitar completamente que One UI / Android mezcle o suba notificaciones al actualizar la barra de avance"
+    "Eliminado el parpadeo entre «Arribando» y «1/2 min»: ahora los minutos de arribo y el estado «Arribando» muestran exactamente lo que devuelve Cuando Llega / SOAP oficial (sin inventar minutos ni adelantar «Arribando»), reservando el cálculo estimado únicamente para coches sin GPS guiados por horario programado",
+    "La barra de avance y el movimiento en el mapa siguen deslizándose suavemente en modo EN VIVO, pero respetando siempre el tiempo oficial exacto de Cuando Llega"
   ]
 }

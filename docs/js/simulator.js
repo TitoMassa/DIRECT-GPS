@@ -1139,7 +1139,7 @@ export class BusSimulator {
       if (src.realBanderaColor) bus.realBanderaColor = src.realBanderaColor;
 
       bus.etaSecondsRemaining = Math.max(0, (bus.etaSecondsRemaining ?? 0) - dt);
-      if (updateEta) {
+      if (updateEta && (bus.isPredicted || !bus.hasOfficialSoapEta)) {
         const mins = Math.ceil(bus.etaSecondsRemaining / 60);
         if (bus.etaSecondsRemaining <= 35) {
           bus.eta = { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' };
@@ -1154,6 +1154,8 @@ export class BusSimulator {
           };
           bus.tiempoRaw = bus.nextLapSourceLive ? `${mins} min. aprox.` : `${mins} min. est.`;
         }
+        bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
+      } else if (updateEta && bus.eta?.valid) {
         bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
       }
     }
@@ -1187,21 +1189,27 @@ export class BusSimulator {
 
     if (updateEta) {
       bus.etaSecondsRemaining = st.etaSecondsRemaining;
-      const mins = Math.ceil(st.etaSecondsRemaining / 60);
-      if (sample.arrived || st.etaSecondsRemaining <= 35) {
-        bus.eta = { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' };
-        bus.tiempoRaw = 'Arribando..';
-      } else {
-        bus.eta = {
-          minutes: mins,
-          valid: true,
-          display: `${mins}`,
-          unit: 'min',
-          urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
-        };
-        bus.tiempoRaw = bus.isPredicted ? `${mins} min. est.` : `${mins} min. aprox.`;
+      // Regla estricta: si el colectivo tiene GPS real y ETA oficial del SOAP (Cuando Llega original),
+      // JAMÁS inventar "Arribando" ni alterar los minutos. Solo calcular ETA si es predicción por horario (sin GPS).
+      if (bus.isPredicted || !bus.hasOfficialSoapEta) {
+        const mins = Math.ceil(st.etaSecondsRemaining / 60);
+        if (sample.arrived || st.etaSecondsRemaining <= 35) {
+          bus.eta = { minutes: 0, valid: true, display: 'YA', unit: 'Arribando', urgency: 'now' };
+          bus.tiempoRaw = 'Arribando..';
+        } else {
+          bus.eta = {
+            minutes: mins,
+            valid: true,
+            display: `${mins}`,
+            unit: 'min',
+            urgency: mins <= 3 ? 'now' : mins <= 9 ? 'soon' : 'later'
+          };
+          bus.tiempoRaw = bus.isPredicted ? `${mins} min. est.` : `${mins} min. aprox.`;
+        }
       }
-      bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
+      if (bus.eta?.valid) {
+        bus.proximityPct = computeProximityPercent(bus.eta.minutes, bus.routeMeters);
+      }
     }
   }
 }

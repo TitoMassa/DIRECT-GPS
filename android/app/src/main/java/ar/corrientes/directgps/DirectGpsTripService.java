@@ -1139,15 +1139,13 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
 
     /**
      * Curva continua C1 basada en simulación EN VIVO (distancia simulada + ETA continuo en segundos).
-     * Elimina 100 % los escalones bruscos al cambiar de minuto y garantiza orden intuitivo entre colectivos.
+     * Elimina 100 % los escalones bruscos y solo marca llegada 100 % cuando el SOAP oficial dice "Arribando" (etaMinutes == 0).
      */
     private static double computeSmoothLiveProgress01(double distMeters, double etaSec, int etaMinutes) {
-        double effEtaSec = etaSec >= 0 ? etaSec : (etaMinutes >= 0 ? etaMinutes * 60.0 : -1);
-        if ((effEtaSec >= 0 && effEtaSec <= 20.0)
-            || etaMinutes == 0
-            || (distMeters >= 0 && distMeters <= 35.0 && (etaMinutes < 0 || etaMinutes <= 1))) {
+        if (etaMinutes == 0) {
             return 1.0;
         }
+        double effEtaSec = etaSec >= 0 ? etaSec : (etaMinutes >= 0 ? etaMinutes * 60.0 : -1);
         double etaProg = effEtaSec >= 0
             ? 1.0 / (1.0 + Math.pow(Math.max(0.0, effEtaSec / 60.0) / 14.0, 1.10))
             : 0.08;
@@ -1156,7 +1154,7 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
             ? 1.0 / (1.0 + Math.pow(Math.max(0.0, distMeters) / 3800.0, 1.05))
             : -1.0;
         double raw = distProg >= 0 ? (0.65 * distProg + 0.35 * etaProg) : etaProg;
-        return Math.max(0.05, Math.min(0.99, raw));
+        return Math.max(0.05, Math.min(0.96, raw));
     }
 
     private static double easeProgress01(double current, double target, boolean instant) {
@@ -1866,12 +1864,11 @@ public class DirectGpsTripService extends Service implements TextToSpeech.OnInit
         }
     }
 
+    /**
+     * Devuelve siempre el ETA oficial exacto proveniente del SOAP de Cuando Llega (sin inventar
+     * "Arribando" ni descontar minutos por cuenta propia).
+     */
     private static int resolveLiveDisplayEtaMin(double simEtaSec, int fallbackEtaMin) {
-        if (fallbackEtaMin == 0) return 0;
-        if (simEtaSec >= 0) {
-            if (simEtaSec <= 35.0) return 0;
-            return Math.max(1, (int) Math.ceil(simEtaSec / 60.0));
-        }
         return fallbackEtaMin;
     }
 

@@ -327,7 +327,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v107') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v107 & direct-gps-data-v5');
+    assert.ok(sw.includes('direct-gps-v108') && sw.includes('direct-gps-data-v5'), 'sw.js should have direct-gps-v108 & direct-gps-data-v5');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1224,13 +1224,58 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
       tripSvcSrc.includes('notif_onboard_expanded'),
     'DirectGpsTripService must expose v3.1.1 stable distance-ranked ordering, fixed setWhen, group summary anchor, interactive actions, and custom onboard card'
   );
+  assert.ok(
+    /resolveLiveDisplayEtaMin\([^)]*\)\s*\{\s*return fallbackEtaMin;\s*\}/.test(tripSvcSrc),
+    'DirectGpsTripService.resolveLiveDisplayEtaMin must return official SOAP ETA verbatim without inventing Arribando'
+  );
   assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_car_primary, "Coche "'), false, 'Expanded notification must show #coche directly without redundant Coche label');
   assert.equal(tripSvcSrc.includes('expandedView.setTextViewText(R.id.notif_driver_line, "Chofer: "'), false, 'Expanded notification must show driver name directly without redundant Chofer label');
+
+  // Verify BusSimulator NEVER overwrites official SOAP ETA ("2 min." stays 2 min, never flickers to "Arribando")
+  {
+    const simSoap = new BusSimulator();
+    const stopPt = { lat: -27.477427, lng: -58.824951 };
+    const traj = {
+      pathPts: [
+        [-27.4820, -58.824951],
+        [-27.4790, -58.824951],
+        [stopPt.lat, stopPt.lng]
+      ],
+      pathCum: [0, 333, 508],
+      totalMeters: 508,
+      leg: 'direct',
+      isAtTerminal: false,
+      speedMps: 6.0
+    };
+    const soapBus = {
+      key: '96-c4035',
+      codigoLinea: 96,
+      identificadorCoche: '4035',
+      lat: -27.4820,
+      lng: -58.824951,
+      gpsMs: Date.now() - 10_000,
+      eta: { minutes: 2, valid: true, display: '2', unit: 'min', urgency: 'now' },
+      tiempoRaw: '2 min.',
+      hasOfficialSoapEta: true,
+      isPredicted: false,
+      etaSecondsRemaining: 120,
+      routeMeters: 508,
+      trajectory: traj
+    };
+    simSoap.reconcile([soapBus], { stopId: 'CT31942', applyPositions: true });
+    for (let s = 0; s < 110; s++) {
+      simSoap.step(1.0, [soapBus], { updateEta: true });
+    }
+    assert.equal(soapBus.eta.minutes, 2, 'Live GPS bus with official SOAP ETA must NEVER flicker to 1 min or Arribando');
+    assert.equal(soapBus.tiempoRaw, '2 min.', 'Live GPS bus tiempoRaw must remain verbatim from SOAP');
+    assert.ok(soapBus.routeMeters < 508, 'BusSimulator must still advance simulated map/bar position smoothly');
+  }
+
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.1'") && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.1 changelog, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.2'") && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.2 changelog, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.1 Stable Distance-Ranked Notification Ordering (Zero Position Jumping), Upgraded Real-Time Push Notifications & strict exclusions');
+  console.log('  ✓ Verified v3.1.2 Exact Official SOAP ETA Preservation (Zero Arribando Flicker), Stable Distance-Ranked Notifications & strict exclusions');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

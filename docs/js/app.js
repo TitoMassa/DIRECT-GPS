@@ -377,6 +377,13 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.2',
+    date: '28/11/2026 · 00:25 hs',
+    items: [
+      '<strong>Minutos y «Arribando» 100 % fieles a Cuando Llega / SOAP oficial (adiós parpadeo Arribando ↔ 1/2 min):</strong> ni el simulador EN VIVO ni las notificaciones push inventan ni sobreescriben los minutos oficiales recibidos por SOAP. Solo se muestra <strong>Arribando</strong> cuando Cuando Llega original también lo indica, reservando la estimación exclusivamente para unidades sin GPS guiadas por horario programado.'
+    ]
+  },
+  {
     version: 'v3.1.1',
     date: '28/11/2026 · 00:15 hs',
     items: [
@@ -2666,6 +2673,7 @@ function normalizeArrivals(rawList, stopId, stopCoords) {
       descripcionCartelBandera: (a.descripcionCartelBandera || a.descripcionCortaBandera || '').trim(),
       tiempoRaw: a.tiempoRestanteArribo || '',
       eta,
+      hasOfficialSoapEta: Boolean(!a.esExtendido && a.tiempoRestanteArribo && eta.valid),
       etaSecondsRemaining: etaSec,
       esAdaptado: Boolean(a.esAdaptado || primaryBus?.esAdaptado),
       esLleno: a.esLleno === true,
@@ -6939,7 +6947,7 @@ function reconcileWithSchedulePrediction(
               if (b.identificadorCoche) matchedCoches.delete(b.identificadorCoche);
               continue;
             }
-            if ((b.isOppositeLeg || isFullCycle) && impliedSpeedMps > 13.5) {
+            if (!b.hasOfficialSoapEta && (b.isOppositeLeg || isFullCycle) && impliedSpeedMps > 13.5) {
               const estSec = Math.max(Math.round(b.routeMeters / 10.5), Math.round(b.routeMeters / 5.8));
               const estMin = Math.max(1, Math.round(estSec / 60));
               b.eta = parseEtaMinutes(`${estMin} min`);
@@ -7126,7 +7134,7 @@ function reconcileWithSchedulePrediction(
               const etaMismatchSec =
                 validSchedRem && b.eta?.valid ? Math.abs(schedRemSec - b.eta.minutes * 60) : 0;
 
-              if (impliedSpeedMps > 13.5 || etaMismatchSec >= 20 * 60) {
+              if (!b.hasOfficialSoapEta && (impliedSpeedMps > 13.5 || etaMismatchSec >= 20 * 60)) {
                 const minPhysSec = Math.round(b.routeMeters / 10.5);
                 const estSec = validSchedRem
                   ? Math.max(minPhysSec, Math.round(schedRemSec))

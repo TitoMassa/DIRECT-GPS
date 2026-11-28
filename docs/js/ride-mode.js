@@ -619,17 +619,17 @@ export class LiveTripTracker {
   }
 
   _computeSmoothLiveProgress(distM, etaSec, etaMin, { isInitial = false } = {}) {
-    const hasEtaSec = Number.isFinite(etaSec) && etaSec >= 0;
-    const effEtaSec = hasEtaSec ? etaSec : etaMin !== null && etaMin >= 0 ? etaMin * 60 : -1;
-    if ((effEtaSec >= 0 && effEtaSec <= 20) || (distM !== null && distM <= 35 && (effEtaSec < 0 || effEtaSec <= 90))) {
+    if (etaMin === 0) {
       return 1;
     }
+    const hasEtaSec = Number.isFinite(etaSec) && etaSec >= 0;
+    const effEtaSec = hasEtaSec ? etaSec : etaMin !== null && etaMin >= 0 ? etaMin * 60 : -1;
     const etaProg =
       effEtaSec >= 0 ? 1 / (1 + Math.pow(Math.max(0, effEtaSec / 60) / 14.0, 1.1)) : 0.08;
     const distProg =
       distM !== null && distM >= 0 ? 1 / (1 + Math.pow(Math.max(0, distM) / 3800.0, 1.05)) : null;
     const target = distProg !== null ? 0.65 * distProg + 0.35 * etaProg : etaProg;
-    const clamped = Math.max(0.05, Math.min(0.99, target));
+    const clamped = Math.max(0.05, Math.min(0.96, target));
     if (isInitial || !Number.isFinite(this.progress01)) return clamped;
     const delta = clamped - this.progress01;
     if (Math.abs(delta) > 0.28) return clamped; // Cambio de unidad/colectivo
