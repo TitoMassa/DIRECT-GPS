@@ -47,6 +47,22 @@ public final class RouteDistanceCalculator {
         }
     }
 
+    public static final class StopItem {
+        public final String id;
+        public final String nombre;
+        public final double lat;
+        public final double lng;
+        public final double along;
+
+        StopItem(String id, String nombre, double lat, double lng, double along) {
+            this.id = id;
+            this.nombre = nombre;
+            this.lat = lat;
+            this.lng = lng;
+            this.along = along;
+        }
+    }
+
     private static final class RouteBranch {
         final String bandera;
         final double[] lats;
@@ -54,14 +70,16 @@ public final class RouteDistanceCalculator {
         final double[] cum;
         final double totalLen;
         final Set<String> stopIds;
+        final List<StopItem> orderedStops;
 
-        RouteBranch(String bandera, double[] lats, double[] lngs, double[] cum, Set<String> stopIds) {
+        RouteBranch(String bandera, double[] lats, double[] lngs, double[] cum, Set<String> stopIds, List<StopItem> orderedStops) {
             this.bandera = bandera;
             this.lats = lats;
             this.lngs = lngs;
             this.cum = cum;
             this.totalLen = cum.length > 0 ? cum[cum.length - 1] : 0;
             this.stopIds = stopIds;
+            this.orderedStops = orderedStops;
         }
     }
 
@@ -165,18 +183,29 @@ public final class RouteDistanceCalculator {
                 }
 
                 Set<String> stopIds = new HashSet<>();
+                List<StopItem> orderedStops = new ArrayList<>();
+                RouteBranch tempBranch = new RouteBranch("", lats, lngs, cum, stopIds, orderedStops);
                 JSONArray stopsArr = obj.optJSONArray("paradas");
                 if (stopsArr != null) {
                     for (int j = 0; j < stopsArr.length(); j++) {
                         JSONObject st = stopsArr.optJSONObject(j);
                         if (st == null) continue;
                         String id = st.optString("identificador", "").trim().toUpperCase(Locale.ROOT);
-                        if (!id.isEmpty()) stopIds.add(id);
+                        if (id.isEmpty() || stopIds.contains(id)) continue;
+                        stopIds.add(id);
+                        double sLa = parseDouble(st.opt("latitud"));
+                        double sLn = parseDouble(st.opt("longitud"));
+                        String sNom = st.optString("descripcion", st.optString("nombre", id)).trim();
+                        if (Double.isFinite(sLa) && Double.isFinite(sLn) && sLa != 0 && sLn != 0) {
+                            Projection pr = projectOnBranch(tempBranch, sLa, sLn);
+                            orderedStops.add(new StopItem(id, sNom.isEmpty() ? id : sNom, sLa, sLn, pr.along));
+                        }
                     }
                 }
+                orderedStops.sort((a, b) -> Double.compare(a.along, b.along));
 
                 String bandera = obj.optString("abreviaturaBanderaSMP", obj.optString("descripcion", "")).trim();
-                list.add(new RouteBranch(bandera, lats, lngs, cum, stopIds));
+                list.add(new RouteBranch(bandera, lats, lngs, cum, stopIds, orderedStops));
             }
 
             if (!list.isEmpty()) {
@@ -187,6 +216,45 @@ public final class RouteDistanceCalculator {
             Log.d(TAG, "Failed loading route " + codLinea + ": " + e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Devuelve la lista ordenada de paradas del ramal que contiene la parada indicada (100 % offline).
+     * Permite activar Modo A Bordo ("Subir") directamente desde cualquier notificación push aunque la app esté cerrada.
+     */
+    public static List<StopItem> loadOrderedStopsForStop(
+        Context ctx,
+        int codLinea,
+        @Nullable String lineName,
+        @Nullable String stopId,
+        double stopLat,
+        double stopLng
+    ) {
+        int resolvedCod = resolveCodLinea(ctx, codLinea, lineName);
+        List<RouteBranch> branches = loadBranches(ctx, resolvedCod);
+        if (branches == null || branches.isEmpty()) return new ArrayList<>();
+        String normStopId = stopId != null ? stopId.trim().toUpperCase(Locale.ROOT) : "";
+        RouteBranch chosen = null;
+        if (!normStopId.isEmpty()) {
+            for (RouteBranch b : branches) {
+                if (b.stopIds.contains(normStopId)) {
+                    chosen = b;
+                    break;
+                }
+            }
+        }
+        if (chosen == null && Double.isFinite(stopLat) && Double.isFinite(stopLng) && stopLat != 0 && stopLng != 0) {
+            double bestDist = Double.MAX_VALUE;
+            for (RouteBranch b : branches) {
+                Projection p = projectOnBranch(b, stopLat, stopLng);
+                if (p.distToLine < bestDist) {
+                    bestDist = p.distToLine;
+                    chosen = b;
+                }
+            }
+        }
+        if (chosen == null) chosen = branches.get(0);
+        return new ArrayList<>(chosen.orderedStops);
     }
 
     /**

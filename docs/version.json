@@ -1,12 +1,12 @@
 {
-  "version": "3.0.1",
-  "versionCode": 301,
+  "version": "3.1.0",
+  "versionCode": 310,
   "releaseDate": "2026-11-27",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.0.1/DIRECT-GPS-v3.0.1-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.0.1",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.0/DIRECT-GPS-v3.1.0-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.0",
   "notes": [
-    "Barra de avance suave y continua basada en Simulación EN VIVO (sin saltos del último GPS), avanzando cada 2 s en segundo plano y sincronizada con la simulación en vivo",
-    "Notificación expandida sin recortes ni textos redundantes: muestra directo #4150, nombre del chofer y distancia (ej. 2,5 km (25 c.))",
-    "Desplazamiento vertical corregido en Ajustes → Alertas (ahora podés deslizar hasta todas las opciones), pestañas en una sola fila y eliminación del botón superior «Aa» (Modo Simple solo desde Ajustes → Apariencia)"
+    "Eliminada la tarjeta flotante inferior al seleccionar una línea individual (pantalla 100 % limpia y despejada sobre la barra inferior)",
+    "Notificaciones push Android en tiempo real renovadas: avance continuo EN VIVO cada 1,5 s con cuenta regresiva en vivo, barra con gradiente del color real de cada línea, micro-hitos de avance, faro esmeralda al acercarse y orden automático por menor tiempo de llegada",
+    "Acciones directas de 1 toque en cada notificación: activar/desactivar «Min a min» y tocar «Subir» desde cualquier aviso (incluso con la app cerrada) + nueva tarjeta personalizada limpia para Modo A Bordo"
   ]
 }

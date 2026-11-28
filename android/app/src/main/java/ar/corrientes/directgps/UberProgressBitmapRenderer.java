@@ -5,17 +5,22 @@ import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.RectF;
+import android.graphics.Shader;
 
 import androidx.annotation.Nullable;
 
 import java.util.Locale;
 
 /**
- * Renderizador gráfico estilo Uber para la barra de progreso única en las notificaciones en vivo.
- * Dibuja un bitmap anti-aliased con línea izquierda->derecha, punto de destino y cápsula del
- * colectivo moviéndose suavemente sin redundancia de barras nativas.
+ * Renderizador gráfico estilo Uber (v3.1.0) para la barra de progreso única en las notificaciones
+ * push en tiempo real de Android:
+ *  - Gradiente con el color real de la línea en el tramo recorrido (izquierda -> colectivo)
+ *  - Puntos de referencia sutiles en el tramo restante para percibir el avance continuo
+ *  - Faro de parada destino que brilla en verde esmeralda cuando el colectivo está próximo
+ *  - Cápsula superior del colectivo con luces delanteras suaves apuntando hacia la derecha
  */
 public final class UberProgressBitmapRenderer {
 
@@ -46,14 +51,22 @@ public final class UberProgressBitmapRenderer {
         return Color.parseColor("#10B981");
     }
 
+    private static int withAlpha(int color, int alpha) {
+        return Color.argb(Math.max(0, Math.min(255, alpha)), Color.red(color), Color.green(color), Color.blue(color));
+    }
+
     /**
      * Genera la barra recta estilo Uber (una sola línea limpia con cápsula del colectivo
-     * avanzando de izquierda a derecha hasta el círculo de destino).
+     * avanzando de izquierda a derecha hasta el punto de parada destino).
      */
     public static Bitmap renderTrack(Context ctx, double progress01, int accentColor, boolean compact) {
+        return renderTrack(ctx, progress01, accentColor, compact, false);
+    }
+
+    public static Bitmap renderTrack(Context ctx, double progress01, int accentColor, boolean compact, boolean imminent) {
         float density = Math.max(2.0f, ctx.getResources().getDisplayMetrics().density);
-        int widthPx = Math.round(310f * density);
-        int heightPx = Math.round((compact ? 24f : 32f) * density);
+        int widthPx = Math.round(316f * density);
+        int heightPx = Math.round((compact ? 25f : 33f) * density);
 
         Bitmap bmp = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(bmp);
@@ -65,54 +78,95 @@ public final class UberProgressBitmapRenderer {
         float cy = heightPx / 2f;
         float trackStart = padX;
         float trackEnd = widthPx - padX;
-        float trackLen = Math.max(1f, trackEnd - trackStart);
 
-        float strokeW = (compact ? 3.2f : 4.0f) * density;
-        float destRadius = (compact ? 4.8f : 5.8f) * density;
-        float busW = (compact ? 28f : 34f) * density;
-        float busH = (compact ? 14f : 17.5f) * density;
+        float strokeW = (compact ? 3.4f : 4.2f) * density;
+        float destRadius = (compact ? 5.0f : 6.0f) * density;
+        float busW = (compact ? 29f : 35f) * density;
+        float busH = (compact ? 14.5f : 18f) * density;
 
-        // Posición X del centro de la cápsula del colectivo (sin salirse de los bordes)
         float minBusX = trackStart + busW * 0.5f;
-        float maxBusX = trackEnd - destRadius - busW * 0.42f;
+        float maxBusX = trackEnd - destRadius - busW * 0.44f;
         float busCx = minBusX + (float) clamped * Math.max(1f, maxBusX - minBusX);
+        float destCx = trackEnd - destRadius * 0.2f;
 
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-        // 1) Tramo restante (derecha) — gris translúcido estilo Uber
+        // 1) Tramo restante (derecha) — riel translúcido limpio
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeCap(Paint.Cap.ROUND);
         p.setStrokeWidth(strokeW);
-        p.setColor(dark ? Color.argb(85, 255, 255, 255) : Color.argb(58, 15, 23, 42));
-        c.drawLine(trackStart, cy, trackEnd - destRadius, cy, p);
+        p.setColor(dark ? Color.argb(72, 255, 255, 255) : Color.argb(52, 15, 23, 42));
+        c.drawLine(trackStart, cy, destCx - destRadius, cy, p);
 
-        // 2) Tramo recorrido (izquierda -> colectivo) — línea sólida nítida estilo Uber
-        p.setColor(dark ? Color.WHITE : Color.parseColor("#111827"));
-        c.drawLine(trackStart, cy, Math.max(trackStart, busCx - busW * 0.35f), cy, p);
-
-        // 3) Punto de parada destino a la derecha (anillo limpio estilo Uber)
+        // 2) Micro-hitos sutiles en el tramo restante para percibir el deslizamiento continuo
         p.setStyle(Paint.Style.FILL);
-        p.setColor(dark ? Color.argb(90, 255, 255, 255) : Color.argb(45, 15, 23, 42));
-        c.drawCircle(trackEnd - destRadius * 0.2f, cy, destRadius, p);
+        p.setColor(dark ? Color.argb(95, 255, 255, 255) : Color.argb(75, 15, 23, 42));
+        float dotR = (compact ? 1.4f : 1.7f) * density;
+        for (int i = 1; i <= 4; i++) {
+            float mx = trackStart + (destCx - trackStart) * (i / 5.0f);
+            if (mx > busCx + busW * 0.65f && mx < destCx - destRadius * 2.1f) {
+                c.drawCircle(mx, cy, dotR, p);
+            }
+        }
+
+        // 3) Tramo recorrido (izquierda -> colectivo) con gradiente del color real de la línea
+        float filledEnd = Math.max(trackStart + 1f, busCx - busW * 0.34f);
         p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(1.8f * density);
-        p.setColor(clamped >= 0.96
-            ? Color.parseColor("#10B981")
-            : (dark ? Color.argb(175, 255, 255, 255) : Color.argb(140, 15, 23, 42)));
-        c.drawCircle(trackEnd - destRadius * 0.2f, cy, destRadius * 0.85f, p);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStrokeWidth(strokeW);
+        int startCol = withAlpha(accentColor, dark ? 150 : 185);
+        int endCol = imminent ? Color.parseColor("#10B981") : accentColor;
+        p.setShader(new LinearGradient(trackStart, cy, filledEnd, cy, startCol, endCol, Shader.TileMode.CLAMP));
+        c.drawLine(trackStart, cy, filledEnd, cy, p);
+        p.setShader(null);
 
-        // 4) Sombra sutil bajo la cápsula del colectivo
+        // 4) Faro de parada destino a la derecha (anillo esmeralda cuando está próximo / llegando)
+        boolean glowStop = imminent || clamped >= 0.86;
+        if (glowStop) {
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(Color.argb(dark ? 65 : 50, 16, 185, 129));
+            c.drawCircle(destCx, cy, destRadius * 1.55f, p);
+        }
         p.setStyle(Paint.Style.FILL);
-        p.setColor(Color.argb(dark ? 110 : 55, 0, 0, 0));
+        p.setColor(glowStop
+            ? Color.parseColor("#10B981")
+            : (dark ? Color.argb(85, 255, 255, 255) : Color.argb(42, 15, 23, 42)));
+        c.drawCircle(destCx, cy, destRadius * 0.62f, p);
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(1.9f * density);
+        p.setColor(glowStop
+            ? Color.parseColor("#34D399")
+            : (dark ? Color.argb(185, 255, 255, 255) : Color.argb(145, 15, 23, 42)));
+        c.drawCircle(destCx, cy, destRadius * 0.92f, p);
+
+        // 5) Haz suave de luces delanteras (apuntando hacia la derecha)
+        if (busCx + busW * 0.72f < destCx - destRadius) {
+            float beamLeft = busCx + busW * 0.44f;
+            float beamRight = Math.min(destCx - destRadius * 1.1f, beamLeft + 10f * density);
+            p.setStyle(Paint.Style.FILL);
+            p.setShader(new LinearGradient(
+                beamLeft, cy, beamRight, cy,
+                Color.argb(dark ? 115 : 65, 253, 224, 71),
+                Color.argb(0, 253, 224, 71),
+                Shader.TileMode.CLAMP
+            ));
+            RectF beam = new RectF(beamLeft, cy - busH * 0.34f, beamRight, cy + busH * 0.34f);
+            c.drawRoundRect(beam, busH * 0.2f, busH * 0.2f, p);
+            p.setShader(null);
+        }
+
+        // 6) Sombra bajo la cápsula del colectivo
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(Color.argb(dark ? 125 : 60, 0, 0, 0));
         RectF shadowRect = new RectF(
             busCx - busW / 2f,
             cy - busH / 2f + 1.2f * density,
             busCx + busW / 2f,
-            cy + busH / 2f + 1.6f * density
+            cy + busH / 2f + 1.8f * density
         );
         c.drawRoundRect(shadowRect, busH * 0.36f, busH * 0.36f, p);
 
-        // 5) Cuerpo de la cápsula del colectivo (vista superior estilo Uber, orientada -> derecha)
+        // 7) Cuerpo de la cápsula del colectivo (vista superior, orientada -> derecha)
         RectF body = new RectF(
             busCx - busW / 2f,
             cy - busH / 2f,
@@ -120,39 +174,38 @@ public final class UberProgressBitmapRenderer {
             cy + busH / 2f
         );
         p.setColor(Color.WHITE);
-        c.drawRoundRect(body, busH * 0.34f, busH * 0.34f, p);
+        c.drawRoundRect(body, busH * 0.35f, busH * 0.35f, p);
 
-        // Borde sutil en modo claro para que la cápsula blanca contraste impecable
         if (!dark) {
             p.setStyle(Paint.Style.STROKE);
             p.setStrokeWidth(1.2f * density);
             p.setColor(Color.argb(95, 15, 23, 42));
-            c.drawRoundRect(body, busH * 0.34f, busH * 0.34f, p);
+            c.drawRoundRect(body, busH * 0.35f, busH * 0.35f, p);
             p.setStyle(Paint.Style.FILL);
         }
 
-        // Franja de color de la línea sobre el techo del colectivo
-        float stripeInsetY = busH * 0.24f;
+        // Franja de color de la línea sobre el techo
+        float stripeInsetY = busH * 0.23f;
         RectF roof = new RectF(
             body.left + busW * 0.16f,
             body.top + stripeInsetY,
-            body.right - busW * 0.28f,
+            body.right - busW * 0.27f,
             body.bottom - stripeInsetY
         );
         p.setColor(accentColor);
         c.drawRoundRect(roof, busH * 0.16f, busH * 0.16f, p);
 
-        // Parabrisas delantero (a la derecha, indicando avance izquierda -> derecha)
+        // Parabrisas delantero (derecha)
         RectF windshield = new RectF(
             body.right - busW * 0.22f,
             body.top + busH * 0.16f,
             body.right - busW * 0.08f,
             body.bottom - busH * 0.16f
         );
-        p.setColor(Color.parseColor("#1E293B"));
+        p.setColor(Color.parseColor("#0F172A"));
         c.drawRoundRect(windshield, busH * 0.12f, busH * 0.12f, p);
 
-        // Luneta trasera (a la izquierda)
+        // Luneta trasera (izquierda)
         RectF rearGlass = new RectF(
             body.left + busW * 0.06f,
             body.top + busH * 0.22f,
@@ -166,7 +219,7 @@ public final class UberProgressBitmapRenderer {
     }
 
     /**
-     * Genera la placa de línea redondeada con color real (ej. 102C, 106C) para la tarjeta interna.
+     * Genera la placa de línea redondeada con color real (ej. 102C, 106C) y brillo sutil.
      */
     public static Bitmap renderLineBadge(Context ctx, String lineName, int bgColor) {
         float density = Math.max(2.0f, ctx.getResources().getDisplayMetrics().density);
@@ -180,7 +233,18 @@ public final class UberProgressBitmapRenderer {
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setStyle(Paint.Style.FILL);
         p.setColor(bgColor);
-        c.drawRoundRect(new RectF(0, 0, widthPx, heightPx), 10f * density, 10f * density, p);
+        RectF outer = new RectF(0, 0, widthPx, heightPx);
+        c.drawRoundRect(outer, 10f * density, 10f * density, p);
+
+        // Sutil brillo superior estilo badge nativo
+        p.setShader(new LinearGradient(
+            0, 0, 0, heightPx * 0.55f,
+            Color.argb(42, 255, 255, 255),
+            Color.argb(0, 255, 255, 255),
+            Shader.TileMode.CLAMP
+        ));
+        c.drawRoundRect(outer, 10f * density, 10f * density, p);
+        p.setShader(null);
 
         p.setColor(Color.WHITE);
         p.setTextAlign(Paint.Align.CENTER);

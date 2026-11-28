@@ -340,25 +340,9 @@ export function createUiExtras(ctx) {
     return true;
   }
 
-  // ── 4. Uber-Style Live Trip Bar + Accessible Subir/Bajar Mode ─────────────
-  const rideBanner = document.getElementById('ride-mode-banner');
-  const liveLineBadge = document.getElementById('live-trip-line-badge');
-  const rideTitle = document.getElementById('ride-mode-title');
-  const rideSub = document.getElementById('ride-mode-sub');
-  const liveTrackWrap = rideBanner?.querySelector('.live-trip-track-wrap');
-  const liveTrackFill = document.getElementById('live-trip-track-fill');
-  const liveBusDot = document.getElementById('live-trip-bus-dot');
-  const liveTripMeta = document.getElementById('live-trip-meta');
-  const btnLiveMin = document.getElementById('btn-live-trip-min');
-  const btnLiveNotif = document.getElementById('btn-live-trip-notif');
-  const btnLiveBoard = document.getElementById('btn-live-trip-board');
-  const btnRideCancel = document.getElementById('btn-ride-mode-cancel');
-
+  // ── 4. Live Trip Tracker (Android Real-Time Push Notifications + Accessible Subir/Bajar) ──
   function syncNotifPermissionButtons() {
     const perm = getNotificationPermissionState();
-    if (btnLiveNotif) {
-      btnLiveNotif.classList.toggle('hidden', perm === 'granted' || perm === 'unsupported');
-    }
     const settingsNotifBtn = document.getElementById('btn-enable-android-notifs');
     if (settingsNotifBtn) {
       if (perm === 'granted') {
@@ -377,95 +361,7 @@ export function createUiExtras(ctx) {
   }
 
   const liveTracker = new LiveTripTracker({
-    onUpdate: (snap) => {
-      if (!rideBanner) return;
-      if (!snap) {
-        rideBanner.classList.add('hidden');
-        rideBanner.classList.remove('is-arrived', 'is-onboard', 'is-boarding-armed');
-        return;
-      }
-      rideBanner.classList.remove('hidden');
-      const isOnboard = snap.phase === 'onboard';
-      const isArmed = snap.phase === 'boarding_armed';
-      rideBanner.classList.toggle('is-onboard', isOnboard);
-      rideBanner.classList.toggle('is-boarding-armed', isArmed);
-      rideBanner.classList.toggle('is-arrived', Boolean(snap.arrivingNow || (!isOnboard && snap.etaMin === 0)));
-      liveTrackWrap?.classList.toggle('hidden', isOnboard);
-
-      const lineCol = getLineColor(snap.lineName || '');
-      rideBanner.style.setProperty('--trip-color', lineCol);
-      if (liveLineBadge) {
-        liveLineBadge.textContent = snap.lineName || '—';
-        liveLineBadge.style.setProperty('--line-color', lineCol);
-      }
-
-      const pct = Math.max(4, Math.min(100, Math.round((snap.progress01 || 0) * 100)));
-      if (liveTrackFill) liveTrackFill.style.width = `${pct}%`;
-      if (liveBusDot) liveBusDot.style.left = `${pct}%`;
-
-      if (isOnboard) {
-        const nextClean = snap.nextStop?.cleanName || 'Fin del recorrido';
-        if (rideTitle) {
-          rideTitle.textContent = snap.arrivingNow
-            ? `ARRIBANDO · ${nextClean}`
-            : `A bordo → ${nextClean}`;
-        }
-        if (rideSub) {
-          const distTxt =
-            Number.isFinite(snap.distToNextM) && snap.distToNextM !== null
-              ? `${formatDistance(snap.distToNextM)} · `
-              : '';
-          const remTxt = `${snap.remainingStops} ${snap.remainingStops === 1 ? 'parada restante' : 'paradas restantes'}`;
-          rideSub.textContent = `${distTxt}${remTxt}${snap.usingPhoneGps ? ' · GPS celular' : ' · GPS coche'}`;
-        }
-        if (btnLiveMin) btnLiveMin.classList.add('hidden');
-        if (btnLiveBoard) {
-          btnLiveBoard.textContent = '🚪 Bajar';
-          btnLiveBoard.classList.add('is-alight');
-          btnLiveBoard.setAttribute('aria-label', 'Bajar del colectivo y finalizar modo viaje');
-        }
-      } else {
-        const etaTxt =
-          snap.etaMin === null
-            ? 'Buscando unidad...'
-            : snap.etaMin <= 0
-              ? 'ARRIBANDO AHORA'
-              : `${snap.etaMin} min`;
-        if (rideTitle) {
-          rideTitle.textContent = `${etaTxt}${snap.coche ? ` · Coche #${snap.coche}` : ''}`;
-        }
-        if (rideSub) {
-          const distTxt =
-            Number.isFinite(snap.distM) && snap.distM > 0
-              ? `A ${formatDistance(snap.distM)} (${formatBlocks(snap.distM)} c.)`
-              : 'En camino';
-          rideSub.textContent = isArmed
-            ? `Subir activado · pasará a modo viaje al llegar · ${distTxt}`
-            : `${distTxt} · ${snap.originStop?.nombre || snap.originStop?.id || ''}`;
-        }
-        if (btnLiveMin) {
-          btnLiveMin.classList.remove('hidden');
-          btnLiveMin.classList.toggle('is-active', Boolean(snap.minuteByMinute));
-          btnLiveMin.setAttribute('aria-pressed', String(Boolean(snap.minuteByMinute)));
-          btnLiveMin.textContent = snap.minuteByMinute ? '✓ Min a min' : 'Min a min';
-        }
-        if (btnLiveBoard) {
-          btnLiveBoard.textContent = isArmed ? '🚌 Ya subí' : '🚌 Subir';
-          btnLiveBoard.classList.remove('is-alight');
-          btnLiveBoard.setAttribute(
-            'aria-label',
-            isArmed ? 'Confirmar que ya subiste al colectivo' : 'Activar modo Subir al colectivo'
-          );
-        }
-      }
-
-      if (liveTripMeta) {
-        const parts = [];
-        if (snap.choferNombre) parts.push(`Chofer: ${snap.choferNombre}`);
-        if (snap.coche) parts.push(`Coche #${snap.coche}`);
-        parts.push(`Prog. real: ${snap.scheduledHHMM || 's/d'}`);
-        liveTripMeta.textContent = parts.join(' · ');
-      }
+    onUpdate: () => {
       syncNotifPermissionButtons();
     },
     onToast: (msg, kind, dur) => showToast(msg, kind, dur),
@@ -480,58 +376,9 @@ export function createUiExtras(ctx) {
     minuteByMinute: alertPrefs.minuteByMinute,
     ttsEnabled: alertPrefs.tts,
     soundEnabled: state.soundEnabled,
-    leadMin: alertPrefs.leadMin
-  });
-
-  btnRideCancel?.addEventListener('click', () => {
-    liveTracker.stop();
-  });
-
-  btnLiveMin?.addEventListener('click', async () => {
-    alertPrefs.minuteByMinute = !alertPrefs.minuteByMinute;
-    saveAlertPrefs();
-    liveTracker.syncPrefs({ minuteByMinute: alertPrefs.minuteByMinute });
-    const chk = document.getElementById('chk-minute-alerts');
-    if (chk) chk.checked = alertPrefs.minuteByMinute;
-    if (alertPrefs.minuteByMinute) {
-      await ensureNotificationPermission();
-      syncNotifPermissionButtons();
-    }
-    showToast(
-      alertPrefs.minuteByMinute
-        ? 'Aviso minuto a minuto activado (timbre + voz)'
-        : 'Aviso minuto a minuto desactivado',
-      alertPrefs.minuteByMinute ? 'success' : 'info',
-      2400
-    );
-  });
-
-  btnLiveNotif?.addEventListener('click', async () => {
-    const ok = await ensureNotificationPermission();
-    syncNotifPermissionButtons();
-    if (ok) {
-      showToast('Notificación estilo Uber activada en tu barra de estado Android', 'success', 3000);
-      liveTracker._dispatchNotification({ alertSound: false, force: true });
-    } else {
-      showToast('Habilitá los permisos de notificación para DIRECT GPS en ajustes del navegador.', 'warn', 4000);
-    }
-  });
-
-  btnLiveBoard?.addEventListener('click', async () => {
-    const snap = liveTracker.getSnapshot();
-    if (snap.phase === 'onboard') {
-      liveTracker.alight();
-      return;
-    }
-    await ensureNotificationPermission();
-    syncNotifPermissionButtons();
-    if (snap.codLinea && ensureLineBranchesLoaded) {
-      await ensureLineBranchesLoaded([snap.codLinea]).catch(() => {});
-    }
-    liveTracker.requestBoard({
-      immediate: snap.phase === 'boarding_armed',
-      routeBranchesCache: state.routeBranchesCache
-    });
+    leadMin: alertPrefs.leadMin,
+    ttsSpeechRate: alertPrefs.ttsRate,
+    ttsSpeakInDnd: alertPrefs.ttsSpeakInDnd
   });
 
   // Escuchar acciones enviadas directamente desde los botones de la notificación Android (Subir / Ya subí / Bajar / Detener)

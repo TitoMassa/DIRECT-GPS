@@ -377,6 +377,15 @@ const el = {
 
 const CHANGELOG_ENTRIES = [
   {
+    version: 'v3.1.0',
+    date: '28/11/2026 · 00:05 hs',
+    items: [
+      '<strong>Eliminada la tarjeta flotante inferior:</strong> al seleccionar una línea individual en una parada ya no aparece la tarjeta flotante que tapaba la barra inferior; todo el seguimiento en vivo se concentra directamente en las <strong>notificaciones push en tiempo real de Android</strong>.',
+      '<strong>Notificaciones push Android en tiempo real renovadas:</strong> barra única con <strong>gradiente del color real de cada línea</strong>, micro-hitos de avance, faro esmeralda al aproximarse y cápsula con luces delanteras avanzando suavemente cada <strong>1,5 s</strong> en modo <em>EN VIVO</em> con cuenta regresiva continua y <strong>orden automático por menor tiempo de arribo</strong>.',
+      '<strong>Control total desde la barra de notificaciones (sin abrir la app):</strong> cada aviso en vivo ahora incluye botones directos para activar/desactivar <strong>Min a min</strong> y tocar <strong>Subir</strong> directamente desde cualquier campanita (cargando las paradas del ramal offline incluso con la app cerrada), además de una nueva tarjeta personalizada limpia para <strong>Modo A Bordo</strong>.'
+    ]
+  },
+  {
     version: 'v3.0.1',
     date: '27/11/2026 · 23:45 hs',
     items: [
