@@ -603,37 +603,161 @@ export function findOppositeStop(activeStop, catalogo, routeBranchesCache) {
 }
 
 /**
- * Construye el perfil histórico de 7 días cruzado en todas las líneas para un Coche o un Chofer
- * a partir del offlineBundle (y datos en vivo actuales).
+ * Construye el perfil histórico completo de 7 días cruzado en todas las líneas para un Coche o un Chofer
+ * fusionando todas las fuentes del offlineBundle (dayObsByDay, dayTripsByDay, coches/choferes) + datos en vivo.
+ * Incluye choferes/coches asociados, turnos, servicios, horarios/salidas y última posición GPS (global y diaria).
  */
 export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBuses = [], lineByCode = null) {
   const normId = String(queryId || '').trim().toUpperCase();
   if (!normId) return null;
 
   const isCar = type === 'coche';
-  const daysMap = new Map(); // dayKey -> { dayKey, entries: [] }
+  const daysMap = new Map(); // dayKey -> Array<entry>
   const linesSet = new Set();
-  const companionsMap = new Map(); // key -> { label, sub, count }
-  let title = isCar ? `Coche #${normId}` : queryId;
+  const companionsMap = new Map(); // key -> { label, count }
+  let title = isCar ? `Coche #${normId}` : String(queryId || '').trim();
   let subtitle = '';
   let esAdaptado = false;
   let lastSeenAt = 0;
   let liveNow = null;
+  let lastPosition = null;
+
+  const isValidCoord = (la, ln) => {
+    const a = Number(la);
+    const b = Number(ln);
+    return Number.isFinite(a) && Number.isFinite(b) && (Math.abs(a) > 0.01 || Math.abs(b) > 0.01);
+  };
+
+  const normName = (s) =>
+    String(s || '')
+      .trim()
+      .replace(/\.+$/, '')
+      .toUpperCase();
+
+  const matchesDriver = (leg, nom, dKey = '') => {
+    const l = String(leg || '').trim().toUpperCase();
+    const n = normName(nom);
+    const k = String(dKey || '').trim().toUpperCase();
+    const qClean = normId.replace(/^LEG:/, '').replace(/^NAME:/, '');
+    return (
+      (l && (l === normId || l === qClean)) ||
+      (n && (n === normId || n === normName(qClean))) ||
+      (k && (k === normId || k === `LEG:${qClean}` || k === `NAME:${normName(qClean)}`))
+    );
+  };
+
+  const trackCompanion = (label) => {
+    if (!label || label.includes('s/d')) return;
+    const prev = companionsMap.get(label) || { label, count: 0 };
+    prev.count++;
+    companionsMap.set(label, prev);
+  };
+
+  const considerLastPosition = (cand) => {
+    if (!cand) return;
+    const ts = Number(cand.lastSeenAt) || 0;
+    const hasCoords = isValidCoord(cand.lat, cand.lng);
+    if (!lastPosition) {
+      if (hasCoords || cand.lastGps || cand.bandera) lastPosition = { ...cand };
+      return;
+    }
+    const prevHasCoords = isValidCoord(lastPosition.lat, lastPosition.lng);
+    const prevTs = Number(lastPosition.lastSeenAt) || 0;
+    const isNewer = ts > prevTs || (ts === prevTs && hasCoords && !prevHasCoords);
+    if (isNewer && (hasCoords || !prevHasCoords)) {
+      lastPosition = {
+        ...lastPosition,
+        ...cand,
+        lat: hasCoords ? Number(cand.lat) : lastPosition.lat,
+        lng: hasCoords ? Number(cand.lng) : lastPosition.lng,
+        serviceNumber: Number(cand.serviceNumber) || (ts === prevTs ? lastPosition.serviceNumber : 0),
+        turnoIndex: Number(cand.turnoIndex) || (ts === prevTs ? lastPosition.turnoIndex : 0),
+        turnoStart: cand.turnoStart || (ts === prevTs ? lastPosition.turnoStart : ''),
+        turnoEnd: cand.turnoEnd || (ts === prevTs ? lastPosition.turnoEnd : '')
+      };
+    } else if (ts === prevTs || (cand.dayKey && cand.dayKey === lastPosition.dayKey && cand.codigoLinea === lastPosition.codigoLinea)) {
+      if (!lastPosition.serviceNumber && cand.serviceNumber) lastPosition.serviceNumber = Number(cand.serviceNumber);
+      if (!lastPosition.turnoIndex && cand.turnoIndex) lastPosition.turnoIndex = Number(cand.turnoIndex);
+      if (!lastPosition.turnoStart && cand.turnoStart) lastPosition.turnoStart = cand.turnoStart;
+      if (!lastPosition.turnoEnd && cand.turnoEnd) lastPosition.turnoEnd = cand.turnoEnd;
+      if (!lastPosition.bandera && cand.bandera) lastPosition.bandera = cand.bandera;
+      if (!lastPosition.lastGps && cand.lastGps) lastPosition.lastGps = cand.lastGps;
+      if (!prevHasCoords && hasCoords) {
+        lastPosition.lat = Number(cand.lat);
+        lastPosition.lng = Number(cand.lng);
+      }
+    }
+  };
+
+  const extractTripHHMM = (turnoHora, tripKey) => {
+    const h = String(turnoHora || '').trim();
+    if (/^\d{2}:\d{2}/.test(h)) return h.slice(0, 5);
+    const m = String(tripKey || '').match(/@(\d{2}:\d{2})/);
+    return m ? m[1] : '';
+  };
 
   const addDayEntry = (dayKey, entry) => {
     if (!dayKey) return;
     if (!daysMap.has(dayKey)) daysMap.set(dayKey, []);
     const list = daysMap.get(dayKey);
-    const exists = list.find(
-      (e) =>
-        e.codigoLinea === entry.codigoLinea &&
-        e.serviceNumber === entry.serviceNumber &&
-        e.companion === entry.companion
-    );
+    const normComp = String(entry.companion || '').trim();
+    const isUnknownComp = !normComp || normComp.includes('s/d');
+    const exists = list.find((e) => {
+      if (e.codigoLinea !== entry.codigoLinea) return false;
+      const sameComp = e.companion === normComp || isUnknownComp || !e.companion || e.companion.includes('s/d');
+      if (!sameComp) return false;
+      // Merge if same service/turno, or if either entry lacks a serviceNumber yet
+      if (e.serviceNumber && entry.serviceNumber && e.serviceNumber !== entry.serviceNumber) return false;
+      if (e.turnoIndex && entry.turnoIndex && e.turnoIndex !== entry.turnoIndex) return false;
+      return true;
+    });
+
+    const incomingTimes = Array.isArray(entry.tripTimes) ? entry.tripTimes.filter(Boolean) : [];
     if (!exists) {
-      list.push(entry);
-    } else if ((entry.lastSeenAt || 0) > (exists.lastSeenAt || 0)) {
-      Object.assign(exists, entry);
+      list.push({
+        ...entry,
+        tripTimes: Array.from(new Set(incomingTimes)).sort()
+      });
+    } else {
+      if ((exists.companion?.includes('s/d') || !exists.companion) && normComp && !isUnknownComp) {
+        exists.companion = normComp;
+      }
+      if (!exists.coche && entry.coche) exists.coche = entry.coche;
+      if (!exists.choferNombre && entry.choferNombre) exists.choferNombre = entry.choferNombre;
+      if (!exists.choferLegajo && entry.choferLegajo) exists.choferLegajo = entry.choferLegajo;
+      if (entry.esAdaptado) exists.esAdaptado = true;
+      if (!exists.serviceNumber && entry.serviceNumber) exists.serviceNumber = Number(entry.serviceNumber);
+      if (!exists.turnoIndex && entry.turnoIndex) exists.turnoIndex = Number(entry.turnoIndex);
+      if (!exists.turnoStart && entry.turnoStart) exists.turnoStart = entry.turnoStart;
+      if (!exists.turnoEnd && entry.turnoEnd) exists.turnoEnd = entry.turnoEnd;
+      if (incomingTimes.length > 0) {
+        exists.tripTimes = Array.from(new Set([...(exists.tripTimes || []), ...incomingTimes])).sort();
+      }
+      if ((entry.firstSeenAt || 0) > 0 && (!exists.firstSeenAt || entry.firstSeenAt < exists.firstSeenAt)) {
+        exists.firstSeenAt = entry.firstSeenAt;
+      }
+      const incomingNewer = (entry.lastSeenAt || 0) >= (exists.lastSeenAt || 0);
+      if (incomingNewer) {
+        if (entry.lastSeenAt) exists.lastSeenAt = entry.lastSeenAt;
+        if (entry.bandera) exists.bandera = entry.bandera;
+        if (entry.lastGps) exists.lastGps = entry.lastGps;
+        if (entry.lastStopId) exists.lastStopId = entry.lastStopId;
+        if (entry.desvioRaw) {
+          exists.desvioRaw = entry.desvioRaw;
+          exists.desvioSec = Number(entry.desvioSec) || 0;
+        }
+        if (isValidCoord(entry.lat, entry.lng)) {
+          exists.lat = Number(entry.lat);
+          exists.lng = Number(entry.lng);
+        }
+      } else {
+        if (!exists.bandera && entry.bandera) exists.bandera = entry.bandera;
+        if (!exists.lastGps && entry.lastGps) exists.lastGps = entry.lastGps;
+        if (!isValidCoord(exists.lat, exists.lng) && isValidCoord(entry.lat, entry.lng)) {
+          exists.lat = Number(entry.lat);
+          exists.lng = Number(entry.lng);
+        }
+      }
     }
   };
 
@@ -642,9 +766,7 @@ export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBus
     const carId = String(b.identificadorCoche || b.coche || '').trim().toUpperCase();
     const drvName = String(b.choferNombre || '').trim();
     const drvLeg = String(b.choferLegajo || '').trim().toUpperCase();
-    const match = isCar
-      ? carId === normId
-      : (drvLeg && drvLeg === normId) || drvName.toUpperCase() === normId;
+    const match = isCar ? carId === normId : matchesDriver(drvLeg, drvName);
     if (!match) continue;
     liveNow = b;
     if (b.esAdaptado) esAdaptado = true;
@@ -652,37 +774,42 @@ export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBus
       title = drvName;
       if (drvLeg) subtitle = `Legajo ${drvLeg}`;
     }
-    const lineName = b.descripcionLinea || lineByCode?.get(Number(b.codigoLinea))?.descripcion || `L${b.codigoLinea}`;
+    const cod = Number(b.codigoLinea) || 0;
+    const lineName = b.descripcionLinea || lineByCode?.get(cod)?.descripcion || `L${cod}`;
     linesSet.add(lineName);
+    const liveTs = Number(b.lastSeenAt) || Date.now();
+    if (liveTs > lastSeenAt) lastSeenAt = liveTs;
+    considerLastPosition({
+      codigoLinea: cod,
+      lineName,
+      coche: carId,
+      choferNombre: drvName,
+      choferLegajo: drvLeg,
+      esAdaptado: Boolean(b.esAdaptado),
+      lat: b.rawLat ?? b.lat ?? b.lastLat ?? null,
+      lng: b.rawLng ?? b.lng ?? b.lastLng ?? null,
+      bandera: b.realBandera || b.descripcionBandera || b.lastBandera || '',
+      lastGps: b.ultimaFechaHoraGPS || b.lastGps || '',
+      lastStopId: b.lastStopId || '',
+      desvioRaw: b.desvio?.raw || b.lastDesvioRaw || '',
+      desvioSec: b.desvio?.seconds ?? b.lastDesvioSec ?? 0,
+      serviceNumber: Number(b.serviceNumber || b.lastServiceNum) || 0,
+      turnoIndex: Number(b.turnoIndex || b.lastTurnoIdx) || 0,
+      turnoStart: b.turnoStart || b.lastTurnoStart || '',
+      turnoEnd: b.turnoEnd || b.lastTurnoEnd || '',
+      dayKey: offlineBundle?.dayKey || '',
+      lastSeenAt: liveTs,
+      enLineaAhora: true
+    });
   }
 
-  // 2) Scan 7-day offlineBundle across ALL lines
+  // 2) Scan 7-day offlineBundle across ALL lines (dayObsByDay + dayTripsByDay + coches/choferes roster)
   const bundleLines = offlineBundle?.lines || {};
   for (const [codStr, lineObj] of Object.entries(bundleLines)) {
     const cod = Number(codStr);
     const lineName = lineObj?.descripcionLinea || lineByCode?.get(cod)?.descripcion || `L${cod}`;
 
-    if (isCar) {
-      for (const c of lineObj?.coches || []) {
-        if (String(c.coche || '').trim().toUpperCase() !== normId) continue;
-        if (c.esAdaptado) esAdaptado = true;
-        if ((c.lastSeenAt || 0) > lastSeenAt) lastSeenAt = c.lastSeenAt;
-        linesSet.add(lineName);
-      }
-    } else {
-      for (const d of lineObj?.choferes || []) {
-        const dLeg = String(d.choferLegajo || '').trim().toUpperCase();
-        const dNom = String(d.choferNombre || '').trim();
-        if (dLeg !== normId && dNom.toUpperCase() !== normId && String(d.driverKey || '').toUpperCase() !== normId) {
-          continue;
-        }
-        if (dNom) title = dNom;
-        if (dLeg) subtitle = `Legajo ${dLeg}`;
-        if ((d.lastSeenAt || 0) > lastSeenAt) lastSeenAt = d.lastSeenAt;
-        linesSet.add(lineName);
-      }
-    }
-
+    // 2a) Per-day observations (fleet_daily_obs — primary 7-day archive)
     const obsByDay = lineObj?.dayObsByDay || {};
     for (const [dayKey, obsList] of Object.entries(obsByDay)) {
       for (const o of obsList || []) {
@@ -691,17 +818,16 @@ export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBus
         const oNom = String(o.choferNombre || '').trim();
         const oKey = String(o.driverKey || '').trim().toUpperCase();
 
-        const match = isCar
-          ? oCar === normId
-          : (oLeg && oLeg === normId) || oNom.toUpperCase() === normId || (oKey && oKey === normId);
+        const match = isCar ? oCar === normId : matchesDriver(oLeg, oNom, oKey);
         if (!match) continue;
 
         if (o.esAdaptado) esAdaptado = true;
         if (!isCar) {
-          if (oNom) title = oNom;
+          if (oNom && !oNom.startsWith('Legajo ')) title = oNom;
           if (oLeg) subtitle = `Legajo ${oLeg}`;
         }
-        if ((o.lastSeenAt || 0) > lastSeenAt) lastSeenAt = o.lastSeenAt;
+        const seenMs = Number(o.lastSeenAt) || 0;
+        if (seenMs > lastSeenAt) lastSeenAt = seenMs;
         linesSet.add(lineName);
 
         const companion = isCar
@@ -712,22 +838,282 @@ export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBus
             ? `Coche #${oCar}`
             : 'Coche s/d';
 
-        if (companion && !companion.includes('s/d')) {
-          const prev = companionsMap.get(companion) || { label: companion, count: 0 };
-          prev.count++;
-          companionsMap.set(companion, prev);
-        }
+        trackCompanion(companion);
+
+        const latVal = isValidCoord(o.lastLat, o.lastLng) ? Number(o.lastLat) : null;
+        const lngVal = isValidCoord(o.lastLat, o.lastLng) ? Number(o.lastLng) : null;
+        const srvNum = Number(o.lastServiceNum) || 0;
+        const turnoIdx = Number(o.lastTurnoIdx) || 0;
 
         addDayEntry(dayKey, {
           dayKey,
           codigoLinea: cod,
           lineName,
-          serviceNumber: Number(o.lastServiceNum) || 0,
-          turnoIndex: Number(o.lastTurnoIdx) || 0,
+          coche: oCar,
+          choferNombre: oNom,
+          choferLegajo: oLeg,
+          esAdaptado: Boolean(o.esAdaptado),
+          serviceNumber: srvNum,
+          turnoIndex: turnoIdx,
+          turnoStart: '',
+          turnoEnd: '',
           bandera: o.lastBandera || '',
+          lastGps: o.lastGps || '',
+          lastStopId: o.lastStopId || '',
+          lat: latVal,
+          lng: lngVal,
+          desvioRaw: o.lastDesvioRaw || '',
+          desvioSec: Number(o.lastDesvioSec) || 0,
           companion,
-          lastSeenAt: o.lastSeenAt || 0,
-          firstSeenAt: o.firstSeenAt || 0
+          tripTimes: [],
+          lastSeenAt: seenMs,
+          firstSeenAt: Number(o.firstSeenAt) || 0
+        });
+
+        considerLastPosition({
+          codigoLinea: cod,
+          lineName,
+          coche: oCar,
+          choferNombre: oNom,
+          choferLegajo: oLeg,
+          esAdaptado: Boolean(o.esAdaptado),
+          lat: latVal,
+          lng: lngVal,
+          bandera: o.lastBandera || '',
+          lastGps: o.lastGps || '',
+          lastStopId: o.lastStopId || '',
+          desvioRaw: o.lastDesvioRaw || '',
+          desvioSec: Number(o.lastDesvioSec) || 0,
+          serviceNumber: srvNum,
+          turnoIndex: turnoIdx,
+          turnoStart: '',
+          turnoEnd: '',
+          dayKey,
+          lastSeenAt: seenMs,
+          enLineaAhora: false
+        });
+      }
+    }
+
+    // 2b) Per-day trip_assignments (enriches departure times & recovers any day without dayObsByDay)
+    const tripsByDay = lineObj?.dayTripsByDay || {};
+    for (const [dayKey, tripList] of Object.entries(tripsByDay)) {
+      for (const t of tripList || []) {
+        const tCar = String(t.coche || '').trim().toUpperCase();
+        const tLeg = String(t.choferLegajo || '').trim().toUpperCase();
+        const tNom = String(t.choferNombre || '').trim();
+
+        const match = isCar ? tCar === normId : matchesDriver(tLeg, tNom);
+        if (!match) continue;
+
+        if (t.esAdaptado) esAdaptado = true;
+        if (!isCar) {
+          if (tNom && !tNom.startsWith('Legajo ') && (!title || title === normId || title.startsWith('Legajo '))) {
+            title = tNom;
+          }
+          if (tLeg && !subtitle) subtitle = `Legajo ${tLeg}`;
+        }
+        const updMs = Number(t.updatedAt) || 0;
+        if (updMs > lastSeenAt) lastSeenAt = updMs;
+        linesSet.add(lineName);
+
+        const companion = isCar
+          ? tNom
+            ? `${tNom}${tLeg ? ` (${tLeg})` : ''}`
+            : 'Chofer s/d'
+          : tCar
+            ? `Coche #${tCar}`
+            : 'Coche s/d';
+
+        const hhmm = extractTripHHMM(t.turnoHora, t.tripKey);
+        const latVal = isValidCoord(t.lat, t.lng) ? Number(t.lat) : null;
+        const lngVal = isValidCoord(t.lat, t.lng) ? Number(t.lng) : null;
+        const tripBandera = String(t.tripKey || '').split('@')[0] || '';
+
+        addDayEntry(dayKey, {
+          dayKey,
+          codigoLinea: cod,
+          lineName,
+          coche: tCar,
+          choferNombre: tNom,
+          choferLegajo: tLeg,
+          esAdaptado: Boolean(t.esAdaptado),
+          serviceNumber: 0,
+          turnoIndex: 0,
+          turnoStart: '',
+          turnoEnd: '',
+          bandera: tripBandera,
+          lastGps: t.ultimaGps || '',
+          lastStopId: t.stopId || '',
+          lat: latVal,
+          lng: lngVal,
+          desvioRaw: t.desvioRaw || '',
+          desvioSec: Number(t.desvioSec) || 0,
+          companion,
+          tripTimes: hhmm ? [hhmm] : [],
+          lastSeenAt: updMs,
+          firstSeenAt: updMs
+        });
+
+        considerLastPosition({
+          codigoLinea: cod,
+          lineName,
+          coche: tCar,
+          choferNombre: tNom,
+          choferLegajo: tLeg,
+          esAdaptado: Boolean(t.esAdaptado),
+          lat: latVal,
+          lng: lngVal,
+          bandera: tripBandera,
+          lastGps: t.ultimaGps || '',
+          lastStopId: t.stopId || '',
+          desvioRaw: t.desvioRaw || '',
+          desvioSec: Number(t.desvioSec) || 0,
+          serviceNumber: 0,
+          turnoIndex: 0,
+          turnoStart: '',
+          turnoEnd: '',
+          dayKey,
+          lastSeenAt: updMs,
+          enLineaAhora: false
+        });
+      }
+    }
+
+    // 2c) Roster coches/choferes (enriches turnoStart–turnoEnd, exact service/turno, and last known GPS)
+    if (isCar) {
+      for (const c of lineObj?.coches || []) {
+        if (String(c.coche || '').trim().toUpperCase() !== normId) continue;
+        if (c.esAdaptado) esAdaptado = true;
+        const seenMs = Number(c.lastSeenAt) || 0;
+        if (seenMs > lastSeenAt) lastSeenAt = seenMs;
+        linesSet.add(lineName);
+
+        const cNom = String(c.lastChoferNombre || '').trim();
+        const cLeg = String(c.lastChoferLegajo || '').trim().toUpperCase();
+        const companion = cNom ? `${cNom}${cLeg ? ` (${cLeg})` : ''}` : 'Chofer s/d';
+        const latVal = isValidCoord(c.lastLat, c.lastLng) ? Number(c.lastLat) : null;
+        const lngVal = isValidCoord(c.lastLat, c.lastLng) ? Number(c.lastLng) : null;
+        const dk = c.lastDayKey || '';
+
+        if (dk) {
+          addDayEntry(dk, {
+            dayKey: dk,
+            codigoLinea: cod,
+            lineName,
+            coche: normId,
+            choferNombre: cNom,
+            choferLegajo: cLeg,
+            esAdaptado: Boolean(c.esAdaptado),
+            serviceNumber: Number(c.lastServiceNum) || 0,
+            turnoIndex: Number(c.lastTurnoIdx) || 0,
+            turnoStart: c.lastTurnoStart || '',
+            turnoEnd: c.lastTurnoEnd || '',
+            bandera: c.lastBandera || '',
+            lastGps: c.lastGps || '',
+            lastStopId: c.lastStopId || '',
+            lat: latVal,
+            lng: lngVal,
+            desvioRaw: c.lastDesvioRaw || '',
+            desvioSec: Number(c.lastDesvioSec) || 0,
+            companion,
+            tripTimes: [],
+            lastSeenAt: seenMs,
+            firstSeenAt: Number(c.firstSeenAt) || 0
+          });
+        }
+        if (companionsMap.size === 0) trackCompanion(companion);
+
+        considerLastPosition({
+          codigoLinea: cod,
+          lineName,
+          coche: normId,
+          choferNombre: cNom,
+          choferLegajo: cLeg,
+          esAdaptado: Boolean(c.esAdaptado),
+          lat: latVal,
+          lng: lngVal,
+          bandera: c.lastBandera || '',
+          lastGps: c.lastGps || '',
+          lastStopId: c.lastStopId || '',
+          desvioRaw: c.lastDesvioRaw || '',
+          desvioSec: Number(c.lastDesvioSec) || 0,
+          serviceNumber: Number(c.lastServiceNum) || 0,
+          turnoIndex: Number(c.lastTurnoIdx) || 0,
+          turnoStart: c.lastTurnoStart || '',
+          turnoEnd: c.lastTurnoEnd || '',
+          dayKey: dk,
+          lastSeenAt: seenMs,
+          enLineaAhora: Boolean(c.enLineaAhora)
+        });
+      }
+    } else {
+      for (const d of lineObj?.choferes || []) {
+        const dLeg = String(d.choferLegajo || '').trim().toUpperCase();
+        const dNom = String(d.choferNombre || '').trim();
+        if (!matchesDriver(dLeg, dNom, d.driverKey)) continue;
+        if (dNom && !dNom.startsWith('Legajo ')) title = dNom;
+        if (dLeg) subtitle = `Legajo ${dLeg}`;
+        if (d.lastEsAdaptado) esAdaptado = true;
+        const seenMs = Number(d.lastSeenAt) || 0;
+        if (seenMs > lastSeenAt) lastSeenAt = seenMs;
+        linesSet.add(lineName);
+
+        const dCar = String(d.lastCoche || '').trim().toUpperCase();
+        const companion = dCar ? `Coche #${dCar}` : 'Coche s/d';
+        const latVal = isValidCoord(d.lastLat, d.lastLng) ? Number(d.lastLat) : null;
+        const lngVal = isValidCoord(d.lastLat, d.lastLng) ? Number(d.lastLng) : null;
+        const dk = d.lastDayKey || '';
+
+        if (dk) {
+          addDayEntry(dk, {
+            dayKey: dk,
+            codigoLinea: cod,
+            lineName,
+            coche: dCar,
+            choferNombre: dNom,
+            choferLegajo: dLeg,
+            esAdaptado: Boolean(d.lastEsAdaptado),
+            serviceNumber: Number(d.lastServiceNum) || 0,
+            turnoIndex: Number(d.lastTurnoIdx) || 0,
+            turnoStart: d.lastTurnoStart || '',
+            turnoEnd: d.lastTurnoEnd || '',
+            bandera: d.lastBandera || '',
+            lastGps: d.lastGps || '',
+            lastStopId: d.lastStopId || '',
+            lat: latVal,
+            lng: lngVal,
+            desvioRaw: d.lastDesvioRaw || '',
+            desvioSec: Number(d.lastDesvioSec) || 0,
+            companion,
+            tripTimes: [],
+            lastSeenAt: seenMs,
+            firstSeenAt: Number(d.firstSeenAt) || 0
+          });
+        }
+        if (companionsMap.size === 0) trackCompanion(companion);
+
+        considerLastPosition({
+          codigoLinea: cod,
+          lineName,
+          coche: dCar,
+          choferNombre: dNom,
+          choferLegajo: dLeg,
+          esAdaptado: Boolean(d.lastEsAdaptado),
+          lat: latVal,
+          lng: lngVal,
+          bandera: d.lastBandera || '',
+          lastGps: d.lastGps || '',
+          lastStopId: d.lastStopId || '',
+          desvioRaw: d.lastDesvioRaw || '',
+          desvioSec: Number(d.lastDesvioSec) || 0,
+          serviceNumber: Number(d.lastServiceNum) || 0,
+          turnoIndex: Number(d.lastTurnoIdx) || 0,
+          turnoStart: d.lastTurnoStart || '',
+          turnoEnd: d.lastTurnoEnd || '',
+          dayKey: dk,
+          lastSeenAt: seenMs,
+          enLineaAhora: Boolean(d.enLineaAhora)
         });
       }
     }
@@ -749,6 +1135,7 @@ export function buildEntitySevenDayProfile(type, queryId, offlineBundle, liveBus
     subtitle: isCar ? (esAdaptado ? 'Unidad adaptada ♿' : 'Unidad urbana/interprovincial') : subtitle || 'Chofer registrado',
     esAdaptado,
     liveNow,
+    lastPosition,
     lastSeenAt,
     lines: Array.from(linesSet).sort((a, b) => a.localeCompare(b, 'es', { numeric: true })),
     companions,

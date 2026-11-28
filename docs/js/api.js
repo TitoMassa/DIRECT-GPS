@@ -931,7 +931,7 @@ export const api = {
   // ── Central System Fleet & Drivers Roster (server-side Durable Object SQLite + live 10s SOAP + full IndexedDB offline cache) ──
   offlineBundle: async () => {
     const res = await apiGet('/api/offline-bundle', null, 15000);
-    if (res?.data) {
+    if (res?.data && hasOfflineBundleContent(res.data)) {
       const savedAt = Number(res.savedAt) || Date.now();
       await persistOfflineBundleSnapshot(res.data, savedAt);
     }
@@ -940,7 +940,11 @@ export const api = {
 
   getOfflineBundleCached: async ({ maxAgeMs = 25000, force = false } = {}) => {
     const now = Date.now();
-    if (!force && lastBundleMemSnap?.data && (isBrowserOffline() || now - lastBundleMemSnap.savedAt < maxAgeMs)) {
+    if (
+      !force &&
+      hasOfflineBundleContent(lastBundleMemSnap?.data) &&
+      (isBrowserOffline() || now - lastBundleMemSnap.savedAt < maxAgeMs)
+    ) {
       return {
         data: lastBundleMemSnap.data,
         savedAt: lastBundleMemSnap.savedAt,
@@ -952,7 +956,11 @@ export const api = {
     if (!force || isBrowserOffline()) {
       idbSnap = await readIdbValue('offline_bundle');
       const idbTs = Number(idbSnap?.savedAt) || 0;
-      if (!force && idbSnap?.data && (isBrowserOffline() || now - idbTs < maxAgeMs)) {
+      if (
+        !force &&
+        hasOfflineBundleContent(idbSnap?.data) &&
+        (isBrowserOffline() || now - idbTs < maxAgeMs)
+      ) {
         sanitizeApiPayload(idbSnap.data);
         lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
         return {
@@ -966,7 +974,7 @@ export const api = {
     if (!isBrowserOffline()) {
       try {
         const res = await apiGet('/api/offline-bundle', null, 15000);
-        if (res?.data) {
+        if (res?.data && hasOfflineBundleContent(res.data)) {
           const savedAt = Number(res.savedAt) || Date.now();
           lastBundleMemSnap = { savedAt, data: res.data };
           if (res.data.liveHorarios && typeof res.data.liveHorarios === 'object') {
@@ -984,11 +992,11 @@ export const api = {
       }
     }
 
-    if (lastBundleMemSnap?.data) {
+    if (hasOfflineBundleContent(lastBundleMemSnap?.data)) {
       return { data: lastBundleMemSnap.data, savedAt: lastBundleMemSnap.savedAt, isOfflineCache: true };
     }
     if (!idbSnap) idbSnap = await readIdbValue('offline_bundle');
-    if (idbSnap?.data) {
+    if (hasOfflineBundleContent(idbSnap?.data)) {
       const idbTs = Number(idbSnap.savedAt) || 0;
       sanitizeApiPayload(idbSnap.data);
       lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
@@ -1127,12 +1135,48 @@ function normalizeOfflineSearchText(str = '') {
 let lastBundleMemSnap = null;
 let lastBundleIdbPersistMs = 0;
 
+function hasOfflineBundleContent(bundleData) {
+  if (!bundleData || typeof bundleData !== 'object') return false;
+  const lines = bundleData.lines;
+  if (lines && typeof lines === 'object' && Object.keys(lines).length > 0) return true;
+  if (Array.isArray(bundleData.resumen?.lineas) && bundleData.resumen.lineas.length > 0) return true;
+  if (Array.isArray(bundleData.activeUnits) && bundleData.activeUnits.length > 0) return true;
+  return false;
+}
+
 export function getCachedOfflineBundle() {
+  return lastBundleMemSnap?.data || null;
+}
+
+export async function hydrateOfflineBundleMemory() {
+  if (hasOfflineBundleContent(lastBundleMemSnap?.data)) {
+    return lastBundleMemSnap.data;
+  }
+  try {
+    const idbSnap = await readIdbValue('offline_bundle');
+    if (idbSnap?.data && hasOfflineBundleContent(idbSnap.data)) {
+      const idbTs = Number(idbSnap.savedAt) || 0;
+      sanitizeApiPayload(idbSnap.data);
+      lastBundleMemSnap = { savedAt: idbTs, data: idbSnap.data };
+      return lastBundleMemSnap.data;
+    }
+  } catch {
+    // Non-fatal: caller can fetch live
+  }
   return lastBundleMemSnap?.data || null;
 }
 
 async function persistOfflineBundleSnapshot(bundleData, savedAt = Date.now()) {
   if (!bundleData || typeof bundleData !== 'object') return;
+  if (!hasOfflineBundleContent(bundleData)) {
+    if (hasOfflineBundleContent(lastBundleMemSnap?.data)) return;
+    const existing = await readIdbValue('offline_bundle').catch(() => null);
+    if (hasOfflineBundleContent(existing?.data)) {
+      sanitizeApiPayload(existing.data);
+      lastBundleMemSnap = { savedAt: Number(existing.savedAt) || 0, data: existing.data };
+      return;
+    }
+  }
   lastBundleMemSnap = { savedAt, data: bundleData };
   lastBundleIdbPersistMs = Date.now();
   await saveIdbValue('offline_bundle', { savedAt, data: bundleData });
@@ -1503,20 +1547,28 @@ function buildCorrientesOfflineTileList() {
 
 let offlineBundleSyncInFlight = null;
 export async function refreshOfflineBundleSilent({ force = false } = {}) {
-  if (isBrowserOffline()) return false;
+  if (isBrowserOffline()) {
+    await hydrateOfflineBundleMemory();
+    return Boolean(hasOfflineBundleContent(lastBundleMemSnap?.data));
+  }
   if (offlineBundleSyncInFlight) return offlineBundleSyncInFlight;
   offlineBundleSyncInFlight = (async () => {
     try {
-      if (!force) {
-        const existing = await readIdbValue('offline_bundle');
-        if (existing?.savedAt && Date.now() - Number(existing.savedAt) < OFFLINE_BUNDLE_REFRESH_MIN_MS) {
+      const existing = await readIdbValue('offline_bundle');
+      if (existing?.data && hasOfflineBundleContent(existing.data)) {
+        const existingTs = Number(existing.savedAt) || 0;
+        if (!lastBundleMemSnap?.data || existingTs > (lastBundleMemSnap.savedAt || 0)) {
+          sanitizeApiPayload(existing.data);
+          lastBundleMemSnap = { savedAt: existingTs, data: existing.data };
+        }
+        if (!force && existingTs && Date.now() - existingTs < OFFLINE_BUNDLE_REFRESH_MIN_MS) {
           return true;
         }
       }
       await api.offlineBundle();
-      return true;
+      return Boolean(hasOfflineBundleContent(lastBundleMemSnap?.data));
     } catch {
-      return false;
+      return Boolean(hasOfflineBundleContent(lastBundleMemSnap?.data));
     } finally {
       offlineBundleSyncInFlight = null;
     }

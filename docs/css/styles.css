@@ -5844,6 +5844,30 @@ button.ev-card:hover {
   font-size: 12px;
 }
 
+.profile-lastpos-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.profile-lastpos-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.profile-lastpos-time {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
 .profile-lines-row {
   display: flex;
   flex-wrap: wrap;
@@ -5918,6 +5942,10 @@ button.ev-card:hover {
 .profile-day-detail span {
   font-size: 10.5px;
   color: var(--text-3);
+}
+
+.profile-day-map-btn {
+  flex-shrink: 0;
 }
 
 /* Favorite Cars & Drivers Section */

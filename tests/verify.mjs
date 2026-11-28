@@ -363,7 +363,7 @@ console.log('6. Testing local server.js HTTP endpoints, SW v98, and v2.7.0 asset
     const html = await (await checkUrl('/')).text();
     assert.ok(html.includes('DIRECT GPS'), 'index.html should contain DIRECT GPS');
     const sw = await (await checkUrl('/sw.js')).text();
-    assert.ok(sw.includes('direct-gps-v114') && sw.includes('direct-gps-data-v7'), 'sw.js should have direct-gps-v114 & direct-gps-data-v7');
+    assert.ok(sw.includes('direct-gps-v115') && sw.includes('direct-gps-data-v7'), 'sw.js should have direct-gps-v115 & direct-gps-data-v7');
     assert.ok(sw.includes('notificationclick') && sw.includes("addEventListener('push'"), 'sw.js must handle push & notificationclick actions');
     for (const asset of [
       '/icons/icon-192.png',
@@ -1759,11 +1759,170 @@ console.log('10. Testing v2.6.1 features (Night Map zero-API, Holidays, Schedule
     assert.ok(routeDistSrc.includes('bestPrev != null && bestDist > 0.5 && bestDist <= 430.0'), 'Android RouteDistanceCalculator must defensively prepend prev branch end onto next branch start');
   }
 
+  // v3.1.9: 7-day history hydration & complete profile (choferes, coches, turnos, servicios, salidas & lastPosition)
+  {
+    const bundleMock = {
+      dayKey: '2026-11-28',
+      retentionDays: 7,
+      lines: {
+        '351': {
+          codigoLinea: 351,
+          descripcionLinea: '106B',
+          coches: [
+            {
+              coche: '2976',
+              esAdaptado: false,
+              lastChoferNombre: 'DABRIO JUAN',
+              lastChoferLegajo: '10304',
+              lastBandera: 'PUERTO-BARRIO NUEVO',
+              lastGps: '27/11/2026 13:46:51',
+              lastLat: -27.498463,
+              lastLng: -58.790611,
+              lastServiceNum: 5,
+              lastTurnoIdx: 1,
+              lastTurnoStart: '06:00',
+              lastTurnoEnd: '13:49',
+              lastSeenAt: 1795798029914,
+              lastDayKey: '2026-11-27'
+            }
+          ],
+          choferes: [
+            {
+              driverKey: 'leg:10304',
+              choferNombre: 'DABRIO JUAN',
+              choferLegajo: '10304',
+              lastCoche: '2976',
+              lastBandera: 'PUERTO-BARRIO NUEVO',
+              lastGps: '27/11/2026 13:46:51',
+              lastLat: -27.498463,
+              lastLng: -58.790611,
+              lastServiceNum: 5,
+              lastTurnoIdx: 1,
+              lastTurnoStart: '06:00',
+              lastTurnoEnd: '13:49',
+              lastSeenAt: 1795798029914,
+              lastDayKey: '2026-11-27'
+            }
+          ],
+          dayObsByDay: {
+            '2026-11-27': [
+              {
+                dayKey: '2026-11-27',
+                coche: '2976',
+                driverKey: 'leg:10304',
+                choferNombre: 'DABRIO JUAN',
+                choferLegajo: '10304',
+                lastBandera: 'PUERTO-BARRIO NUEVO',
+                lastGps: '27/11/2026 13:46:51',
+                lastLat: -27.498463,
+                lastLng: -58.790611,
+                lastServiceNum: 5,
+                lastTurnoIdx: 1,
+                lastSeenAt: 1795798029914
+              }
+            ],
+            '2026-11-24': [
+              {
+                dayKey: '2026-11-24',
+                coche: '2595',
+                driverKey: 'leg:10304',
+                choferNombre: 'DABRIO JUAN',
+                choferLegajo: '10304',
+                lastBandera: 'BARRIO NUEVO-PUERTO',
+                lastGps: '24/11/2026 11:34:53',
+                lastLat: -27.46151,
+                lastLng: -58.8369,
+                lastServiceNum: 0,
+                lastTurnoIdx: 0,
+                lastSeenAt: 1795530893000
+              }
+            ]
+          },
+          dayTripsByDay: {
+            '2026-11-27': [
+              {
+                tripKey: 'BARRIO NUEVO PUERTO@06:00',
+                turnoHora: '06:00',
+                coche: '2976',
+                choferNombre: 'DABRIO JUAN',
+                choferLegajo: '10304',
+                ultimaGps: '27/11/2026 06:05:00',
+                lat: -27.5041,
+                lng: -58.7875,
+                updatedAt: 1795770300000
+              },
+              {
+                tripKey: 'BARRIO NUEVO PUERTO@09:04',
+                turnoHora: '09:04',
+                coche: '2976',
+                choferNombre: 'DABRIO JUAN',
+                choferLegajo: '10304',
+                ultimaGps: '27/11/2026 09:10:00',
+                lat: -27.48,
+                lng: -58.81,
+                updatedAt: 1795781400000
+              }
+            ],
+            '2026-11-26': [
+              {
+                tripKey: 'PUERTO BARRIO NUEVO@12:03',
+                turnoHora: '12:03',
+                coche: '2976',
+                choferNombre: 'DABRIO JUAN',
+                choferLegajo: '10304',
+                ultimaGps: '26/11/2026 12:15:00',
+                lat: -27.479532,
+                lng: -58.812345,
+                updatedAt: 1795706100000
+              }
+            ]
+          }
+        }
+      }
+    };
+
+    const drvProf = buildEntitySevenDayProfile('chofer', '10304', bundleMock, []);
+    assert.equal(drvProf.title, 'DABRIO JUAN');
+    assert.equal(drvProf.subtitle, 'Legajo 10304');
+    assert.equal(drvProf.days.length, 3, '7-day profile must fuse dayObsByDay + dayTripsByDay across all days');
+    assert.equal(drvProf.days[0].dayKey, '2026-11-27');
+    assert.equal(drvProf.days[0].entries[0].serviceNumber, 5);
+    assert.equal(drvProf.days[0].entries[0].turnoIndex, 1);
+    assert.equal(drvProf.days[0].entries[0].turnoStart, '06:00');
+    assert.equal(drvProf.days[0].entries[0].turnoEnd, '13:49');
+    assert.deepEqual(drvProf.days[0].entries[0].tripTimes, ['06:00', '09:04']);
+    assert.equal(drvProf.days[1].dayKey, '2026-11-26', 'dayTripsByDay-only day must be recovered in 7-day profile');
+    assert.equal(drvProf.lastPosition?.coche, '2976');
+    assert.equal(drvProf.lastPosition?.serviceNumber, 5);
+    assert.equal(drvProf.lastPosition?.turnoStart, '06:00');
+    assert.equal(drvProf.lastPosition?.lastGps, '27/11/2026 13:46:51');
+    assert.ok(Math.abs(drvProf.lastPosition?.lat - -27.498463) < 0.0001);
+
+    const carProf = buildEntitySevenDayProfile('coche', '2976', bundleMock, []);
+    assert.equal(carProf.days.length, 2);
+    assert.equal(carProf.lastPosition?.choferNombre, 'DABRIO JUAN');
+    assert.equal(carProf.lastPosition?.turnoEnd, '13:49');
+
+    const apiJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'api.js'), 'utf8');
+    assert.ok(
+      apiJsSrc.includes('export async function hydrateOfflineBundleMemory') &&
+        apiJsSrc.includes('function hasOfflineBundleContent'),
+      'api.js must hydrate lastBundleMemSnap from IndexedDB and guard against empty bundle clobbering'
+    );
+    const uiExtrasSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'ui-extras.js'), 'utf8');
+    assert.ok(
+      uiExtrasSrc.includes('async function openEntityProfileModal') &&
+        uiExtrasSrc.includes('btn-profile-locate-last') &&
+        uiExtrasSrc.includes('data-day-loc-idx'),
+      'ui-extras.js must async-load 7-day bundle on demand and expose last-position + per-day map locate buttons'
+    );
+  }
+
   const appJsSrc = await fs.readFile(path.join(ROOT, 'docs', 'js', 'app.js'), 'utf8');
-  assert.ok(appJsSrc.includes("version: 'v3.1.8'") && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.8 changelog, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
+  assert.ok(appJsSrc.includes("version: 'v3.1.9'") && appJsSrc.includes('hydrateOfflineBundleMemory()') && appJsSrc.includes('applyTerminalCoords') && appJsSrc.includes('buildCitySimCorrectionGlide') && appJsSrc.includes('hasOfficialSoapEta') && appJsSrc.includes('STORAGE_ARMED_ALERTS_KEY') && appJsSrc.includes('checkAndPromptMissingPermissions'), 'app.js must include v3.1.9 changelog, startup bundle hydration, terminal snap helpers, smooth GPS recovery glide, hasOfficialSoapEta, persistent alerts, and startup permissions');
   assert.equal(/function pauseRealtime\(\)[\s\S]{0,400}state\.isAppPaused\s*=\s*true/.test(appJsSrc), false, 'pauseRealtime must NOT suspend the app on minimize');
 
-  console.log('  ✓ Verified v3.1.8 Next-Bandera-Fills-Gap 0m Connected Polylines (all 26 lines / 65 untouched original ends), Exact Polyline-Tip Terminal Snap, 3-min/5-min Schedule Rules & Smooth GPS Recovery');
+  console.log('  ✓ Verified v3.1.9 Complete 7-Day History Hydration & Last-Position Profile, v3.1.8 Next-Bandera-Fills-Gap 0m Connected Polylines, Terminal Snap, 3-min/5-min Schedule Rules & Smooth GPS Recovery');
 }
 
 console.log('\nALL 10 END-TO-END VERIFICATION SUITES PASSED!');

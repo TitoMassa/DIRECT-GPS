@@ -5,6 +5,7 @@ import {
   warmOfflineArchive,
   refreshOfflineBundleSilent,
   getCachedOfflineBundle,
+  hydrateOfflineBundleMemory,
   distanceMeters,
   formatDistance,
   formatBlocks,
@@ -376,6 +377,13 @@ const el = {
 };
 
 const CHANGELOG_ENTRIES = [
+  {
+    version: 'v3.1.9',
+    date: '28/11/2026 · 04:45 hs',
+    items: [
+      '<strong>Historial completo de 7 días restaurado y enriquecido en todas las líneas:</strong> corregido el bug de arranque que dejaba el paquete de 7 días sin hidratar en memoria (mostrando «Aún no hay observaciones históricas» al abrir Ficha 7d o Favoritos). Ahora se carga automáticamente desde caché local / servidor al instante y muestra el historial completo de <strong>choferes, coches, servicios, turnos (con horarios y salidas) y última posición GPS</strong> con botón <strong>Ver en mapa</strong> global y por cada día.'
+    ]
+  },
   {
     version: 'v3.1.8',
     date: '28/11/2026 · 04:25 hs',
@@ -833,7 +841,8 @@ const uiExtras = createUiExtras({
       lastStopId: u.lastStopId || '',
       desvioRaw: u.desvio?.raw || u.lastDesvioRaw || '',
       desvioSec: u.desvio?.seconds || u.lastDesvioSec || 0,
-      enLineaAhora: true
+      enLineaAhora: u.enLineaAhora !== undefined ? Boolean(u.enLineaAhora) : true,
+      entityType: u.entityType === 'chofer' ? 'chofer' : 'coche'
     });
   },
   onFavoritesChanged: () => renderFavorites(),
@@ -10389,8 +10398,11 @@ function renderLineFlotaView() {
                 ? `Los coches de ${escapeHtml(dayNavInfo.main)} se registran automáticamente al iniciar el servicio. Mirá el diagrama completo en Servicios.`
                 : isHistoricalSrvDay
                   ? `No quedaron registros de coches guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                  : `El sistema escanea automáticamente todas las líneas y guarda el registro diario por ${retentionDays} días.`
+                  : allCoches.length > 0
+                    ? `Todavía no salieron unidades en el día de hoy. Tenés ${allCoches.length} coches en el historial de ${retentionDays} días.`
+                    : `El sistema escanea automáticamente todas las líneas y guarda el registro diario por ${retentionDays} días.`
           }</p>
+          ${!query && !isHistoricalSrvDay && !isFutureSrvDay && allCoches.length > 0 && maxDayOffset >= 1 ? `<button type="button" id="btn-flota-go-yesterday" class="secondary-action-btn">Ver actividad de ayer</button>` : ''}
         </div>
       `;
     } else {
@@ -10531,8 +10543,11 @@ function renderLineFlotaView() {
                 ? `Los choferes de ${escapeHtml(dayNavInfo.main)} se asignan automáticamente al iniciar cada turno. Mirá los horarios en Servicios.`
                 : isHistoricalSrvDay
                   ? `No quedaron registros de choferes guardados para ${escapeHtml(dayNavInfo.main)}. Usá las flechas para recorrer los últimos ${retentionDays} días.`
-                  : `El sistema guarda automáticamente la actividad diaria de cada chofer durante ${retentionDays} días.`
+                  : allChoferes.length > 0
+                    ? `Todavía no salieron unidades en el día de hoy. Tenés ${allChoferes.length} choferes en el historial de ${retentionDays} días.`
+                    : `El sistema guarda automáticamente la actividad diaria de cada chofer durante ${retentionDays} días.`
           }</p>
+          ${!query && !isHistoricalSrvDay && !isFutureSrvDay && allChoferes.length > 0 && maxDayOffset >= 1 ? `<button type="button" id="btn-flota-go-yesterday" class="secondary-action-btn">Ver actividad de ayer</button>` : ''}
         </div>
       `;
     } else {
@@ -11034,6 +11049,11 @@ function renderLineFlotaView() {
     haptic('light');
     fv.serviceDayCache?.delete(selectedServiceDayKey);
     loadServiceHistoryDay(linea, serviceDayOffset, { force: true });
+  });
+  document.getElementById('btn-flota-go-yesterday')?.addEventListener('click', () => {
+    if (maxDayOffset < 1) return;
+    haptic('light');
+    loadServiceHistoryDay(linea, 1);
   });
 
   const subTabs = Array.from(el.lineasContent.querySelectorAll('[data-flota-tab]'));
@@ -13725,7 +13745,8 @@ async function init() {
     showToast('No se pudo cargar el catálogo de líneas', 'warn');
   }
 
-  // Automatically cache routes, 24h schedules, 7-day fleet/services bundle, live SOAP schedules (10m), and Corrientes OSM map tiles
+  // Hydrate 7-day fleet bundle from IndexedDB immediately (0ms delay for Ficha 7d & Favoritos), then refresh in background
+  hydrateOfflineBundleMemory().catch(() => {});
   setTimeout(() => warmOfflineArchive(), 1500);
   setInterval(() => {
     if (!state.isAppPaused && !state.isOffline) {

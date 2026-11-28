@@ -536,14 +536,14 @@ export function createUiExtras(ctx) {
     btnProfileFav.textContent = nowFav ? '★ Favorito' : '☆ Seguir';
   });
 
-  function openEntityProfileModal(type, id, meta = {}) {
-    if (!profileModal || !profileBody) return;
-    const bundle = getOfflineBundleData?.() || null;
+  let profileOpenSeq = 0;
+
+  function renderProfileIntoModal(type, id, meta, bundle) {
     const liveUnits = getAllLiveUnits?.() || [];
     const profile = buildEntitySevenDayProfile(type, id, bundle, liveUnits, state.catalogo?.lineByCode);
     if (!profile) {
       showToast('Sin datos históricos suficientes todavía.', 'info', 2400);
-      return;
+      return null;
     }
 
     activeProfileReq = {
@@ -552,7 +552,7 @@ export function createUiExtras(ctx) {
       label: profile.title,
       sub: profile.subtitle,
       lineName: meta.lineName || profile.lines[0] || '',
-      codLinea: meta.codLinea || profile.liveNow?.codigoLinea || 0
+      codLinea: meta.codLinea || profile.liveNow?.codigoLinea || profile.lastPosition?.codigoLinea || 0
     };
 
     if (profileTitle) profileTitle.textContent = profile.title;
@@ -560,7 +560,7 @@ export function createUiExtras(ctx) {
       const liveTxt = profile.liveNow
         ? `● En línea ahora (${profile.liveNow.descripcionLinea || ''})`
         : profile.lines.length > 0
-          ? `Líneas en 7 días: ${profile.lines.join(', ')}`
+          ? `${profile.subtitle && !profile.subtitle.startsWith('Unidad ') && profile.subtitle !== 'Chofer registrado' ? `${profile.subtitle} · ` : ''}Líneas 7d: ${profile.lines.join(', ')}`
           : profile.subtitle;
       profileSub.textContent = liveTxt;
     }
@@ -592,6 +592,7 @@ export function createUiExtras(ctx) {
         `
         : '';
 
+    const dayLocateTargets = [];
     const daysHtml =
       profile.days.length > 0
         ? `
@@ -601,7 +602,7 @@ export function createUiExtras(ctx) {
               ${profile.days
                 .map((d) => {
                   const [y, mo, da] = d.dayKey.split('-');
-                  const niceDate = `${da}/${mo}/${y}`;
+                  const niceDate = da && mo && y ? `${da}/${mo}/${y}` : d.dayKey;
                   return `
                     <div class="profile-day-card">
                       <div class="profile-day-date mono">${esc(niceDate)}</div>
@@ -609,16 +610,57 @@ export function createUiExtras(ctx) {
                         ${d.entries
                           .map((en) => {
                             const col = getLineColor(en.lineName);
+                            const turnoSpan = en.turnoStart && en.turnoEnd ? ` (${en.turnoStart}–${en.turnoEnd})` : '';
                             const srv = en.serviceNumber
-                              ? `Srv ${en.serviceNumber}${en.turnoIndex ? ` · T${en.turnoIndex}` : ''}`
+                              ? `Srv ${en.serviceNumber}${en.turnoIndex ? ` · T${en.turnoIndex}` : ''}${turnoSpan}`
                               : '';
+                            const gpsTime = en.lastGps
+                              ? String(en.lastGps).match(/(\d{2}:\d{2})/)?.[1] || ''
+                              : '';
+                            const tripsStr =
+                              Array.isArray(en.tripTimes) && en.tripTimes.length > 0
+                                ? `Salidas: ${en.tripTimes.slice(0, 4).join(', ')}${en.tripTimes.length > 4 ? '…' : ''}`
+                                : '';
+                            const detailParts = [
+                              srv,
+                              en.bandera,
+                              gpsTime ? `Últ. GPS ${gpsTime}` : '',
+                              tripsStr
+                            ].filter(Boolean);
+                            const hasLoc =
+                              Number.isFinite(Number(en.lat)) &&
+                              Number.isFinite(Number(en.lng)) &&
+                              (Math.abs(Number(en.lat)) > 0.01 || Math.abs(Number(en.lng)) > 0.01);
+                            let mapBtnHtml = '';
+                            if (hasLoc) {
+                              const idx = dayLocateTargets.length;
+                              dayLocateTargets.push({
+                                codigoLinea: en.codigoLinea,
+                                descripcionLinea: en.lineName,
+                                coche: en.coche || (type === 'coche' ? profile.id : ''),
+                                choferNombre: en.choferNombre || (type === 'chofer' ? profile.title : ''),
+                                choferLegajo: en.choferLegajo || (type === 'chofer' ? profile.id : ''),
+                                esAdaptado: Boolean(en.esAdaptado || profile.esAdaptado),
+                                lat: Number(en.lat),
+                                lng: Number(en.lng),
+                                bandera: en.bandera || '',
+                                lastGps: en.lastGps || '',
+                                lastStopId: en.lastStopId || '',
+                                desvioRaw: en.desvioRaw || '',
+                                desvioSec: en.desvioSec || 0,
+                                enLineaAhora: false,
+                                entityType: type
+                              });
+                              mapBtnHtml = `<button type="button" class="mini-pill-btn profile-day-map-btn" data-day-loc-idx="${idx}" title="Ver última posición de este día en el mapa">Mapa</button>`;
+                            }
                             return `
                               <div class="profile-day-row">
                                 <span class="fleet-roster-line-pill" style="background:${col}">${esc(en.lineName)}</span>
                                 <div class="profile-day-detail">
-                                  <strong>${esc(en.companion)}</strong>
-                                  <span>${esc([srv, en.bandera].filter(Boolean).join(' · ') || 'Actividad registrada')}</span>
+                                  <strong>${esc(en.companion || 'Actividad registrada')}</strong>
+                                  <span>${esc(detailParts.join(' · ') || 'Actividad registrada')}</span>
                                 </div>
+                                ${mapBtnHtml}
                               </div>
                             `;
                           })
@@ -631,10 +673,18 @@ export function createUiExtras(ctx) {
             </div>
           </div>
         `
-        : `<div class="fleet-roster-empty">Aún no hay observaciones históricas en el paquete de 7 días para esta unidad.</div>`;
+        : `<div class="fleet-roster-empty">Aún no hay observaciones históricas en los últimos 7 días para esta unidad.</div>`;
 
-    const liveBannerHtml = profile.liveNow
-      ? `
+    const lp = profile.lastPosition;
+    const lpHasCoords =
+      lp &&
+      Number.isFinite(Number(lp.lat)) &&
+      Number.isFinite(Number(lp.lng)) &&
+      (Math.abs(Number(lp.lat)) > 0.01 || Math.abs(Number(lp.lng)) > 0.01);
+
+    let statusBannerHtml = '';
+    if (profile.liveNow) {
+      statusBannerHtml = `
         <div class="profile-live-banner">
           <div>
             <strong>● En línea ahora · Línea ${esc(profile.liveNow.descripcionLinea || '')}</strong>
@@ -644,11 +694,40 @@ export function createUiExtras(ctx) {
           </div>
           <button type="button" id="btn-profile-locate-live" class="primary-action-btn seg-btn-xs">Ver en mapa</button>
         </div>
-      `
-      : '';
+      `;
+    } else if (lp) {
+      const lpTurnoSpan = lp.turnoStart && lp.turnoEnd ? ` (${lp.turnoStart}–${lp.turnoEnd})` : '';
+      const lpSrv = lp.serviceNumber
+        ? `Srv ${lp.serviceNumber}${lp.turnoIndex ? ` · T${lp.turnoIndex}` : ''}${lpTurnoSpan}`
+        : '';
+      const lpPartner =
+        type === 'coche'
+          ? lp.choferNombre
+            ? `Chofer ${lp.choferNombre}`
+            : ''
+          : lp.coche
+            ? `Coche #${lp.coche}`
+            : '';
+      const lpMeta = [lpSrv, lpPartner, lp.bandera].filter(Boolean).join(' · ');
+      const lpWhen = lp.lastGps
+        ? `Últ. GPS: ${lp.lastGps}`
+        : lp.dayKey
+          ? `Últ. actividad: ${lp.dayKey.split('-').reverse().join('/')}`
+          : '';
+      statusBannerHtml = `
+        <div class="profile-lastpos-banner">
+          <div>
+            <strong>Última posición · Línea ${esc(lp.lineName || '')}</strong>
+            ${lpMeta ? `<div class="profile-lastpos-meta">${esc(lpMeta)}</div>` : ''}
+            ${lpWhen ? `<div class="profile-lastpos-time mono">${esc(lpWhen)}</div>` : ''}
+          </div>
+          ${lpHasCoords ? `<button type="button" id="btn-profile-locate-last" class="secondary-action-btn seg-btn-xs">Ver en mapa</button>` : ''}
+        </div>
+      `;
+    }
 
     profileBody.innerHTML = `
-      ${liveBannerHtml}
+      ${statusBannerHtml}
       ${linesHtml ? `<div class="profile-lines-row">${linesHtml}</div>` : ''}
       ${companionsHtml}
       ${daysHtml}
@@ -657,10 +736,89 @@ export function createUiExtras(ctx) {
     profileBody.querySelector('#btn-profile-locate-live')?.addEventListener('click', () => {
       const u = profile.liveNow;
       closeProfileModal();
-      if (u) locateUnitOnMap?.(u);
+      if (u) locateUnitOnMap?.({ ...u, enLineaAhora: true, entityType: type });
     });
 
+    profileBody.querySelector('#btn-profile-locate-last')?.addEventListener('click', () => {
+      if (!lp || !lpHasCoords) return;
+      closeProfileModal();
+      locateUnitOnMap?.({
+        codigoLinea: lp.codigoLinea,
+        descripcionLinea: lp.lineName,
+        coche: lp.coche || (type === 'coche' ? profile.id : ''),
+        choferNombre: lp.choferNombre || (type === 'chofer' ? profile.title : ''),
+        choferLegajo: lp.choferLegajo || (type === 'chofer' ? profile.id : ''),
+        esAdaptado: Boolean(lp.esAdaptado || profile.esAdaptado),
+        lat: Number(lp.lat),
+        lng: Number(lp.lng),
+        bandera: lp.bandera || '',
+        lastGps: lp.lastGps || '',
+        lastStopId: lp.lastStopId || '',
+        desvioRaw: lp.desvioRaw || '',
+        desvioSec: lp.desvioSec || 0,
+        enLineaAhora: false,
+        entityType: type
+      });
+    });
+
+    profileBody.querySelectorAll('[data-day-loc-idx]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const target = dayLocateTargets[Number(btn.dataset.dayLocIdx)];
+        if (!target) return;
+        closeProfileModal();
+        locateUnitOnMap?.(target);
+      });
+    });
+
+    return profile;
+  }
+
+  async function openEntityProfileModal(type, id, meta = {}) {
+    if (!profileModal || !profileBody) return;
+    const mySeq = ++profileOpenSeq;
+    const currentBundle = getOfflineBundleData?.() || null;
+    const hasBundleLines = Boolean(currentBundle?.lines && Object.keys(currentBundle.lines).length > 0);
+
+    if (hasBundleLines) {
+      const rendered = renderProfileIntoModal(type, id, meta, currentBundle);
+      if (!rendered) return;
+      profileModal.classList.remove('hidden');
+
+      // If no days matched in the memory snapshot, silently refresh the 7-day bundle once and re-render if still open
+      if (rendered.days.length === 0 && typeof api?.getOfflineBundleCached === 'function') {
+        try {
+          const fresh = await api.getOfflineBundleCached({ maxAgeMs: 60000, force: true });
+          if (mySeq !== profileOpenSeq || profileModal.classList.contains('hidden')) return;
+          if (fresh?.data?.lines && Object.keys(fresh.data.lines).length > 0) {
+            renderProfileIntoModal(type, id, meta, fresh.data);
+          }
+        } catch {
+          // Keep rendered state
+        }
+      }
+      return;
+    }
+
+    // Memory bundle not hydrated yet (e.g. cold boot or IndexedDB cache hit): open modal with loading state and hydrate immediately!
+    const fallbackTitle = type === 'coche' ? `Coche #${String(id || '').trim()}` : String(meta.label || id || '').trim();
+    if (profileTitle) profileTitle.textContent = fallbackTitle;
+    if (profileSub) profileSub.textContent = 'Sincronizando historial de 7 días…';
+    profileBody.innerHTML = `<div class="fleet-roster-empty">Cargando historial completo de 7 días…</div>`;
     profileModal.classList.remove('hidden');
+
+    let loadedBundle = null;
+    if (typeof api?.getOfflineBundleCached === 'function') {
+      try {
+        const res = await api.getOfflineBundleCached({ maxAgeMs: 90000 });
+        if (res?.data?.lines && Object.keys(res.data.lines).length > 0) {
+          loadedBundle = res.data;
+        }
+      } catch {
+        // Fall through to empty render
+      }
+    }
+    if (mySeq !== profileOpenSeq || profileModal.classList.contains('hidden')) return;
+    renderProfileIntoModal(type, id, meta, loadedBundle || getOfflineBundleData?.() || null);
   }
 
   // ── 6. Customizable Schedule Image Exporter (PNG / JPG — Ida/Vuelta + Paradas) ──

@@ -1,10 +1,10 @@
 {
-  "version": "3.1.8",
-  "versionCode": 318,
+  "version": "3.1.9",
+  "versionCode": 319,
   "releaseDate": "2026-11-28",
-  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.8/DIRECT-GPS-v3.1.8-android.apk",
-  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.8",
+  "apkUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/download/v3.1.9/DIRECT-GPS-v3.1.9-android.apk",
+  "releaseUrl": "https://github.com/TitoMassa/DIRECT-GPS/releases/tag/v3.1.9",
   "notes": [
-    "Corregida la dirección de unión de trazados en las 26 líneas: el final de cada bandera vuelve exactamente a su punta de línea original intacta (ej. Plaza Barrio Pirayuí en 106A/B), y ahora es el inicio de la bandera siguiente (ej. el trazado azul) el que completa el hueco desde ese punto sin mover las cabeceras"
+    "Corregido el bug del historial de 7 días en todas las líneas: al abrir Ficha 7d o Favoritos ahora hidrata/carga automáticamente el paquete completo de 7 días (sin quedar vacío tras reabrir o actualizar) y muestra choferes, coches, servicios, turnos con horarios/salidas y última posición GPS con botón Ver en mapa global y por día"
   ]
 }
